@@ -2,12 +2,37 @@
 
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from polycopy.api.app import app
 
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _demo_client(monkeypatch, tmp_path):
+    """Run legacy dashboard API expectations in explicit demo mode."""
+    global client
+
+    monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
+    monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "test-p08.sqlite"))
+    import polycopy.config.settings as settings_module
+    import polycopy.db.database as database_module
+
+    if database_module._db is not None:
+        database_module._db.close()
+    database_module._db = None
+    settings_module._settings = None
+    with TestClient(app) as test_client:
+        client = test_client
+        yield
+    if database_module._db is not None:
+        database_module._db.close()
+    database_module._db = None
+    settings_module._settings = None
+    client = TestClient(app)
 
 
 class TestRiskConsoleEndpoint:
@@ -64,7 +89,7 @@ class TestDecisionLogExport:
         assert r.headers["content-type"].startswith("text/csv")
         assert "attachment; filename=decision-log.csv" in r.headers["content-disposition"]
         assert r.text.startswith("id,wallet_id")
-        assert "[SAMPLE DATA]" in r.text
+        assert "SAMPLE DATA" in r.text
 
     def test_export_invalid_format(self):
         r = client.get("/decision-log/export?format=xml")

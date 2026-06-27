@@ -261,6 +261,11 @@ class DashboardRepository:
         gates = [
             RiskGateView(gate_name="order_kill_switch", verdict="blocked" if settings.order_kill_switch else "pass", reason="Kill switch engaged — all orders blocked." if settings.order_kill_switch else "Kill switch inactive."),
             RiskGateView(gate_name="paper_mode", verdict="pass", reason=f"PAPER ONLY mode is {settings.paper_mode}."),
+            RiskGateView(gate_name="exposure_limit.order_size", verdict="pass", reason=f"Max order size: {settings.max_order_size} (0 = unlimited)."),
+            RiskGateView(gate_name="exposure_limit.per_market", verdict="pass", reason=f"Max per market: {settings.max_exposure_per_market} (0 = unlimited)."),
+            RiskGateView(gate_name="exposure_limit.per_wallet", verdict="pass", reason=f"Max per wallet: {settings.max_exposure_per_wallet} (0 = unlimited)."),
+            RiskGateView(gate_name="exposure_limit.per_outcome", verdict="pass", reason=f"Max per outcome: {settings.max_exposure_per_outcome} (0 = unlimited)."),
+            RiskGateView(gate_name="exposure_limit.global", verdict="pass", reason=f"Max global: {settings.max_exposure_global} (0 = unlimited)."),
         ]
         exposures = {
             "global": summary.total_cost_basis,

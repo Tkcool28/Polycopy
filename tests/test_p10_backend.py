@@ -1327,10 +1327,24 @@ class TestAPIValidation:
         _idempotency_store.clear()
 
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch, tmp_path):
         from fastapi.testclient import TestClient
         from polycopy.api.app import app
-        return TestClient(app)
+        monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
+        monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "test-p10-api-validation.sqlite"))
+        import polycopy.config.settings as settings_module
+        import polycopy.db.database as database_module
+
+        if database_module._db is not None:
+            database_module._db.close()
+        database_module._db = None
+        settings_module._settings = None
+        with TestClient(app) as test_client:
+            yield test_client
+        if database_module._db is not None:
+            database_module._db.close()
+        database_module._db = None
+        settings_module._settings = None
 
     def test_health_endpoint(self, client):
         resp = client.get("/health")
