@@ -1,0 +1,8 @@
+# Placeholder — define services when needed (e.g., local DB, dashboard).
+# Not yet used in Phase 01.
+#
+# services:
+#   polycopy-dashboard:
+#     build: .
+#     ports:
+#       - "8501:8501"
