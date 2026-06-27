@@ -1,45 +1,46 @@
-# Environment / secrets
-.env
+# Polymarket / prediction-market data sources
+*.env
 .env.*
 !.env.example
-*.pem
-*.key
-*.p12
-*.pfx
+
+# Local data artifacts
+data/audits/*.json
+!data/audits/.gitkeep
+data/fixtures/
+data/cache/
 
 # Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
+*.egg-info/
 .venv/
-venv/
+.pytest_cache/
+.ruff_cache/
 
-# Runtime databases / local state
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+frontend/dist
+coverage/
+
+# Generated build artifacts
+*.tsbuildinfo
+
+# Local database files
 *.db
-*.db-*
 *.sqlite
 *.sqlite3
-*.sqlite3-*
-data/*.db
-data/*.sqlite*
-instance/
-
-# Node / frontend
+.env
+.mypy_cache/
 node_modules/
 frontend/node_modules/
 dist/
 build/
 frontend/dist/
 frontend/build/
-coverage/
 frontend/coverage/
-*.tsbuildinfo
-
-# OS/editor
-.DS_Store
-.vscode/
-.idea/
