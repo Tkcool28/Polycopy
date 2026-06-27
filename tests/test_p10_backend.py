@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 from datetime import datetime, timezone, timedelta
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from polycopy.scoring.engine import (
     score_wallet,
@@ -20,16 +20,12 @@ from polycopy.domain.copyability import (
     MissingField,
     Verdict,
 )
-from polycopy.domain.signal import Signal, SignalStrength
 from polycopy.discovery.wallet_discovery import (
     WalletDiscovery,
-    RelatedWalletDetector,
     TradeDetector,
     make_dedup_key,
 )
 from polycopy.discovery.models import (
-    DedupRecord,
-    RelatedWalletCandidate,
     TrackedTrade,
     WalletSource,
 )
@@ -38,14 +34,11 @@ from polycopy.risk.gates import (
     PaperMode,
 )
 from polycopy.risk.fill_model import (
-    FillModel,
     MarketDepth,
     DepthLevel,
 )
 from polycopy.adapters.paper_broker import PaperBroker
-from polycopy.risk.marks import MarkEngine, MarkPrice
-from polycopy.risk.pnl import PnlTracker
-from polycopy.risk.settlement import SettlementEngine, SettlementEvidence
+from polycopy.risk.settlement import SettlementEvidence
 from polycopy.adapters.disabled_live_broker import DisabledLiveBroker
 
 
@@ -68,7 +61,7 @@ class TestScoringBoundaries:
     def test_exactly_70_is_copy_candidate(self):
         """Score of exactly 70.0 with no critical missing → COPY_CANDIDATE."""
         now = datetime.now(timezone.utc)
-        result = score_wallet(
+        score_wallet(
             wallet_id=uuid4(),
             sharpe_ratio=2.0,
             win_rate=0.70,
@@ -428,7 +421,7 @@ class TestWalletDiscovery:
 
     def test_related_detection_source(self):
         disc = WalletDiscovery()
-        entry = disc.add_from_related_detection("0xghi789")
+        disc.add_from_related_detection("0xghi789")
         assert WalletSource.RELATED_DETECTION in disc.get_sources("0xghi789")
 
     def test_multi_source_merge(self):

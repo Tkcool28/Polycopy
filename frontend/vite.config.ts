@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig, type ProxyOptions } from 'vite'
 import react from '@vitejs/plugin-react'
 
@@ -32,5 +33,12 @@ export default defineConfig({
       '/config': backend,
       '/idempotency': backend,
     },
+  },
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    css: false,
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
   },
 })
