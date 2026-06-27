@@ -1,4 +1,10 @@
-"""Polycopy adapter implementations — concrete providers for various data sources."""
+"""Polycopy adapter implementations — concrete providers for various data sources.
+
+Note: Discovery and scoring modules live in separate packages:
+- polycopy.discovery — wallet/trade discovery, dedup, related-wallet detection
+- polycopy.scoring — deterministic copyability scoring engine
+- polycopy.engine — orchestration entry point
+"""
 
 from polycopy.adapters.sample import (
     SampleWalletDataProvider,

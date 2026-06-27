@@ -63,6 +63,46 @@ class Settings(BaseSettings):
     http_timeout_seconds: float = Field(default=10.0, description="HTTP request timeout.")
     http_rate_limit_rps: float = Field(default=2.0, description="Max requests per second to public APIs.")
 
+    # ── Wallet discovery ────────────────────────────────────────────────────
+    manual_watchlist: list[str] = Field(
+        default_factory=list,
+        description="Hardcoded wallet addresses to track (never auto-discovered).",
+    )
+
+    # ── Trade detection / dedup ─────────────────────────────────────────────
+    staleness_seconds: float = Field(
+        default=120.0,
+        description="Trades older than this are flagged as stale (seconds).",
+    )
+    dedup_window_seconds: float = Field(
+        default=60.0,
+        description="Window for deduplicating trades (seconds).",
+    )
+    dedup_granularity_seconds: int = Field(
+        default=60,
+        description="Timestamp truncation granularity for dedup key (seconds).",
+    )
+
+    # ── Scoring engine ─────────────────────────────────────────────────────
+    score_copy_threshold: float = Field(
+        default=70.0,
+        description="Minimum score for COPY_CANDIDATE verdict (0-100).",
+    )
+    score_watchlist_threshold: float = Field(
+        default=50.0,
+        description="Minimum score for WATCHLIST verdict (0-100).",
+    )
+
+    # ── Related-wallet detection ───────────────────────────────────────────
+    related_min_signals: int = Field(
+        default=2,
+        description="Minimum signals required to flag a wallet as possibly related.",
+    )
+    related_confidence_threshold: float = Field(
+        default=0.4,
+        description="Minimum heuristic confidence to consider a related-wallet plausible.",
+    )
+
     # ── Fail-closed validators ──────────────────────────────────────────────
 
     @field_validator("log_level")

@@ -14,6 +14,13 @@ from polycopy.domain.source_trade import SourceTrade
 from polycopy.domain.decision_log import DecisionLogEntry
 from polycopy.domain.experiment import ExperimentRun
 from polycopy.domain.raw_snapshot import RawSnapshot
+from polycopy.domain.copyability import (
+    CopyabilityScore,
+    ScoreComponent,
+    Verdict,
+    DataQuality,
+    MissingField,
+)
 
 __all__ = [
     "Wallet", "WalletBalance",
@@ -26,4 +33,5 @@ __all__ = [
     "DecisionLogEntry",
     "ExperimentRun",
     "RawSnapshot",
+    "CopyabilityScore", "ScoreComponent", "Verdict", "DataQuality", "MissingField",
 ]
