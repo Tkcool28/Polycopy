@@ -28,6 +28,10 @@ pip install -e ".[dev]"
 # Seed demo data (clearly labeled sample — safe)
 python scripts/seed_demo_data.py
 
+# Optional: allow API demo fallback responses for an otherwise empty DB.
+# Default is false: real empty tables return empty collections and no sample data.
+export POLYCOPY_ENABLE_DEMO_DATA=true
+
 # Start API server
 uvicorn polycopy.api.app:app --host 127.0.0.1 --port 8000
 
@@ -191,6 +195,7 @@ All settings are env-prefixed `POLYCOPY_*` and loaded from `.env` if present.
 | `POLYCOPY_PAPER_MODE` | `paper_manual` | `research_only`, `paper_manual`, `paper_auto` |
 | `POLYCOPY_ORDER_KILL_SWITCH` | `false` | Global order block |
 | `POLYCOPY_DB_PATH` | `polycopy.db` | SQLite path |
+| `POLYCOPY_ENABLE_DEMO_DATA` | `false` | Explicit demo/sample API fallback mode. Demo data is returned only when this is `true`; otherwise an empty real DB returns empty collections and accurate data-health. Demo/sample records must carry `is_sample=true` and DEMO DATA / SAMPLE DATA labels. |
 | `POLYCOPY_LOG_LEVEL` | `INFO` | Logging level |
 | `POLYCOPY_HTTP_RATE_LIMIT_RPS` | `2.0` | Public API rate limit |
 | `POLYCOPY_FILL_FEE_RATE` | `0.001` | Paper fill fee (0.1%) |

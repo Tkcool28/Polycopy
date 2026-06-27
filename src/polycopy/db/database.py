@@ -29,7 +29,7 @@ class Database:
     def connect(self) -> "Database":
         """Open (or create) the SQLite database and run pending migrations."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         if self.echo:
             self._conn.set_trace_callback(lambda sql: logger.debug("SQL: %s", sql))

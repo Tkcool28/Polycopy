@@ -22,9 +22,23 @@ def _clear_idempotency():
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch, tmp_path):
     """Sync test client for FastAPI app."""
-    return TestClient(app)
+    monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
+    monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "test-api.sqlite"))
+    import polycopy.config.settings as settings_module
+    import polycopy.db.database as database_module
+
+    if database_module._db is not None:
+        database_module._db.close()
+    database_module._db = None
+    settings_module._settings = None
+    with TestClient(app) as test_client:
+        yield test_client
+    if database_module._db is not None:
+        database_module._db.close()
+    database_module._db = None
+    settings_module._settings = None
 
 
 # ── Health & system status ────────────────────────────────────────────────────
