@@ -27,3 +27,9 @@ Thumbs.db
 *.swp
 frontend/dist
 coverage/
+
+# Generated build artifacts
+*.tsbuildinfo
+
+# Local database files
+*.db
