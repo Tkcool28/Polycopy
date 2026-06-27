@@ -11,6 +11,7 @@ from polycopy.adapters.sample import (
 from polycopy.adapters.bullpen import BullpenReadOnlyAdapter
 from polycopy.adapters.paper_broker import PaperBroker
 from polycopy.adapters.disabled_live_broker import DisabledLiveBroker
+from polycopy.risk.gates import PaperMode
 from polycopy.adapters.snapshot_provenance import SnapshotProvenance
 from polycopy.domain.order import OrderSide, OrderType
 
@@ -83,7 +84,7 @@ class TestPaperBroker:
 
     @pytest.mark.asyncio
     async def test_place_order_fills(self):
-        broker = PaperBroker()
+        broker = PaperBroker(paper_mode=PaperMode.PAPER_AUTO)
         order = await broker.place_order(
             market_id=_M1,
             side=OrderSide.BUY,
@@ -99,7 +100,7 @@ class TestPaperBroker:
 
     @pytest.mark.asyncio
     async def test_position_created_on_buy(self):
-        broker = PaperBroker()
+        broker = PaperBroker(paper_mode=PaperMode.PAPER_AUTO)
         await broker.place_order(_M1, OrderSide.BUY, OrderType.MARKET, "Yes", 10.0, 0.60, _W1)
         pos = await broker.get_position(_M1, _W1, "Yes")
         assert pos is not None
@@ -108,7 +109,7 @@ class TestPaperBroker:
 
     @pytest.mark.asyncio
     async def test_position_avg_price_on_second_buy(self):
-        broker = PaperBroker()
+        broker = PaperBroker(paper_mode=PaperMode.PAPER_AUTO)
         await broker.place_order(_M1, OrderSide.BUY, OrderType.MARKET, "Yes", 10.0, 0.60, _W1)
         await broker.place_order(_M1, OrderSide.BUY, OrderType.MARKET, "Yes", 10.0, 0.70, _W1)
         pos = await broker.get_position(_M1, _W1, "Yes")
@@ -118,7 +119,7 @@ class TestPaperBroker:
 
     @pytest.mark.asyncio
     async def test_sell_closes_position(self):
-        broker = PaperBroker()
+        broker = PaperBroker(paper_mode=PaperMode.PAPER_AUTO)
         await broker.place_order(_M1, OrderSide.BUY, OrderType.MARKET, "Yes", 10.0, 0.60, _W1)
         await broker.place_order(_M1, OrderSide.SELL, OrderType.MARKET, "Yes", 10.0, 0.70, _W1)
         pos = await broker.get_position(_M1, _W1, "Yes")
@@ -126,7 +127,7 @@ class TestPaperBroker:
 
     @pytest.mark.asyncio
     async def test_list_positions(self):
-        broker = PaperBroker()
+        broker = PaperBroker(paper_mode=PaperMode.PAPER_AUTO)
         await broker.place_order(_M1, OrderSide.BUY, OrderType.MARKET, "Yes", 10.0, 0.60, _W1)
         positions = await broker.list_positions(_W1)
         assert len(positions) == 1

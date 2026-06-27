@@ -103,6 +103,52 @@ class Settings(BaseSettings):
         description="Minimum heuristic confidence to consider a related-wallet plausible.",
     )
 
+    # ── Paper trading modes (P04) ────────────────────────────────────────
+    paper_mode: str = Field(
+        default="paper_manual",
+        description="Paper mode: research_only / paper_manual / paper_auto.",
+    )
+    order_kill_switch: bool = Field(
+        default=False,
+        description="Global kill switch — when True, ALL order creation is blocked.",
+    )
+
+    # ── Exposure limits (P04) ────────────────────────────────────────────
+    max_exposure_per_market: float = Field(
+        default=0.0,
+        description="Max notional exposure per market (0 = unlimited).",
+    )
+    max_exposure_per_wallet: float = Field(
+        default=0.0,
+        description="Max notional exposure per wallet across all markets (0 = unlimited).",
+    )
+    max_exposure_per_outcome: float = Field(
+        default=0.0,
+        description="Max notional exposure per (market, outcome) pair (0 = unlimited).",
+    )
+    max_exposure_global: float = Field(
+        default=0.0,
+        description="Max global notional exposure across all wallets (0 = unlimited).",
+    )
+    max_order_size: float = Field(
+        default=0.0,
+        description="Max notional size of a single order (0 = unlimited).",
+    )
+
+    # ── Fill model (P04) ─────────────────────────────────────────────────
+    fill_fee_rate: float = Field(
+        default=0.001,
+        description="Fee rate applied to paper order notional (0.1% default).",
+    )
+    review_delay_seconds: float = Field(
+        default=30.0,
+        description="Delay before paper orders can fill in paper_manual mode.",
+    )
+    use_conservative_mark: bool = Field(
+        default=False,
+        description="If True, mark positions at bid price (worst-case) instead of mid.",
+    )
+
     # ── Fail-closed validators ──────────────────────────────────────────────
 
     @field_validator("log_level")
@@ -121,6 +167,14 @@ class Settings(BaseSettings):
 
         if v not in hashlib.algorithms_available:
             raise ValueError(f"snapshot_hash_algo {v!r} not available; see hashlib.algorithms_available")
+        return v
+
+    @field_validator("paper_mode")
+    @classmethod
+    def _validate_paper_mode(cls, v: str) -> str:
+        allowed = {"research_only", "paper_manual", "paper_auto"}
+        if v not in allowed:
+            raise ValueError(f"paper_mode must be one of {allowed}, got {v!r}")
         return v
 
     @model_validator(mode="after")

@@ -54,3 +54,29 @@ class TestSettings:
         s1 = get_settings(reload=True)
         s2 = get_settings()
         assert s1 is s2
+
+    def test_default_paper_mode(self):
+        s = Settings()
+        assert s.paper_mode == "paper_manual"
+
+    def test_invalid_paper_mode(self):
+        with pytest.raises(ValueError, match="paper_mode"):
+            Settings(paper_mode="live_trading")
+
+    def test_default_kill_switch_inactive(self):
+        s = Settings()
+        assert s.order_kill_switch is False
+
+    def test_exposure_defaults_unlimited(self):
+        s = Settings()
+        assert s.max_exposure_per_market == 0.0
+        assert s.max_exposure_global == 0.0
+        assert s.max_order_size == 0.0
+
+    def test_fill_fee_rate_default(self):
+        s = Settings()
+        assert s.fill_fee_rate == 0.001
+
+    def test_review_delay_default(self):
+        s = Settings()
+        assert s.review_delay_seconds == 30.0
