@@ -1,0 +1,27 @@
+# Polymarket / prediction-market data sources
+*.env
+.env.*
+!.env.example
+
+# Local data artifacts
+data/audits/*.json
+!data/audits/.gitkeep
+data/fixtures/
+data/cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
