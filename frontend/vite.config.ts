@@ -1,5 +1,16 @@
-import { defineConfig } from 'vite'
+import { defineConfig, type ProxyOptions } from 'vite'
 import react from '@vitejs/plugin-react'
+
+const backend = 'http://127.0.0.1:8000'
+
+const spaRouteProxy: ProxyOptions = {
+  target: backend,
+  bypass: (req) => {
+    if (req.headers.accept?.includes('text/html')) {
+      return '/index.html'
+    }
+  },
+}
 
 export default defineConfig({
   plugins: [react()],
@@ -7,19 +18,19 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     proxy: {
-      '/health': 'http://127.0.0.1:8000',
-      '/system': 'http://127.0.0.1:8000',
-      '/scans': 'http://127.0.0.1:8000',
-      '/wallets': 'http://127.0.0.1:8000',
-      '/signals': 'http://127.0.0.1:8000',
-      '/paper': 'http://127.0.0.1:8000',
-      '/positions': 'http://127.0.0.1:8000',
-      '/portfolio': 'http://127.0.0.1:8000',
-      '/decision-log': 'http://127.0.0.1:8000',
-      '/experiments': 'http://127.0.0.1:8000',
-      '/data': 'http://127.0.0.1:8000',
-      '/config': 'http://127.0.0.1:8000',
-      '/idempotency': 'http://127.0.0.1:8000',
+      '/health': backend,
+      '/system': backend,
+      '/scans': backend,
+      '/wallets': spaRouteProxy,
+      '/signals': spaRouteProxy,
+      '/paper': backend,
+      '/positions': backend,
+      '/portfolio': spaRouteProxy,
+      '/decision-log': backend,
+      '/experiments': backend,
+      '/data': backend,
+      '/config': backend,
+      '/idempotency': backend,
     },
   },
 })

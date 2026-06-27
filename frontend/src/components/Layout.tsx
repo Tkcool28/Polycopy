@@ -8,7 +8,7 @@ export function Layout() {
     <div className="app">
       <Banners />
       <Header />
-      < Nav />
+      <Nav />
       <main className="main-content">
         <Outlet />
       </main>
