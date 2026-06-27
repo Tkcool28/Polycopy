@@ -244,7 +244,11 @@ async def _fetch_market_prices(
 
             source_id = market_row["source_id"]
             if source_id.startswith("sample-"):
-                return _get_sample_market(market_id)
+                logger.warning(
+                    "Market %s is sample-backed; refusing sample prices without --use-sample",
+                    market_id,
+                )
+                return None
 
             resp = await client.get(f"/markets/{source_id}")
             if resp.status_code == 404:
@@ -281,8 +285,12 @@ async def _fetch_market_prices(
             )
 
         except Exception as e:
-            logger.warning("Failed to fetch market %s: %s", market_id, e)
-            return _get_sample_market(market_id)
+            logger.warning(
+                "Failed to fetch live market %s; no sample price fallback without --use-sample: %s",
+                market_id,
+                e,
+            )
+            return None
 
 
 def _get_sample_market(market_id: str) -> Market | None:

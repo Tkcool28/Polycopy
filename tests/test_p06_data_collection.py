@@ -12,12 +12,9 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import json
-import sqlite3
-import tempfile
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -27,8 +24,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from polycopy.config.settings import Settings
 from polycopy.db.database import Database
-from polycopy.domain.order import OrderSide
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
+
+
+class FailingAsyncClient:
+    """Minimal async client that fails requests without touching the network."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        raise RuntimeError("provider unavailable")
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────────
@@ -213,6 +222,25 @@ class TestRunScan:
         rows = db.fetchall("SELECT * FROM signals")
         assert len(rows) > 0
 
+    @pytest.mark.asyncio
+    async def test_live_market_fetch_failure_does_not_use_sample(
+        self,
+        db: Database,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Live market provider failure returns no markets, not sample fallback."""
+        from scripts.run_scan import ScanResult, _fetch_markets
+
+        monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: FailingAsyncClient())
+
+        result = ScanResult()
+        markets = await _fetch_markets(db, settings, limit=5, result=result, use_sample=False)
+
+        assert markets == []
+        assert result.errors
+        assert not any(m.is_sample for m in markets)
+
 
 # ── update_paper_portfolio tests ───────────────────────────────────────────────
 
@@ -237,6 +265,74 @@ class TestUpdatePaperPortfolio:
 
         assert result.positions_updated == 0
         assert result.ended_at is not None
+
+    @pytest.mark.asyncio
+    async def test_live_price_fetch_failure_does_not_use_sample(
+        self,
+        db: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Live price provider failure returns None, not a hardcoded sample mark."""
+        from scripts.update_paper_portfolio import _fetch_market_prices
+
+        market_id = str(uuid.uuid4())
+        db.execute(
+            """INSERT INTO markets
+               (id, source_id, source, question, active, closed, resolved,
+                volume_24h, fetched_at, is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                market_id,
+                "live-condition-id",
+                "polymarket",
+                "Live market",
+                1,
+                0,
+                0,
+                100.0,
+                datetime.now(timezone.utc).isoformat(),
+                0,
+            ),
+        )
+        db.conn.commit()
+        monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: FailingAsyncClient())
+
+        market = await _fetch_market_prices(db, market_id, use_sample=False)
+
+        assert market is None
+
+    @pytest.mark.asyncio
+    async def test_live_price_fetch_refuses_sample_market_without_sample_flag(
+        self,
+        db: Database,
+    ) -> None:
+        """Sample-backed DB markets require explicit sample mode for sample marks."""
+        from scripts.update_paper_portfolio import _fetch_market_prices
+
+        market_id = str(uuid.uuid4())
+        db.execute(
+            """INSERT INTO markets
+               (id, source_id, source, question, active, closed, resolved,
+                volume_24h, fetched_at, is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                market_id,
+                "sample-market-001",
+                "sample",
+                "Sample market [SAMPLE DATA]",
+                1,
+                0,
+                0,
+                100.0,
+                datetime.now(timezone.utc).isoformat(),
+                1,
+            ),
+        )
+        db.conn.commit()
+
+        market = await _fetch_market_prices(db, market_id, use_sample=False)
+
+        assert market is None
 
 
 # ── settle_paper_positions tests ───────────────────────────────────────────────

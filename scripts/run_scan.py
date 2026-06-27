@@ -38,13 +38,11 @@ from polycopy.discovery.wallet_discovery import (
     TradeDetector,
     WalletDiscovery,
 )
-from polycopy.domain.copyability import Verdict
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.order import OrderSide
 from polycopy.domain.source_trade import SourceTrade
 from polycopy.engine.evaluate import evaluate_wallet
-from polycopy.scoring.engine import score_wallet
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
 
 logger = logging.getLogger(__name__)
@@ -440,8 +438,12 @@ async def _fetch_markets(
             return markets
         except Exception as e:
             result.errors.append(f"Market fetch failed: {e}")
-            logger.warning("Market fetch failed, falling back to sample: %s", e)
-            return _get_sample_markets()
+            logger.warning(
+                "Market fetch failed; returning no live markets. "
+                "Sample markets are only used with --use-sample: %s",
+                e,
+            )
+            return []
 
 
 async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[SourceTrade]:

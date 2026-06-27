@@ -35,7 +35,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
-from polycopy.domain.market import Market, MarketOutcome
 from polycopy.risk.settlement import SettlementEvidence, SettlementEngine
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
 
@@ -209,7 +208,6 @@ async def _check_resolution(
     )
 
     if market_row is None:
-        result = (None, None)
         return None
 
     if market_row["resolved"] and market_row["resolution_outcome"]:
@@ -300,11 +298,11 @@ def _persist_settlement(
     recording realized_pnl and setting a tiny residual quantity.
     Alternatively, we delete the position row entirely.
     """
-    payout = settlement_result.payout
-    cost_basis = position_row["quantity"] * position_row["avg_entry_price"]
-    realized_pnl = payout - cost_basis
-
-    # Delete the position (it's fully settled and closed)
+    # Known P06 limitation: realized P&L is computed by SettlementEngine and
+    # aggregated in SettlementResult, but there is not yet a closed-position
+    # ledger/audit table to persist per-position settlement P&L. Avoid writing
+    # partial audit state here; P07+ should add a dedicated settlement ledger.
+    # Delete the position (it's fully settled and closed).
     db.execute(
         "DELETE FROM positions WHERE id = ?",
         (position_row["id"],),

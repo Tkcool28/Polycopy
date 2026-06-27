@@ -34,18 +34,14 @@ from pathlib import Path
 # Add src to path for inline execution
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from polycopy.config.settings import BrokerMode, get_settings
-from polycopy.db.database import Database, get_database
+from polycopy.config.settings import get_settings
+from polycopy.db.database import Database
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.raw_snapshot import RawSnapshot
 from polycopy.domain.source_trade import SourceTrade
-from polycopy.domain.wallet import Wallet, WalletBalance
+from polycopy.domain.wallet import Wallet
 from polycopy.engine.evaluate import evaluate_wallet
-from polycopy.providers.market_data import MarketDataProvider
-from polycopy.providers.resolution import ResolutionProvider
-from polycopy.providers.trade_feed import TradeFeedProvider
-from polycopy.providers.wallet_data import WalletDataProvider
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
 
 logger = logging.getLogger(__name__)
@@ -207,7 +203,7 @@ class PolymarketCollector:
         client = await self._get_client()
         try:
             # CLOB trades endpoint — attempt with condition_id
-            resp = await client.get(f"/trades", params={"condition_id": market_source_id})
+            resp = await client.get("/trades", params={"condition_id": market_source_id})
             resp.raise_for_status()
             raw_data = resp.json()
 

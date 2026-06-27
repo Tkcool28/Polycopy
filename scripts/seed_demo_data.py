@@ -37,13 +37,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
-from polycopy.domain.copyability import (
-    CopyabilityScore,
-    DataQuality,
-    MissingField,
-    ScoreComponent,
-    Verdict,
-)
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.order import Order, OrderSide, OrderStatus, OrderType

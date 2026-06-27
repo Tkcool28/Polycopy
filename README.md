@@ -38,3 +38,6 @@ make audit   # run data capability probe
 - No real-money trade execution path exists.
 - Live broker adapters fail closed (refuse to execute).
 - All sample/fixture data is visibly labeled.
+- P06 operational scripts only use sample market/pricing data when invoked with
+  `--use-sample`; live provider failures are logged and leave data missing
+  rather than substituting fictional sample prices or markets.
