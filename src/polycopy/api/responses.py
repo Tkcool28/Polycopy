@@ -115,6 +115,15 @@ class PaperOrderPreview(BaseModel):
     is_sample: bool = False
 
 
+class PaperOrderPreviewRequest(BaseModel):
+    """Request body for previewing a paper order."""
+    market_id: UUID = Field(description="Market ID for the paper order preview.")
+    outcome: str = Field(min_length=1, max_length=100, description="Outcome label to trade.")
+    side: str = Field(pattern="^(buy|sell)$", description="Paper order side: buy or sell.")
+    quantity: float = Field(gt=0, le=1_000_000, description="Paper quantity to preview.")
+    price: float = Field(ge=0.0, le=1.0, description="Limit price for the paper preview.")
+
+
 class PaperOrderApproveRequest(BaseModel):
     """Request to approve (confirm and fill) a pending paper order."""
     order_id: UUID = Field(description="ID of the pending order to approve.")
@@ -280,6 +289,26 @@ class IdempotencyKeyResponse(BaseModel):
     key: str = Field(description="Idempotency key submitted.")
     is_duplicate: bool = Field(description="True if this key was already processed.")
     message: str = Field(description="Status message.")
+
+
+# ── Risk console ─────────────────────────────────────────────────────────────
+
+class RiskGateView(BaseModel):
+    """A single risk gate check result for display."""
+    gate_name: str = Field(description="Name of the gate check.")
+    verdict: str = Field(description="pass | blocked | needs_review")
+    reason: str = Field(description="Human-readable reason.")
+    is_sample: bool = False
+
+
+class RiskConsoleResponse(BaseModel):
+    """Risk console overview — current state of all risk gates."""
+    kill_switch_active: bool = Field(description="Whether the order kill switch is engaged.")
+    paper_mode: str = Field(description="Current paper trading mode.")
+    exposure_limits: dict[str, float] = Field(description="Current exposure limits.")
+    current_exposures: dict[str, float] = Field(description="Current exposure levels (sample).")
+    gates: list[RiskGateView] = Field(description="Results of all gate checks.")
+    is_sample_data: bool = False
 
 
 # ── Error responses ──────────────────────────────────────────────────────────

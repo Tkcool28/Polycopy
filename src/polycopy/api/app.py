@@ -23,8 +23,8 @@ from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
-from fastapi.responses import JSONResponse
+from fastapi import Body, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse, Response
 
 from polycopy.api.responses import (
     ConfigView,
@@ -40,10 +40,13 @@ from polycopy.api.responses import (
     OrdersResponse,
     PaperOrderApproveRequest,
     PaperOrderPreview,
+    PaperOrderPreviewRequest,
     PaperOrderRejectRequest,
     PortfolioSummary,
     PositionView,
     PositionsResponse,
+    RiskConsoleResponse,
+    RiskGateView,
     ScanResponse,
     ScanResult,
     SignalView,
@@ -277,30 +280,51 @@ async def get_signal_detail(signal_id: UUID):
 
 @app.post("/paper/preview", response_model=PaperOrderPreview, tags=["paper"])
 async def preview_paper_order(
-    market_id: UUID,
-    outcome: str = Query(..., min_length=1, max_length=100),
-    side: str = Query(..., pattern="^(buy|sell)$"),
-    quantity: float = Query(..., gt=0, le=1_000_000),
-    price: float = Query(..., ge=0.0, le=1.0),
+    request: PaperOrderPreviewRequest | None = Body(default=None),
+    market_id: UUID | None = None,
+    outcome: str | None = Query(default=None, min_length=1, max_length=100),
+    side: str | None = Query(default=None, pattern="^(buy|sell)$"),
+    quantity: float | None = Query(default=None, gt=0, le=1_000_000),
+    price: float | None = Query(default=None, ge=0.0, le=1.0),
 ):
     """Preview a paper order — estimate fill price, fees, and total cost.
 
     This does NOT create or place an order. It only returns a quote.
-    No real trade is executed.
+    No real trade is executed. The dashboard sends JSON; query parameters are
+    still accepted for compatibility with earlier API tests/scripts.
     """
+    if request is None:
+        if None in (market_id, outcome, side, quantity, price):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="market_id, outcome, side, quantity, and price are required.",
+            )
+        assert market_id is not None
+        assert outcome is not None
+        assert side is not None
+        assert quantity is not None
+        assert price is not None
+        request = PaperOrderPreviewRequest(
+            market_id=market_id,
+            outcome=outcome,
+            side=side,
+            quantity=quantity,
+            price=price,
+        )
+
     # Estimate fill (simplified: fill at requested price, 0.1% fee)
-    estimated_fill = price
+    estimated_fill = request.price
     fee_rate = 0.001
-    notional = estimated_fill * quantity
+    notional = estimated_fill * request.quantity
     estimated_fee = notional * fee_rate
     total_cost = notional + estimated_fee
 
     return PaperOrderPreview(
-        market_id=market_id,
-        outcome=outcome,
-        side=side,
-        quantity=quantity,
-        price=price,
+        market_id=request.market_id,
+        outcome=request.outcome,
+        side=request.side,
+        quantity=request.quantity,
+        price=request.price,
         estimated_fill_price=estimated_fill,
         estimated_fee=round(estimated_fee, 6),
         estimated_total_cost=round(total_cost, 6),
@@ -621,6 +645,133 @@ async def check_idempotency_key(key: str):
         key=key,
         is_duplicate=is_dup,
         message=msg,
+    )
+
+
+# ── Risk console ──────────────────────────────────────────────────────────────
+
+@app.get("/risk/console", response_model=RiskConsoleResponse, tags=["risk"])
+async def risk_console():
+    """Risk console overview — current state of all risk gates.
+
+    Returns sample/fixture data showing gate pass/block status.
+    No real risk evaluation is performed — this is a display endpoint.
+    """
+    settings = get_settings()
+
+    # Build sample gate results
+    gates = [
+        RiskGateView(
+            gate_name="order_kill_switch",
+            verdict="blocked" if settings.order_kill_switch else "pass",
+            reason="Kill switch inactive." if not settings.order_kill_switch else "Kill switch engaged — all orders blocked.",
+        ),
+        RiskGateView(
+            gate_name="paper_mode",
+            verdict="pass",
+            reason=f"Mode is {settings.paper_mode}.",
+        ),
+        RiskGateView(
+            gate_name="exposure_limit.order_size",
+            verdict="pass",
+            reason=f"Max order size: {settings.max_order_size} (0 = unlimited).",
+        ),
+        RiskGateView(
+            gate_name="exposure_limit.per_market",
+            verdict="pass",
+            reason=f"Max per market: {settings.max_exposure_per_market} (0 = unlimited).",
+        ),
+        RiskGateView(
+            gate_name="exposure_limit.per_wallet",
+            verdict="pass",
+            reason=f"Max per wallet: {settings.max_exposure_per_wallet} (0 = unlimited).",
+        ),
+        RiskGateView(
+            gate_name="exposure_limit.per_outcome",
+            verdict="pass",
+            reason=f"Max per outcome: {settings.max_exposure_per_outcome} (0 = unlimited).",
+        ),
+        RiskGateView(
+            gate_name="exposure_limit.global",
+            verdict="pass",
+            reason=f"Max global: {settings.max_exposure_global} (0 = unlimited).",
+        ),
+    ]
+
+    return RiskConsoleResponse(
+        kill_switch_active=settings.order_kill_switch,
+        paper_mode=settings.paper_mode,
+        exposure_limits={
+            "max_order_size": settings.max_order_size,
+            "max_per_market": settings.max_exposure_per_market,
+            "max_per_wallet": settings.max_exposure_per_wallet,
+            "max_per_outcome": settings.max_exposure_per_outcome,
+            "max_global": settings.max_exposure_global,
+        },
+        current_exposures={
+            "global": 6.5,
+            "per_wallet_sample": 6.5,
+            "per_market_sample": 6.5,
+            "per_outcome_sample": 6.5,
+        },
+        gates=gates,
+        is_sample_data=True,
+    )
+
+
+# ── Decision log export ───────────────────────────────────────────────────────
+
+@app.get("/decision-log/export", tags=["decision-log"])
+async def decision_log_export(format: str = Query(default="json", pattern="^(json|csv)$")):
+    """Export decision log entries as JSON or CSV.
+
+    Returns sample/fixture export data. No real decisions are stored yet.
+    """
+    now = datetime.now(timezone.utc)
+    entries = [
+        {
+            "id": "00000000-0000-0000-0000-000000000099",
+            "wallet_id": "00000000-0000-0000-0000-000000000001",
+            "market_id": "00000000-0000-0000-0000-000000000010",
+            "decision_type": "skip",
+            "signal_ids": [],
+            "order_id": None,
+            "rationale": "Score below threshold — skipped.  [SAMPLE DATA]",
+            "metrics": {"score": 42.0, "threshold": 70.0},
+            "created_at": now.isoformat(),
+            "is_sample": True,
+        },
+    ]
+
+    if format == "csv":
+        import csv
+        import io
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        # Header
+        writer.writerow([
+            "id", "wallet_id", "market_id", "decision_type",
+            "signal_ids", "order_id", "rationale", "metrics",
+            "created_at", "is_sample",
+        ])
+        for e in entries:
+            writer.writerow([
+                e["id"], e["wallet_id"], e["market_id"], e["decision_type"],
+                "|".join(e["signal_ids"]), e["order_id"] or "",
+                e["rationale"], str(e["metrics"]),
+                e["created_at"], e["is_sample"],
+            ])
+
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=decision-log.csv"},
+        )
+
+    return JSONResponse(
+        content={"format": "json", "entries": entries, "is_sample_data": True},
+        headers={"Content-Disposition": "attachment; filename=decision-log.json"},
     )
 
 

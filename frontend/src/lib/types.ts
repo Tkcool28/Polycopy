@@ -188,3 +188,61 @@ export interface ExperimentMetricsResponse {
   profitable_count: number;
   is_sample_data: boolean;
 }
+
+export interface RiskGateView {
+  gate_name: string;
+  verdict: string;
+  reason: string;
+  is_sample: boolean;
+}
+
+export interface RiskConsoleResponse {
+  kill_switch_active: boolean;
+  paper_mode: string;
+  exposure_limits: Record<string, number>;
+  current_exposures: Record<string, number>;
+  gates: RiskGateView[];
+  is_sample_data: boolean;
+}
+
+export interface PaperOrderPreview {
+  market_id: string;
+  outcome: string;
+  side: string;
+  quantity: number;
+  price: number;
+  estimated_fill_price: number;
+  estimated_fee: number;
+  estimated_total_cost: number;
+  is_sample: boolean;
+}
+
+export interface OrderView {
+  id: string;
+  market_id: string;
+  wallet_id: string;
+  side: string;
+  order_type: string;
+  outcome: string;
+  quantity: number;
+  price: number;
+  status: string;
+  filled_quantity: number;
+  signal_id: string | null;
+  created_at: string;
+  updated_at: string | null;
+  is_sample: boolean;
+}
+
+export interface OrdersResponse {
+  orders: OrderView[];
+  total_count: number;
+  is_sample_data: boolean;
+}
+
+export interface DecisionLogExportResponse {
+  format: string;
+  data?: string;
+  entries?: Record<string, unknown>[];
+  is_sample_data: boolean;
+}

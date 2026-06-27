@@ -7,6 +7,9 @@ import { TradeDetailPage } from './pages/TradeDetailPage';
 import { PortfolioPage } from './pages/PortfolioPage';
 import { SignalsPage } from './pages/SignalsPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { PaperOrdersPage } from './pages/PaperOrdersPage';
+import { RiskConsolePage } from './pages/RiskConsolePage';
+import { ExperimentsPage } from './pages/ExperimentsPage';
 
 export function App() {
   return (
@@ -18,7 +21,10 @@ export function App() {
         <Route path="/radar" element={<TradeRadarPage />} />
         <Route path="/radar/:signalId" element={<TradeDetailPage />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
+        <Route path="/orders" element={<PaperOrdersPage />} />
+        <Route path="/risk" element={<RiskConsolePage />} />
         <Route path="/signals" element={<SignalsPage />} />
+        <Route path="/experiments" element={<ExperimentsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

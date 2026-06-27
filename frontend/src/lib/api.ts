@@ -29,8 +29,16 @@ export const api = {
     request<import('./types').PortfolioSummary>('/portfolio/summary'),
   decisionLog: (limit = 50, offset = 0) =>
     request<import('./types').DecisionLogResponse>(`/decision-log?limit=${limit}&offset=${offset}`),
+  decisionLogExport: (format: 'json' | 'csv') =>
+    request<import('./types').DecisionLogExportResponse>(`/decision-log/export?format=${format}`),
   experiments: (limit = 50, offset = 0) =>
     request<import('./types').ExperimentMetricsResponse>(`/experiments?limit=${limit}&offset=${offset}`),
+  riskConsole: () =>
+    request<import('./types').RiskConsoleResponse>('/risk/console'),
+  paperOrders: (statusFilter?: string) =>
+    request<import('./types').OrdersResponse>(
+      `/paper/orders${statusFilter ? `?status=${statusFilter}` : ''}`,
+    ),
   config: () => request<import('./types').ConfigView>('/config'),
   dataHealth: () => request<import('./types').DataHealthResponse>('/data/health'),
 };

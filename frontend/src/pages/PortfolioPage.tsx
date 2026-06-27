@@ -7,6 +7,22 @@ export function PortfolioPage() {
   const { data: positions, loading: posLoad } = useApi(() => api.positions());
   const { data: decisions, loading: decLoad } = useApi(() => api.decisionLog(20));
 
+  const handleExport = async (format: 'json' | 'csv') => {
+    try {
+      const res = await fetch(`/decision-log/export?format=${format}`);
+      if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `decision-log.${format}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert(`Export failed: ${(e as Error).message}`);
+    }
+  };
+
   if (sumLoad) return <LoadingState label="Loading portfolio..." />;
   if (sumErr) return <ErrorState message={sumErr} />;
 
@@ -78,30 +94,40 @@ export function PortfolioPage() {
         {decLoad ? (
           <LoadingState />
         ) : decisions && decisions.entries.length > 0 ? (
-          <table className="table table--responsive">
-            <thead>
-              <tr>
-                <th>Type</th>
-                <th>Rationale</th>
-                <th>Time</th>
-              </tr>
-            </thead>
-            <tbody>
-              {decisions.entries.map((e) => (
-                <tr key={e.id}>
-                  <td data-label="Type">
-                    <span className={`tag tag--${e.decision_type === 'skip' ? 'skip' : e.decision_type === 'copy' ? 'copy' : 'watch'}`}>
-                      {e.decision_type}
-                    </span>
-                  </td>
-                  <td data-label="Rationale" style={{ fontFamily: 'var(--font-sans)', fontSize: '0.78rem' }}>
-                    {e.rationale}
-                  </td>
-                  <td data-label="Time">{formatDateTime(e.created_at)}</td>
+          <>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <button onClick={() => handleExport('csv')} style={btnExportStyle}>
+                Export CSV
+              </button>
+              <button onClick={() => handleExport('json')} style={btnExportStyle}>
+                Export JSON
+              </button>
+            </div>
+            <table className="table table--responsive">
+              <thead>
+                <tr>
+                  <th>Type</th>
+                  <th>Rationale</th>
+                  <th>Time</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {decisions.entries.map((e) => (
+                  <tr key={e.id}>
+                    <td data-label="Type">
+                      <span className={`tag tag--${e.decision_type === 'skip' ? 'skip' : e.decision_type === 'copy' ? 'copy' : 'watch'}`}>
+                        {e.decision_type}
+                      </span>
+                    </td>
+                    <td data-label="Rationale" style={{ fontFamily: 'var(--font-sans)', fontSize: '0.78rem' }}>
+                      {e.rationale}
+                    </td>
+                    <td data-label="Time">{formatDateTime(e.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
         ) : (
           <EmptyState message="No decisions recorded" />
         )}
@@ -109,3 +135,14 @@ export function PortfolioPage() {
     </>
   );
 }
+
+const btnExportStyle: React.CSSProperties = {
+  padding: '6px 12px',
+  background: 'var(--bg-elevated)',
+  color: 'var(--text-secondary)',
+  border: '1px solid var(--border)',
+  borderRadius: 'var(--radius-sm)',
+  cursor: 'pointer',
+  fontSize: '0.75rem',
+  fontWeight: 500,
+};

@@ -5,7 +5,10 @@ const NAV_ITEMS = [
   { to: '/wallets', label: 'Wallets', icon: '◈' },
   { to: '/radar', label: 'Radar', icon: '◎' },
   { to: '/signals', label: 'Signals', icon: '◇' },
+  { to: '/orders', label: 'Orders', icon: '◈' },
   { to: '/portfolio', label: 'Portfolio', icon: '▤' },
+  { to: '/risk', label: 'Risk', icon: '⚠' },
+  { to: '/experiments', label: 'Experiments', icon: '⚗' },
   { to: '/settings', label: 'Settings', icon: '⚙' },
 ];
 
