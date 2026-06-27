@@ -23,7 +23,7 @@ No external services are required beyond Polymarket's public read-only API.
 ┌────────────────┼────────────────────────────────┐
 │                ▼   FastAPI (:8000)               │
 │  ┌─────────────────────────────────────────────┐│
-│  │  API Layer (22 endpoints, Pydantic v2)      ││
+│  │  API Layer (20 endpoints, Pydantic v2)      ││
 │  └──────┬──────────────────────────────────────┘│
 │         │                                       │
 │  ┌──────┴──────────────────────────────────┐    │
@@ -118,7 +118,7 @@ INCOMPLETE). See `docs/copyability-scoring-v1.md`.
 
 ### API (`api/`)
 
-FastAPI application with 22 typed endpoints. All response models are Pydantic
+FastAPI application with 20 typed endpoints. All response models are Pydantic
 v2. State-changing endpoints require `X-Idempotency-Key` header. Config
 endpoint excludes secrets.
 
