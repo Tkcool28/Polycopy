@@ -593,3 +593,463 @@ class TestDashboardDataHealth:
             assert resp.status_code == 200
             data = resp.json()
             assert data["snapshot_count"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Configured staleness threshold tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_raw_snapshot(db, source: str, fetched_at: str, is_sample: int = 0) -> None:
+    """Insert a single raw_snapshots row with a controlled fetched_at."""
+    db.execute(
+        """
+        INSERT INTO raw_snapshots
+            (id, source, endpoint, query_params, file_path, content_hash, hash_algo,
+             content_type, size_bytes, fetched_at, ingested_at, is_sample)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (str(uuid.uuid4()), source, "/markets", "{}", "/snap.json", "h", "sha256",
+         "application/json", 10, fetched_at, fetched_at, is_sample),
+    )
+    db.conn.commit()
+
+
+class TestConfiguredStalenessThreshold:
+    """Data Health must use the configured staleness_seconds, not a hard-coded value."""
+
+    def _client_with_staleness(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staleness: float
+    ) -> TestClient:
+        """Create a client with a custom staleness_seconds value."""
+        db_path = tmp_path / "staleness.db"
+        monkeypatch.setenv("POLYCOPY_DB_PATH", str(db_path))
+        monkeypatch.delenv("POLYCOPY_ENABLE_DEMO_DATA", raising=False)
+
+        import polycopy.config.settings as settings_module
+        import polycopy.db.database as db_module
+
+        if db_module._db is not None:
+            db_module._db.close()
+        db_module._db = None
+        settings_module._settings = None
+
+        settings = __import__("polycopy.config.settings", fromlist=["get_settings"]).get_settings(reload=True)
+        # Override staleness via the dataclass field
+        object.__setattr__(settings, "staleness_seconds", staleness)
+
+        db = __import__("polycopy.db.database", fromlist=["get_database"]).get_database(reload=True)
+        from polycopy.api.app import app as _app
+        return db, TestClient(_app)
+
+    def test_snapshot_121_seconds_stale_with_120_threshold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With staleness=120, a 121s-old snapshot must be stale."""
+        from datetime import datetime, timezone
+
+        db, client = self._client_with_staleness(tmp_path, monkeypatch, 120.0)
+        now = datetime.now(timezone.utc)
+        # Insert with fetched_at 121 seconds in the past
+        old_ts_121 = (now.replace(microsecond=0) - __import__("datetime").timedelta(seconds=121)).isoformat()
+        # Ensure table exists
+        _seed_raw_snapshot(db, "src_a", old_ts_121)
+
+        try:
+            resp = client.get("/data/health")
+            assert resp.status_code == 200
+            data = resp.json()
+            # Find src_a
+            src_a = next(s for s in data["sources"] if "src_a" in s["source"])
+            assert src_a["status"] == "stale", f"Expected stale, got {src_a['status']}"
+        finally:
+            db.close()
+
+    def test_snapshot_119_seconds_not_stale_with_120_threshold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With staleness=120, a 119s-old snapshot must be ok."""
+        from datetime import datetime, timezone
+        db, client = self._client_with_staleness(tmp_path, monkeypatch, 120.0)
+        now = datetime.now(timezone.utc)
+        old_ts_119 = (now.replace(microsecond=0) - __import__("datetime").timedelta(seconds=119)).isoformat()
+        _seed_raw_snapshot(db, "src_b", old_ts_119)
+
+        try:
+            resp = client.get("/data/health")
+            assert resp.status_code == 200
+            data = resp.json()
+            src_b = next(s for s in data["sources"] if "src_b" in s["source"])
+            assert src_b["status"] == "ok", f"Expected ok, got {src_b['status']}"
+        finally:
+            db.close()
+
+    def test_configured_staleness_followed_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When staleness is set to 60s, a 61s-old snapshot becomes stale."""
+        from datetime import datetime, timezone
+        db, client = self._client_with_staleness(tmp_path, monkeypatch, 60.0)
+        now = datetime.now(timezone.utc)
+        old_ts_61 = (now.replace(microsecond=0) - __import__("datetime").timedelta(seconds=61)).isoformat()
+        _seed_raw_snapshot(db, "src_c", old_ts_61)
+
+        try:
+            resp = client.get("/data/health")
+            assert resp.status_code == 200
+            data = resp.json()
+            src_c = next(s for s in data["sources"] if "src_c" in s["source"])
+            assert src_c["status"] == "stale"
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: Snapshot-only overall health derivation
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotOnlyOverallHealth:
+    """When provider_health is empty, derive overall_status from source statuses."""
+
+    def _make_client(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        from polycopy.api.app import app
+        import polycopy.db.database as db_module
+        import polycopy.config.settings as settings_module
+
+        db_path = tmp_path / "oh.db"
+        monkeypatch.setenv("POLYCOPY_DB_PATH", str(db_path))
+        monkeypatch.delenv("POLYCOPY_ENABLE_DEMO_DATA", raising=False)
+        if db_module._db is not None:
+            db_module._db.close()
+        db_module._db = None
+        settings_module._settings = None
+        get_settings = __import__("polycopy.config.settings", fromlist=["get_settings"]).get_settings
+        get_database = __import__("polycopy.db.database", fromlist=["get_database"]).get_database
+        get_settings(reload=True)
+        db = get_database(reload=True)
+        return db, TestClient(app)
+
+    def _seed_snapshot_age(self, db, source: str, age_seconds: float) -> None:
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        ts = (now - timedelta(seconds=age_seconds)).isoformat()
+        db.execute(
+            """
+            INSERT INTO raw_snapshots
+                (id, source, endpoint, query_params, file_path, content_hash, hash_algo,
+                 content_type, size_bytes, fetched_at, ingested_at, is_sample)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (str(uuid.uuid4()), source, "/markets", "{}", "/s.json", "h", "sha256",
+             "application/json", 5, ts, ts),
+        )
+        db.conn.commit()
+
+    def test_all_fresh_sources_healthy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db, client = self._make_client(tmp_path, monkeypatch)
+        self._seed_snapshot_age(db, "fresh_src", 5.0)
+        try:
+            resp = client.get("/data/health")
+            data = resp.json()
+            assert data["overall_status"] == "healthy"
+        finally:
+            db.close()
+
+    def test_one_fresh_one_stale_degraded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db, client = self._make_client(tmp_path, monkeypatch)
+        self._seed_snapshot_age(db, "deg_fresh", 5.0)
+        self._seed_snapshot_age(db, "deg_stale", 400.0)
+        try:
+            resp = client.get("/data/health")
+            data = resp.json()
+            assert data["overall_status"] == "degraded"
+        finally:
+            db.close()
+
+    def test_all_stale_degraded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db, client = self._make_client(tmp_path, monkeypatch)
+        self._seed_snapshot_age(db, "s1", 301.0)
+        self._seed_snapshot_age(db, "s2", 400.0)
+        try:
+            resp = client.get("/data/health")
+            data = resp.json()
+            assert data["overall_status"] == "degraded"
+        finally:
+            db.close()
+
+    def test_all_unavailable_unhealthy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Provider-health error row only -> overall_status is degraded/error."""
+        from datetime import datetime, timezone
+        db, client = self._make_client(tmp_path, monkeypatch)
+        db.execute(
+            "INSERT INTO provider_health (provider, capability, status, last_attempt, http_status, error_message) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("test", "failing", "error", datetime.now(timezone.utc).isoformat(), 500, "down"),
+        )
+        db.conn.commit()
+        try:
+            resp = client.get("/data/health")
+            data = resp.json()
+            # At least the error source should make overall degraded or unavailable
+            assert data["overall_status"] in ("degraded", "unavailable")
+        finally:
+            db.close()
+
+    def test_no_snapshots_empty_db_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty DB with no provider_health and no snapshots -> unavailable."""
+        db, client = self._make_client(tmp_path, monkeypatch)
+        try:
+            resp = client.get("/data/health")
+            data = resp.json()
+            assert data["overall_status"] == "unavailable"
+            assert data["sources"] == []
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Buy fills debit simulated USDC
+# ---------------------------------------------------------------------------
+
+
+class TestBuyFillDebitsUSDC:
+    """Approving a buy order must reduce the wallet's simulated USDC balance."""
+
+    def _make_client_and_wallet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial_usdc: float
+    ):
+        from datetime import datetime, timezone
+        from polycopy.api.app import app
+        import polycopy.db.database as db_module
+        import polycopy.config.settings as settings_module
+
+        db_path = tmp_path / "buy.db"
+        monkeypatch.setenv("POLYCOPY_DB_PATH", str(db_path))
+        monkeypatch.delenv("POLYCOPY_ENABLE_DEMO_DATA", raising=False)
+        if db_module._db is not None:
+            db_module._db.close()
+        db_module._db = None
+        settings_module._settings = None
+        get_settings = __import__("polycopy.config.settings", fromlist=["get_settings"]).get_settings
+        get_database = __import__("polycopy.db.database", fromlist=["get_database"]).get_database
+        get_settings(reload=True)
+        db = get_database(reload=True)
+        now = datetime.now(timezone.utc).isoformat()
+        wallet_id = "00000000-0000-0000-0000-000000000099"
+        market_id = "00000000-0000-0000-0000-000000000098"
+        order_id = str(uuid.uuid4())
+        db.execute(
+            "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, 0, ?)",
+            (wallet_id, "0xBUYTEST", "buy-wallet", now),
+        )
+        db.execute(
+            "INSERT INTO wallet_balances (wallet_id, currency, amount, as_of, is_sample) VALUES (?, ?, ?, ?, 0)",
+            (wallet_id, "USDC", initial_usdc, now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO markets (id, source_id, source, question, active, closed, resolved, fetched_at, is_sample) "
+            "VALUES (?, ?, ?, ?, 1, 0, 0, ?, 0)",
+            (market_id, "m-buy", "test", "Buy test?", now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO orders "
+            "(id, market_id, wallet_id, side, order_type, outcome, quantity, price, status, filled_quantity, created_at, updated_at, is_sample) "
+            "VALUES (?, ?, ?, 'buy', 'limit', 'Yes', ?, ?, 'pending', 0.0, ?, ?, 0)",
+            (order_id, market_id, wallet_id, 10.0, 0.5, now, now),
+        )
+        db.conn.commit()
+        return db, TestClient(app), order_id, wallet_id
+
+    def _reset_and_reload(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Restart service objects to simulate API restart."""
+        import polycopy.db.database as db_module
+        import polycopy.config.settings as settings_module
+        from polycopy.api.app import _idempotency_store
+        from polycopy.api.app import _bidask_provider as _ba
+        # Set snapshot for deterministic fills
+        _ba.set_snapshot(
+            "00000000-0000-0000-0000-000000000098", "Yes",
+            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
+        )
+        if db_module._db is not None:
+            db_module._db.close()
+        db_module._db = None
+        settings_module._settings = None
+        _idempotency_store._db = None
+        _idempotency_store._ensured_table = False
+        get_settings = __import__("polycopy.config.settings", fromlist=["get_settings"]).get_settings
+        get_database = __import__("polycopy.db.database", fromlist=["get_database"]).get_database
+        get_settings(reload=True)
+        get_database(reload=True)
+
+    def test_successful_buy_debits_cash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Start with known USDC, approve buy, confirm cash decreases by notional + fee."""
+        from polycopy.api.app import _bidask_provider
+        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 100.0)
+        _bidask_provider.set_snapshot(
+            "00000000-0000-0000-0000-000000000098", "Yes",
+            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
+        )
+        try:
+            resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "test buy"})
+            assert resp.status_code == 200
+            data = resp.json()
+            # Check balance decreased
+            bal = client.get(f"/wallets/{wallet_id}").json()["balances"][0]
+            assert bal["currency"] == "USDC"
+            # Approve uses order limit price (0.5) for accounting, not the market ask
+            from polycopy.config.settings import get_settings as _gs
+            fee_rate = _gs().fill_fee_rate  # 0.001
+            qty = 10.0
+            limit_price = 0.5  # order price
+            notional = limit_price * qty
+            fee = notional * fee_rate
+            expected = 100.0 - notional - fee
+            assert abs(bal["amount"] - expected) < 0.001, f"bal={bal['amount']}, expected={expected}"
+            # Exactly one position
+            positions = client.get("/positions", params={"wallet_id": wallet_id}).json()["positions"]
+            assert len(positions) == 1
+            # One fill = order status filled
+            assert data["status"] == "filled"
+            # Order ID unchanged
+            assert data["id"] == order_id
+        finally:
+            db.close()
+
+    def test_insufficient_cash_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Start below required total. Approval fails with no mutation."""
+        from polycopy.api.app import _bidask_provider
+        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 1.0)
+        _bidask_provider.set_snapshot(
+            "00000000-0000-0000-0000-000000000098", "Yes",
+            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
+        )
+        try:
+            resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "should fail"})
+            assert resp.status_code == 409
+            assert "insufficient" in resp.json()["detail"].lower()
+            # Balance unchanged
+            bal = client.get(f"/wallets/{wallet_id}").json()["balances"][0]
+            assert bal["amount"] == 1.0
+            # No position
+            positions = client.get("/positions", params={"wallet_id": wallet_id}).json()["positions"]
+            assert len(positions) == 0
+            # Order still pending
+            orders = client.get("/paper/orders", params={"status": "pending"}).json()["orders"]
+            assert any(o["id"] == order_id for o in orders)
+            # No decision log
+            decisions = client.get("/decision-log").json()["entries"]
+            assert not any(e["order_id"] == order_id for e in decisions)
+        finally:
+            db.close()
+
+    def test_exact_balance_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Balance == notional + fee. Approval succeeds, final balance is 0."""
+        from polycopy.config.settings import get_settings as _gs
+        from polycopy.api.app import _bidask_provider
+        fee_rate = _gs().fill_fee_rate
+        limit_price = 0.5
+        qty = 10.0
+        notional = limit_price * qty
+        fee = notional * fee_rate
+        total = notional + fee
+        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, total)
+        _bidask_provider.set_snapshot(
+            "00000000-0000-0000-0000-000000000098", "Yes",
+            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
+        )
+        try:
+            resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "exact"})
+            assert resp.status_code == 200
+            bal = client.get(f"/wallets/{wallet_id}").json()["balances"][0]
+            assert abs(bal["amount"]) < 1e-9
+        finally:
+            db.close()
+
+    def test_idempotent_restart_no_double_debit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Approve once, restart, replay same request. Cash debited only once."""
+        from polycopy.api.app import _bidask_provider
+        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 100.0)
+        _bidask_provider.set_snapshot(
+            "00000000-0000-0000-0000-000000000098", "Yes",
+            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
+        )
+        try:
+            first = client.post("/paper/approve", json={"order_id": order_id, "notes": "idempotent restart"})
+            assert first.status_code == 200
+            bal_after_first = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
+            # Simulate restart
+            self._reset_and_reload(tmp_path, monkeypatch)
+            self._reset_and_reload(tmp_path, monkeypatch)
+            from polycopy.api.app import _idempotency_store
+            _idempotency_store._db = None
+            _idempotency_store._ensured_table = False
+            __import__("polycopy.db.database", fromlist=["get_database"]).get_database(reload=True)
+            second = client.post("/paper/approve", json={"order_id": order_id, "notes": "idempotent restart"})
+            assert second.status_code == 200
+            bal_after_second = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
+            assert abs(bal_after_first - bal_after_second) < 1e-9, (
+                f"Double debit! first={bal_after_first}, second={bal_after_second}"
+            )
+        finally:
+            db.close()
+
+    def test_buy_then_sell_accounting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Buy debits cash. Sell credits proceeds. Confirm P&L consistent."""
+        from polycopy.api.app import _bidask_provider
+        from polycopy.config.settings import get_settings as _gs
+        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 100.0)
+        _bidask_provider.set_snapshot(
+            "00000000-0000-0000-0000-000000000098", "Yes",
+            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
+        )
+        try:
+            buy_resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "buy"})
+            assert buy_resp.status_code == 200
+            balance_after_buy = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
+            # Now sell: a matching sell order must be created. Use a direct buy->sell flow.
+            # Create a new pending sell order referencing the same market/outcome/wallet/qty.
+            sell_order_id = str(uuid.uuid4())
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            position = client.get("/positions", params={"wallet_id": wallet_id}).json()["positions"][0]
+            sell_qty = position["quantity"]
+            sell_price = 0.65
+            db.execute(
+                "INSERT OR IGNORE INTO orders "
+                "(id, market_id, wallet_id, side, order_type, outcome, quantity, price, status, filled_quantity, created_at, updated_at, is_sample) "
+                "VALUES (?, ?, ?, 'sell', 'limit', 'Yes', ?, ?, 'pending', 0.0, ?, ?, 0)",
+                (sell_order_id, position["market_id"], wallet_id, sell_qty, sell_price, now, now),
+            )
+            db.conn.commit()
+            sell_resp = client.post("/paper/approve", json={"order_id": sell_order_id, "notes": "sell"})
+            assert sell_resp.status_code == 200
+            balance_after_sell = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
+            # Cash must have increased by sell_price * sell_qty - fee
+            fee_rate = _gs().fill_fee_rate
+            sell_proceeds = sell_price * sell_qty * (1.0 - fee_rate)
+            assert balance_after_sell > balance_after_buy
+            assert abs((balance_after_sell - balance_after_buy) - sell_proceeds) < 0.01
+        finally:
+            db.close()

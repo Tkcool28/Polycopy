@@ -789,6 +789,21 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
             detail=f"Risk gate blocked: {gate_result.gate_name} — {gate_result.reason}",
         )
 
+    # Compute fee and validate cash for buy orders
+    fee = float(row["price"]) * filled_quantity * settings.fill_fee_rate
+    slippage = 0.0
+    if side == "buy":
+        total_debit = float(row["price"]) * filled_quantity + fee
+        cash_row = db.fetchone(
+            "SELECT amount FROM wallet_balances WHERE wallet_id = ? AND currency = 'USDC' ORDER BY id DESC LIMIT 1",
+            (row["wallet_id"],),
+        )
+        if cash_row is not None and float(cash_row["amount"]) + 1e-9 < total_debit:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Insufficient simulated USDC balance: need {total_debit:.6f}, have {float(cash_row['amount']):.6f}.",
+            )
+
     # Transition the exact order to filled
     db.execute(
         """
@@ -801,9 +816,9 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
         (filled_quantity, now.isoformat(), str(request.order_id)),
     )
 
-    # Create or update position
-    fee = float(row["price"]) * filled_quantity * settings.fill_fee_rate
-    slippage = 0.0
+    # Debit cash for buy orders; create/update position
+    if side == "buy":
+        _adjust_usdc_balance(db, row["wallet_id"], -total_debit, now, bool(row["is_sample"]))
     try:
         position_metrics = _upsert_position(db, row["market_id"], row["wallet_id"], row["outcome"], side, filled_quantity, float(row["price"]), now, bool(row["is_sample"]))
         if side == "sell":

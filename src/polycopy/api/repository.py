@@ -51,6 +51,19 @@ SAMPLE_EXPERIMENT_ID = UUID("00000000-0000-0000-0000-000000000015")
 SAMPLE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
+def _derive_overall_status(sources: list[SourceHealthView]) -> str:
+    """Derive an overall health status from per-source statuses."""
+    if not sources:
+        return "unavailable"
+    if all(s.status == "ok" for s in sources):
+        return "healthy"
+    if all(s.status in ("stale", "partial") for s in sources):
+        return "degraded"
+    if any(s.status in ("ok", "stale", "partial") for s in sources):
+        return "degraded"
+    return "unavailable"
+
+
 def _dt(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
@@ -259,6 +272,8 @@ class DashboardRepository:
         )
 
         # Fallback: if no provider_health rows exist, derive from raw_snapshots
+        staleness_threshold = self.settings.staleness_seconds if self.settings else 120.0
+
         if not ph_rows:
             rows = self.db.fetchall(
                 "SELECT source, COUNT(*) AS n, MIN(fetched_at) AS oldest, "
@@ -289,7 +304,7 @@ class DashboardRepository:
                 newest = _dt(row["newest"])
                 freshness = seconds_since(newest) if newest else None
                 status = "ok" if row["n"] else "unavailable"
-                if freshness is not None and freshness > 300:
+                if freshness is not None and freshness > staleness_threshold:
                     status = "stale"
                 sources.append(SourceHealthView(
                     source=self._label(row["source"], bool(row["is_sample"])),
@@ -307,7 +322,7 @@ class DashboardRepository:
             )
             count = int(count_row["n"] if count_row else 0)
             missing: list[str] = []
-            overall = "unavailable" if count == 0 else "healthy"
+            overall = _derive_overall_status(sources)
             return DataHealthResponse(
                 sources=sources,
                 snapshot_count=count,
@@ -326,7 +341,7 @@ class DashboardRepository:
             freshness = seconds_since(last_success) if last_success else None
 
             status = row["status"]
-            if status == "ok" and freshness is not None and freshness > 300:
+            if status == "ok" and freshness is not None and freshness > staleness_threshold:
                 status = "stale"
             if status == "disabled":
                 missing_capabilities.append(f"{row['provider']}.{row['capability']}")
@@ -351,14 +366,7 @@ class DashboardRepository:
         count = int(count_row["n"] if count_row else 0)
 
         # Determine overall status
-        if not sources:
-            overall = "unavailable"
-        elif all(s.status == "ok" for s in sources):
-            overall = "healthy"
-        elif any(s.status in ("ok", "stale", "partial") for s in sources):
-            overall = "degraded"
-        else:
-            overall = "unavailable"
+        overall = _derive_overall_status(sources)
 
         return DataHealthResponse(
             sources=sources,
