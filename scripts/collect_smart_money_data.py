@@ -112,11 +112,21 @@ class CollectionResult:
 # ── Polymarket collector (live) ────────────────────────────────────────────────
 
 class PolymarketCollector:
-    """Fetches market and trade data from Polymarket public APIs."""
+    """Fetches market and trade data from Polymarket public APIs.
+
+    v0.4 (P21 fix): Uses the data-api (https://data-api.polymarket.com/trades)
+    for trade ingestion. CLOB /trades requires auth (HTTP 401). Gamma has no
+    /trades endpoint. See reports/polymarket_trade_ingestion_audit.md.
+    """
 
     def __init__(self, settings=None):
         self.settings = settings or get_settings()
         self._client = None
+        # Cache of per-market asset_id → outcome label mapping, keyed by
+        # condition_id. Populated when markets are fetched.
+        self._asset_to_outcome: dict[str, dict[str, str]] = {}
+        # Shared adapter instance (lazy)
+        self._trade_adapter = None
 
     async def _get_client(self):
         if self._client is None or self._client.is_closed:
@@ -127,10 +137,6 @@ class PolymarketCollector:
                 timeout=self.settings.http_timeout_seconds,
             )
         return self._client
-
-    async def close(self):
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
 
     async def collect_markets(
         self,
@@ -175,6 +181,11 @@ class PolymarketCollector:
                 try:
                     market = self._parse_market(item)
                     self._persist_market(db, market)
+                    # Cache asset_id → outcome map for trade ingestion.
+                    cond = market.source_id
+                    asset_map = self._build_asset_to_outcome_map(item)
+                    if asset_map:
+                        self._asset_to_outcome[cond] = asset_map
                     markets.append(market)
                     result.markets_fetched += 1
                 except Exception as e:
@@ -190,52 +201,75 @@ class PolymarketCollector:
             logger.error("Failed to fetch markets: %s", e)
             return []
 
+    async def _get_trade_adapter(self):
+        """Lazy-init the shared PolymarketPublicAdapter used for trade ingestion."""
+        if self._trade_adapter is None:
+            from polycopy.adapters.polymarket import PolymarketPublicAdapter
+            self._trade_adapter = PolymarketPublicAdapter(
+                gamma_base_url=self.settings.gamma_base_url,
+                clob_base_url=self.settings.clob_base_url,
+                data_api_base_url=self.settings.data_api_base_url,
+                timeout=self.settings.http_timeout_seconds,
+                rate_limit_rps=self.settings.http_rate_limit_rps,
+                data_api_window_size=self.settings.data_api_window_size,
+                data_api_request_interval_seconds=self.settings.data_api_request_interval_seconds,
+            )
+        return self._trade_adapter
+
     async def collect_trades(
         self,
         db: Database,
         market_source_id: str,
         result: CollectionResult | None = None,
+        since: datetime | None = None,
+        limit: int = 200,
     ) -> list[SourceTrade]:
-        """Fetch recent trades for a market from CLOB API."""
+        """Fetch recent trades for a market from the public data-api.
+
+        v0.4 (P21 fix): Replaces the broken `client.get("/trades")` calls
+        against gamma/clob with the data-api global-window strategy. See
+        reports/polymarket_trade_ingestion_audit.md for live evidence.
+
+        Behavior:
+          - Uses the adapter's shared global-window cache (one HTTP call
+            across all markets in a run).
+          - Slices client-side by conditionId.
+          - Maps asset_id → outcome label using cached clobTokenIds ordering.
+          - Persists trades to source_trades with is_sample=0.
+          - On any error, logs and returns [] (graceful degradation).
+          - Never fabricates data: empty window → empty result + warning.
+        """
         if result is None:
             result = CollectionResult()
 
-        client = await self._get_client()
+        # Save snapshot of the global window (best-effort) — captures provenance.
         try:
-            # CLOB trades endpoint — attempt with condition_id
-            resp = await client.get("/trades", params={"condition_id": market_source_id})
-            resp.raise_for_status()
-            raw_data = resp.json()
-
-            if not isinstance(raw_data, list):
-                raw_data = [raw_data] if raw_data else []
-
-            # Save snapshot
-            snapshot = self._save_snapshot(
-                db=db,
-                source="polymarket_clob",
-                endpoint="/trades",
-                params={"condition_id": market_source_id},
-                data=raw_data,
-            )
-            if snapshot:
+            adapter = await self._get_trade_adapter()
+            window = await adapter._fetch_global_window()
+            if window:
+                self._save_snapshot(
+                    db=db,
+                    source="polymarket_data_api",
+                    endpoint="/trades",
+                    params={"limit": self.settings.data_api_window_size, "filter": "global_window"},
+                    data=window,
+                )
                 result.snapshots_saved += 1
+        except Exception as e:
+            logger.debug("snapshot save skipped: %s", e)
+            adapter = await self._get_trade_adapter()
 
-            trades = []
-            for item in raw_data:
-                try:
-                    trade = self._parse_trade(item, market_source_id)
-                    if trade:
-                        self._persist_trade(db, trade)
-                        trades.append(trade)
-                        result.trades_fetched += 1
-                except Exception as e:
-                    result.trades_failed += 1
-                    result.errors.append(f"Trade parse error: {e}")
-                    logger.warning("Failed to parse trade: %s", e)
+        if since is None:
+            since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-            return trades
-
+        asset_to_outcome = self._asset_to_outcome.get(market_source_id) or {}
+        try:
+            trades = await adapter.get_recent_trades(
+                market_source_id=market_source_id,
+                since=since,
+                limit=limit,
+                asset_to_outcome=asset_to_outcome,
+            )
         except Exception as e:
             result.trades_failed += 1
             result.missing_data_log.append(
@@ -243,6 +277,91 @@ class PolymarketCollector:
             )
             logger.warning("No trades for market %s: %s", market_source_id, e)
             return []
+
+        persisted = []
+        for trade in trades:
+            try:
+                self._persist_trade(db, trade)
+                persisted.append(trade)
+                result.trades_fetched += 1
+            except Exception as e:
+                result.trades_failed += 1
+                result.errors.append(f"Trade persist error: {e}")
+                logger.warning("Failed to persist trade: %s", e)
+        return persisted
+
+    async def probe_and_record_capability(self, db: Database) -> dict:
+        """Probe data-api trade availability and record a capability_flags row.
+
+        Returns the probe dict:
+          {
+            "status": "ok" | "unavailable" | "partial",
+            "wallet_attribution_available": bool,
+            "trades_returned": int,
+            "http_status": int,
+            "error": Optional[str],
+          }
+        """
+        adapter = await self._get_trade_adapter()
+        probe = await adapter.probe_trade_capability()
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            details = json.dumps({
+                "trades_returned": probe["trades_returned"],
+                "http_status": probe["http_status"],
+                "error": probe["error"],
+                "endpoint": "/trades",
+                "host": self.settings.data_api_base_url,
+            }, sort_keys=True)
+            # Upsert capability_flags row for "polymarket_data_api_trades"
+            existing = db.fetchone(
+                "SELECT id, first_verified_at FROM capability_flags WHERE capability = ?",
+                ("polymarket_data_api_trades",),
+            )
+            wallet_attr = 1 if probe["wallet_attribution_available"] else 0
+            if existing:
+                db.execute(
+                    """UPDATE capability_flags
+                       SET status = ?, wallet_attribution_available = ?,
+                           details = ?, last_verified_at = ?
+                       WHERE capability = ?""",
+                    (
+                        probe["status"],
+                        wallet_attr,
+                        details,
+                        now_iso,
+                        "polymarket_data_api_trades",
+                    ),
+                )
+            else:
+                first_iso = now_iso
+                db.execute(
+                    """INSERT INTO capability_flags
+                       (capability, status, wallet_attribution_available,
+                        details, first_verified_at, last_verified_at, is_sample)
+                       VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                    (
+                        "polymarket_data_api_trades",
+                        probe["status"],
+                        wallet_attr,
+                        details,
+                        first_iso,
+                        now_iso,
+                    ),
+                )
+            db.conn.commit()
+        except Exception as e:
+            logger.warning("Failed to record capability flag: %s", e)
+        return probe
+
+    async def close(self):
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        if self._trade_adapter is not None:
+            try:
+                await self._trade_adapter.aclose()
+            except Exception:
+                pass
 
     async def collect_wallet_balance(self, address: str) -> Wallet | None:
         """Fetch wallet USDC balance. Returns None if unavailable."""
@@ -286,6 +405,51 @@ class PolymarketCollector:
             fetched_at=datetime.now(timezone.utc),
             is_sample=False,
         )
+
+    @staticmethod
+    def _parse_clob_token_ids(data: dict) -> list[str]:
+        """Extract clobTokenIds as a Python list of token_id strings.
+
+        Gamma returns clobTokenIds as a JSON-string-encoded array of token IDs.
+        Returns [] if missing or malformed.
+        """
+        import json as _json
+        raw = data.get("clobTokenIds")
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return [str(t) for t in raw]
+        if isinstance(raw, str):
+            try:
+                parsed = _json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(t) for t in parsed]
+            except Exception:
+                return []
+        return []
+
+    @staticmethod
+    def _build_asset_to_outcome_map(data: dict) -> dict[str, str]:
+        """Build asset_id → outcome-label map for a Gamma market object.
+
+        Gamma's clobTokenIds is a JSON-encoded array of token IDs in the same
+        order as the `outcomes` array. This map lets us rewrite the raw
+        data-api `outcome` string (which can be denormalized across markets)
+        to the canonical outcome label for THIS market.
+        """
+        import json as _json
+        try:
+            outcomes = data.get("outcomes", "[]")
+            tokens = data.get("clobTokenIds", "[]")
+            if isinstance(outcomes, str):
+                outcomes = _json.loads(outcomes)
+            if isinstance(tokens, str):
+                tokens = _json.loads(tokens)
+            if not isinstance(outcomes, list) or not isinstance(tokens, list):
+                return {}
+            return {str(tok): str(lab) for tok, lab in zip(tokens, outcomes)}
+        except Exception:
+            return {}
 
     @staticmethod
     def _parse_trade(data: dict, market_source_id: str) -> SourceTrade | None:
@@ -492,6 +656,22 @@ async def run_collection(
     collector = PolymarketCollector(settings)
 
     try:
+        # 0. Probe data-api capability and record flag (before any trade fetch).
+        if not skip_trades:
+            logger.info("Probing data-api /trades capability...")
+            try:
+                cap = await collector.probe_and_record_capability(db)
+                logger.info(
+                    "data-api /trades: status=%s wallet_attr=%s trades=%s http=%s err=%s",
+                    cap["status"],
+                    cap["wallet_attribution_available"],
+                    cap["trades_returned"],
+                    cap["http_status"],
+                    cap["error"],
+                )
+            except Exception as e:
+                logger.warning("Capability probe failed: %s", e)
+
         # 1. Collect markets
         logger.info("Fetching active markets (limit=%d)...", limit)
         markets = await collector.collect_markets(db, limit=limit, result=result)

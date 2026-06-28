@@ -95,7 +95,7 @@ class TestPolymarketResolutionProvider:
                 return _Response()
 
         adapter = PolymarketPublicAdapter("https://gamma.example", "https://clob.example")
-        adapter._client = _Client()  # noqa: SLF001 - injected fake client
+        adapter._gamma_client = _Client()  # noqa: SLF001 - injected fake gamma client (P21: was _client)
         return await adapter.check_resolution("m1")
 
     @pytest.mark.asyncio

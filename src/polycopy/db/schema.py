@@ -7,7 +7,7 @@ schema version. Each migration is a list of SQL statements.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # ── Version 1: initial schema ───────────────────────────────────────────────────
 _V1_DDL: list[str] = [
@@ -234,13 +234,31 @@ _V3_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);",
 ]
 
+# ── Version 4: capability flags (data availability + wallet attribution) ───────
+_V4_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS capability_flags (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        capability        TEXT NOT NULL,
+        status            TEXT NOT NULL,         -- 'ok' | 'unavailable' | 'partial' | 'unknown'
+        wallet_attribution_available INTEGER NOT NULL DEFAULT 0,  -- 0/1
+        details           TEXT NOT NULL DEFAULT '{}',  -- JSON object
+        first_verified_at TEXT NOT NULL,         -- ISO-8601 UTC
+        last_verified_at  TEXT NOT NULL,         -- ISO-8601 UTC
+        is_sample         INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(capability)
+    );""",
+    "CREATE INDEX IF NOT EXISTS idx_capability_flags_capability ON capability_flags(capability);",
+]
+
+
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version from (version - 1).
 MIGRATIONS: dict[int, list[str]] = {
     1: _V1_DDL,
     2: _V2_DDL,
     3: _V3_DDL,
+    4: _V4_DDL,
 }
 
 # Current DDL is the latest migration
-CURRENT_DDL: list[str] = MIGRATIONS[SCHEMA_VERSION]
+CURRENT_DDL: list[str] = MIGRATIONS[SCHEMA_VERSION] 

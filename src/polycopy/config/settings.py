@@ -44,6 +44,25 @@ class Settings(BaseSettings):
     # ── Polymarket public endpoints (read-only, no auth) ───────────────────
     gamma_base_url: str = Field(default="https://gamma-api.polymarket.com", description="Gamma API base URL.")
     clob_base_url: str = Field(default="https://clob.polymarket.com", description="CLOB API base URL.")
+    # NOTE: data-api.polymarket.com exposes /trades (full wallet-attributed trade
+    # history, no auth) and is the actual public source for SourceTrade ingestion.
+    # The CLOB /trades endpoint requires authentication (HTTP 401) and is NOT used.
+    data_api_base_url: str = Field(
+        default="https://data-api.polymarket.com",
+        description="Public data API base URL. Provides unauthenticated /trades and /positions.",
+    )
+    # Maximum global-trades window per fetch (data-api hard-caps at ~1000). This
+    # window is filtered client-side per market since data-api ignores the
+    # conditionId filter parameter.
+    data_api_window_size: int = Field(
+        default=1000,
+        description="Max trades returned by one data-api call (hard cap ~1000).",
+    )
+    # Per-market rate: sleep this long between per-market data-api calls.
+    data_api_request_interval_seconds: float = Field(
+        default=0.25,
+        description="Seconds to sleep between per-market trade fetches.",
+    )
 
     # ── Polymarket credentials (ONLY for broker_mode=polymarket) ───────────
     polymarket_private_key: Optional[str] = Field(default=None, description="Wallet private key. NEVER set in paper mode.")
