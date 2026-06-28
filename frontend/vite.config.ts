@@ -30,6 +30,7 @@ export default defineConfig({
       '/decision-log': backend,
       '/experiments': backend,
       '/data': backend,
+      '/data/health': backend,
       '/config': backend,
       '/idempotency': backend,
     },

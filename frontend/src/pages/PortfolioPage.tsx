@@ -9,7 +9,7 @@ export function PortfolioPage() {
 
   const handleExport = async (format: 'json' | 'csv') => {
     try {
-      const res = await fetch(`/decision-log/export?format=${format}`);
+      const res = await fetch(api.decisionLogExportUrl(format));
       if (!res.ok) throw new Error(`Export failed: ${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);

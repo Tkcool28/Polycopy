@@ -5,6 +5,7 @@ import { Card, LoadingState, ErrorState, EmptyState } from '../components/ui';
 
 export function PaperOrdersPage() {
   const { data: orders, loading, error, refetch } = useApi(() => api.paperOrders());
+  const { data: status } = useApi(() => api.systemStatus());
   const [previewData, setPreviewData] = useState<import('../lib/types').PaperOrderPreview | null>(null);
   const [note, setNote] = useState('');
   const [actionResult, setActionResult] = useState<string | null>(null);
@@ -18,12 +19,13 @@ export function PaperOrdersPage() {
 
   const handlePreview = async () => {
     try {
-      const result = await fetch('/paper/preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ market_id: marketId, outcome, side, quantity, price }),
+      const data = await api.paperPreview({
+        market_id: marketId,
+        outcome,
+        side,
+        quantity,
+        price,
       });
-      const data = await result.json();
       setPreviewData(data);
       setActionResult(null);
     } catch (e) {
@@ -33,18 +35,13 @@ export function PaperOrdersPage() {
 
   const handleApprove = async (orderId: string) => {
     try {
-      const result = await fetch('/paper/approve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order_id: orderId }),
-      });
-      if (result.ok) {
-        setActionResult(`Order ${orderId.slice(0, 8)}… APPROVED (paper_manual)  [SAMPLE]`);
+      const result = await api.paperApprove({ order_id: orderId, notes: note || undefined });
+      if (result?.status !== 'error') {
+        setActionResult(`Order ${orderId.slice(0, 8)}… APPROVED (${status?.paper_mode ?? 'paper'}) ${previewData?.is_sample ? '[SAMPLE]' : ''}`);
         setNote('');
         refetch();
       } else {
-        const err = await result.json();
-        setActionResult(`Approve failed: ${err.detail}`);
+        setActionResult(`Approve failed: ${result?.detail ?? 'unknown error'}`);
       }
     } catch (e) {
       setActionResult(`Approve failed: ${(e as Error).message}`);
@@ -53,17 +50,12 @@ export function PaperOrdersPage() {
 
   const handleReject = async (orderId: string) => {
     try {
-      const result = await fetch('/paper/reject', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ order_id: orderId }),
-      });
-      if (result.ok) {
-        setActionResult(`Order ${orderId.slice(0, 8)}… REJECTED (paper_manual)  [SAMPLE]`);
+      const result = await api.paperReject({ order_id: orderId, notes: note || undefined });
+      if (result?.status !== 'error') {
+        setActionResult(`Order ${orderId.slice(0, 8)}… REJECTED (${status?.paper_mode ?? 'paper'})`);
         refetch();
       } else {
-        const err = await result.json();
-        setActionResult(`Reject failed: ${err.detail}`);
+        setActionResult(`Reject failed: ${result?.detail ?? 'unknown error'}`);
       }
     } catch (e) {
       setActionResult(`Reject failed: ${(e as Error).message}`);
@@ -119,7 +111,7 @@ export function PaperOrdersPage() {
 
         {previewData && (
           <div style={{ marginTop: 16, padding: 12, background: 'var(--bg-elevated)', borderRadius: 'var(--radius-sm)' }}>
-            <h4 style={{ fontSize: '0.85rem', marginBottom: 8 }}>Preview Result  [SAMPLE DATA]</h4>
+            <h4 style={{ fontSize: '0.85rem', marginBottom: 8 }}>Preview Result {previewData?.is_sample ? ' [SAMPLE DATA]' : ` — ${status?.paper_mode ?? 'paper'}`}</h4>
             <div className="detail-grid">
               <div className="detail-grid__label">Est. Fill Price</div>
               <div className="detail-grid__value">{formatPercent(previewData.estimated_fill_price)}</div>
@@ -196,12 +188,12 @@ export function PaperOrdersPage() {
 
       <Card title="Manual Action Note" badge="AUDIT">
         <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginBottom: 8 }}>
-          Notes are stored locally for audit. They do not affect order execution.
+          Notes are sent to the backend audit log with the approval or rejection. They do not affect order execution.
         </div>
         <textarea
           value={note}
           onChange={(e) => setNote(e.target.value)}
-          placeholder="Add a note about this decision (optional, stored locally only)..."
+          placeholder="Add a note about this decision (optional audit note)..."
           style={{ ...inputStyle, width: '100%', minHeight: 60, resize: 'vertical' }}
         />
       </Card>

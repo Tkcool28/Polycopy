@@ -7,7 +7,7 @@ schema version. Each migration is a list of SQL statements.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 # ── Version 1: initial schema ───────────────────────────────────────────────────
 _V1_DDL: list[str] = [
@@ -95,7 +95,7 @@ _V1_DDL: list[str] = [
         market_id       TEXT NOT NULL REFERENCES markets(id),
         wallet_id       TEXT NOT NULL REFERENCES wallets(id),
         outcome         TEXT NOT NULL,
-        quantity        REAL NOT NULL CHECK(quantity > 0),
+        quantity        REAL NOT NULL CHECK(quantity >= 0),
         avg_entry_price REAL NOT NULL CHECK(avg_entry_price >= 0 AND avg_entry_price <= 1),
         current_price   REAL NOT NULL CHECK(current_price >= 0 AND current_price <= 1),
         realized_pnl    REAL NOT NULL DEFAULT 0,
@@ -188,10 +188,58 @@ _V1_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_snapshots_fetched ON raw_snapshots(fetched_at);",
 ]
 
+# ── Version 2: provider health tracking ─────────────────────────────────────────
+_V2_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS provider_health (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider      TEXT NOT NULL,
+        capability    TEXT NOT NULL,
+        status        TEXT NOT NULL,
+        last_success  TEXT,
+        last_attempt  TEXT,
+        http_status   INTEGER,
+        error_message TEXT,
+        sample_count  INTEGER NOT NULL DEFAULT 0,
+        live_count    INTEGER NOT NULL DEFAULT 0,
+        is_sample     INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(provider, capability)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_provider_health_provider ON provider_health(provider);",
+]
+
+# ── Version 3: allow closed paper positions to retain realized P&L ──────────────
+_V3_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS positions_new (
+        id              TEXT PRIMARY KEY,
+        market_id       TEXT NOT NULL REFERENCES markets(id),
+        wallet_id       TEXT NOT NULL REFERENCES wallets(id),
+        outcome         TEXT NOT NULL,
+        quantity        REAL NOT NULL CHECK(quantity >= 0),
+        avg_entry_price REAL NOT NULL CHECK(avg_entry_price >= 0 AND avg_entry_price <= 1),
+        current_price   REAL NOT NULL CHECK(current_price >= 0 AND current_price <= 1),
+        realized_pnl    REAL NOT NULL DEFAULT 0,
+        opened_at       TEXT NOT NULL,
+        updated_at      TEXT,
+        is_sample       INTEGER NOT NULL DEFAULT 0
+    );""",
+    """INSERT INTO positions_new (
+        id, market_id, wallet_id, outcome, quantity, avg_entry_price,
+        current_price, realized_pnl, opened_at, updated_at, is_sample
+    ) SELECT id, market_id, wallet_id, outcome, quantity, avg_entry_price,
+             current_price, realized_pnl, opened_at, updated_at, is_sample
+        FROM positions;""",
+    "DROP TABLE positions;",
+    "ALTER TABLE positions_new RENAME TO positions;",
+    "CREATE INDEX IF NOT EXISTS idx_positions_wallet ON positions(wallet_id);",
+    "CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);",
+]
+
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version from (version - 1).
 MIGRATIONS: dict[int, list[str]] = {
     1: _V1_DDL,
+    2: _V2_DDL,
+    3: _V3_DDL,
 }
 
 # Current DDL is the latest migration

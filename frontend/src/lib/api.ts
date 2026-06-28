@@ -1,8 +1,9 @@
 const BASE = import.meta.env.VITE_API_BASE ?? '';
 
-async function request<T>(path: string): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
+    ...init,
   });
   if (!res.ok) {
     throw new Error(`API ${path} failed: ${res.status} ${res.statusText}`);
@@ -39,6 +40,29 @@ export const api = {
     request<import('./types').OrdersResponse>(
       `/paper/orders${statusFilter ? `?status=${statusFilter}` : ''}`,
     ),
+  paperPreview: (body: {
+    market_id: string;
+    outcome: string;
+    side: string;
+    quantity: number;
+    price: number;
+  }) =>
+    request<import('./types').PaperOrderPreview>('/paper/preview', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  paperApprove: (body: { order_id: string; notes?: string }) =>
+    request<{ status: string; detail?: string }>('/paper/approve', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  paperReject: (body: { order_id: string; notes?: string }) =>
+    request<{ status: string; detail?: string }>('/paper/reject', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  decisionLogExportUrl: (format: 'json' | 'csv') =>
+    `${import.meta.env.VITE_API_BASE ?? ''}/decision-log/export?format=${format}`,
   config: () => request<import('./types').ConfigView>('/config'),
   dataHealth: () => request<import('./types').DataHealthResponse>('/data/health'),
 };

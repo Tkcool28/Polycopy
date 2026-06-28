@@ -1326,11 +1326,56 @@ class TestAPIValidation:
         yield
         _idempotency_store.clear()
 
+    @pytest.fixture(autouse=True)
+    def _setup_bidask(self):
+        """Provide bid/ask snapshots for paper preview tests."""
+        from polycopy.api.app import _bidask_provider
+        _bidask_provider.set_snapshot(
+            market_id="00000000-0000-0000-0000-000000000001",
+            outcome="Yes",
+            bid=0.62,
+            ask=0.68,
+            ask_volume=100.0,
+            bid_volume=50.0,
+        )
+        _bidask_provider.set_snapshot(
+            market_id="00000000-0000-0000-0000-000000000001",
+            outcome="No",
+            bid=0.30,
+            ask=0.35,
+            ask_volume=80.0,
+            bid_volume=100.0,
+        )
+        _bidask_provider.set_snapshot(
+            market_id="00000000-0000-0000-0000-000000000022",
+            outcome="Yes",
+            bid=0.55,
+            ask=0.60,
+            ask_volume=20.0,  # small depth → partial fills
+            bid_volume=100.0,
+        )
+        yield
+        _bidask_provider.clear()
+
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch, tmp_path):
         from fastapi.testclient import TestClient
         from polycopy.api.app import app
-        return TestClient(app)
+        monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
+        monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "test-p10-api-validation.sqlite"))
+        import polycopy.config.settings as settings_module
+        import polycopy.db.database as database_module
+
+        if database_module._db is not None:
+            database_module._db.close()
+        database_module._db = None
+        settings_module._settings = None
+        with TestClient(app) as test_client:
+            yield test_client
+        if database_module._db is not None:
+            database_module._db.close()
+        database_module._db = None
+        settings_module._settings = None
 
     def test_health_endpoint(self, client):
         resp = client.get("/health")
@@ -1385,8 +1430,14 @@ class TestAPIValidation:
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert data["estimated_fill_price"] == 0.65
         assert data["is_sample"] is True
+        assert data["status"] == "pending"
+        assert data["bid"] == 0.62
+        assert data["ask"] == 0.68
+        assert data["spread"] == 0.06
+        assert "passed_gates" in data
+        assert "failed_gates" in data
+        assert data["fill_model_version"] == "polycopy-fill-v1"
 
     def test_paper_preview_missing_params_422(self, client):
         """Missing required params returns 422."""
@@ -1404,38 +1455,82 @@ class TestAPIValidation:
         })
         assert resp.status_code == 422
 
-    def test_paper_approve_returns_accepted(self, client):
+    @staticmethod
+    def _seed_pending_order(order_id: str):
+        """Seed a pending order in the DB so approve/reject can transition it."""
+        from polycopy.db.database import get_database
+        db = get_database()
+        now = "2026-06-28T12:00:00+00:00"
+        db.execute(
+            "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000002", "0xtest", "test", 0, now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000001", "m1", "test", "Test Q", now, 0),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO orders
+                (id, market_id, wallet_id, side, order_type, outcome, quantity, price,
+                 status, filled_quantity, created_at, updated_at, is_sample)
+            VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 10.0, 0.65, 'pending', 0.0, ?, ?, 0)
+            """,
+            (order_id, "00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002", now, now),
+        )
+        db.conn.commit()
+
+    def test_paper_approve_returns_filled(self, client):
+        order_id = "00000000-0000-0000-0000-000000000099"
+        self._seed_pending_order(order_id)
         resp = client.post("/paper/approve", json={
-            "order_id": "00000000-0000-0000-0000-000000000099",
+            "order_id": order_id,
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
-        assert data["is_sample"] is True
+        # paper_manual mode: order is PENDING then confirm_and_fill → FILLED
+        assert data["status"] == "filled"
+        assert data["id"] == order_id
 
     def test_paper_reject_returns_cancelled(self, client):
+        order_id = "00000000-0000-0000-0000-000000000098"
+        self._seed_pending_order(order_id)
         resp = client.post("/paper/reject", json={
-            "order_id": "00000000-0000-0000-0000-000000000099",
+            "order_id": order_id,
         })
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "cancelled"
+        assert data["id"] == order_id
 
-    def test_paper_approve_duplicate_rejected(self, client):
-        """Duplicate approval within window returns 409."""
-        payload = {"order_id": "00000000-0000-0000-0000-000000000099"}
+    def test_paper_approve_duplicate_idempotent(self, client):
+        """Duplicate approval is idempotent: returns same result, status 200."""
+        order_id = "00000000-0000-0000-0000-000000000097"
+        self._seed_pending_order(order_id)
+        payload = {"order_id": order_id}
         resp1 = client.post("/paper/approve", json=payload)
         assert resp1.status_code == 200
+        data1 = resp1.json()
         resp2 = client.post("/paper/approve", json=payload)
-        assert resp2.status_code == 409
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        # Idempotent: same order_id returned
+        assert data1["id"] == data2["id"]
+        assert data1["status"] == data2["status"]
 
-    def test_paper_reject_duplicate_rejected(self, client):
-        """Duplicate rejection within window returns 409."""
-        payload = {"order_id": "00000000-0000-0000-0000-000000000099"}
+    def test_paper_reject_duplicate_idempotent(self, client):
+        """Duplicate rejection is idempotent: returns same result, status 200."""
+        order_id = "00000000-0000-0000-0000-000000000096"
+        self._seed_pending_order(order_id)
+        payload = {"order_id": order_id}
         resp1 = client.post("/paper/reject", json=payload)
         assert resp1.status_code == 200
+        data1 = resp1.json()
         resp2 = client.post("/paper/reject", json=payload)
-        assert resp2.status_code == 409
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data1["id"] == data2["id"]
+        assert data1["status"] == data2["status"]
 
     def test_positions_returns_sample(self, client):
         resp = client.get("/positions")

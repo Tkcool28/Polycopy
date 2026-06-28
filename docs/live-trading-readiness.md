@@ -6,6 +6,10 @@ Polycopy has **no real-money execution path**. The `DisabledLiveBroker`
 raises on every operation. This is intentional and correct for the current
 research phase.
 
+The persistent API layer (FastAPI + SQLite) is operational and serves
+persistent paper-trading data across restarts. This document covers the
+additional gates required before any real-money order can be placed.
+
 Transitioning to live trading requires a separate implementation PR that
 passes the review gates below. This document defines what must be true
 before any real-money order can be placed.

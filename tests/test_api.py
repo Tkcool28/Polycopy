@@ -22,9 +22,33 @@ def _clear_idempotency():
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch, tmp_path):
     """Sync test client for FastAPI app."""
-    return TestClient(app)
+    monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
+    monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "test-api.sqlite"))
+    from polycopy.api.app import _bidask_provider
+    import polycopy.config.settings as settings_module
+    import polycopy.db.database as database_module
+
+    if database_module._db is not None:
+        database_module._db.close()
+    database_module._db = None
+    settings_module._settings = None
+    _bidask_provider.set_snapshot(
+        market_id="00000000-0000-0000-0000-000000000010",
+        outcome="Yes",
+        bid=0.62,
+        ask=0.68,
+        ask_volume=100.0,
+        bid_volume=50.0,
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+    _bidask_provider.clear()
+    if database_module._db is not None:
+        database_module._db.close()
+    database_module._db = None
+    settings_module._settings = None
 
 
 # ── Health & system status ────────────────────────────────────────────────────
@@ -104,52 +128,88 @@ class TestSignals:
 # ── Paper orders (idempotency) ────────────────────────────────────────────────
 
 class TestPaperOrders:
-    def test_preview_returns_quote(self, client):
+    @staticmethod
+    def _seed_pending_order(order_id: str):
+        """Seed a pending order in the DB so approve/reject can transition it."""
+        from polycopy.db.database import get_database
+        db = get_database()
+        now = "2026-06-28T12:00:00+00:00"
+        db.execute(
+            "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000002", "0xtest", "test", 0, now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000001", "m1", "test", "Test Q", now, 0),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO orders
+                (id, market_id, wallet_id, side, order_type, outcome, quantity, price,
+                 status, filled_quantity, created_at, updated_at, is_sample)
+            VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 10.0, 0.65, 'pending', 0.0, ?, ?, 0)
+            """,
+            (order_id, "00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002", now, now),
+        )
+        db.conn.commit()
+
+    def test_preview_order_response_model(self, client):
         resp = client.post(
             "/paper/preview",
-            params={
+            json={
                 "market_id": "00000000-0000-0000-0000-000000000010",
                 "outcome": "Yes",
                 "side": "buy",
-                "quantity": 10.0,
+                "quantity": 10,
                 "price": 0.65,
             },
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["estimated_fill_price"] == 0.65
+        assert data["estimated_fill_price"] == 0.68
         assert data["estimated_fee"] > 0
         assert data["estimated_total_cost"] > 0
 
     def test_approve_order_succeeds(self, client):
-        resp = client.post("/paper/approve", json={"order_id": "00000000-0000-0000-0000-000000000001"})
+        order_id = "00000000-0000-0000-0000-000000000001"
+        self._seed_pending_order(order_id)
+        resp = client.post("/paper/approve", json={"order_id": order_id})
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
+        assert data["status"] == "filled"
+        assert data["id"] == order_id
 
     def test_approve_order_duplicate_rejected(self, client):
-        payload = {"order_id": "00000000-0000-0000-0000-000000000001"}
+        order_id = "00000000-0000-0000-0000-000000000001"
+        self._seed_pending_order(order_id)
+        payload = {"order_id": order_id}
         # First submission
         resp1 = client.post("/paper/approve", json=payload)
         assert resp1.status_code == 200
 
-        # Duplicate submission — same order_id hits same idempotency key
+        # Duplicate submission — same order_id replays the same safe result
         resp2 = client.post("/paper/approve", json=payload)
-        assert resp2.status_code == 409
-        assert "duplicate" in resp2.json()["detail"].lower()
+        assert resp2.status_code == 200
+        assert resp2.json()["id"] == resp1.json()["id"]
 
     def test_reject_order_succeeds(self, client):
-        resp = client.post("/paper/reject", json={"order_id": "00000000-0000-0000-0000-000000000002"})
+        order_id = "00000000-0000-0000-0000-000000000002"
+        self._seed_pending_order(order_id)
+        resp = client.post("/paper/reject", json={"order_id": order_id})
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "cancelled"
+        assert data["id"] == order_id
 
     def test_reject_order_duplicate_rejected(self, client):
-        payload = {"order_id": "00000000-0000-0000-0000-000000000002"}
+        order_id = "00000000-0000-0000-0000-000000000002"
+        self._seed_pending_order(order_id)
+        payload = {"order_id": order_id}
         resp1 = client.post("/paper/reject", json=payload)
         assert resp1.status_code == 200
         resp2 = client.post("/paper/reject", json=payload)
-        assert resp2.status_code == 409
+        assert resp2.status_code == 200
+        assert resp2.json()["id"] == resp1.json()["id"]
 
     def test_list_paper_orders(self, client):
         resp = client.get("/paper/orders")

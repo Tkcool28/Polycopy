@@ -10,6 +10,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import { PaperOrdersPage } from './pages/PaperOrdersPage';
 import { RiskConsolePage } from './pages/RiskConsolePage';
 import { ExperimentsPage } from './pages/ExperimentsPage';
+import { DataHealthPage } from './pages/DataHealthPage';
 
 export function App() {
   return (
@@ -25,6 +26,7 @@ export function App() {
         <Route path="/risk" element={<RiskConsolePage />} />
         <Route path="/signals" element={<SignalsPage />} />
         <Route path="/experiments" element={<ExperimentsPage />} />
+        <Route path="/data-health" element={<DataHealthPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

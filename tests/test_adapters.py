@@ -13,6 +13,7 @@ from polycopy.adapters.paper_broker import PaperBroker
 from polycopy.adapters.disabled_live_broker import DisabledLiveBroker
 from polycopy.risk.gates import PaperMode
 from polycopy.adapters.snapshot_provenance import SnapshotProvenance
+from polycopy.adapters.polymarket import PolymarketPublicAdapter
 from polycopy.domain.order import OrderSide, OrderType
 
 # Fixed UUIDs for PaperBroker tests
@@ -57,6 +58,62 @@ class TestSampleAdapters:
         provider = SampleResolutionProvider()
         result = await provider.check_resolution("any")
         assert result is None
+
+
+class TestPolymarketResolutionProvider:
+    """Resolution adapter only returns confirmed, valid resolutions."""
+
+    @staticmethod
+    def _payload(**overrides):
+        payload = {
+            "conditionId": "m1",
+            "question": "Will it resolve?",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["1", "0"]',
+            "active": False,
+            "closed": True,
+            "resolved": True,
+            "resolutionOutcome": "Yes",
+        }
+        payload.update(overrides)
+        return payload
+
+    async def _check(self, payload):
+        class _Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        class _Client:
+            is_closed = False
+
+            async def get(self, _path):
+                return _Response()
+
+        adapter = PolymarketPublicAdapter("https://gamma.example", "https://clob.example")
+        adapter._client = _Client()  # noqa: SLF001 - injected fake client
+        return await adapter.check_resolution("m1")
+
+    @pytest.mark.asyncio
+    async def test_open_market_cannot_resolve(self):
+        result = await self._check(self._payload(active=True, closed=False, resolved=False, resolutionOutcome=None))
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_resolved_with_valid_outcome_returns_market(self):
+        result = await self._check(self._payload())
+        assert result is not None
+        assert result.resolution_outcome == "Yes"
+
+    @pytest.mark.asyncio
+    async def test_disputed_or_missing_outcome_cannot_settle(self):
+        assert await self._check(self._payload(disputed=True)) is None
+        assert await self._check(self._payload(resolutionOutcome=None)) is None
+        assert await self._check(self._payload(resolutionOutcome="Maybe")) is None
 
 
 class TestBullpenSkeleton:

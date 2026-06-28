@@ -119,8 +119,9 @@ INCOMPLETE). See `docs/copyability-scoring-v1.md`.
 ### API (`api/`)
 
 FastAPI application with 20 typed endpoints. All response models are Pydantic
-v2. State-changing endpoints require `X-Idempotency-Key` header. Config
-endpoint excludes secrets.
+v2. State-changing endpoints use SQLite-backed idempotency keys (persistent
+across restarts). Config endpoint excludes secrets. Includes persistent
+`IdempotencyStore` backed by SQLite `idempotency_keys` table.
 
 ### Discovery (`discovery/`)
 
@@ -169,6 +170,7 @@ App
         ├── PortfolioPage   — positions + P&L
         ├── RiskConsolePage — kill switch, gates, limits
         ├── ExperimentsPage — experiment metrics
+        ├── DataHealthPage  — freshness KPIs and per-source table status
         └── SettingsPage    — config (secrets excluded)
 ```
 
@@ -218,12 +220,16 @@ POST /paper/preview
   → FillModel.quoteFill() [bid/ask + slippage + fees]
   → ReviewDelay (paper_manual: 30s wait)
 
-POST /paper/approve (with X-Idempotency-Key)
+POST /paper/approve (with SQLite-backed idempotency)
   → PaperBroker.place_order()
   → PnlTracker.record_buy/sell (FIFO lots)
   → Position updated
   → DecisionLogEntry created
   → Counterfactual scenarios computed
+  → IdempotencyStore.check_and_store() (persistent replay protection)
+
+GET /paper/orders → persistent order list (survives API restart)
+GET /positions → persistent position list (survives API restart)
 ```
 
 ### Settlement
@@ -254,6 +260,6 @@ settle_paper_positions.py
 src/polycopy/    — ~5,000 lines Python
 frontend/src/    — ~1,500 lines TypeScript/CSS
 scripts/         — ~1,200 lines Python
-tests/           — ~2,000 lines Python (283 tests)
+tests/           — ~2,600 lines Python (466 tests)
 docs/            — ~2,000 lines Markdown
 ```

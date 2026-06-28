@@ -157,7 +157,8 @@ export interface ConfigView {
 
 export interface SourceHealthView {
   source: string;
-  last_fetched_at: string | null;
+  last_success_at: string | null;
+  last_attempt_at: string | null;
   status: string;
   details: string;
 }

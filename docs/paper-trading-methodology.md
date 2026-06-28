@@ -119,8 +119,9 @@ Signal → Preview → [Manual Review] → Approve/Reject → Fill → Position
 
 ### Approve (POST /paper/approve)
 
-Requires `X-Idempotency-Key` header. If the key was seen within 5 minutes,
-the request is rejected as a duplicate.
+Uses SQLite-backed idempotency (persistent across restarts). If the same
+request is replayed, the stored result is returned — no duplicate orders,
+positions, or decision log entries are created.
 
 On approval:
 1. Order status transitions to FILLED

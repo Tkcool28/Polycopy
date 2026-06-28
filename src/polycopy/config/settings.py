@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # ── Database ────────────────────────────────────────────────────────────
     db_path: Path = Field(default=Path("polycopy.db"), description="SQLite database path.")
     db_echo: bool = Field(default=False, description="Echo SQL statements (debug).")
+    enable_demo_data: bool = Field(
+        default=False,
+        description=(
+            "Explicit demo/sample API mode. When false, empty real DB tables return empty "
+            "collections and no sample fallback. When true, demo records may be returned and "
+            "must be visibly labeled is_sample=True / DEMO DATA / SAMPLE DATA."
+        ),
+    )
 
     # ── Snapshot provenance ─────────────────────────────────────────────────
     snapshot_dir: Path = Field(default=Path("data/snapshots"), description="Directory for raw API snapshots.")
@@ -143,6 +151,10 @@ class Settings(BaseSettings):
     review_delay_seconds: float = Field(
         default=30.0,
         description="Delay before paper orders can fill in paper_manual mode.",
+    )
+    order_preview_max_age_seconds: float = Field(
+        default=3600.0,
+        description="Max age (seconds) of a pending order before it expires and cannot be approved.",
     )
     use_conservative_mark: bool = Field(
         default=False,
