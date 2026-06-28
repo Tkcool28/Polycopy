@@ -38,6 +38,7 @@ from polycopy.api.responses import (
 )
 from polycopy.config.settings import Settings
 from polycopy.db.database import Database, get_database
+from polycopy.domain.source_trade import is_sentinel_trader_address
 
 SAMPLE_LABEL = "DEMO DATA / SAMPLE DATA"
 
@@ -117,6 +118,11 @@ class DashboardRepository:
         return bool(self.settings and self.settings.enable_demo_data)
 
     def scans(self, page: Page) -> ScanResponse:
+        # Defensive: filter sentinel / empty / whitespace-only wallet
+        # addresses so a fake row from an interrupted upgrade or a
+        # manually-inserted row never reaches the dashboard. The v5
+        # migration already deletes these on upgrade; this is belt-and-
+        # braces for read endpoints.
         rows = self.db.fetchall(
             """
             SELECT w.id, w.address, w.label, w.is_sample,
@@ -129,6 +135,7 @@ class DashboardRepository:
             """,
             (page.limit, page.offset),
         )
+        rows = [r for r in rows if not is_sentinel_trader_address(r["address"])]
         total = self._count("wallets")
         if total == 0 and self.demo_enabled:
             return ScanResponse(scans=self._sample_scans()[page.offset : page.offset + page.limit], total_count=1, is_sample_data=True)
@@ -151,6 +158,10 @@ class DashboardRepository:
             "SELECT id, address, label, is_sample FROM wallets ORDER BY created_at DESC, id LIMIT ? OFFSET ?",
             (page.limit, page.offset),
         )
+        # Defensive: filter sentinel / empty / whitespace-only addresses
+        # before mapping to response models so they cannot leak into the
+        # dashboard JSON. See scans() above for rationale.
+        rows = [r for r in rows if not is_sentinel_trader_address(r["address"])]
         total = self._count("wallets")
         if total == 0 and self.demo_enabled:
             sample = self._sample_wallets()[page.offset : page.offset + page.limit]
@@ -160,7 +171,11 @@ class DashboardRepository:
 
     def wallet(self, wallet_id: UUID) -> WalletDetailView | None:
         row = self.db.fetchone("SELECT id, address, label, is_sample FROM wallets WHERE id = ?", (str(wallet_id),))
-        if row is not None:
+        # Defensive: refuse to return a sentinel / empty / whitespace-only
+        # wallet even if its UUID somehow exists. The v5 migration deletes
+        # such rows on upgrade, but a manual post-upgrade INSERT could
+        # reintroduce them.
+        if row is not None and not is_sentinel_trader_address(row["address"]):
             return self._wallet_from_row(row)
         if self.demo_enabled and wallet_id == SAMPLE_WALLET_ID:
             return self._sample_wallets()[0]

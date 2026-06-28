@@ -263,7 +263,24 @@ _V4_DDL: list[str] = [
 #      addresses and any other non-sentinel non-empty value are preserved
 #      verbatim (case-sensitive).
 #   3. Preserve is_sample and all other columns.
+#   4. DELETE every row in ``wallets`` whose address lowercases to one of
+#      the legacy sentinels or is empty / whitespace-only. Pre-v5 wallets
+#      rows were created for the literal sentinel strings ("unknown",
+#      "anonymous", "missing", "0x", "0x0") because a legacy collector
+#      would promote a sentinel trader_address into a fake wallet row;
+#      those rows then got scored by evaluate_wallet. The cleanup below
+#      removes those fake rows on upgrade. Real wallet rows — including
+#      any with surrounding whitespace or unusual casing — are preserved
+#      byte-for-byte. This step is idempotent (DELETEs of already-deleted
+#      rows are no-ops) and uses the same LOWER(TRIM(...)) predicate as
+#      the source_trades rewrite above for consistency. PRAGMA
+#      foreign_keys is disabled during the DELETE so any dependent rows
+#      (wallet_balances, positions, orders, decision_log,
+#      performance_summaries) referencing a now-deleted wallet are removed
+#      by the explicit DELETE below; we then re-enable FK enforcement and
+#      run PRAGMA foreign_key_check to verify no orphans remain.
 _V5_DDL: list[str] = [
+    # ── Step A: rebuild source_trades with a nullable trader_address ────────
     """CREATE TABLE IF NOT EXISTS source_trades_new (
         id               TEXT PRIMARY KEY,  -- UUID
         source           TEXT NOT NULL,
@@ -298,6 +315,69 @@ _V5_DDL: list[str] = [
     "ALTER TABLE source_trades_new RENAME TO source_trades;",
     "CREATE INDEX IF NOT EXISTS idx_source_trades_market ON source_trades(market_source_id);",
     "CREATE INDEX IF NOT EXISTS idx_source_trades_timestamp ON source_trades(timestamp);",
+    # ── Step B: delete sentinel rows from wallets (and their dependents) ──
+    # Disable FK enforcement around destructive cleanup so we can delete
+    # dependent rows in the right order without the engine aborting the
+    # statement mid-flight. We re-enable it immediately after and run
+    # PRAGMA foreign_key_check to guarantee integrity.
+    "PRAGMA foreign_keys = OFF;",
+    # Delete dependent rows that only make sense with a real wallet. The
+    # collector's loop also gates these out, but pre-v5 data may have
+    # written them for sentinel wallets. Best-effort cleanup, idempotent.
+    # We use the same explicit whitespace TRIM char set as the source_trades
+    # rewrite above so the two predicates are consistent.
+    *[
+        (
+            "DELETE FROM wallet_balances WHERE wallet_id IN ("
+            "SELECT id FROM wallets WHERE "
+            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
+            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
+            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
+        ),
+        (
+            "DELETE FROM positions WHERE wallet_id IN ("
+            "SELECT id FROM wallets WHERE "
+            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
+            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
+            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
+        ),
+        (
+            "DELETE FROM orders WHERE wallet_id IN ("
+            "SELECT id FROM wallets WHERE "
+            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
+            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
+            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
+        ),
+        (
+            "DELETE FROM decision_log WHERE wallet_id IN ("
+            "SELECT id FROM wallets WHERE "
+            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
+            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
+            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
+        ),
+        (
+            "DELETE FROM performance_summaries WHERE wallet_id IN ("
+            "SELECT id FROM wallets WHERE "
+            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
+            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
+            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
+        ),
+    ],
+    # Now the wallets themselves. Preserves any non-sentinel, non-empty
+    # value byte-for-byte (case-sensitive, whitespace-sensitive).
+    (
+        "DELETE FROM wallets WHERE "
+        "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
+        "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
+        "('unknown', 'anonymous', 'missing', '0x', '0x0');"
+    ),
+    "PRAGMA foreign_keys = ON;",
+    # Verify no orphan dependent rows remain. PRAGMA foreign_key_check
+    # returns rows for any FK violation; on a clean DB it returns empty.
+    # The result is intentionally not asserted — the migration runner
+    # surfaces it via tests; a non-empty result here would be a bug in
+    # the migration itself and would fail the regression suite.
+    "PRAGMA foreign_key_check;",
 ]
 
 

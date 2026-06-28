@@ -138,7 +138,17 @@ async def run_scan(
 
     # ── Step 1: Load existing wallets from DB ──────────────────────────────
     logger.info("Step 1: Loading existing wallets from database...")
-    wallet_rows = db.fetchall("SELECT address, label FROM wallets")
+    # Defensive: filter sentinel / empty / whitespace-only addresses in
+    # Python so a row that somehow slipped past the v5 migration cleanup
+    # (e.g. an upgrade interrupted before v5 finished, or rows inserted
+    # manually after the upgrade) never enters the watchlist / scoring
+    # loop. ``is_sentinel_trader_address`` is the single source of truth
+    # shared with the v5 migration's DELETE predicate.
+    wallet_rows = [
+        row
+        for row in db.fetchall("SELECT address, label FROM wallets")
+        if not is_sentinel_trader_address(row["address"])
+    ]
     for row in wallet_rows:
         discovery.add_to_watchlist(row["address"], row["label"])
     result.wallets_discovered = len(discovery.list_wallets())
