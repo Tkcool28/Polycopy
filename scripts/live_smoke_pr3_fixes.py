@@ -31,9 +31,14 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Make repo importable when run from anywhere.
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE / "src"))
+# Make repo importable when run from anywhere. The script lives at
+# `<repo>/scripts/live_smoke_pr3_fixes.py`, so the real package source
+# directory is `<repo>/src` — not `<repo>/scripts/src`. Derive from __file__.
+_HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parent
+_SRC_DIR = _REPO_ROOT / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 from polycopy.adapters.polymarket import (  # noqa: E402
     PolymarketPublicAdapter,

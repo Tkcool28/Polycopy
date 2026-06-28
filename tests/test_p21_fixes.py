@@ -860,3 +860,94 @@ def test_schema_version_after_migration(tmp_path: Path):
         "SCHEMA_VERSION constant should be 5 after the v5 migration"
     )
     db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P3 — smoke script path bootstrap (Codex review)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_live_smoke_script_path_bootstrap():
+    """P3: ``scripts/live_smoke_pr3_fixes.py`` must insert the REPO-LEVEL
+    ``src`` directory (``<repo>/src``) into ``sys.path``, NOT
+    ``<repo>/scripts/src``.
+
+    The smoke script must run from any cwd without PYTHONPATH, and it must
+    never depend on the current working directory to find ``polycopy``.
+    """
+    import os  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script_path = repo_root / "scripts" / "live_smoke_pr3_fixes.py"
+    assert script_path.is_file(), f"smoke script missing at {script_path}"
+
+    # Sanity: there must NOT be a stray `<repo>/scripts/src` directory
+    # that would silently mask the bug.
+    bad_src = repo_root / "scripts" / "src"
+    assert not bad_src.exists(), (
+        f"unexpected stray directory {bad_src} — would silently mask the bug"
+    )
+
+    # Run the ACTUAL script's path bootstrap in a child process from a
+    # foreign working directory with NO PYTHONPATH. We invoke `python -c`
+    # which loads the real script as a module and then asserts on the
+    # resulting sys.path. If the bootstrap is correct, sys.path contains
+    # the repo-level src; if buggy, the import raises ModuleNotFoundError.
+    venv_python = repo_root / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        import pytest as _pytest  # noqa: PLC0415
+
+        _pytest.skip(f"venv python not found at {venv_python}")
+
+    # Use `runpy.run_path` to execute the script as `__main__`. This runs
+    # the path-bootstrap code at the top AND avoids hitting the live
+    # data-api (the script's main() runs synchronously, but the network
+    # failure mode still returns [] gracefully — see test below).
+    #
+    # Cleanest check: actually import the script's top-level namespace
+    # WITHOUT triggering main(). We do that by reading the script, then
+    # exec'ing it in a namespace where `asyncio.run` is patched to a no-op.
+
+    probe = f"""
+import sys
+import builtins
+
+# Block the script from running main() by short-circuiting asyncio.run.
+def _noop_run(*a, **kw):
+    raise SystemExit(0)
+import asyncio
+asyncio.run = _noop_run
+
+import pathlib
+script_path = {str(script_path)!r}
+ns = {{"__name__": "__not_main__", "__file__": script_path}}
+exec(compile(open(script_path).read(), script_path, "exec"), ns)
+
+bad = str({str(repo_root)!r} + '/scripts/src')
+good = str({str(repo_root)!r} + '/src')
+assert bad not in sys.path, (
+    f"smoke script inserted the wrong path {{bad}}; expected {{good}}"
+)
+assert good in sys.path, (
+    f"smoke script did not insert {{good}} into sys.path; "
+    f"sys.path[0:5]={{sys.path[:5]}}"
+)
+import polycopy  # noqa: F401
+print("PROBE_OK")
+"""
+    result = subprocess.run(
+        [str(venv_python), "-c", probe],
+        cwd="/tmp",
+        env={**os.environ, "PYTHONPATH": ""},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "PROBE_OK" in result.stdout, (
+        f"smoke path-bootstrap probe did not pass.\n"
+        f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+    )
+    assert result.returncode == 0, (
+        f"probe exited {result.returncode}; stderr={result.stderr!r}"
+    )
