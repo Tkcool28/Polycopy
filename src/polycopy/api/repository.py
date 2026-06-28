@@ -306,7 +306,7 @@ class DashboardRepository:
                 "SELECT COUNT(*) AS n, MIN(fetched_at) AS oldest, MAX(fetched_at) AS newest FROM raw_snapshots"
             )
             count = int(count_row["n"] if count_row else 0)
-            missing = []
+            missing: list[str] = []
             overall = "unavailable" if count == 0 else "healthy"
             return DataHealthResponse(
                 sources=sources,

@@ -125,7 +125,9 @@ silently substitute fictional values.
 ### Idempotency
 
 - Settlement is idempotent — same evidence → same result
-- API state-changing endpoints require `X-Idempotency-Key`
+- API state-changing endpoints use SQLite-backed idempotency keys (persistent
+  across restarts). Replays return the stored result without creating
+  duplicates.
 - Demo data seeding is idempotent with `--force`
 
 ## API Security

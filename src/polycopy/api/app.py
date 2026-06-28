@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import Body, FastAPI, HTTPException, Query, status
@@ -100,9 +100,9 @@ def _persist_paper_result(result: dict[str, object], decision_type: str, rationa
     order_id = str(result["id"])
     outcome = str(result["outcome"])
     side = str(result["side"])
-    quantity = float(result["quantity"])
-    price = float(result["price"])
-    filled_quantity = float(result["filled_quantity"])
+    quantity = float(result["quantity"])  # type: ignore[arg-type]
+    price = float(result["price"])  # type: ignore[arg-type]
+    filled_quantity = float(result["filled_quantity"])  # type: ignore[arg-type]
     is_sample = 1 if bool(result.get("is_sample", True)) else 0
 
     db.execute(
@@ -385,7 +385,7 @@ async def preview_paper_order(
     # Max loss: worst-case cost if filled at the far edge of the book
     depth_available = depth_model.total_volume
     worst_price = depth_model.levels[-1].price if depth_model.levels else (ask if request.side == "buy" else bid)
-    fill_for_max = fillable_qty if fillable_qty > 0 else quantity
+    fill_for_max = fillable_qty if fillable_qty > 0 else (quantity or 0.0)
     if request.side == "buy":
         max_loss = abs((worst_price - estimated_fill) * fill_for_max + estimated_fee)
     else:
@@ -525,19 +525,19 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
     if prev:
         # Replay stored result
         return OrderView(
-            id=UUID(prev["id"]),
-            market_id=UUID(prev["market_id"]),
-            wallet_id=UUID(prev["wallet_id"]),
-            side=prev["side"],
-            order_type=prev["order_type"],
-            outcome=prev["outcome"],
-            quantity=float(prev["quantity"]),
-            price=float(prev["price"]),
-            status=prev["status"],
-            filled_quantity=float(prev["filled_quantity"]),
-            created_at=datetime.fromisoformat(prev["created_at"]),
-            updated_at=datetime.fromisoformat(prev["updated_at"]) if prev.get("updated_at") else None,
-            is_sample=prev.get("is_sample", True),
+            id=UUID(cast(str, prev["id"])),
+            market_id=UUID(cast(str, prev["market_id"])),
+            wallet_id=UUID(cast(str, prev["wallet_id"])),
+            side=cast(str, prev["side"]),
+            order_type=cast(str, prev["order_type"]),
+            outcome=cast(str, prev["outcome"]),
+            quantity=float(cast(str, prev["quantity"])),
+            price=float(cast(str, prev["price"])),
+            status=cast(str, prev["status"]),
+            filled_quantity=float(cast(str, prev["filled_quantity"])),
+            created_at=datetime.fromisoformat(cast(str, prev["created_at"])),
+            updated_at=datetime.fromisoformat(cast(str, prev["updated_at"])) if prev.get("updated_at") else None,
+            is_sample=bool(prev.get("is_sample", True)),
         )
 
     # Build a PaperBroker scoped to this request
@@ -575,10 +575,11 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
         price = 0.65
 
     # Place order through the broker
+    from polycopy.domain.order import OrderType as _OrderType
     order = await broker.place_order(
         market_id=market_id,
         side=side,
-        order_type="limit",
+        order_type=_OrderType("limit"),
         outcome=outcome,
         quantity=quantity,
         price=price,
@@ -599,7 +600,7 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
         # Decision log is stored in the persistent DB via the repository
         # For now, we record the note in the order flow
 
-    result = {
+    result: dict[str, object] = {
         "id": str(order.id),
         "market_id": str(order.market_id),
         "wallet_id": str(order.wallet_id),
@@ -658,19 +659,19 @@ async def reject_paper_order(request: PaperOrderRejectRequest):
     if prev:
         # Replay stored result
         return OrderView(
-            id=UUID(prev["id"]),
-            market_id=UUID(prev["market_id"]),
-            wallet_id=UUID(prev["wallet_id"]),
-            side=prev["side"],
-            order_type=prev["order_type"],
-            outcome=prev["outcome"],
-            quantity=float(prev["quantity"]),
-            price=float(prev["price"]),
-            status=prev["status"],
-            filled_quantity=float(prev["filled_quantity"]),
-            created_at=datetime.fromisoformat(prev["created_at"]),
-            updated_at=datetime.fromisoformat(prev["updated_at"]) if prev.get("updated_at") else None,
-            is_sample=prev.get("is_sample", True),
+            id=UUID(cast(str, prev["id"])),
+            market_id=UUID(cast(str, prev["market_id"])),
+            wallet_id=UUID(cast(str, prev["wallet_id"])),
+            side=cast(str, prev["side"]),
+            order_type=cast(str, prev["order_type"]),
+            outcome=cast(str, prev["outcome"]),
+            quantity=float(cast(str, prev["quantity"])),
+            price=float(cast(str, prev["price"])),
+            status=cast(str, prev["status"]),
+            filled_quantity=float(cast(str, prev["filled_quantity"])),
+            created_at=datetime.fromisoformat(cast(str, prev["created_at"])),
+            updated_at=datetime.fromisoformat(cast(str, prev["updated_at"])) if prev.get("updated_at") else None,
+            is_sample=bool(prev.get("is_sample", True)),
         )
 
     # Build a synthetic cancelled order for the rejection
@@ -703,15 +704,15 @@ async def reject_paper_order(request: PaperOrderRejectRequest):
 
     return OrderView(
         id=cancelled_order_id,
-        market_id=UUID(result["market_id"]),
-        wallet_id=UUID(result["wallet_id"]),
-        side=result["side"],
-        order_type=result["order_type"],
-        outcome=result["outcome"],
-        quantity=result["quantity"],
-        price=result["price"],
-        status=result["status"],
-        filled_quantity=result["filled_quantity"],
+        market_id=UUID(cast(str, result["market_id"])),
+        wallet_id=UUID(cast(str, result["wallet_id"])),
+        side=cast(str, result["side"]),
+        order_type=cast(str, result["order_type"]),
+        outcome=cast(str, result["outcome"]),
+        quantity=float(cast(str, result["quantity"])),
+        price=float(cast(str, result["price"])),
+        status=cast(str, result["status"]),
+        filled_quantity=float(cast(str, result["filled_quantity"])),
         created_at=now,
         updated_at=now,
         is_sample=True,

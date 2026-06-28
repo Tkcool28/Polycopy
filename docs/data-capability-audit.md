@@ -1,6 +1,6 @@
 # Data Capability Audit
 
-**Generated (UTC):** 2026-06-27T15:53:23Z
+**Generated (UTC):** 2026-06-28T03:40:00Z
 **Tool:** polycopy-probe/0.1
 **Machine-readable copy:** `data/audits/data-capability-audit.json`
 

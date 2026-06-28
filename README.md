@@ -4,8 +4,9 @@ Paper-only copy-trading harness for Polymarket prediction markets. Discovers
 "smart money" wallets, scores copyability, generates signals, and simulates
 paper trades — with no real-money execution path at any layer.
 
-**Status:** v0.2.0 — Phases 01–08 complete. Paper trading, risk gates, API,
-dashboard, and data collection pipeline operational. 283 tests passing.
+**Status:** v0.2.0 — Phases 01–17 complete. Paper trading, risk gates,
+persistent API, React dashboard, data collection pipeline, and live-read-only
+Polymarket validation operational. 466 tests passing.
 
 ## Safety First
 
@@ -114,7 +115,7 @@ src/polycopy/
   utils/           → FileLock concurrency guard
 scripts/           → operational scripts (collect, scan, update, settle, seed, probe)
 frontend/          → React/Vite/TypeScript dark command-center dashboard
-tests/             → 283 pytest tests (Phases 01–08)
+tests/             → 466 pytest tests (Phases 01–17)
 docs/              → design docs, audits, methodology
 data/audits/       → machine-readable capability audit artifacts
 ```
@@ -143,8 +144,11 @@ data/audits/       → machine-readable capability audit artifacts
 | GET | `/experiments` | Experiment run metrics |
 | GET | `/data/health` | Data source health |
 
-All state-changing endpoints require an `X-Idempotency-Key` header.
-Duplicate keys within 5 minutes are rejected.
+All state-changing endpoints use SQLite-backed idempotency keys (persistent
+across restarts). Duplicate requests replay the stored result.
+
+Dashboard also includes a **Data Health** page (`/data-health`) showing freshness
+KPIs and per-source table status.
 
 ## Dashboard Pages
 
@@ -158,6 +162,7 @@ Duplicate keys within 5 minutes are rejected.
 | `/portfolio` | Portfolio | Open positions + P&L breakdown |
 | `/risk` | Risk Console | Kill switch, gate state, exposure limits |
 | `/experiments` | Experiments | Experiment run metrics |
+|| `/data-health` | Data Health | Freshness KPIs and per-source table status |
 | `/settings` | Settings | Config view (secrets excluded) |
 
 ## Paper Trading Modes
@@ -206,10 +211,11 @@ See `src/polycopy/config/settings.py` for the full list with validators.
 ## Testing
 
 ```bash
-python -m pytest tests/ -v          # 283 tests
+python -m pytest tests/ -v          # 466 tests
 python -m pytest tests/ -k test_p04 # Phase 04 risk gates
 python -m pytest tests/ -k test_p06 # Phase 06 data collection
 python -m pytest tests/ -k test_p08 # Phase 08 dashboard features
+python -m pytest tests/ -k test_p17 # P17 end-to-end integration tests
 ```
 
 ## Documents
