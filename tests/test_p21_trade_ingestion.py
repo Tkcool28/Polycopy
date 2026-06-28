@@ -26,9 +26,9 @@ from pathlib import Path
 
 from polycopy.adapters.polymarket import (
     PolymarketPublicAdapter,
-    _deterministic_source_trade_id,
     _normalize_side,
     _to_datetime,
+    deterministic_source_trade_id_v2,
 )
 from polycopy.db.database import Database
 from polycopy.domain.order import OrderSide
@@ -450,12 +450,14 @@ def test_malformed_trade_response():
     assert len(trades) == 0
 
 
-# ─── Test 8: Missing wallet attribution → trader_address = "unknown" ────
+# ─── Test 8: Missing wallet attribution → trader_address = None ────────────
 
 
 def test_missing_wallet_attribution():
     """If the response doesn't include proxyWallet/maker/taker, the persisted
-    SourceTrade.trader_address is the literal string 'unknown' (NOT a fake 0x)."""
+    SourceTrade.trader_address is ``None`` (P2 fix: NOT the legacy literal
+    'unknown', which used to collapse all anonymous trades into one fake
+    pseudo-wallet)."""
 
     anon_window = _load_fixture("data_api_trades.json")["anonymous_window"]
 
@@ -477,7 +479,7 @@ def test_missing_wallet_attribution():
     trades = asyncio.run(run())
     assert len(trades) == 1
     t = trades[0]
-    assert t.trader_address == "unknown", f"expected 'unknown', got {t.trader_address!r}"
+    assert t.trader_address is None, f"expected None, got {t.trader_address!r}"
     # is_sample must be False — we do NOT synthesize fake data
     assert t.is_sample is False
 
@@ -564,8 +566,10 @@ def test_transaction_hash_stability():
     t1, t2 = asyncio.run(run())
     assert len(t1) == 1 and len(t2) == 1
     assert t1[0].source_trade_id == t2[0].source_trade_id
-    # tx hash is lowercased by the deterministic helper
-    assert t1[0].source_trade_id == "0xdeadbeef00000000"
+    # P1 fix: source_trade_id is now the deterministic v2 hash over the
+    # canonical row payload. It is NOT the bare tx-hash anymore.
+    assert t1[0].source_trade_id.startswith("polymarket:")
+    assert len(t1[0].source_trade_id) == len("polymarket:") + 64
 
 
 # ─── Test 11: No sample fallback on real error ───────────────────────────
@@ -636,16 +640,47 @@ def test_normalize_side():
 
 
 def test_deterministic_id_from_txhash():
-    sid = _deterministic_source_trade_id("0xABCDEF1234567890", "a", 1, 0.5, 1.0)
-    assert sid == "0xabcdef1234567890"
+    """With a real on-chain tx hash, v2 produces a deterministic sha256 over
+    the canonical payload (NOT the bare tx-hash)."""
+    sid = deterministic_source_trade_id_v2({
+        "transactionHash": "0xABCDEF1234567890",
+        "asset": "a",
+        "timestamp": 1,
+        "price": 0.5,
+        "size": 1.0,
+    })
+    assert sid.startswith("polymarket:")
+    # Same input → same output (deterministic)
+    sid2 = deterministic_source_trade_id_v2({
+        "transactionHash": "0xABCDEF1234567890",
+        "asset": "a",
+        "timestamp": 1,
+        "price": 0.5,
+        "size": 1.0,
+    })
+    assert sid == sid2
 
 
 def test_deterministic_id_fallback():
-    """When no tx hash, deterministic sha256 of asset|ts|price|size is used."""
-    sid1 = _deterministic_source_trade_id(None, "asset-x", 1782636254, 0.5, 1.0)
-    sid2 = _deterministic_source_trade_id("", "asset-x", 1782636254, 0.5, 1.0)
+    """When no tx hash is provided, v2 still produces a stable sha256 of the
+    canonical payload. With and without tx_hash=None, the canonical payload
+    drops the tx field → identical output."""
+    sid1 = deterministic_source_trade_id_v2({
+        "transactionHash": None,
+        "asset": "asset-x",
+        "timestamp": 1782636254,
+        "price": 0.5,
+        "size": 1.0,
+    })
+    sid2 = deterministic_source_trade_id_v2({
+        "transactionHash": "",
+        "asset": "asset-x",
+        "timestamp": 1782636254,
+        "price": 0.5,
+        "size": 1.0,
+    })
     assert sid1 == sid2
-    assert sid1.startswith("sha256:")
+    assert sid1.startswith("polymarket:")
 
 
 # ─── Test 14: Anonymous-only window → run_scan reports skip ───────────────

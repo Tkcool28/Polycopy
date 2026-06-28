@@ -7,7 +7,7 @@ schema version. Each migration is a list of SQL statements.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # ── Version 1: initial schema ───────────────────────────────────────────────────
 _V1_DDL: list[str] = [
@@ -250,6 +250,42 @@ _V4_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_capability_flags_capability ON capability_flags(capability);",
 ]
 
+# ── Version 5: source_trades.trader_address becomes NULLable ─────────────────
+# Rationale: anonymous data-api rows (no proxyWallet) used to be persisted with
+# the literal sentinel string "unknown", which then collapsed into a single
+# pseudo-wallet and got scored by evaluate_wallet. The fix is to:
+#   1. Allow trader_address to be NULL (the absence of attribution).
+#   2. Copy all existing rows verbatim — the migration does NOT rewrite any
+#      legacy "unknown" string; that is a data-shape concern handled by the
+#      adapter on new writes. Historical "unknown" rows remain as-is.
+#   3. Preserve is_sample and all other columns.
+_V5_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS source_trades_new (
+        id               TEXT PRIMARY KEY,  -- UUID
+        source           TEXT NOT NULL,
+        source_trade_id  TEXT NOT NULL,
+        market_source_id TEXT NOT NULL,
+        side             TEXT NOT NULL,
+        outcome          TEXT NOT NULL,
+        quantity         REAL NOT NULL CHECK(quantity > 0),
+        price            REAL NOT NULL CHECK(price >= 0 AND price <= 1),
+        trader_address   TEXT,                -- nullable (was NOT NULL pre-v5)
+        timestamp        TEXT NOT NULL,     -- ISO-8601 UTC
+        is_sample        INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(source, source_trade_id)
+    );""",
+    """INSERT INTO source_trades_new (
+        id, source, source_trade_id, market_source_id, side, outcome,
+        quantity, price, trader_address, timestamp, is_sample
+    ) SELECT id, source, source_trade_id, market_source_id, side, outcome,
+             quantity, price, trader_address, timestamp, is_sample
+      FROM source_trades;""",
+    "DROP TABLE source_trades;",
+    "ALTER TABLE source_trades_new RENAME TO source_trades;",
+    "CREATE INDEX IF NOT EXISTS idx_source_trades_market ON source_trades(market_source_id);",
+    "CREATE INDEX IF NOT EXISTS idx_source_trades_timestamp ON source_trades(timestamp);",
+]
+
 
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version from (version - 1).
@@ -258,6 +294,7 @@ MIGRATIONS: dict[int, list[str]] = {
     2: _V2_DDL,
     3: _V3_DDL,
     4: _V4_DDL,
+    5: _V5_DDL,
 }
 
 # Current DDL is the latest migration

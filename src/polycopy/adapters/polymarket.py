@@ -26,7 +26,7 @@ Trade ingestion contract (verified 2026-06-28):
     client-side.
   - Pagination: data-api uses offset+limit (limit hard-capped at ~1000).
   - Per trade, the response includes:
-      proxyWallet      (real 0x address, identifies trader)
+      proxyWallet      (real 0x address, identifies trader) — MAY be missing
       side             ("BUY" | "SELL")
       asset            (CLOB token ID for the traded outcome)
       conditionId      (hex 0x market identifier)
@@ -39,6 +39,22 @@ Trade ingestion contract (verified 2026-06-28):
       title, slug      (denormalized market metadata)
       name, pseudonym  (user metadata; not address-bound)
 
+P2 fix (2026-06-28): when ``proxyWallet`` (or ``maker``/``trader``) is missing,
+the adapter persists the trade with ``trader_address=None``. Anonymous trades
+remain in ``source_trades`` as market-level observations, but they are EXCLUDED
+from wallet discovery and ``evaluate_wallet`` scoring. The downstream
+collector (``scripts/collect_smart_money_data.py``) tracks
+``anonymous_trades_skipped`` separately from ``wallets_discovered``.
+
+P1 fix (2026-06-28): ``source_trade_id`` is computed by
+:func:`deterministic_source_trade_id_v2`, which hashes a canonical payload of
+every distinguishing row field (``transactionHash``, ``asset``,
+``conditionId``, ``side``, ``outcome``, ``outcomeIndex``, ``price``, ``size``,
+``timestamp``, ``proxyWallet``). Two rows that share an on-chain
+``transactionHash`` but differ in any other field get DIFFERENT IDs, so they
+do not collide on the ``UNIQUE(source, source_trade_id)`` constraint and
+cannot overwrite each other in ``source_trades``.
+
 The adapter caches a single global window per process and slices it per
 conditionId; this matches the server's actual behavior (no per-market filter)
 and minimizes network roundtrips.
@@ -49,7 +65,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Optional, cast
 
@@ -93,15 +111,118 @@ def _normalize_side(value: Any) -> Optional[OrderSide]:
     return None
 
 
+# Match a "real" on-chain transaction hash: 0x + 8+ hex chars.
+# Short/non-hex values (e.g. "0xshort", "0x", "garbage") are treated as missing.
+_TX_HASH_RE = re.compile(r"^0x[0-9a-f]{8,}$")
+
+
+def deterministic_source_trade_id_v2(raw: dict) -> str:
+    """Build a canonical, row-level ``source_trade_id`` for a data-api trade.
+
+    The ID is computed from a sha256 over a canonical separator-joined payload
+    that includes EVERY distinguishing row field. Two rows from the same
+    on-chain transaction but with different assets/outcomes/sides/prices/sizes
+    produce DIFFERENT IDs.
+
+    Properties:
+      - Deterministic: identical input dict → identical ID.
+      - Idempotent: refetching the same data produces the same ID.
+      - Row-distinguishing: rows from the same transactionHash but with
+        different (asset, outcome, side, price, size, ts, wallet) get different
+        IDs.
+      - Input-order independent: every field is normalized to a canonical
+        string before joining.
+      - Missing fields become "" in the payload (no sentinel that could
+        collide with a real value).
+      - Short / non-hex transactionHash values are treated as missing and
+        do NOT contribute to the canonical payload.
+      - Versioned: payload starts with "v2|" so any legacy tx-hash-only IDs
+        in production never collide with v2 IDs.
+
+    Args:
+        raw: dict from data-api /trades (any subset of canonical fields is OK;
+             missing fields become "").
+
+    Returns:
+        str of the form ``"polymarket:<64-char-sha256-hex>"``.
+    """
+    # 1. transactionHash — lowercased, stripped, validated as a "real" 0x hash.
+    tx = str(raw.get("transactionHash") or "").strip().lower()
+    if not _TX_HASH_RE.match(tx):
+        tx = ""  # treat short / non-hex / missing as missing
+
+    asset = str(raw.get("asset") or "")
+
+    cond = str(raw.get("conditionId") or "").strip().lower()
+
+    side = str(raw.get("side") or "").strip().upper()
+
+    outcome = str(raw.get("outcome") or "")
+
+    outcome_index_raw = raw.get("outcomeIndex")
+    outcome_index = "" if outcome_index_raw is None else str(outcome_index_raw)
+
+    # Numeric fields formatted with fixed precision to avoid float-repr drift.
+    price_raw: Any = raw.get("price")
+    try:
+        price_str = f"{float(price_raw):.10f}"
+    except (TypeError, ValueError):
+        price_str = ""
+
+    size_raw: Any = raw.get("size")
+    try:
+        size_str = f"{float(size_raw):.10f}"
+    except (TypeError, ValueError):
+        size_str = ""
+
+    ts_raw: Any = raw.get("timestamp")
+    try:
+        ts_int = int(float(ts_raw))
+        ts_str = str(ts_int)
+    except (TypeError, ValueError):
+        ts_str = ""
+
+    wallet = str(
+        raw.get("proxyWallet") or raw.get("maker") or raw.get("trader") or ""
+    ).strip().lower()
+    if wallet.startswith("0x"):
+        wallet = wallet[2:]
+
+    payload = "|".join([
+        "v2",
+        tx,                # may be "" if missing / invalid
+        asset, cond, side, outcome, outcome_index,
+        price_str, size_str, ts_str, wallet,
+    ])
+    return "polymarket:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _deterministic_source_trade_id(tx_hash: Any, asset: Any, ts: Any, price: Any, size: Any) -> str:
-    """Build a deterministic source_trade_id from transaction hash when present,
-    falling back to a sha256 of (asset, ts, price, size)."""
-    if tx_hash:
-        s = str(tx_hash).strip().lower()
-        if s.startswith("0x") and len(s) >= 10:
-            return s
-    raw = f"{asset}|{ts}|{price}|{size}"
-    return "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
+    """DEPRECATED: kept as a back-compat shim for existing imports / tests.
+
+    The old behavior was unsafe: it returned the lowercased tx_hash alone when
+    present, which made all rows sharing a transaction collapse onto a single
+    source_trade_id and overwrite each other in source_trades.
+
+    The new row-distinguishing algorithm is :func:`deterministic_source_trade_id_v2`.
+    Callers should migrate to passing the full raw dict to v2 directly. This
+    shim logs a DeprecationWarning on first call per process and delegates to
+    v2 by reconstructing a minimal raw dict from the legacy positional args.
+    """
+    warnings.warn(
+        "_deterministic_source_trade_id is deprecated; use "
+        "deterministic_source_trade_id_v2(raw_dict) for row-distinguishing IDs.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    legacy_raw = {
+        "transactionHash": tx_hash,
+        "asset": asset,
+        "timestamp": ts,
+        "price": price,
+        "size": size,
+    }
+    return deterministic_source_trade_id_v2(legacy_raw)
 
 
 # ── Adapter ──────────────────────────────────────────────────────────────────
@@ -316,17 +437,22 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
 
             wallet = raw.get("proxyWallet") or raw.get("maker") or raw.get("trader") or ""
             wallet = str(wallet).strip()
-            # On the data-api, proxyWallet is a real 0x address. If empty/null,
-            # we record "unknown" — but we do NOT fabricate a fake address.
+            # On the data-api, proxyWallet is a real 0x address. If empty/null
+            # we record trader_address=None (P2 fix: anonymous trades MUST NOT
+            # be promoted to a fake "unknown" wallet — they remain in
+            # source_trades as market-level observations but are excluded
+            # from wallet discovery and scoring).
             if not wallet or wallet.lower() in ("none", "null", "0x"):
-                trader_address = "unknown"
+                trader_address: Optional[str] = None
             else:
                 trader_address = wallet
 
-            tx_hash = raw.get("transactionHash")
-            source_trade_id = _deterministic_source_trade_id(
-                tx_hash, asset, ts_raw, price_raw, size_raw
-            )
+            # P1 fix: build a row-distinguishing source_trade_id from the WHOLE
+            # raw dict. Previously we passed only (tx_hash, asset, ts, price,
+            # size), which collapsed all rows from the same transaction to a
+            # single id and let later rows overwrite earlier ones in
+            # source_trades (UNIQUE(source, source_trade_id) + INSERT OR REPLACE).
+            source_trade_id = deterministic_source_trade_id_v2(raw)
 
             return SourceTrade(
                 source="polymarket_data_api",

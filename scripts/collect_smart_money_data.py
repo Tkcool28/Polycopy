@@ -74,6 +74,7 @@ class CollectionResult:
         self.trades_fetched: int = 0
         self.trades_failed: int = 0
         self.wallets_discovered: int = 0
+        self.anonymous_trades_skipped: int = 0  # P2: trades with no attributable wallet
         self.snapshots_saved: int = 0
         self.signals_generated: int = 0
         self.missing_data_log: list[str] = []
@@ -102,6 +103,7 @@ class CollectionResult:
             f"  markets: {self.markets_fetched} fetched, {self.markets_failed} failed\n"
             f"  trades:  {self.trades_fetched} fetched, {self.trades_failed} failed\n"
             f"  wallets: {self.wallets_discovered} discovered\n"
+            f"  anonymous trades skipped: {self.anonymous_trades_skipped}\n"
             f"  snapshots saved: {self.snapshots_saved}\n"
             f"  signals: {self.signals_generated}\n"
             f"  missing data entries: {len(self.missing_data_log)}\n"
@@ -684,6 +686,13 @@ async def run_collection(
                 trades = await collector.collect_trades(db, market.source_id, result)
                 # Discover wallets from trades
                 for trade in trades:
+                    # P2 fix: anonymous trades (trader_address=None) MUST NOT be
+                    # promoted to fake wallets. They are still persisted in
+                    # source_trades as market-level observations, but they are
+                    # skipped here so they cannot be scored by evaluate_wallet.
+                    if trade.trader_address is None or not str(trade.trader_address).strip():
+                        result.anonymous_trades_skipped += 1
+                        continue
                     wallet = Wallet(
                         address=trade.trader_address,
                         label=f"discovered-from-{trade.source}",
@@ -717,8 +726,16 @@ async def run_collection(
 
 
 def _get_unique_trader_addresses(db: Database) -> list[str]:
-    """Get distinct trader addresses from source_trades."""
-    rows = db.fetchall("SELECT DISTINCT trader_address FROM source_trades")
+    """Get distinct trader addresses from source_trades.
+
+    Defensive: filters out NULL and empty-string addresses so anonymous trades
+    (P2) cannot end up in the scoring loop even if they bypass the collector's
+    anonymous skip.
+    """
+    rows = db.fetchall(
+        "SELECT DISTINCT trader_address FROM source_trades "
+        "WHERE trader_address IS NOT NULL AND trader_address != ''"
+    )
     return [row["trader_address"] for row in rows]
 
 
@@ -738,6 +755,7 @@ def _record_experiment(db: Database, result: CollectionResult) -> None:
             "markets_fetched": result.markets_fetched,
             "trades_fetched": result.trades_fetched,
             "wallets_discovered": result.wallets_discovered,
+            "trades_anonymous": result.anonymous_trades_skipped,
             "errors": len(result.errors),
             "missing_data": len(result.missing_data_log),
         },
