@@ -174,46 +174,111 @@ def _persist_paper_result(result: dict[str, object], decision_type: str, rationa
     db.conn.commit()
 
 
-def _compute_existing_exposure(db, column: str, value: str, exclude_order_id: str) -> float:
-    """Compute total filled notional exposure for a dimension, excluding a specific order."""
-    if column == "market_id":
-        rows = db.fetchall(
-            "SELECT quantity, price FROM orders WHERE market_id = ? AND status = 'filled' AND id != ?",
-            (value, exclude_order_id),
-        )
-    else:
-        rows = db.fetchall(
-            "SELECT quantity, price FROM orders WHERE wallet_id = ? AND status = 'filled' AND id != ?",
-            (value, exclude_order_id),
-        )
-    return sum(float(r["quantity"]) * float(r["price"]) for r in rows)
+OPEN_EXPOSURE_ORDER_STATUSES = ("pending", "accepted", "partially_filled")
 
 
-def _compute_existing_outcome_exposure(db, market_id: str, outcome: str, wallet_id: str, exclude_order_id: str) -> float:
-    """Compute total filled notional exposure for a (market, outcome) pair."""
-    rows = db.fetchall(
-        "SELECT quantity, price FROM orders WHERE market_id = ? AND outcome = ? AND wallet_id = ? AND status = 'filled' AND id != ?",
-        (market_id, outcome, wallet_id, exclude_order_id),
+def _position_exposure_where(db, where: str = "", params: tuple[object, ...] = ()) -> float:
+    row = db.fetchone(
+        f"SELECT COALESCE(SUM(quantity * avg_entry_price), 0) AS total FROM positions{where}",
+        params,
     )
-    return sum(float(r["quantity"]) * float(r["price"]) for r in rows)
+    return float(row["total"] if row else 0.0)
+
+
+def _open_order_exposure_where(db, where: str = "", params: tuple[object, ...] = ()) -> float:
+    row = db.fetchone(
+        f"""
+        SELECT COALESCE(SUM((quantity - filled_quantity) * price), 0) AS total
+          FROM orders
+         WHERE side = 'buy'
+           AND status IN ({','.join('?' for _ in OPEN_EXPOSURE_ORDER_STATUSES)})
+           AND quantity > filled_quantity
+           {where}
+        """,
+        (*OPEN_EXPOSURE_ORDER_STATUSES, *params),
+    )
+    return float(row["total"] if row else 0.0)
+
+
+def _compute_existing_exposure(db, column: str, value: str, exclude_order_id: str) -> float:
+    """Compute paper exposure for a market or wallet.
+
+    Exposure is open long position cost basis plus other open buy order notional.
+    Filled orders are represented by positions and are intentionally not summed
+    again, so sells and partial closes reduce risk immediately.
+    """
+    if column not in {"market_id", "wallet_id"}:
+        raise ValueError(f"Unsupported exposure column: {column}")
+    return _position_exposure_where(db, f" WHERE {column} = ?", (value,)) + _open_order_exposure_where(
+        db, f" AND {column} = ? AND id != ?", (value, exclude_order_id)
+    )
+
+
+def _compute_existing_outcome_exposure(db, market_id: str, outcome: str, exclude_order_id: str) -> float:
+    """Compute total exposure for a (market, outcome) pair across all wallets."""
+    return _position_exposure_where(db, " WHERE market_id = ? AND outcome = ?", (market_id, outcome)) + _open_order_exposure_where(
+        db, " AND market_id = ? AND outcome = ? AND id != ?", (market_id, outcome, exclude_order_id)
+    )
 
 
 def _compute_existing_global_exposure(db, exclude_order_id: str) -> float:
-    """Compute total global filled notional exposure, excluding a specific order."""
+    """Compute total global paper exposure across open positions and buy orders."""
+    return _position_exposure_where(db) + _open_order_exposure_where(db, " AND id != ?", (exclude_order_id,))
+
+
+def _adjust_usdc_balance(db, wallet_id: str, delta: float, now: datetime, is_sample: bool) -> None:
+    """Apply a simulated paper-cash balance delta when a USDC row exists.
+
+    The API never touches real funds. If no USDC balance has been seeded for a
+    wallet, leave balances absent rather than fabricating starting cash.
+    """
     row = db.fetchone(
-        "SELECT COALESCE(SUM(quantity * price), 0) AS total FROM orders WHERE status = 'filled' AND id != ?",
-        (exclude_order_id,),
+        "SELECT id, amount FROM wallet_balances WHERE wallet_id = ? AND currency = 'USDC' ORDER BY id DESC LIMIT 1",
+        (wallet_id,),
     )
-    return float(row["total"] if row else 0)
+    if row is None:
+        return
+    new_amount = float(row["amount"]) + delta
+    if new_amount < -1e-9:
+        raise ValueError("Insufficient simulated USDC balance for paper cash update.")
+    db.execute(
+        "UPDATE wallet_balances SET amount = ?, as_of = ?, is_sample = ? WHERE id = ?",
+        (max(0.0, new_amount), now.isoformat(), int(is_sample), row["id"]),
+    )
 
 
-def _upsert_position(db, market_id: str, wallet_id: str, outcome: str, filled_qty: float, price: float, now: datetime, is_sample: bool) -> None:
-    """Create or update a position after an order fill."""
+def _upsert_position(db, market_id: str, wallet_id: str, outcome: str, side: str, filled_qty: float, price: float, now: datetime, is_sample: bool) -> dict[str, float]:
+    """Create or update a position after an order fill.
+
+    Buys increase long exposure using weighted-average cost. Sells require an
+    existing long, realize P&L using that average-cost basis, reduce quantity,
+    and leave a zero-quantity row on full close so historical realized P&L is
+    retained by the current schema.
+    """
     position_id = str(uuid5(NAMESPACE_URL, f"polycopy-position:{market_id}:{wallet_id}:{outcome}"))
     existing = db.fetchone(
         "SELECT * FROM positions WHERE market_id = ? AND wallet_id = ? AND outcome = ?",
         (market_id, wallet_id, outcome),
     )
+    if side == "sell":
+        if existing is None:
+            raise ValueError("Cannot approve sell order without an open position.")
+        held_qty = float(existing["quantity"])
+        if filled_qty > held_qty + 1e-9:
+            raise ValueError(f"Cannot approve sell quantity {filled_qty:g}; only {held_qty:g} held.")
+        avg_entry = float(existing["avg_entry_price"])
+        realized = (price - avg_entry) * filled_qty
+        new_qty = max(0.0, held_qty - filled_qty)
+        db.execute(
+            """
+            UPDATE positions
+            SET quantity = ?, current_price = ?, realized_pnl = ?, updated_at = ?
+            WHERE market_id = ? AND wallet_id = ? AND outcome = ?
+            """,
+            (new_qty, price, float(existing["realized_pnl"]) + realized, now.isoformat(), market_id, wallet_id, outcome),
+        )
+        return {"realized_pnl": realized, "remaining_quantity": new_qty}
+
     if existing is None:
         db.execute(
             """
@@ -224,9 +289,11 @@ def _upsert_position(db, market_id: str, wallet_id: str, outcome: str, filled_qt
             """,
             (position_id, market_id, wallet_id, outcome, filled_qty, price, price, 0.0, now.isoformat(), now.isoformat(), is_sample),
         )
+        return {"realized_pnl": 0.0, "remaining_quantity": filled_qty}
     else:
-        new_qty = float(existing["quantity"]) + filled_qty
-        new_avg = (float(existing["quantity"]) * float(existing["avg_entry_price"]) + filled_qty * price) / new_qty
+        existing_qty = float(existing["quantity"])
+        new_qty = existing_qty + filled_qty
+        new_avg = (existing_qty * float(existing["avg_entry_price"]) + filled_qty * price) / new_qty
         db.execute(
             """
             UPDATE positions
@@ -235,6 +302,7 @@ def _upsert_position(db, market_id: str, wallet_id: str, outcome: str, filled_qt
             """,
             (new_qty, new_avg, price, now.isoformat(), market_id, wallet_id, outcome),
         )
+        return {"realized_pnl": 0.0, "remaining_quantity": new_qty}
 
 
 def _check_idempotency(scope: str, request_hash: str) -> tuple[bool, str]:
@@ -687,11 +755,25 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
         exposure_limits=exposure_limits,
     )
 
-    order_notional = float(row["price"]) * float(row["quantity"])
+    side = str(row["side"])
+    filled_quantity = float(row["quantity"])
+    if side == "sell":
+        existing_position = db.fetchone(
+            "SELECT quantity FROM positions WHERE market_id = ? AND wallet_id = ? AND outcome = ?",
+            (row["market_id"], row["wallet_id"], row["outcome"]),
+        )
+        held_qty = float(existing_position["quantity"]) if existing_position is not None else 0.0
+        if existing_position is None or filled_quantity > held_qty + 1e-9:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot approve sell order: quantity {filled_quantity:g} exceeds held position {held_qty:g}.",
+            )
+
+    order_notional = 0.0 if side == "sell" else float(row["price"]) * filled_quantity
     # Compute current exposure excluding this order (it's pending, not filled)
     market_exposure = _compute_existing_exposure(db, "market_id", row["market_id"], exclude_order_id=str(request.order_id))
     wallet_exposure = _compute_existing_exposure(db, "wallet_id", row["wallet_id"], exclude_order_id=str(request.order_id))
-    outcome_exposure = _compute_existing_outcome_exposure(db, row["market_id"], row["outcome"], row["wallet_id"], exclude_order_id=str(request.order_id))
+    outcome_exposure = _compute_existing_outcome_exposure(db, row["market_id"], row["outcome"], exclude_order_id=str(request.order_id))
     global_exposure = _compute_existing_global_exposure(db, exclude_order_id=str(request.order_id))
 
     gate_result = risk_gate.check(
@@ -708,7 +790,6 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
         )
 
     # Transition the exact order to filled
-    filled_quantity = float(row["quantity"])
     db.execute(
         """
         UPDATE orders
@@ -721,7 +802,15 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
     )
 
     # Create or update position
-    _upsert_position(db, row["market_id"], row["wallet_id"], row["outcome"], filled_quantity, float(row["price"]), now, bool(row["is_sample"]))
+    fee = float(row["price"]) * filled_quantity * settings.fill_fee_rate
+    slippage = 0.0
+    try:
+        position_metrics = _upsert_position(db, row["market_id"], row["wallet_id"], row["outcome"], side, filled_quantity, float(row["price"]), now, bool(row["is_sample"]))
+        if side == "sell":
+            _adjust_usdc_balance(db, row["wallet_id"], float(row["price"]) * filled_quantity - fee, now, bool(row["is_sample"]))
+    except ValueError as exc:
+        db.conn.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
     # Persist decision log
     decision_id = str(uuid5(NAMESPACE_URL, f"polycopy-decision:paper_approve:{request.order_id}"))
@@ -740,7 +829,19 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
             "[]",
             str(request.order_id),
             request.notes or "Operator approved PAPER ONLY simulated order.",
-            json.dumps({"paper_only": True, "status": "filled", "filled_quantity": filled_quantity}, sort_keys=True),
+            json.dumps(
+                {
+                    "paper_only": True,
+                    "status": "filled",
+                    "filled_quantity": filled_quantity,
+                    "fee": round(fee, 6),
+                    "fee_rate": settings.fill_fee_rate,
+                    "slippage": slippage,
+                    "realized_pnl": round(position_metrics["realized_pnl"], 6),
+                    "remaining_quantity": round(position_metrics["remaining_quantity"], 6),
+                },
+                sort_keys=True,
+            ),
             now.isoformat(),
             bool(row["is_sample"]),
         ),
