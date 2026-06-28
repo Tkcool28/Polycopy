@@ -99,7 +99,7 @@ describe('PaperOrdersPage', () => {
     expect(screen.getByText(/\[DEMO\]/i)).toBeInTheDocument()
   })
 
-  it('approve calls API and shows result', async () => {
+  it('approve sends notes from input field', async () => {
     api.paperOrders.mockResolvedValue(makeOrders())
     api.systemStatus.mockResolvedValue({ paper_mode: 'paper_manual' })
     api.paperApprove.mockResolvedValue({ status: 'ok' })
@@ -112,11 +112,17 @@ describe('PaperOrdersPage', () => {
     )
 
     await screen.findByText('pending')
+    // Type a note
+    const textarea = screen.getByPlaceholderText(/Add a note/i);
+    await user.type(textarea, 'My custom approval note')
     await user.click(screen.getByRole('button', { name: /approve/i }))
-    expect(api.paperApprove).toHaveBeenCalledWith({ order_id: '00000000-0000-0000-0000-000000000001', notes: undefined })
+    expect(api.paperApprove).toHaveBeenCalledWith({
+      order_id: '00000000-0000-0000-0000-000000000001',
+      notes: 'My custom approval note',
+    })
   })
 
-  it('reject calls API and shows result', async () => {
+  it('reject sends notes from input field', async () => {
     api.paperOrders.mockResolvedValue(makeOrders())
     api.systemStatus.mockResolvedValue({ paper_mode: 'paper_manual' })
     api.paperReject.mockResolvedValue({ status: 'ok' })
@@ -129,7 +135,13 @@ describe('PaperOrdersPage', () => {
     )
 
     await screen.findByText('pending')
+    // Type a note
+    const textarea = screen.getByPlaceholderText(/Add a note/i);
+    await user.type(textarea, 'My custom rejection note')
     await user.click(screen.getByRole('button', { name: /reject/i }))
-    expect(api.paperReject).toHaveBeenCalledWith({ order_id: '00000000-0000-0000-0000-000000000001', notes: undefined })
+    expect(api.paperReject).toHaveBeenCalledWith({
+      order_id: '00000000-0000-0000-0000-000000000001',
+      notes: 'My custom rejection note',
+    })
   })
 })
