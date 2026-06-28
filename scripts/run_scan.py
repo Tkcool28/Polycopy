@@ -67,6 +67,7 @@ class ScanResult:
     def __init__(self) -> None:
         self.wallets_discovered: int = 0
         self.wallets_scored: int = 0
+        self.trades_total: int = 0
         self.trades_processed: int = 0
         self.trades_deduped: int = 0
         self.trades_stale: int = 0
@@ -91,6 +92,7 @@ class ScanResult:
             f"    watchlist: {self.watchlist}\n"
             f"    skipped: {self.skipped}\n"
             f"    incomplete: {self.incomplete}\n"
+            f"  trades total: {self.trades_total}\n"
             f"  trades processed: {self.trades_processed}\n"
             f"    deduped: {self.trades_deduped}\n"
             f"    stale: {self.trades_stale}\n"
@@ -149,12 +151,16 @@ async def run_scan(
 
     # ── Step 3: Fetch trades per market → discover wallets ────────────────
     logger.info("Step 3: Fetching trades for %d markets...", len(markets))
+    # `all_trades` retains every fetched trade (anonymous + attributed) for
+    # provenance / market-level counts / persistence. Anonymous trades are
+    # still persisted upstream via the ingest path; they simply don't reach
+    # wallet-dependent consumers below.
     all_trades = []
     for market in markets:
         trades = await _fetch_trades(db, market.source_id, now, result, use_sample)
         all_trades.extend(trades)
 
-        # Discover wallets from trades
+        # Discover wallets from attributed trades only
         for trade in trades:
             # Sentinel filter: skip NULL and legacy sentinel trader_address
             # values so they never end up as wallet rows.
@@ -171,12 +177,28 @@ async def run_scan(
             )
             _persist_wallet(db, wallet)
 
+    # Separate attributed trades (real wallet address) from anonymous ones.
+    # Only attributed trades may enter wallet-dependent processing.
+    attributed_trades = [
+        t for t in all_trades if not is_sentinel_trader_address(t.trader_address)
+    ]
+
+    result.trades_total = len(all_trades)
     result.wallets_discovered = len(discovery.list_wallets())
-    logger.info("  Total wallets after discovery: %d", result.wallets_discovered)
+    logger.info(
+        "  Total wallets after discovery: %d (attributed trades: %d, anonymous: %d)",
+        result.wallets_discovered,
+        len(attributed_trades),
+        result.anonymous_trades_skipped,
+    )
 
     # ── Step 4: Trade detection (dedup + staleness) ───────────────────────
+    # Only attributed trades reach the detector. The detector calls
+    # wallet_address.lower() inside make_dedup_key and TrackedTrade, so it
+    # would crash on anonymous trades. Anonymous trades are kept in
+    # `all_trades` for provenance but excluded here.
     logger.info("Step 4: Running trade detection...")
-    for trade in all_trades:
+    for trade in attributed_trades:
         tracked = trade_detector.process_trade(
             source=trade.source,
             source_trade_id=trade.source_trade_id,
@@ -649,9 +671,11 @@ def _record_experiment(db: Database, result: ScanResult, settings) -> None:
             "watchlist": result.watchlist,
             "skipped": result.skipped,
             "incomplete": result.incomplete,
+            "trades_total": result.trades_total,
             "trades_processed": result.trades_processed,
             "trades_deduped": result.trades_deduped,
             "trades_stale": result.trades_stale,
+            "anonymous_trades_skipped": result.anonymous_trades_skipped,
             "signals": result.signals,
             "related_wallets": result.related_wallets,
             "errors": len(result.errors),
