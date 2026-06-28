@@ -18,6 +18,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -36,7 +39,7 @@ def seeded_db(clean_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         [sys.executable, "scripts/seed_demo_data.py", "--db", str(clean_db_path)],
         capture_output=True,
         text=True,
-        cwd="/root/Polycopy",
+        cwd=REPO_ROOT,
     )
     assert result.returncode == 0, f"seed failed: {result.stderr}"
     return clean_db_path
@@ -516,14 +519,14 @@ class TestRejectPendingAndSettlementIdempotency:
             [sys.executable, "scripts/settle_paper_positions.py", "--db", str(seeded_db)],
             capture_output=True,
             text=True,
-            cwd="/root/Polycopy",
+            cwd=REPO_ROOT,
         )
 
         result2 = subprocess.run(
             [sys.executable, "scripts/settle_paper_positions.py", "--db", str(seeded_db)],
             capture_output=True,
             text=True,
-            cwd="/root/Polycopy",
+            cwd=REPO_ROOT,
         )
 
         # Both should succeed (or confirm nothing to settle)
