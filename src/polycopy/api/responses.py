@@ -103,15 +103,52 @@ class SignalsResponse(BaseModel):
 # ── Paper orders ──────────────────────────────────────────────────────────────
 
 class PaperOrderPreview(BaseModel):
-    """Preview of a paper order before confirmation."""
+    """Preview of a paper order before confirmation.
+
+    Fields mirror the full paper-fill pipeline: executable bid/ask,
+    spread/depth snapshot, configurable slippage, fees, review delay,
+    source-entry deterioration, and all risk-gate/fill-mode checks.
+    Missing market data returns HTTP 422 with status=INCOMPLETE.
+    """
     market_id: UUID
     outcome: str
     side: str
     quantity: float
     price: float
-    estimated_fill_price: float = Field(description="Estimated fill price including slippage.")
+    # requested fill vs simulated fill
+    requested_price: float = Field(description="Original limit price submitted.")
+    estimated_fill_price: float = Field(description="Expected fill price including slippage.")
     estimated_fee: float = Field(description="Estimated fee.")
-    estimated_total_cost: float = Field(description="Total cost including fee.")
+    estimated_total_cost: float = Field(default=0.0, description="Total cost including fee.")
+    # market spread/depth snapshot
+    bid: Optional[float] = Field(default=None, description="Best bid at decision time (polymarket).")
+    ask: Optional[float] = Field(description="Best ask at decision time (polymarket).")
+    spread: Optional[float] = Field(default=None, description="ask - bid (market spread).")
+    spread_cost: float = Field(default=0.0, description="Cost due to crossing the spread.")
+    depth_available: Optional[float] = Field(default=None, description="Volume available at executable price.")
+    fillable_quantity: Optional[float] = Field(default=None, description="Fillable quantity given depth.")
+    is_complete_fill: bool = Field(default=True, description="True if full qty is fillable.")
+    snapshot_timestamp: Optional[str] = Field(default=None, description="ISO timestamp of bid/ask snapshot.")
+    # slippage / fees / review delay
+    slippage: float = Field(default=0.0, description="Price impact vs best price.")
+    fee_rate: float = Field(default=0.001, description="Fee rate applied to notional.")
+    fee: float = Field(default=0.0, description="Absolute fee amount = notional * fee_rate.")
+    review_delay_seconds: float = Field(default=0.0, description="Seconds until paper_manual order can fill.")
+    expires_at: Optional[str] = Field(default=None, description="ISO timestamp when preview quote expires.")
+    # source-entry / deterioration / staleness
+    source_entry_age_seconds: Optional[float] = Field(default=None, description="Age of underlying source trade at decision time.")
+    staleness_seconds: float = Field(default=0.0, description="Configurable staleness threshold.")
+    is_stale: bool = Field(default=False, description="True if source entry is older than staleness_seconds.")
+    # risk / price-impact / liquidity / exposure
+    price_impact_ratio: Optional[float] = Field(default=None, description="Order notional / depth_available (0-1+).")
+    exposure_impact: float = Field(default=0.0, description="Additional global exposure if filled.")
+    max_loss: float = Field(default=0.0, description="Worst-case cost if filled at worst price.")
+    passed_gates: list[str] = Field(default_factory=list, description="Gate names that passed review.")
+    failed_gates: list[str] = Field(default_factory=list, description="Gate names that blocked or flagged.")
+    rejection_reason: Optional[str] = Field(default=None, description="Human-readable rejection reason if blocked.")
+    # meta
+    fill_model_version: str = Field(default="polycopy-fill-v1", description="Fill model identifier for audit.")
+    status: str = Field(description=" preview status: pending | rejected | incomplete | expired.")
     is_sample: bool = False
 
 
@@ -122,16 +159,20 @@ class PaperOrderPreviewRequest(BaseModel):
     side: str = Field(pattern="^(buy|sell)$", description="Paper order side: buy or sell.")
     quantity: float = Field(gt=0, le=1_000_000, description="Paper quantity to preview.")
     price: float = Field(ge=0.0, le=1.0, description="Limit price for the paper preview.")
+    source_trade_id: Optional[str] = Field(default=None, description="Source trade ID that triggered this order (for deterioration/staleness tracking).")
+    received_at: Optional[str] = Field(default=None, description="ISO timestamp when the source trade was first detected (UTC).")
 
 
 class PaperOrderApproveRequest(BaseModel):
     """Request to approve (confirm and fill) a pending paper order."""
     order_id: UUID = Field(description="ID of the pending order to approve.")
+    notes: Optional[str] = Field(default=None, description="Optional operator rationale / decision note.")
 
 
 class PaperOrderRejectRequest(BaseModel):
     """Request to reject (cancel) a pending paper order."""
     order_id: UUID = Field(description="ID of the pending order to reject.")
+    notes: Optional[str] = Field(default=None, description="Operator rationale for rejection.")
 
 
 class OrderView(BaseModel):

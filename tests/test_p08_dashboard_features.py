@@ -18,6 +18,7 @@ def _demo_client(monkeypatch, tmp_path):
 
     monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
     monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "test-p08.sqlite"))
+    from polycopy.api.app import _bidask_provider
     import polycopy.config.settings as settings_module
     import polycopy.db.database as database_module
 
@@ -25,9 +26,26 @@ def _demo_client(monkeypatch, tmp_path):
         database_module._db.close()
     database_module._db = None
     settings_module._settings = None
+    _bidask_provider.set_snapshot(
+        market_id="00000000-0000-0000-0000-000000000010",
+        outcome="Yes",
+        bid=0.62,
+        ask=0.68,
+        ask_volume=100.0,
+        bid_volume=50.0,
+    )
+    _bidask_provider.set_snapshot(
+        market_id="00000000-0000-0000-0000-000000000010",
+        outcome="No",
+        bid=0.30,
+        ask=0.35,
+        ask_volume=80.0,
+        bid_volume=100.0,
+    )
     with TestClient(app) as test_client:
         client = test_client
         yield
+    _bidask_provider.clear()
     if database_module._db is not None:
         database_module._db.close()
     database_module._db = None
@@ -107,7 +125,7 @@ class TestPaperOrderPreviewBackend:
         })
         assert r.status_code == 200
         data = r.json()
-        assert data["estimated_fill_price"] == 0.65
+        assert data["estimated_fill_price"] == 0.68
         assert data["estimated_fee"] > 0
         assert data["estimated_total_cost"] > 0
         assert data["is_sample"] is True
@@ -139,7 +157,7 @@ class TestPaperOrderApproveReject:
         order_id = str(uuid4())
         r = client.post("/paper/approve", json={"order_id": order_id})
         assert r.status_code == 200
-        assert r.json()["status"] == "accepted"
+        assert r.json()["status"] == "filled"
 
     def test_reject_returns_cancelled(self):
         order_id = str(uuid4())
@@ -152,8 +170,8 @@ class TestPaperOrderApproveReject:
         r1 = client.post("/paper/approve", json={"order_id": order_id})
         assert r1.status_code == 200
         r2 = client.post("/paper/approve", json={"order_id": order_id})
-        assert r2.status_code == 409
-        assert "Duplicate" in r2.json()["detail"]
+        assert r2.status_code == 200
+        assert r2.json()["id"] == r1.json()["id"]
 
 
 class TestExistingEndpointsStillWork:

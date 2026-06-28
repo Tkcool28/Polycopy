@@ -26,6 +26,7 @@ def client(monkeypatch, tmp_path):
     """Sync test client for FastAPI app."""
     monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
     monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "test-api.sqlite"))
+    from polycopy.api.app import _bidask_provider
     import polycopy.config.settings as settings_module
     import polycopy.db.database as database_module
 
@@ -33,8 +34,17 @@ def client(monkeypatch, tmp_path):
         database_module._db.close()
     database_module._db = None
     settings_module._settings = None
+    _bidask_provider.set_snapshot(
+        market_id="00000000-0000-0000-0000-000000000010",
+        outcome="Yes",
+        bid=0.62,
+        ask=0.68,
+        ask_volume=100.0,
+        bid_volume=50.0,
+    )
     with TestClient(app) as test_client:
         yield test_client
+    _bidask_provider.clear()
     if database_module._db is not None:
         database_module._db.close()
     database_module._db = None
@@ -131,7 +141,7 @@ class TestPaperOrders:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data["estimated_fill_price"] == 0.65
+        assert data["estimated_fill_price"] == 0.68
         assert data["estimated_fee"] > 0
         assert data["estimated_total_cost"] > 0
 
@@ -139,7 +149,7 @@ class TestPaperOrders:
         resp = client.post("/paper/approve", json={"order_id": "00000000-0000-0000-0000-000000000001"})
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
+        assert data["status"] == "filled"
 
     def test_approve_order_duplicate_rejected(self, client):
         payload = {"order_id": "00000000-0000-0000-0000-000000000001"}
@@ -147,10 +157,10 @@ class TestPaperOrders:
         resp1 = client.post("/paper/approve", json=payload)
         assert resp1.status_code == 200
 
-        # Duplicate submission — same order_id hits same idempotency key
+        # Duplicate submission — same order_id replays the same safe result
         resp2 = client.post("/paper/approve", json=payload)
-        assert resp2.status_code == 409
-        assert "duplicate" in resp2.json()["detail"].lower()
+        assert resp2.status_code == 200
+        assert resp2.json()["id"] == resp1.json()["id"]
 
     def test_reject_order_succeeds(self, client):
         resp = client.post("/paper/reject", json={"order_id": "00000000-0000-0000-0000-000000000002"})
@@ -163,7 +173,8 @@ class TestPaperOrders:
         resp1 = client.post("/paper/reject", json=payload)
         assert resp1.status_code == 200
         resp2 = client.post("/paper/reject", json=payload)
-        assert resp2.status_code == 409
+        assert resp2.status_code == 200
+        assert resp2.json()["id"] == resp1.json()["id"]
 
     def test_list_paper_orders(self, client):
         resp = client.get("/paper/orders")

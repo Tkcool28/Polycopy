@@ -1326,6 +1326,37 @@ class TestAPIValidation:
         yield
         _idempotency_store.clear()
 
+    @pytest.fixture(autouse=True)
+    def _setup_bidask(self):
+        """Provide bid/ask snapshots for paper preview tests."""
+        from polycopy.api.app import _bidask_provider
+        _bidask_provider.set_snapshot(
+            market_id="00000000-0000-0000-0000-000000000001",
+            outcome="Yes",
+            bid=0.62,
+            ask=0.68,
+            ask_volume=100.0,
+            bid_volume=50.0,
+        )
+        _bidask_provider.set_snapshot(
+            market_id="00000000-0000-0000-0000-000000000001",
+            outcome="No",
+            bid=0.30,
+            ask=0.35,
+            ask_volume=80.0,
+            bid_volume=100.0,
+        )
+        _bidask_provider.set_snapshot(
+            market_id="00000000-0000-0000-0000-000000000022",
+            outcome="Yes",
+            bid=0.55,
+            ask=0.60,
+            ask_volume=20.0,  # small depth → partial fills
+            bid_volume=100.0,
+        )
+        yield
+        _bidask_provider.clear()
+
     @pytest.fixture
     def client(self, monkeypatch, tmp_path):
         from fastapi.testclient import TestClient
@@ -1399,8 +1430,14 @@ class TestAPIValidation:
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert data["estimated_fill_price"] == 0.65
         assert data["is_sample"] is True
+        assert data["status"] == "pending"
+        assert data["bid"] == 0.62
+        assert data["ask"] == 0.68
+        assert data["spread"] == 0.06
+        assert "passed_gates" in data
+        assert "failed_gates" in data
+        assert data["fill_model_version"] == "polycopy-fill-v1"
 
     def test_paper_preview_missing_params_422(self, client):
         """Missing required params returns 422."""
@@ -1418,13 +1455,14 @@ class TestAPIValidation:
         })
         assert resp.status_code == 422
 
-    def test_paper_approve_returns_accepted(self, client):
+    def test_paper_approve_returns_filled(self, client):
         resp = client.post("/paper/approve", json={
             "order_id": "00000000-0000-0000-0000-000000000099",
         })
         assert resp.status_code == 200
         data = resp.json()
-        assert data["status"] == "accepted"
+        # paper_manual mode: order is PENDING then confirm_and_fill → FILLED
+        assert data["status"] == "filled"
         assert data["is_sample"] is True
 
     def test_paper_reject_returns_cancelled(self, client):
@@ -1435,21 +1473,30 @@ class TestAPIValidation:
         data = resp.json()
         assert data["status"] == "cancelled"
 
-    def test_paper_approve_duplicate_rejected(self, client):
-        """Duplicate approval within window returns 409."""
+    def test_paper_approve_duplicate_idempotent(self, client):
+        """Duplicate approval is idempotent: returns same result, status 200."""
         payload = {"order_id": "00000000-0000-0000-0000-000000000099"}
         resp1 = client.post("/paper/approve", json=payload)
         assert resp1.status_code == 200
+        data1 = resp1.json()
         resp2 = client.post("/paper/approve", json=payload)
-        assert resp2.status_code == 409
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        # Idempotent: same order_id returned
+        assert data1["id"] == data2["id"]
+        assert data1["status"] == data2["status"]
 
-    def test_paper_reject_duplicate_rejected(self, client):
-        """Duplicate rejection within window returns 409."""
+    def test_paper_reject_duplicate_idempotent(self, client):
+        """Duplicate rejection is idempotent: returns same result, status 200."""
         payload = {"order_id": "00000000-0000-0000-0000-000000000099"}
         resp1 = client.post("/paper/reject", json=payload)
         assert resp1.status_code == 200
+        data1 = resp1.json()
         resp2 = client.post("/paper/reject", json=payload)
-        assert resp2.status_code == 409
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data1["id"] == data2["id"]
+        assert data1["status"] == data2["status"]
 
     def test_positions_returns_sample(self, client):
         resp = client.get("/positions")
