@@ -38,6 +38,7 @@ from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
+from polycopy.domain.source_trade import is_sentinel_trader_address
 from polycopy.domain.raw_snapshot import RawSnapshot
 from polycopy.domain.source_trade import SourceTrade
 from polycopy.domain.wallet import Wallet
@@ -690,7 +691,10 @@ async def run_collection(
                     # promoted to fake wallets. They are still persisted in
                     # source_trades as market-level observations, but they are
                     # skipped here so they cannot be scored by evaluate_wallet.
-                    if trade.trader_address is None or not str(trade.trader_address).strip():
+                    # ``is_sentinel_trader_address`` covers both NULL and legacy
+                    # sentinel strings ("unknown" / "anonymous" / "missing" /
+                    # "0x" / "0x0").
+                    if is_sentinel_trader_address(trade.trader_address):
                         result.anonymous_trades_skipped += 1
                         continue
                     wallet = Wallet(
@@ -731,12 +735,24 @@ def _get_unique_trader_addresses(db: Database) -> list[str]:
     Defensive: filters out NULL and empty-string addresses so anonymous trades
     (P2) cannot end up in the scoring loop even if they bypass the collector's
     anonymous skip.
+
+    Note: the v5 migration normalizes legacy sentinel strings
+    ("unknown" / "anonymous" / "missing" / "0x" / "0x0") to NULL on upgrade,
+    so the DB-level filter alone is sufficient for upgraded databases. The
+    ``is_sentinel_trader_address`` runtime helper below provides defense in
+    depth and is the source of truth for live collectors/scoring loops.
     """
     rows = db.fetchall(
         "SELECT DISTINCT trader_address FROM source_trades "
-        "WHERE trader_address IS NOT NULL AND trader_address != ''"
+        "WHERE trader_address IS NOT NULL "
+        "AND TRIM(trader_address) != '' "
+        "AND LOWER(TRIM(trader_address)) NOT IN ('unknown', 'anonymous', 'missing', '0x', '0x0')"
     )
-    return [row["trader_address"] for row in rows]
+    return [
+        row["trader_address"]
+        for row in rows
+        if not is_sentinel_trader_address(row["trader_address"])
+    ]
 
 
 def _record_experiment(db: Database, result: CollectionResult) -> None:

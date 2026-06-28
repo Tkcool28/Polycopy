@@ -46,6 +46,7 @@ from polycopy.adapters.polymarket import (  # noqa: E402
 )
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.db.schema import SCHEMA_VERSION  # noqa: E402
+from polycopy.domain.source_trade import is_sentinel_trader_address  # noqa: E402
 
 
 def banner(msg: str) -> None:
@@ -176,9 +177,8 @@ async def main() -> int:
     kv("anonymous trades (trader_address=None)", n_anonymous)
     kv("attributed trades (real 0x address)", n_attributed)
 
-    # Verify: NO "unknown" / "anonymous" / "missing" / "0x0" sentinels
-    sentinels = {"unknown", "anonymous", "missing", "0x0"}
-    bad = [t.trader_address for t in parsed_trades if t.trader_address in sentinels]
+    # Verify: NO "unknown" / "anonymous" / "missing" / "0x" / "0x0" sentinels
+    bad = [t.trader_address for t in parsed_trades if is_sentinel_trader_address(t.trader_address)]
     kv("legacy sentinel addresses persisted", len(bad))
     if bad:
         kv("  examples", bad[:3])
@@ -232,12 +232,17 @@ async def main() -> int:
     kv("same-tx distinct rows preserved (P1 proof)", same_tx_preserved)
 
     # 9. Wallet discovery mirroring collector's logic
+    # Filter out sentinels at the SQL layer (matches _get_unique_trader_addresses
+    # in scripts/collect_smart_money_data.py — keep in sync).
     unique_addrs = [
         r["trader_address"]
         for r in db.fetchall(
             "SELECT DISTINCT trader_address FROM source_trades "
-            "WHERE trader_address IS NOT NULL AND trader_address != ''"
+            "WHERE trader_address IS NOT NULL "
+            "AND TRIM(trader_address) != '' "
+            "AND LOWER(TRIM(trader_address)) NOT IN ('unknown', 'anonymous', 'missing', '0x', '0x0')"
         )
+        if not is_sentinel_trader_address(r["trader_address"])
     ]
     kv("distinct non-NULL trader_addresses for scoring", len(unique_addrs))
     kv("  unique wallets to be discovered", len(set(unique_addrs)))
@@ -257,10 +262,10 @@ async def main() -> int:
 
     # 10. Verify NO fake / unknown wallet exists
     banner("Verification: no fake wallets")
-    bad_wallets = db.fetchall(
-        "SELECT address FROM wallets "
-        "WHERE address IS NULL OR address IN ('unknown','anonymous','missing','0x0')"
-    )
+    bad_wallets = [
+        w for w in db.fetchall("SELECT address FROM wallets")
+        if is_sentinel_trader_address(w["address"])
+    ]
     kv("fake / unknown wallet rows", len(bad_wallets))
     if bad_wallets:
         kv("  examples", [r["address"] for r in bad_wallets[:3]])

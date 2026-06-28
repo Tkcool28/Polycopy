@@ -41,7 +41,7 @@ from polycopy.discovery.wallet_discovery import (
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.order import OrderSide
-from polycopy.domain.source_trade import SourceTrade
+from polycopy.domain.source_trade import SourceTrade, is_sentinel_trader_address
 from polycopy.engine.evaluate import evaluate_wallet
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
 
@@ -76,6 +76,7 @@ class ScanResult:
         self.incomplete: int = 0
         self.signals: int = 0
         self.related_wallets: int = 0
+        self.anonymous_trades_skipped: int = 0
         self.missing_data: list[str] = []
         self.errors: list[str] = []
         self.started_at = datetime.now(timezone.utc)
@@ -93,6 +94,7 @@ class ScanResult:
             f"  trades processed: {self.trades_processed}\n"
             f"    deduped: {self.trades_deduped}\n"
             f"    stale: {self.trades_stale}\n"
+            f"    anonymous (sentinel) skipped: {self.anonymous_trades_skipped}\n"
             f"  related wallets: {self.related_wallets}\n"
             f"  signals generated: {self.signals}\n"
             f"  missing data entries: {len(self.missing_data)}\n"
@@ -154,6 +156,11 @@ async def run_scan(
 
         # Discover wallets from trades
         for trade in trades:
+            # Sentinel filter: skip NULL and legacy sentinel trader_address
+            # values so they never end up as wallet rows.
+            if is_sentinel_trader_address(trade.trader_address):
+                result.anonymous_trades_skipped += 1
+                continue
             discovery.add_from_polymarket(trade.trader_address)
             # Persist wallet to DB
             from polycopy.domain.wallet import Wallet

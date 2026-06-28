@@ -250,14 +250,18 @@ _V4_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_capability_flags_capability ON capability_flags(capability);",
 ]
 
-# ── Version 5: source_trades.trader_address becomes NULLable ─────────────────
+# ── Version 5: source_trades.trader_address becomes NULLable, sentinels → NULL ─
 # Rationale: anonymous data-api rows (no proxyWallet) used to be persisted with
-# the literal sentinel string "unknown", which then collapsed into a single
-# pseudo-wallet and got scored by evaluate_wallet. The fix is to:
+# the literal sentinel string "unknown" (or "anonymous", "missing", "0x0",
+# "0x"). Those strings then collapsed into a single pseudo-wallet and got
+# scored by evaluate_wallet. The fix:
 #   1. Allow trader_address to be NULL (the absence of attribution).
-#   2. Copy all existing rows verbatim — the migration does NOT rewrite any
-#      legacy "unknown" string; that is a data-shape concern handled by the
-#      adapter on new writes. Historical "unknown" rows remain as-is.
+#   2. Normalize ALL legacy sentinel values to NULL during the COPY step
+#      below. This is a one-shot, self-correcting rewrite — historical rows
+#      that were "unknown" / "anonymous" / "missing" / "0x" / "0x0" /
+#      empty / whitespace are converted to NULL on upgrade. Real 0x
+#      addresses and any other non-sentinel non-empty value are preserved
+#      verbatim (case-sensitive).
 #   3. Preserve is_sample and all other columns.
 _V5_DDL: list[str] = [
     """CREATE TABLE IF NOT EXISTS source_trades_new (
@@ -277,8 +281,18 @@ _V5_DDL: list[str] = [
     """INSERT INTO source_trades_new (
         id, source, source_trade_id, market_source_id, side, outcome,
         quantity, price, trader_address, timestamp, is_sample
-    ) SELECT id, source, source_trade_id, market_source_id, side, outcome,
-             quantity, price, trader_address, timestamp, is_sample
+    ) SELECT
+        id, source, source_trade_id, market_source_id, side, outcome,
+        quantity, price,
+        CASE
+            WHEN trader_address IS NULL THEN NULL
+            WHEN LENGTH(TRIM(trader_address, ' \t\n\r\v\f')) = 0 THEN NULL
+            WHEN LOWER(TRIM(trader_address, ' \t\n\r\v\f')) IN (
+                'unknown', 'anonymous', 'missing', '0x', '0x0'
+            ) THEN NULL
+            ELSE trader_address
+        END,
+        timestamp, is_sample
       FROM source_trades;""",
     "DROP TABLE source_trades;",
     "ALTER TABLE source_trades_new RENAME TO source_trades;",

@@ -798,15 +798,20 @@ def test_schema_v4_to_v5_migration(tmp_path: Path):
     )
     conn.commit()
 
-    # Both rows preserved.
+    # Both rows preserved. Legacy sentinels are normalized to NULL by
+    # the v5 migration itself (CASE expression in the COPY step).
     rows = conn.execute(
         "SELECT source_trade_id, trader_address FROM source_trades ORDER BY source_trade_id"
     ).fetchall()
     assert len(rows) == 2
     by_id = {r["source_trade_id"]: r["trader_address"] for r in rows}
-    assert by_id["row-attr"] == "0xATTRIBUTED_WALLET"
-    assert by_id["row-unknown"] == "unknown", (
-        "legacy 'unknown' sentinel must be preserved verbatim"
+    assert by_id["row-attr"] == "0xATTRIBUTED_WALLET", (
+        "real 0x wallet must be preserved verbatim by the migration"
+    )
+    assert by_id["row-unknown"] is None, (
+        "legacy 'unknown' sentinel must be normalized to NULL by the "
+        "v5 migration (P2 Codex fix); the migration must NOT preserve "
+        "sentinel strings"
     )
 
     # trader_address is now nullable.
@@ -950,4 +955,424 @@ print("PROBE_OK")
     )
     assert result.returncode == 0, (
         f"probe exited {result.returncode}; stderr={result.stderr!r}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2 (Codex review) — legacy sentinel trader_address handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_is_sentinel_trader_address_helper():
+    """Unit tests for the shared sentinel-detection helper.
+
+    The helper is the single source of truth used by both the v5
+    migration's runtime filter and by every wallet-discovery / scoring
+    query path in the codebase.
+    """
+    from polycopy.domain.source_trade import (  # noqa: PLC0415
+        LEGACY_TRADER_ADDRESS_SENTINELS,
+        is_sentinel_trader_address,
+    )
+
+    # Sentinel set contents.
+    assert "unknown" in LEGACY_TRADER_ADDRESS_SENTINELS
+    assert "anonymous" in LEGACY_TRADER_ADDRESS_SENTINELS
+    assert "missing" in LEGACY_TRADER_ADDRESS_SENTINELS
+    assert "0x" in LEGACY_TRADER_ADDRESS_SENTINELS
+    assert "0x0" in LEGACY_TRADER_ADDRESS_SENTINELS
+    # Real 0x addresses are NOT in the sentinel set.
+    assert "0xATTRIBUTED" not in LEGACY_TRADER_ADDRESS_SENTINELS
+    assert "0xrealwallet" not in LEGACY_TRADER_ADDRESS_SENTINELS
+
+    # Detection cases.
+    assert is_sentinel_trader_address(None) is True
+    assert is_sentinel_trader_address("") is True
+    assert is_sentinel_trader_address("   ") is True
+    assert is_sentinel_trader_address("\t\n") is True
+    # Case-insensitive match against sentinels (after strip).
+    assert is_sentinel_trader_address("unknown") is True
+    assert is_sentinel_trader_address("Unknown") is True
+    assert is_sentinel_trader_address("UNKNOWN") is True
+    assert is_sentinel_trader_address("  unknown  ") is True
+    assert is_sentinel_trader_address("anonymous") is True
+    assert is_sentinel_trader_address("ANONYMOUS") is True
+    assert is_sentinel_trader_address("missing") is True
+    assert is_sentinel_trader_address("Missing") is True
+    assert is_sentinel_trader_address("0x") is True
+    assert is_sentinel_trader_address("0x0") is True
+    assert is_sentinel_trader_address("0X0") is True
+
+    # Non-sentinel, non-empty values pass through.
+    assert is_sentinel_trader_address("0xATTRIBUTED_WALLET") is False
+    assert is_sentinel_trader_address("0xrealwallet") is False
+    assert is_sentinel_trader_address("0x1234abcd") is False
+    assert is_sentinel_trader_address("some_random_string") is False
+    # Defensive: non-string non-None.
+    assert is_sentinel_trader_address(123) is True  # type: ignore[arg-type]
+
+
+def test_v4_to_v5_migration_normalizes_known_sentinels_to_null(tmp_path: Path):
+    """Pre-v5 source_trades has trader_address NOT NULL with legacy
+    sentinel strings. After v5 the column is nullable AND legacy
+    sentinels are converted to NULL by the migration itself (P2 fix).
+
+    Covers: "unknown", "Unknown", "ANONYMOUS", "missing", "Missing",
+    "0x0", "0X0", empty, whitespace-only, mixed-case.
+    """
+    conn = _init_db_at_version(tmp_path / "v4sentinels.db", 4)
+
+    sentinel_cases = [
+        "unknown", "Unknown", "UNKNOWN", "uNkNoWn",
+        "anonymous", "ANONYMOUS", "Anonymous",
+        "missing", "Missing", "MISSING",
+        "0x0", "0X0", "0x", "0X",
+        "", "   ", "\t\n",
+    ]
+    for i, value in enumerate(sentinel_cases):
+        conn.execute(
+            """INSERT INTO source_trades
+               (id, source, source_trade_id, market_source_id, side, outcome,
+                quantity, price, trader_address, timestamp, is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            (
+                str(uuid.uuid4()),
+                "polymarket_data_api",
+                f"sentinel-{i:02d}",
+                "0xcond",
+                "BUY", "Yes", 1.0, 0.5, value,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    conn.commit()
+
+    # Apply v5 migration.
+    for stmt in _V5_DDL:
+        conn.execute(stmt)
+    conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",
+        ("5",),
+    )
+    conn.commit()
+
+    # Every sentinel row must have trader_address = NULL.
+    rows = conn.execute(
+        "SELECT source_trade_id, trader_address FROM source_trades "
+        "WHERE source_trade_id LIKE 'sentinel-%' ORDER BY source_trade_id"
+    ).fetchall()
+    assert len(rows) == len(sentinel_cases)
+    for r in rows:
+        assert r["trader_address"] is None, (
+            f"sentinel {r['source_trade_id']!r} should be NULL after v5, "
+            f"got {r['trader_address']!r}"
+        )
+
+    # Schema version is still 5 (no version bump).
+    sv = conn.execute(
+        "SELECT value FROM _meta WHERE key = 'schema_version'"
+    ).fetchone()
+    assert sv is not None
+    assert int(sv["value"]) == 5
+
+    conn.close()
+
+
+def test_v4_to_v5_migration_preserves_real_wallets(tmp_path: Path):
+    """Real 0x wallet addresses (and any other non-sentinel non-empty
+    value) must be preserved verbatim by the v5 migration — case-sensitive.
+    """
+    conn = _init_db_at_version(tmp_path / "v4real.db", 4)
+
+    real_cases = [
+        "0xATTRIBUTED_WALLET",
+        "0x1234567890abcdef1234567890abcdef12345678",  # 40-hex
+        "0xabc",  # malformed but non-sentinel — defensive preserve
+        "custom_string_value",  # non-0x — defensive preserve
+    ]
+    for i, value in enumerate(real_cases):
+        conn.execute(
+            """INSERT INTO source_trades
+               (id, source, source_trade_id, market_source_id, side, outcome,
+                quantity, price, trader_address, timestamp, is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            (
+                str(uuid.uuid4()),
+                "polymarket_data_api",
+                f"real-{i:02d}",
+                "0xcond",
+                "BUY", "Yes", 1.0, 0.5, value,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    conn.commit()
+
+    for stmt in _V5_DDL:
+        conn.execute(stmt)
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT source_trade_id, trader_address FROM source_trades "
+        "WHERE source_trade_id LIKE 'real-%' ORDER BY source_trade_id"
+    ).fetchall()
+    by_id = {r["source_trade_id"]: r["trader_address"] for r in rows}
+    assert by_id["real-00"] == "0xATTRIBUTED_WALLET"
+    assert by_id["real-01"] == "0x1234567890abcdef1234567890abcdef12345678"
+    assert by_id["real-02"] == "0xabc"
+    assert by_id["real-03"] == "custom_string_value"
+    conn.close()
+
+
+def test_runtime_wallet_discovery_excludes_sentinels(tmp_path: Path):
+    """The runtime wallet-discovery SQL query (mirroring
+    _get_unique_trader_addresses) must exclude sentinel values via the
+    shared helper — independent of the migration cleanup.
+    """
+    from polycopy.domain.source_trade import (  # noqa: PLC0415
+        is_sentinel_trader_address,
+    )
+
+    db_path = tmp_path / "disc.db"
+    db = Database(db_path=db_path).connect()
+
+    rows = [
+        ("real-1", "0xREAL_WALLET_1"),
+        ("real-2", "0xREAL_WALLET_2"),
+        ("null", None),
+        ("empty", ""),
+        ("whitespace", "   "),
+        ("sentinel-unknown", "unknown"),
+        ("sentinel-missing", "Missing"),
+        ("sentinel-zerox", "0x0"),
+        ("real-malformed", "0xabc"),  # malformed but non-sentinel
+    ]
+    for sid, addr in rows:
+        db.execute(
+            """INSERT INTO source_trades
+               (id, source, source_trade_id, market_source_id, side, outcome,
+                quantity, price, trader_address, timestamp, is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            (
+                str(uuid.uuid4()), "polymarket_data_api", sid, "0xcond",
+                "BUY", "Yes", 1.0, 0.5, addr,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    db.conn.commit()
+
+    # Mirrors the production SQL filter.
+    raw_addrs = [
+        r["trader_address"]
+        for r in db.fetchall(
+            "SELECT DISTINCT trader_address FROM source_trades "
+            "WHERE trader_address IS NOT NULL AND trader_address != ''"
+        )
+    ]
+    # Plus the Python-level sentinel filter.
+    final = [
+        a for a in raw_addrs
+        if not is_sentinel_trader_address(a)
+    ]
+
+    # Real wallets + malformed-but-non-sentinel survive.
+    assert set(final) == {"0xREAL_WALLET_1", "0xREAL_WALLET_2", "0xabc"}
+    assert "unknown" not in final
+    assert "Missing" not in final
+    assert "0x0" not in final
+    assert "" not in final
+    assert None not in final
+    db.close()
+
+
+def test_runtime_wallet_scoring_never_receives_sentinels(tmp_path: Path):
+    """The list of unique trader addresses passed to evaluate_wallet
+    scoring must never contain any sentinel value — even if migration
+    cleanup somehow failed, the runtime filter must catch them.
+    """
+    from polycopy.domain.source_trade import (  # noqa: PLC0415
+        is_sentinel_trader_address,
+    )
+
+    db_path = tmp_path / "scoring.db"
+    db = Database(db_path=db_path).connect()
+
+    mixed = [
+        "0xREAL_WALLET_1",
+        "0xREAL_WALLET_2",
+        "unknown",
+        "Missing",
+        "0x0",
+        "",
+        None,
+    ]
+    for i, addr in enumerate(mixed):
+        db.execute(
+            """INSERT INTO source_trades
+               (id, source, source_trade_id, market_source_id, side, outcome,
+                quantity, price, trader_address, timestamp, is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            (
+                str(uuid.uuid4()), "polymarket_data_api", f"row-{i}", "0xcond",
+                "BUY", "Yes", 1.0, 0.5, addr,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    db.conn.commit()
+
+    candidate_addrs = [
+        r["trader_address"]
+        for r in db.fetchall(
+            "SELECT DISTINCT trader_address FROM source_trades "
+            "WHERE trader_address IS NOT NULL AND trader_address != ''"
+        )
+    ]
+    scoring_inputs = [a for a in candidate_addrs if not is_sentinel_trader_address(a)]
+
+    # The scoring inputs list must contain ONLY real wallets.
+    assert set(scoring_inputs) == {"0xREAL_WALLET_1", "0xREAL_WALLET_2"}
+    for s in scoring_inputs:
+        assert s.startswith("0x")
+        assert len(s) >= 5  # not just "0x"
+    db.close()
+
+
+def test_mixed_real_null_empty_sentinel_window_produces_only_real_wallets(
+    monkeypatch, tmp_path: Path,
+):
+    """End-to-end mirror of the collector's persist + wallet-discovery
+    loop on a window containing real, null, empty, whitespace, and
+    sentinel trader_addresses. Only real wallets must be created.
+    """
+    import sys as _sys  # noqa: PLC0415
+
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in _sys.path:
+        _sys.path.insert(0, str(repo_root))
+
+    from scripts.collect_smart_money_data import (  # noqa: PLC0415
+        CollectionResult,
+        _get_unique_trader_addresses,
+    )
+
+    db_path = tmp_path / "mixed_sentinel.db"
+    db = Database(db_path=db_path).connect()
+    result = CollectionResult()
+
+    cases = [
+        ("real-1", "0xREAL_WALLET_1", "attributed"),
+        ("real-2", "0xREAL_WALLET_2", "attributed"),
+        ("null-row", None, "anonymous"),
+        ("empty-row", "", "anonymous"),
+        ("ws-row", "   ", "anonymous"),
+        ("sentinel-unknown", "unknown", "anonymous"),
+        ("sentinel-missing", "Missing", "anonymous"),
+        ("sentinel-zerox", "0x0", "anonymous"),
+    ]
+    for sid, addr, kind in cases:
+        db.execute(
+            """INSERT INTO source_trades
+               (id, source, source_trade_id, market_source_id, side, outcome,
+                quantity, price, trader_address, timestamp, is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            (
+                str(uuid.uuid4()), "polymarket_data_api", sid, "0xcond",
+                "BUY", "Yes", 1.0, 0.5, addr,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        # Mirror the collector's per-trade decision.
+        from polycopy.domain.source_trade import (  # noqa: PLC0415
+            is_sentinel_trader_address,
+        )
+
+        if addr is None or str(addr).strip() == "":
+            result.anonymous_trades_skipped += 1
+            continue
+        if is_sentinel_trader_address(addr):
+            result.anonymous_trades_skipped += 1
+            continue
+        # Attributed: persist wallet.
+        db.execute(
+            """INSERT OR REPLACE INTO wallets
+               (id, address, label, is_sample, created_at)
+               VALUES (?, ?, ?, 0, ?)""",
+            (
+                str(uuid.uuid4()),
+                addr,
+                "discovered-from-polymarket_data_api",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        result.wallets_discovered += 1
+    db.conn.commit()
+
+    # Final assertions: only real wallets created, no fake / sentinel.
+    wallets = db.fetchall("SELECT address FROM wallets")
+    addrs = sorted(w["address"] for w in wallets)
+    assert addrs == ["0xREAL_WALLET_1", "0xREAL_WALLET_2"]
+
+    # Helper also returns only real wallets (after migration + filter).
+    unique = _get_unique_trader_addresses(db)
+    assert set(unique) == {"0xREAL_WALLET_1", "0xREAL_WALLET_2"}
+
+    # Counters: 2 attributed, 6 anonymous-skipped.
+    assert result.wallets_discovered == 2
+    assert result.anonymous_trades_skipped == 6
+    db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression guard: no test fixture uses a hardcoded future timestamp
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_no_hardcoded_test_seeds():
+    """Permanent guard: no test file may seed rows with a hardcoded
+    ISO timestamp that becomes "in the future" or "in the distant
+    past" relative to wall-clock and breaks time-dependent assertions
+    (notably ``order_preview_max_age_seconds`` at /paper/approve).
+
+    Found bug (2026-06-28): multiple test files seeded orders with the
+    literal "2026-06-28T12:00:00+00:00". Once wall-clock passed that
+    value, the /paper/approve handler returned 409 "preview expired"
+    and the full pytest suite began failing 13 paper-approve tests.
+
+    This test scans every other test_*.py file and asserts the
+    forbidden literal does not appear as an active seed (i.e. on the
+    right-hand side of a real assignment that ends up in a SQL
+    INSERT). Comments mentioning the historical bad pattern are
+    explicitly allowed.
+    """
+
+    # The single hardcoded literal that caused the time bomb.
+    forbidden_literal = "2026-06-28T12:00:00+00:00"
+
+    tests_dir = Path(__file__).resolve().parent
+    this_file = tests_dir / "test_p21_fixes.py"
+    offenders: list[tuple[Path, int, str]] = []
+
+    # A line is "active" (real seed) if it does something with the
+    # forbidden literal beyond just commenting on it. Heuristic:
+    # exclude lines whose stripped text starts with "#".
+    for test_file in sorted(tests_dir.glob("test_*.py")):
+        if test_file == this_file:
+            # The guard test itself mentions the forbidden literal in
+            # its docstring/comments — that's fine, it is the guard.
+            continue
+        try:
+            text = test_file.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if forbidden_literal not in line:
+                continue
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                # Documentation comment about the historical bug — allowed.
+                continue
+            offenders.append((test_file, lineno, line.strip()))
+
+    assert not offenders, (
+        "hardcoded timestamps detected as active seeds in test fixtures "
+        "(these turn into time bombs once wall-clock passes them):\n"
+        + "\n".join(f"  {p}:{ln}: {snippet}" for p, ln, snippet in offenders)
     )

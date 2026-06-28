@@ -11,6 +11,46 @@ from pydantic import BaseModel, Field
 from polycopy.domain.order import OrderSide
 
 
+# ── Legacy sentinel normalization ──────────────────────────────────────────────
+# Some upstream sources historically emitted the literal strings "unknown",
+# "anonymous", "missing", "0x" or "0x0" as a stand-in for "no wallet
+# attribution". These were persisted to ``source_trades.trader_address`` on
+# pre-v5 databases. They MUST be treated identically to ``NULL`` (no
+# attribution): excluded from wallet discovery and from ``evaluate_wallet``
+# scoring.
+#
+# The set is intentionally lowercased and stripped before comparison; real
+# 0x addresses pass through ``is_sentinel_trader_address`` unchanged.
+LEGACY_TRADER_ADDRESS_SENTINELS: frozenset[str] = frozenset(
+    {"unknown", "anonymous", "missing", "0x", "0x0"}
+)
+
+
+def is_sentinel_trader_address(value: Optional[str]) -> bool:
+    """Return True if ``value`` is a legacy sentinel or otherwise empty.
+
+    Matches:
+      - ``None``
+      - empty string and whitespace-only strings
+      - case-insensitive matches against ``LEGACY_TRADER_ADDRESS_SENTINELS``
+        (after ``str.strip()``).
+
+    Real 0x addresses (any string starting with "0x" plus at least 40 hex
+    chars, or any other non-sentinel non-empty value) return ``False``.
+    Defensive: we deliberately do NOT validate the 0x format here; any
+    non-sentinel, non-empty value passes through so we don't accidentally
+    drop a real wallet due to a malformed address.
+    """
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return True
+    stripped = value.strip()
+    if not stripped:
+        return True
+    return stripped.lower() in LEGACY_TRADER_ADDRESS_SENTINELS
+
+
 class SourceTrade(BaseModel):
     """A trade observed from an external data source (not our own order).
 
