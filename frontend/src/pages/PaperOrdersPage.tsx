@@ -35,7 +35,7 @@ export function PaperOrdersPage() {
 
   const handleApprove = async (orderId: string) => {
     try {
-      const result = await api.paperApprove({ order_id: orderId });
+      const result = await api.paperApprove({ order_id: orderId, notes: note || undefined });
       if (result?.status !== 'error') {
         setActionResult(`Order ${orderId.slice(0, 8)}… APPROVED (${status?.paper_mode ?? 'paper'}) ${previewData?.is_sample ? '[SAMPLE]' : ''}`);
         setNote('');
@@ -50,7 +50,7 @@ export function PaperOrdersPage() {
 
   const handleReject = async (orderId: string) => {
     try {
-      const result = await api.paperReject({ order_id: orderId });
+      const result = await api.paperReject({ order_id: orderId, notes: note || undefined });
       if (result?.status !== 'error') {
         setActionResult(`Order ${orderId.slice(0, 8)}… REJECTED (${status?.paper_mode ?? 'paper'})`);
         refetch();
@@ -188,12 +188,12 @@ export function PaperOrdersPage() {
 
       <Card title="Manual Action Note" badge="AUDIT">
         <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginBottom: 8 }}>
-          Notes are stored locally for audit. They do not affect order execution.
+          Notes are sent to the backend audit log with the approval or rejection. They do not affect order execution.
         </div>
         <textarea
           value={note}
           onChange={(e) => setNote(e.target.value)}
-          placeholder="Add a note about this decision (optional, stored locally only)..."
+          placeholder="Add a note about this decision (optional audit note)..."
           style={{ ...inputStyle, width: '100%', minHeight: 60, resize: 'vertical' }}
         />
       </Card>

@@ -52,6 +52,7 @@ from polycopy.api.responses import (
 )
 from polycopy.api.repository import DashboardRepository, Page
 from polycopy.config.settings import get_settings
+from polycopy.db.database import get_database
 from polycopy.providers.bidask import BidAskProvider
 from polycopy.risk.idempotency import IdempotencyStore
 
@@ -152,7 +153,7 @@ def _persist_paper_result(result: dict[str, object], decision_type: str, rationa
     decision_id = str(uuid5(NAMESPACE_URL, f"polycopy-decision:{decision_type}:{order_id}"))
     db.execute(
         """
-        INSERT OR REPLACE INTO decision_log (
+        INSERT OR IGNORE INTO decision_log (
             id, wallet_id, market_id, decision_type, signal_ids, order_id,
             rationale, metrics, created_at, is_sample
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -171,6 +172,69 @@ def _persist_paper_result(result: dict[str, object], decision_type: str, rationa
         ),
     )
     db.conn.commit()
+
+
+def _compute_existing_exposure(db, column: str, value: str, exclude_order_id: str) -> float:
+    """Compute total filled notional exposure for a dimension, excluding a specific order."""
+    if column == "market_id":
+        rows = db.fetchall(
+            "SELECT quantity, price FROM orders WHERE market_id = ? AND status = 'filled' AND id != ?",
+            (value, exclude_order_id),
+        )
+    else:
+        rows = db.fetchall(
+            "SELECT quantity, price FROM orders WHERE wallet_id = ? AND status = 'filled' AND id != ?",
+            (value, exclude_order_id),
+        )
+    return sum(float(r["quantity"]) * float(r["price"]) for r in rows)
+
+
+def _compute_existing_outcome_exposure(db, market_id: str, outcome: str, wallet_id: str, exclude_order_id: str) -> float:
+    """Compute total filled notional exposure for a (market, outcome) pair."""
+    rows = db.fetchall(
+        "SELECT quantity, price FROM orders WHERE market_id = ? AND outcome = ? AND wallet_id = ? AND status = 'filled' AND id != ?",
+        (market_id, outcome, wallet_id, exclude_order_id),
+    )
+    return sum(float(r["quantity"]) * float(r["price"]) for r in rows)
+
+
+def _compute_existing_global_exposure(db, exclude_order_id: str) -> float:
+    """Compute total global filled notional exposure, excluding a specific order."""
+    row = db.fetchone(
+        "SELECT COALESCE(SUM(quantity * price), 0) AS total FROM orders WHERE status = 'filled' AND id != ?",
+        (exclude_order_id,),
+    )
+    return float(row["total"] if row else 0)
+
+
+def _upsert_position(db, market_id: str, wallet_id: str, outcome: str, filled_qty: float, price: float, now: datetime, is_sample: bool) -> None:
+    """Create or update a position after an order fill."""
+    position_id = str(uuid5(NAMESPACE_URL, f"polycopy-position:{market_id}:{wallet_id}:{outcome}"))
+    existing = db.fetchone(
+        "SELECT * FROM positions WHERE market_id = ? AND wallet_id = ? AND outcome = ?",
+        (market_id, wallet_id, outcome),
+    )
+    if existing is None:
+        db.execute(
+            """
+            INSERT INTO positions (
+                id, market_id, wallet_id, outcome, quantity, avg_entry_price,
+                current_price, realized_pnl, opened_at, updated_at, is_sample
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (position_id, market_id, wallet_id, outcome, filled_qty, price, price, 0.0, now.isoformat(), now.isoformat(), is_sample),
+        )
+    else:
+        new_qty = float(existing["quantity"]) + filled_qty
+        new_avg = (float(existing["quantity"]) * float(existing["avg_entry_price"]) + filled_qty * price) / new_qty
+        db.execute(
+            """
+            UPDATE positions
+            SET quantity = ?, avg_entry_price = ?, current_price = ?, updated_at = ?
+            WHERE market_id = ? AND wallet_id = ? AND outcome = ?
+            """,
+            (new_qty, new_avg, price, now.isoformat(), market_id, wallet_id, outcome),
+        )
 
 
 def _check_idempotency(scope: str, request_hash: str) -> tuple[bool, str]:
@@ -508,22 +572,30 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
 
     Uses SQLite-backed idempotency keyed by (scope=paper_approve, order_id, notes hash).
     Replaying the same payload returns the stored result (idempotent).
-    Different payload (e.g. different notes) creates a new action.
+
+    Loads request.order_id from SQLite, validates it is pending, runs
+    current stale-price + risk checks, then transitions that exact order
+    to filled. Creates/updates the associated position exactly once and
+    persists a decision log entry against the same order.
+
     PAPER ONLY — no real trade execution.
     """
-    from polycopy.adapters.paper_broker import PaperBroker
     from polycopy.risk.gates import ExposureLimits, PaperMode
 
     settings = get_settings()
     now = datetime.now(timezone.utc)
 
-    # Idempotency: scope + order_id + notes hash
+    scope = f"paper_approve:{request.idempotency_key}" if request.idempotency_key else "paper_approve"
     req_hash = IdempotencyStore.compute_request_hash(
-        "paper_approve", str(request.order_id), request.notes or ""
+        "paper_approve", order_id=str(request.order_id), notes=request.notes or "", idempotency_key=request.idempotency_key or ""
     )
-    prev = _idempotency_store.lookup("paper_approve", req_hash)
+    if request.idempotency_key:
+        _idempotency_store._ensure_table()  # noqa: SLF001 - conflict check for optional client key
+        existing_key = _idempotency_store.db.fetchone("SELECT request_hash FROM idempotency_keys WHERE scope = ? LIMIT 1", (scope,))
+        if existing_key is not None and existing_key["request_hash"] != req_hash:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Idempotency key was already used with a different payload")
+    prev = _idempotency_store.lookup(scope, req_hash)
     if prev:
-        # Replay stored result
         return OrderView(
             id=UUID(cast(str, prev["id"])),
             market_id=UUID(cast(str, prev["market_id"])),
@@ -540,7 +612,64 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
             is_sample=bool(prev.get("is_sample", True)),
         )
 
-    # Build a PaperBroker scoped to this request
+    # Load the existing order from SQLite
+    db = get_database()
+    row = db.fetchone("SELECT * FROM orders WHERE id = ?", (str(request.order_id),))
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Order {request.order_id} not found.",
+        )
+
+    current_status = row["status"]
+    if current_status in ("filled",):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} is already filled.",
+        )
+    if current_status in ("cancelled", "rejected"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} is {current_status} and cannot be approved.",
+        )
+    if current_status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} is in status {current_status}, not pending.",
+        )
+
+    # Validate preview/order is not expired
+    order_created_at = datetime.fromisoformat(row["created_at"]) if row["created_at"] else now
+    if order_created_at.tzinfo is None:
+        order_created_at = order_created_at.replace(tzinfo=timezone.utc)
+    age_seconds = (now - order_created_at).total_seconds()
+    if settings.order_preview_max_age_seconds > 0 and age_seconds > settings.order_preview_max_age_seconds:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} preview expired ({age_seconds:.0f}s old).",
+        )
+
+    # Re-run current stale-price check
+    source_entry_age: float | None = None
+    if row["created_at"]:
+        try:
+            created_dt = datetime.fromisoformat(row["created_at"])
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=timezone.utc)
+            source_entry_age = (now - created_dt).total_seconds()
+        except (ValueError, TypeError):
+            source_entry_age = None
+
+    is_stale = False
+    if source_entry_age is not None and settings.staleness_seconds > 0:
+        is_stale = source_entry_age > settings.staleness_seconds
+    if is_stale:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} source entry stale ({source_entry_age:.0f}s > {settings.staleness_seconds:.0f}s).",
+        )
+
+    # Re-run risk checks
     paper_mode = PaperMode(settings.paper_mode)
     exposure_limits = ExposureLimits(
         max_per_market=settings.max_exposure_per_market,
@@ -549,95 +678,109 @@ async def approve_paper_order(request: PaperOrderApproveRequest):
         max_global=settings.max_exposure_global,
         max_order_size=settings.max_order_size,
     )
-    broker = PaperBroker(
+    from polycopy.risk.gates import OrderKillSwitch, RiskGate
+
+    ks = OrderKillSwitch(active=settings.order_kill_switch)
+    risk_gate = RiskGate(
+        kill_switch=ks,
         paper_mode=paper_mode,
         exposure_limits=exposure_limits,
-        review_delay_seconds=settings.review_delay_seconds,
-        fee_rate=settings.fill_fee_rate,
     )
 
-    # Synthetic market_id/wallet_id from order context
-    # (In a real flow, we'd look these up from the pending order)
-    market_id = str(getattr(request, "market_id", UUID("00000000-0000-0000-0000-000000000010")))
-    wallet_id = str(getattr(request, "wallet_id", UUID("00000000-0000-0000-0000-000000000001")))
+    order_notional = float(row["price"]) * float(row["quantity"])
+    # Compute current exposure excluding this order (it's pending, not filled)
+    market_exposure = _compute_existing_exposure(db, "market_id", row["market_id"], exclude_order_id=str(request.order_id))
+    wallet_exposure = _compute_existing_exposure(db, "wallet_id", row["wallet_id"], exclude_order_id=str(request.order_id))
+    outcome_exposure = _compute_existing_outcome_exposure(db, row["market_id"], row["outcome"], row["wallet_id"], exclude_order_id=str(request.order_id))
+    global_exposure = _compute_existing_global_exposure(db, exclude_order_id=str(request.order_id))
 
-    # Using a paper preview request to place the order through the broker
-    preview_req = getattr(request, "_preview_context", None)
-    if preview_req:
-        side = preview_req.get("side", "buy")
-        outcome = preview_req.get("outcome", "Yes")
-        quantity = float(preview_req.get("quantity", request.quantity if hasattr(request, "quantity") else 10.0))
-        price = float(preview_req.get("price", 0.65))
-    else:
-        side = "buy"
-        outcome = "Yes"
-        quantity = 10.0
-        price = 0.65
+    gate_result = risk_gate.check(
+        order_notional=order_notional,
+        market_exposure=market_exposure,
+        wallet_exposure=wallet_exposure,
+        outcome_exposure=outcome_exposure,
+        global_exposure=global_exposure,
+    )
+    if gate_result.is_blocked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Risk gate blocked: {gate_result.gate_name} — {gate_result.reason}",
+        )
 
-    # Place order through the broker
-    from polycopy.domain.order import OrderType as _OrderType
-    order = await broker.place_order(
-        market_id=market_id,
-        side=side,
-        order_type=_OrderType("limit"),
-        outcome=outcome,
-        quantity=quantity,
-        price=price,
-        wallet_id=wallet_id,
-        now=now,
-        is_sample=True,
+    # Transition the exact order to filled
+    filled_quantity = float(row["quantity"])
+    db.execute(
+        """
+        UPDATE orders
+        SET status = 'filled',
+            filled_quantity = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (filled_quantity, now.isoformat(), str(request.order_id)),
     )
 
-    # In paper_manual mode, confirm immediately (auto-fill for demo)
-    if paper_mode == PaperMode.PAPER_MANUAL:
-        from datetime import timedelta
+    # Create or update position
+    _upsert_position(db, row["market_id"], row["wallet_id"], row["outcome"], filled_quantity, float(row["price"]), now, bool(row["is_sample"]))
 
-        order = await broker.confirm_and_fill(str(order.id), now=now + timedelta(seconds=settings.review_delay_seconds))
+    # Persist decision log
+    decision_id = str(uuid5(NAMESPACE_URL, f"polycopy-decision:paper_approve:{request.order_id}"))
+    db.execute(
+        """
+        INSERT OR IGNORE INTO decision_log (
+            id, wallet_id, market_id, decision_type, signal_ids, order_id,
+            rationale, metrics, created_at, is_sample
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            decision_id,
+            row["wallet_id"],
+            row["market_id"],
+            "paper_approve",
+            "[]",
+            str(request.order_id),
+            request.notes or "Operator approved PAPER ONLY simulated order.",
+            json.dumps({"paper_only": True, "status": "filled", "filled_quantity": filled_quantity}, sort_keys=True),
+            now.isoformat(),
+            bool(row["is_sample"]),
+        ),
+    )
+    db.conn.commit()
 
-    # If notes provided, record as decision log entry
-    if request.notes:
-        broker._orders[str(order.id)] = order
-        # Decision log is stored in the persistent DB via the repository
-        # For now, we record the note in the order flow
-
+    # Build result
     result: dict[str, object] = {
-        "id": str(order.id),
-        "market_id": str(order.market_id),
-        "wallet_id": str(order.wallet_id),
-        "side": order.side.value,
-        "order_type": order.order_type.value,
-        "outcome": order.outcome,
-        "quantity": order.quantity,
-        "price": order.price,
-        "status": order.status.value,
-        "filled_quantity": order.filled_quantity,
-        "created_at": order.created_at.isoformat(),
-        "updated_at": order.updated_at.isoformat() if order.updated_at else now.isoformat(),
-        "is_sample": order.is_sample,
+        "id": str(request.order_id),
+        "market_id": row["market_id"],
+        "wallet_id": row["wallet_id"],
+        "side": row["side"],
+        "order_type": row["order_type"],
+        "outcome": row["outcome"],
+        "quantity": float(row["quantity"]),
+        "price": float(row["price"]),
+        "status": "filled",
+        "filled_quantity": filled_quantity,
+        "created_at": row["created_at"],
+        "updated_at": now.isoformat(),
+        "is_sample": bool(row["is_sample"]),
     }
 
     # Store in idempotency store
-    _persist_paper_result(
-        result,
-        "paper_approve",
-        request.notes or "Operator approved PAPER ONLY simulated order.",
-    )
-    _idempotency_store.check_and_store("paper_approve", req_hash, result)
+    _idempotency_store.check_and_store(scope, req_hash, result)
 
     return OrderView(
-        id=order.id,
-        market_id=order.market_id,
-        wallet_id=order.wallet_id,
-        side=order.side.value,
-        order_type=order.order_type.value,
-        outcome=order.outcome,
-        quantity=order.quantity,
-        price=order.price,
-        status=order.status.value,
-        filled_quantity=order.filled_quantity,
-        created_at=order.created_at,
-        updated_at=order.updated_at or now,
-        is_sample=order.is_sample,
+        id=request.order_id,
+        market_id=UUID(row["market_id"]),
+        wallet_id=UUID(row["wallet_id"]),
+        side=row["side"],
+        order_type=row["order_type"],
+        outcome=row["outcome"],
+        quantity=float(row["quantity"]),
+        price=float(row["price"]),
+        status="filled",
+        filled_quantity=filled_quantity,
+        created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else now,
+        updated_at=now,
+        is_sample=bool(row["is_sample"]),
     )
 
 
@@ -647,15 +790,25 @@ async def reject_paper_order(request: PaperOrderRejectRequest):
 
     Uses SQLite-backed idempotency keyed by (scope=paper_reject, order_id, notes hash).
     Replaying the same payload returns the stored result (idempotent).
+
+    Loads request.order_id from SQLite, validates it is pending, transitions
+    that exact order to cancelled/rejected. Persists operator note and one
+    decision log entry against the same order.
+
     PAPER ONLY — no real trade execution.
     """
     now = datetime.now(timezone.utc)
 
-    # Idempotency: scope + order_id + notes hash
+    scope = f"paper_reject:{request.idempotency_key}" if request.idempotency_key else "paper_reject"
     req_hash = IdempotencyStore.compute_request_hash(
-        "paper_reject", str(request.order_id), request.notes or ""
+        "paper_reject", order_id=str(request.order_id), notes=request.notes or "", idempotency_key=request.idempotency_key or ""
     )
-    prev = _idempotency_store.lookup("paper_reject", req_hash)
+    if request.idempotency_key:
+        _idempotency_store._ensure_table()  # noqa: SLF001 - conflict check for optional client key
+        existing_key = _idempotency_store.db.fetchone("SELECT request_hash FROM idempotency_keys WHERE scope = ? LIMIT 1", (scope,))
+        if existing_key is not None and existing_key["request_hash"] != req_hash:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Idempotency key was already used with a different payload")
+    prev = _idempotency_store.lookup(scope, req_hash)
     if prev:
         # Replay stored result
         return OrderView(
@@ -674,48 +827,101 @@ async def reject_paper_order(request: PaperOrderRejectRequest):
             is_sample=bool(prev.get("is_sample", True)),
         )
 
-    # Build a synthetic cancelled order for the rejection
-    import uuid as _uuid
-    cancelled_order_id = _uuid.uuid4()
+    # Load the existing order from SQLite
+    db = get_database()
+    row = db.fetchone("SELECT * FROM orders WHERE id = ?", (str(request.order_id),))
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Order {request.order_id} not found.",
+        )
 
-    result = {
-        "id": str(cancelled_order_id),
-        "market_id": str(getattr(request, "market_id", UUID("00000000-0000-0000-0000-000000000010"))),
-        "wallet_id": str(getattr(request, "wallet_id", UUID("00000000-0000-0000-0000-000000000001"))),
-        "side": "buy",
-        "order_type": "limit",
-        "outcome": "Yes",
-        "quantity": 10.0,
-        "price": 0.65,
+    current_status = row["status"]
+    if current_status == "filled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} is already filled and cannot be rejected.",
+        )
+    if current_status in ("cancelled", "rejected"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} is already {current_status}.",
+        )
+    if current_status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Order {request.order_id} is in status {current_status}, not pending.",
+        )
+
+    # Transition the exact order to cancelled
+    db.execute(
+        """
+        UPDATE orders
+        SET status = 'cancelled',
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (now.isoformat(), str(request.order_id)),
+    )
+
+    # Persist decision log with operator note
+    decision_id = str(uuid5(NAMESPACE_URL, f"polycopy-decision:paper_reject:{request.order_id}"))
+    db.execute(
+        """
+        INSERT OR IGNORE INTO decision_log (
+            id, wallet_id, market_id, decision_type, signal_ids, order_id,
+            rationale, metrics, created_at, is_sample
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            decision_id,
+            row["wallet_id"],
+            row["market_id"],
+            "paper_reject",
+            "[]",
+            str(request.order_id),
+            request.notes or "Operator rejected PAPER ONLY simulated order.",
+            json.dumps({"paper_only": True, "status": "cancelled"}, sort_keys=True),
+            now.isoformat(),
+            bool(row["is_sample"]),
+        ),
+    )
+    db.conn.commit()
+
+    # Build result
+    result: dict[str, object] = {
+        "id": str(request.order_id),
+        "market_id": row["market_id"],
+        "wallet_id": row["wallet_id"],
+        "side": row["side"],
+        "order_type": row["order_type"],
+        "outcome": row["outcome"],
+        "quantity": float(row["quantity"]),
+        "price": float(row["price"]),
         "status": "cancelled",
         "filled_quantity": 0.0,
-        "created_at": now.isoformat(),
+        "created_at": row["created_at"],
         "updated_at": now.isoformat(),
-        "is_sample": True,
+        "is_sample": bool(row["is_sample"]),
     }
 
-    # Store in idempotency store (duplicate rejection prevention)
-    _persist_paper_result(
-        result,
-        "paper_reject",
-        request.notes or "Operator rejected PAPER ONLY simulated order.",
-    )
-    _idempotency_store.check_and_store("paper_reject", req_hash, result)
+    # Store in idempotency store
+    _idempotency_store.check_and_store(scope, req_hash, result)
 
     return OrderView(
-        id=cancelled_order_id,
-        market_id=UUID(cast(str, result["market_id"])),
-        wallet_id=UUID(cast(str, result["wallet_id"])),
-        side=cast(str, result["side"]),
-        order_type=cast(str, result["order_type"]),
-        outcome=cast(str, result["outcome"]),
-        quantity=float(cast(str, result["quantity"])),
-        price=float(cast(str, result["price"])),
-        status=cast(str, result["status"]),
-        filled_quantity=float(cast(str, result["filled_quantity"])),
-        created_at=now,
+        id=request.order_id,
+        market_id=UUID(row["market_id"]),
+        wallet_id=UUID(row["wallet_id"]),
+        side=row["side"],
+        order_type=row["order_type"],
+        outcome=row["outcome"],
+        quantity=float(row["quantity"]),
+        price=float(row["price"]),
+        status="cancelled",
+        filled_quantity=0.0,
+        created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else now,
         updated_at=now,
-        is_sample=True,
+        is_sample=bool(row["is_sample"]),
     )
 
 

@@ -140,6 +140,35 @@ def _reset_api_state_demo(db_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     get_database(reload=True)
 
 
+
+def _insert_pending_order(order_id: str, market_id: str, *, quantity: float = 10.0, price: float = 0.65) -> None:
+    """Insert an existing pending paper order that approve/reject can transition."""
+    from datetime import datetime, timezone
+
+    from polycopy.db.database import get_database
+
+    db = get_database()
+    now = datetime.now(timezone.utc).isoformat()
+    wallet_id = "00000000-0000-0000-0000-000000000002"
+    db.execute(
+        "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
+        (wallet_id, "0xpaper", "paper", 1, now),
+    )
+    db.execute(
+        "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
+        (market_id, f"paper-{market_id}", "paper", "Paper market", now, 1),
+    )
+    db.execute(
+        """
+        INSERT OR REPLACE INTO orders (
+            id, market_id, wallet_id, side, order_type, outcome, quantity, price,
+            status, filled_quantity, created_at, updated_at, is_sample
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (order_id, market_id, wallet_id, "buy", "limit", "Yes", quantity, price, "pending", 0.0, now, now, 1),
+    )
+    db.conn.commit()
+
 # ---------------------------------------------------------------------------
 # Test 1: Clean DB -> seed -> scan -> persisted data -> API -> restart same IDs
 # ---------------------------------------------------------------------------
@@ -333,6 +362,7 @@ class TestPaperPreviewApproveRestartRetrieve:
         _reset_api_state_demo(seeded_db, monkeypatch)
 
         from polycopy.api.app import app, _bidask_provider
+        from polycopy.db.database import get_database
 
         market_id = "00000000-0000-0000-0000-000000000042"
         _bidask_provider.set_snapshot(
@@ -340,25 +370,35 @@ class TestPaperPreviewApproveRestartRetrieve:
         )
 
         order_id = str(uuid.uuid4())
+        # Seed the pending order
+        db = get_database()
+        now = "2026-06-28T12:00:00+00:00"
+        db.execute(
+            "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000080", "0xtest", "test", 0, now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
+            (market_id, "m1", "test", "Test Q", now, 0),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO orders
+                (id, market_id, wallet_id, side, order_type, outcome, quantity, price,
+                 status, filled_quantity, created_at, updated_at, is_sample)
+            VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 5.0, 0.63, 'pending', 0.0, ?, ?, 0)
+            """,
+            (order_id, market_id, "00000000-0000-0000-0000-000000000080", now, now),
+        )
+        db.conn.commit()
 
         # First session -- approve
         with TestClient(app) as client:
-            preview = client.post(
-                "/paper/preview",
-                json={
-                    "market_id": market_id,
-                    "outcome": "Yes",
-                    "side": "buy",
-                    "quantity": 5,
-                    "price": 0.63,
-                },
-            )
-            assert preview.status_code == 200
-
             approve = client.post("/paper/approve", json={"order_id": order_id, "notes": "e2e approve"})
             assert approve.status_code == 200
             first_order_id = approve.json()["id"]
             first_status = approve.json()["status"]
+            assert first_order_id == order_id
 
         # Simulate restart
         _reset_api_state_demo(seeded_db, monkeypatch)
@@ -381,12 +421,12 @@ class TestPaperPreviewApproveRestartRetrieve:
 # ---------------------------------------------------------------------------
 
 class TestIdempotencyReplay:
-    """Same idempotency key -> no duplicate orders/positions/decisions."""
+    """Same payload/idempotency key -> no duplicate orders/positions/decisions."""
 
     def test_approve_idempotent_no_duplicate(
         self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Approving the same order_id twice returns same result, no duplicates."""
+        """Approving the same existing order twice returns same result, no duplicates."""
         _reset_api_state_demo(seeded_db, monkeypatch)
 
         from polycopy.api.app import app, _bidask_provider
@@ -397,55 +437,43 @@ class TestIdempotencyReplay:
         )
 
         order_id = str(uuid.uuid4())
+        _insert_pending_order(order_id, market_id, quantity=8, price=0.59)
 
         with TestClient(app) as client:
             before_orders = client.get("/paper/orders").json()["total_count"]
             before_decisions = client.get("/decision-log").json()["total_count"]
 
-            # Preview first
-            client.post(
-                "/paper/preview",
-                json={
-                    "market_id": market_id,
-                    "outcome": "Yes",
-                    "side": "buy",
-                    "quantity": 8,
-                    "price": 0.59,
-                },
-            )
-
-            # First approve
             first = client.post(
                 "/paper/approve", json={"order_id": order_id, "notes": "idempotent test"}
             )
             assert first.status_code == 200
             first_id = first.json()["id"]
 
-            # Second approve (same payload -> idempotent replay)
             second = client.post(
                 "/paper/approve", json={"order_id": order_id, "notes": "idempotent test"}
             )
             assert second.status_code == 200
             assert second.json()["id"] == first_id
 
-            # Only one new order and one new decision
             after_orders = client.get("/paper/orders").json()["total_count"]
             after_decisions = client.get("/decision-log").json()["total_count"]
-            assert after_orders == before_orders + 1
+            assert after_orders == before_orders
             assert after_decisions == before_decisions + 1
 
     def test_reject_idempotent_no_duplicate(
         self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Rejecting the same order twice returns same result, no duplicates."""
+        """Rejecting the same existing order twice returns same result, no duplicates."""
         _reset_api_state_demo(seeded_db, monkeypatch)
 
         from polycopy.api.app import app
 
         order_id = str(uuid.uuid4())
+        _insert_pending_order(order_id, "00000000-0000-0000-0000-000000000088")
 
         with TestClient(app) as client:
             before_orders = client.get("/paper/orders").json()["total_count"]
+            before_decisions = client.get("/decision-log").json()["total_count"]
 
             first = client.post(
                 "/paper/reject", json={"order_id": order_id, "notes": "reject test"}
@@ -460,7 +488,9 @@ class TestIdempotencyReplay:
             assert second.json()["id"] == first_id
 
             after_orders = client.get("/paper/orders").json()["total_count"]
-            assert after_orders == before_orders + 1
+            after_decisions = client.get("/decision-log").json()["total_count"]
+            assert after_orders == before_orders
+            assert after_decisions == before_decisions + 1
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +509,7 @@ class TestRejectPendingAndSettlementIdempotency:
         from polycopy.api.app import app
 
         order_id = str(uuid.uuid4())
+        _insert_pending_order(order_id, "00000000-0000-0000-0000-000000000089")
 
         with TestClient(app) as client:
             resp = client.post(

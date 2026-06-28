@@ -1455,27 +1455,59 @@ class TestAPIValidation:
         })
         assert resp.status_code == 422
 
+    @staticmethod
+    def _seed_pending_order(order_id: str):
+        """Seed a pending order in the DB so approve/reject can transition it."""
+        from polycopy.db.database import get_database
+        db = get_database()
+        now = "2026-06-28T12:00:00+00:00"
+        db.execute(
+            "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000002", "0xtest", "test", 0, now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000001", "m1", "test", "Test Q", now, 0),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO orders
+                (id, market_id, wallet_id, side, order_type, outcome, quantity, price,
+                 status, filled_quantity, created_at, updated_at, is_sample)
+            VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 10.0, 0.65, 'pending', 0.0, ?, ?, 0)
+            """,
+            (order_id, "00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002", now, now),
+        )
+        db.conn.commit()
+
     def test_paper_approve_returns_filled(self, client):
+        order_id = "00000000-0000-0000-0000-000000000099"
+        self._seed_pending_order(order_id)
         resp = client.post("/paper/approve", json={
-            "order_id": "00000000-0000-0000-0000-000000000099",
+            "order_id": order_id,
         })
         assert resp.status_code == 200
         data = resp.json()
         # paper_manual mode: order is PENDING then confirm_and_fill → FILLED
         assert data["status"] == "filled"
-        assert data["is_sample"] is True
+        assert data["id"] == order_id
 
     def test_paper_reject_returns_cancelled(self, client):
+        order_id = "00000000-0000-0000-0000-000000000098"
+        self._seed_pending_order(order_id)
         resp = client.post("/paper/reject", json={
-            "order_id": "00000000-0000-0000-0000-000000000099",
+            "order_id": order_id,
         })
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "cancelled"
+        assert data["id"] == order_id
 
     def test_paper_approve_duplicate_idempotent(self, client):
         """Duplicate approval is idempotent: returns same result, status 200."""
-        payload = {"order_id": "00000000-0000-0000-0000-000000000099"}
+        order_id = "00000000-0000-0000-0000-000000000097"
+        self._seed_pending_order(order_id)
+        payload = {"order_id": order_id}
         resp1 = client.post("/paper/approve", json=payload)
         assert resp1.status_code == 200
         data1 = resp1.json()
@@ -1488,7 +1520,9 @@ class TestAPIValidation:
 
     def test_paper_reject_duplicate_idempotent(self, client):
         """Duplicate rejection is idempotent: returns same result, status 200."""
-        payload = {"order_id": "00000000-0000-0000-0000-000000000099"}
+        order_id = "00000000-0000-0000-0000-000000000096"
+        self._seed_pending_order(order_id)
+        payload = {"order_id": order_id}
         resp1 = client.post("/paper/reject", json=payload)
         assert resp1.status_code == 200
         data1 = resp1.json()

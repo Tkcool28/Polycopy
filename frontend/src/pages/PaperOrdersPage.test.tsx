@@ -113,7 +113,7 @@ describe('PaperOrdersPage', () => {
 
     await screen.findByText('pending')
     await user.click(screen.getByRole('button', { name: /approve/i }))
-    expect(api.paperApprove).toHaveBeenCalledWith({ order_id: '00000000-0000-0000-0000-000000000001' })
+    expect(api.paperApprove).toHaveBeenCalledWith({ order_id: '00000000-0000-0000-0000-000000000001', notes: undefined })
   })
 
   it('reject calls API and shows result', async () => {
@@ -130,6 +130,6 @@ describe('PaperOrdersPage', () => {
 
     await screen.findByText('pending')
     await user.click(screen.getByRole('button', { name: /reject/i }))
-    expect(api.paperReject).toHaveBeenCalledWith({ order_id: '00000000-0000-0000-0000-000000000001' })
+    expect(api.paperReject).toHaveBeenCalledWith({ order_id: '00000000-0000-0000-0000-000000000001', notes: undefined })
   })
 })

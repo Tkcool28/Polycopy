@@ -74,8 +74,8 @@ describe('SettingsPage', () => {
     api.config.mockResolvedValue(makeConfig())
     api.dataHealth.mockResolvedValue(makeDataHealth({
       sources: [
-        { source: 'polymarket_clob', last_fetched_at: '2026-06-27T12:00:00Z', status: 'ok', details: 'Connected' },
-        { source: 'gamma_api', last_fetched_at: '2026-06-26T00:00:00Z', status: 'stale', details: 'Data 2h old' },
+        { source: 'polymarket_clob', last_success_at: '2026-06-27T12:00:00Z', last_attempt_at: '2026-06-27T12:01:00Z', status: 'ok', details: 'Connected' },
+        { source: 'gamma_api', last_success_at: '2026-06-26T00:00:00Z', last_attempt_at: '2026-06-26T00:05:00Z', status: 'stale', details: 'Data 2h old' },
       ],
     }))
     render(

@@ -188,8 +188,25 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
     # ── ResolutionProvider ───────────────────────────────────────────────────
 
     async def check_resolution(self, market_id: str) -> Optional[Market]:
-        """Check resolution via Gamma API."""
-        return await self.get_market(market_id)
+        """Return a market only when Gamma confirms a valid, final resolution."""
+        client = await self._get_client()
+        resp = await client.get(f"/markets/{market_id}")
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("disputed") or data.get("dispute"):
+            return None
+        market = self._parse_gamma_market(data)
+        if not market.resolved or not market.closed:
+            return None
+        if not market.resolution_outcome:
+            return None
+        valid_outcomes = {outcome.label for outcome in market.outcomes}
+        if market.resolution_outcome not in valid_outcomes:
+            return None
+        return market
+
 
     async def list_resolved_since(self, since_timestamp: str, limit: int = 100) -> list[Market]:
         """List resolved markets. Gamma API supports closed=true filter."""

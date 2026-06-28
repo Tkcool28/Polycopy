@@ -191,7 +191,7 @@ export function makeDecisionLog(overrides: Partial<DecisionLogResponse> = {}): D
 export function makeDataHealth(overrides: Partial<DataHealthResponse> = {}): DataHealthResponse {
   return {
     sources: [
-      { source: 'polymarket_clob', last_fetched_at: '2026-06-27T12:00:00Z', status: 'ok', details: 'Connected' },
+      { source: 'polymarket_clob', last_success_at: '2026-06-27T12:00:00Z', last_attempt_at: '2026-06-27T12:00:00Z', status: 'ok', details: 'Connected' },
     ],
     snapshot_count: 42,
     oldest_snapshot: '2026-06-26T00:00:00Z',

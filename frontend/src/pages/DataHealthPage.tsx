@@ -64,7 +64,8 @@ export function DataHealthPage() {
               <tr>
                 <th>Source</th>
                 <th>Status</th>
-                <th>Last Fetched</th>
+                <th>Last Success</th>
+                <th>Last Attempt</th>
                 <th>Details</th>
               </tr>
             </thead>
@@ -81,8 +82,11 @@ export function DataHealthPage() {
                       {s.status}
                     </span>
                   </td>
-                  <td data-label="Last Fetched" style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                    {s.last_fetched_at ? formatDateTime(s.last_fetched_at) : '—'}
+                  <td data-label="Last Success" style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    {s.last_success_at ? formatDateTime(s.last_success_at) : '—'}
+                  </td>
+                  <td data-label="Last Attempt" style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    {s.last_attempt_at ? formatDateTime(s.last_attempt_at) : '—'}
                   </td>
                   <td data-label="Details" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
                     {s.details}

@@ -51,12 +51,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  paperApprove: (body: { order_id: string }) =>
+  paperApprove: (body: { order_id: string; notes?: string }) =>
     request<{ status: string; detail?: string }>('/paper/approve', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  paperReject: (body: { order_id: string }) =>
+  paperReject: (body: { order_id: string; notes?: string }) =>
     request<{ status: string; detail?: string }>('/paper/reject', {
       method: 'POST',
       body: JSON.stringify(body),

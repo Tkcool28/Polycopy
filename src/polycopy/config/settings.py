@@ -152,6 +152,10 @@ class Settings(BaseSettings):
         default=30.0,
         description="Delay before paper orders can fill in paper_manual mode.",
     )
+    order_preview_max_age_seconds: float = Field(
+        default=3600.0,
+        description="Max age (seconds) of a pending order before it expires and cannot be approved.",
+    )
     use_conservative_mark: bool = Field(
         default=False,
         description="If True, mark positions at bid price (worst-case) instead of mid.",

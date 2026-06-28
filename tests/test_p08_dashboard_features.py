@@ -153,20 +153,48 @@ class TestPaperOrderPreviewBackend:
 
 
 class TestPaperOrderApproveReject:
+    @staticmethod
+    def _seed_pending_order(order_id: str):
+        """Seed a pending order in the DB so approve/reject can transition it."""
+        from polycopy.db.database import get_database
+        db = get_database()
+        now = "2026-06-28T12:00:00+00:00"
+        db.execute(
+            "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000002", "0xtest", "test", 0, now),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
+            ("00000000-0000-0000-0000-000000000001", "m1", "test", "Test Q", now, 0),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO orders
+                (id, market_id, wallet_id, side, order_type, outcome, quantity, price,
+                 status, filled_quantity, created_at, updated_at, is_sample)
+            VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 10.0, 0.65, 'pending', 0.0, ?, ?, 0)
+            """,
+            (order_id, "00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002", now, now),
+        )
+        db.conn.commit()
+
     def test_approve_returns_accepted(self):
         order_id = str(uuid4())
+        self._seed_pending_order(order_id)
         r = client.post("/paper/approve", json={"order_id": order_id})
         assert r.status_code == 200
         assert r.json()["status"] == "filled"
 
     def test_reject_returns_cancelled(self):
         order_id = str(uuid4())
+        self._seed_pending_order(order_id)
         r = client.post("/paper/reject", json={"order_id": order_id})
         assert r.status_code == 200
         assert r.json()["status"] == "cancelled"
 
     def test_approve_idempotency_duplicate(self):
         order_id = str(uuid4())
+        self._seed_pending_order(order_id)
         r1 = client.post("/paper/approve", json={"order_id": order_id})
         assert r1.status_code == 200
         r2 = client.post("/paper/approve", json={"order_id": order_id})

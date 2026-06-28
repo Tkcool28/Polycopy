@@ -167,12 +167,14 @@ class PaperOrderApproveRequest(BaseModel):
     """Request to approve (confirm and fill) a pending paper order."""
     order_id: UUID = Field(description="ID of the pending order to approve.")
     notes: Optional[str] = Field(default=None, description="Optional operator rationale / decision note.")
+    idempotency_key: Optional[str] = Field(default=None, description="Optional client-supplied idempotency key.")
 
 
 class PaperOrderRejectRequest(BaseModel):
     """Request to reject (cancel) a pending paper order."""
     order_id: UUID = Field(description="ID of the pending order to reject.")
     notes: Optional[str] = Field(default=None, description="Operator rationale for rejection.")
+    idempotency_key: Optional[str] = Field(default=None, description="Optional client-supplied idempotency key.")
 
 
 class OrderView(BaseModel):
