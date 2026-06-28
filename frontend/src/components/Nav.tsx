@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { to: '/portfolio', label: 'Portfolio', icon: '▤' },
   { to: '/risk', label: 'Risk', icon: '⚠' },
   { to: '/experiments', label: 'Experiments', icon: '⚗' },
+  { to: '/data-health', label: 'Data Health', icon: '◉' },
   { to: '/settings', label: 'Settings', icon: '⚙' },
 ];
 
