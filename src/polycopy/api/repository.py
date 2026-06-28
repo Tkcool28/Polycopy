@@ -248,13 +248,126 @@ class DashboardRepository:
         return ExperimentMetricsResponse(experiments=experiments, total_count=total, profitable_count=profitable, is_sample_data=any(e.is_sample for e in experiments))
 
     def data_health(self) -> DataHealthResponse:
-        rows = self.db.fetchall("SELECT source, COUNT(*) AS n, MIN(fetched_at) AS oldest, MAX(fetched_at) AS newest, MAX(is_sample) AS is_sample FROM raw_snapshots GROUP BY source ORDER BY source")
-        if not rows and self.demo_enabled:
-            return DataHealthResponse(sources=[SourceHealthView(source=f"sample_snapshot_source [{SAMPLE_LABEL}]", last_fetched_at=SAMPLE_TIME, status="ok", details="Demo mode enabled; sample provenance only.")], snapshot_count=1, oldest_snapshot=SAMPLE_TIME, newest_snapshot=SAMPLE_TIME, overall_status="healthy")
-        sources = [SourceHealthView(source=self._label(row["source"], bool(row["is_sample"])), last_fetched_at=_dt(row["newest"]), status="ok" if row["n"] else "unavailable", details=f"{row['n']} persisted snapshots") for row in rows]
-        count_row = self.db.fetchone("SELECT COUNT(*) AS n, MIN(fetched_at) AS oldest, MAX(fetched_at) AS newest FROM raw_snapshots")
+        """Build data health response from provider_health + raw_snapshots tables."""
+        from polycopy.risk.freshness import seconds_since
+
+        # Check provider_health table
+        ph_rows = self.db.fetchall(
+            "SELECT provider, capability, status, last_success, last_attempt, "
+            "http_status, error_message, live_count, sample_count, is_sample "
+            "FROM provider_health ORDER BY provider, capability"
+        )
+
+        # Fallback: if no provider_health rows exist, derive from raw_snapshots
+        if not ph_rows:
+            rows = self.db.fetchall(
+                "SELECT source, COUNT(*) AS n, MIN(fetched_at) AS oldest, "
+                "MAX(fetched_at) AS newest, MAX(is_sample) AS is_sample "
+                "FROM raw_snapshots GROUP BY source ORDER BY source"
+            )
+            if not rows and self.demo_enabled:
+                return DataHealthResponse(
+                    sources=[SourceHealthView(
+                        source=f"sample_snapshot_source [{SAMPLE_LABEL}]",
+                        last_success_at=SAMPLE_TIME,
+                        last_attempt_at=SAMPLE_TIME,
+                        status="ok",
+                        live_count=0,
+                        sample_count=1,
+                        is_sample=True,
+                        details="Demo mode enabled; sample provenance only.",
+                    )],
+                    snapshot_count=1,
+                    oldest_snapshot=SAMPLE_TIME,
+                    newest_snapshot=SAMPLE_TIME,
+                    missing_capabilities=[],
+                    overall_status="healthy",
+                )
+
+            sources = []
+            for row in rows:
+                newest = _dt(row["newest"])
+                freshness = seconds_since(newest) if newest else None
+                status = "ok" if row["n"] else "unavailable"
+                if freshness is not None and freshness > 300:
+                    status = "stale"
+                sources.append(SourceHealthView(
+                    source=self._label(row["source"], bool(row["is_sample"])),
+                    last_success_at=newest,
+                    last_attempt_at=newest,
+                    status=status,
+                    live_count=row["n"] if not row["is_sample"] else 0,
+                    sample_count=row["n"] if row["is_sample"] else 0,
+                    is_sample=bool(row["is_sample"]),
+                    freshness_seconds=freshness,
+                    details=f"{row['n']} persisted snapshots",
+                ))
+            count_row = self.db.fetchone(
+                "SELECT COUNT(*) AS n, MIN(fetched_at) AS oldest, MAX(fetched_at) AS newest FROM raw_snapshots"
+            )
+            count = int(count_row["n"] if count_row else 0)
+            missing = []
+            overall = "unavailable" if count == 0 else "healthy"
+            return DataHealthResponse(
+                sources=sources,
+                snapshot_count=count,
+                oldest_snapshot=_dt(count_row["oldest"]) if count_row else None,
+                newest_snapshot=_dt(count_row["newest"]) if count_row else None,
+                missing_capabilities=missing,
+                overall_status=overall,
+            )
+
+        # Build from provider_health rows
+        sources = []
+        missing_capabilities = []
+        for row in ph_rows:
+            last_success = _dt(row["last_success"]) if row["last_success"] else None
+            last_attempt = _dt(row["last_attempt"]) if row["last_attempt"] else None
+            freshness = seconds_since(last_success) if last_success else None
+
+            status = row["status"]
+            if status == "ok" and freshness is not None and freshness > 300:
+                status = "stale"
+            if status == "disabled":
+                missing_capabilities.append(f"{row['provider']}.{row['capability']}")
+
+            sources.append(SourceHealthView(
+                source=f"{row['provider']}.{row['capability']}",
+                last_success_at=last_success,
+                last_attempt_at=last_attempt,
+                status=status,
+                http_status=row["http_status"],
+                live_count=row["live_count"],
+                sample_count=row["sample_count"],
+                is_sample=bool(row["is_sample"]),
+                error_message=row["error_message"] or "",
+                freshness_seconds=freshness,
+                details=f"{row['live_count']} live / {row['sample_count']} sample",
+            ))
+
+        count_row = self.db.fetchone(
+            "SELECT COUNT(*) AS n, MIN(fetched_at) AS oldest, MAX(fetched_at) AS newest FROM raw_snapshots"
+        )
         count = int(count_row["n"] if count_row else 0)
-        return DataHealthResponse(sources=sources, snapshot_count=count, oldest_snapshot=_dt(count_row["oldest"]) if count_row else None, newest_snapshot=_dt(count_row["newest"]) if count_row else None, overall_status="unavailable" if count == 0 else "healthy")
+
+        # Determine overall status
+        if not sources:
+            overall = "unavailable"
+        elif all(s.status == "ok" for s in sources):
+            overall = "healthy"
+        elif any(s.status in ("ok", "stale", "partial") for s in sources):
+            overall = "degraded"
+        else:
+            overall = "unavailable"
+
+        return DataHealthResponse(
+            sources=sources,
+            snapshot_count=count,
+            oldest_snapshot=_dt(count_row["oldest"]) if count_row and count_row["oldest"] else None,
+            newest_snapshot=_dt(count_row["newest"]) if count_row and count_row["newest"] else None,
+            missing_capabilities=missing_capabilities,
+            overall_status=overall,
+        )
 
     def risk_console(self, settings: Settings) -> RiskConsoleResponse:
         summary = self.portfolio_summary()

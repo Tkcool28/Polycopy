@@ -281,8 +281,15 @@ class ExperimentMetricsResponse(BaseModel):
 
 class SourceHealthView(BaseModel):
     source: str
-    last_fetched_at: Optional[datetime] = None
-    status: str = Field(description="ok | stale | unavailable")
+    last_success_at: Optional[datetime] = None
+    last_attempt_at: Optional[datetime] = None
+    status: str = Field(description="ok | partial | failure | disabled | unavailable")
+    http_status: Optional[int] = None
+    live_count: int = 0
+    sample_count: int = 0
+    error_message: str = ""
+    freshness_seconds: Optional[float] = None
+    is_sample: bool = False
     details: str = ""
 
 
@@ -291,6 +298,7 @@ class DataHealthResponse(BaseModel):
     snapshot_count: int
     oldest_snapshot: Optional[datetime] = None
     newest_snapshot: Optional[datetime] = None
+    missing_capabilities: list[str] = Field(default_factory=list)
     overall_status: str = Field(description="healthy | degraded | unavailable")
 
 

@@ -7,7 +7,7 @@ schema version. Each migration is a list of SQL statements.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ── Version 1: initial schema ───────────────────────────────────────────────────
 _V1_DDL: list[str] = [
@@ -188,10 +188,30 @@ _V1_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_snapshots_fetched ON raw_snapshots(fetched_at);",
 ]
 
+# ── Version 2: provider health tracking ─────────────────────────────────────────
+_V2_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS provider_health (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider      TEXT NOT NULL,
+        capability    TEXT NOT NULL,
+        status        TEXT NOT NULL,
+        last_success  TEXT,
+        last_attempt  TEXT,
+        http_status   INTEGER,
+        error_message TEXT,
+        sample_count  INTEGER NOT NULL DEFAULT 0,
+        live_count    INTEGER NOT NULL DEFAULT 0,
+        is_sample     INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(provider, capability)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_provider_health_provider ON provider_health(provider);",
+]
+
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version from (version - 1).
 MIGRATIONS: dict[int, list[str]] = {
     1: _V1_DDL,
+    2: _V2_DDL,
 }
 
 # Current DDL is the latest migration
