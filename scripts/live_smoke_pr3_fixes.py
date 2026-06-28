@@ -108,7 +108,7 @@ async def main() -> int:
         kv("error", cap["error"])
 
     banner("Fetch global window (real data-api /trades?limit=1000)")
-    raw_window = await a._fetch_global_window(max_age_seconds=0.0)
+    raw_window, _fresh = await a._fetch_global_window(max_age_seconds=0.0)
     kv("raw rows fetched", len(raw_window))
     if not raw_window:
         print("  !! empty window — cannot continue smoke")

@@ -739,10 +739,12 @@ def test_429_retry_handled():
         finally:
             await a.aclose()
 
-    result = asyncio.run(run())
+    result, fresh = asyncio.run(run())
     assert call_count["n"] >= 2, f"expected retry, only {call_count['n']} calls"
     assert isinstance(result, list)
     assert len(result) >= 1, "expected at least 1 trade after retry"
+    # The retry path is the one that actually returned data, so fresh=True.
+    assert fresh is True, "fresh_fetch must be True on the successful retry"
 
 
 # ─── Test 16: window cache age respected ─────────────────────────────────
@@ -762,13 +764,16 @@ def test_window_cache_within_max_age():
         a.data_api_request_interval_seconds = 0.0
         try:
             # First fetch — populates cache
-            w1 = await a._fetch_global_window()
+            w1, fresh1 = await a._fetch_global_window()
             # Second fetch within cache window — should use cache
-            w2 = await a._fetch_global_window()
-            return w1, w2, call_count["n"]
+            w2, fresh2 = await a._fetch_global_window()
+            return w1, w2, fresh1, fresh2, call_count["n"]
         finally:
             await a.aclose()
 
-    w1, w2, n = asyncio.run(run())
+    w1, w2, fresh1, fresh2, n = asyncio.run(run())
     assert n == 1, f"expected 1 HTTP call (cached), got {n}"
     assert len(w1) == len(w2)
+    # First call was a fresh fetch; second was a cache hit.
+    assert fresh1 is True, "first call must be fresh"
+    assert fresh2 is False, "second call must be a cache hit"

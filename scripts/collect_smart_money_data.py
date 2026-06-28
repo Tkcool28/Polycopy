@@ -246,10 +246,13 @@ class PolymarketCollector:
             result = CollectionResult()
 
         # Save snapshot of the global window (best-effort) — captures provenance.
+        # P3 fix (PR #3): only snapshot on a REAL upstream fetch, not on every
+        # per-market call that hits the cached window. Otherwise an N-market run
+        # inflates ``snapshots_saved`` by N even though only one HTTP call was made.
         try:
             adapter = await self._get_trade_adapter()
-            window = await adapter._fetch_global_window()
-            if window:
+            window, fresh = await adapter._fetch_global_window()
+            if window and fresh:
                 self._save_snapshot(
                     db=db,
                     source="polymarket_data_api",

@@ -45,6 +45,21 @@ from polycopy.domain.source_trade import SourceTrade, is_sentinel_trader_address
 from polycopy.engine.evaluate import evaluate_wallet
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
 
+# Shared live-trade ingestion helper (PR #3 P2 fix). Imports are at module
+# scope so both run_scan and collect_smart_money_data consume the SAME
+# PolymarketPublicAdapter construction path and the SAME normalization.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from _live_ingest import (  # type: ignore[import-not-found]
+        PolymarketPublicAdapter,  # re-exported for type annotations
+        build_trade_adapter,
+        fetch_recent_trades_for_market,
+    )
+except ImportError:  # pragma: no cover — defensive: fall back to direct adapter import
+    from polycopy.adapters.polymarket import PolymarketPublicAdapter  # type: ignore[no-redef]
+    fetch_recent_trades_for_market = None  # type: ignore[assignment]
+    build_trade_adapter = None  # type: ignore[assignment] 
+
 logger = logging.getLogger(__name__)
 
 
@@ -486,32 +501,66 @@ async def _fetch_markets(
 
 
 async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[SourceTrade]:
-    """Fetch trades for a market or return sample trades."""
+    """Fetch trades for a market or return sample trades.
+
+    P2 fix (PR #3): live ``use_sample=False`` mode used to hit a legacy
+    ``settings.gamma_base_url + /trades`` endpoint, which has never existed
+    on Gamma (returns 404) and which silently fabricated ``polymarket_clob``
+    trades via the local ``_parse_clob_trade`` shim. The actual public,
+    unauthenticated trade source is the data-api
+    (``data-api.polymarket.com/trades``), wired through the shared
+    :class:`PolymarketPublicAdapter`. We now route BOTH ``run_scan`` and
+    ``collect_smart_money_data`` through the same adapter so the
+    normalization and snapshot provenance are identical.
+
+    Behavior contract:
+      - ``use_sample=True`` → returns the existing labeled sample trades
+        unchanged (no adapter call).
+      - ``use_sample=False`` → uses the shared adapter, returns [] on any
+        network/parse failure (graceful degradation; no crash).
+      - The global window is fetched ONCE per scan and reused for every
+        market in the run, courtesy of the adapter's in-process cache.
+    """
     if use_sample:
         return _get_sample_trades(market_source_id)
 
-    import httpx
-    settings = get_settings()
-    async with httpx.AsyncClient(base_url=settings.gamma_base_url, timeout=settings.http_timeout_seconds) as client:
-        try:
-            resp = await client.get("/trades", params={"condition_id": market_source_id})
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, list):
-                data = [data] if data else []
+    adapter = _get_scan_trade_adapter()
+    # Pass epoch-zero as ``since`` so the adapter returns the FULL global
+    # window (the data-api hard-caps at ~1000 trades). A scan run wants the
+    # complete recent picture, not a per-call delta. The collector uses
+    # ``since=start_of_today`` for incremental ingestion — run_scan is
+    # deliberately different: it's a snapshot of current state.
+    return await fetch_recent_trades_for_market(
+        adapter,
+        market_source_id=market_source_id,
+        since=datetime.fromtimestamp(0, tz=timezone.utc),
+        limit=200,
+    )
 
-            trades = []
-            for item in data:
-                try:
-                    trade = _parse_clob_trade(item, market_source_id)
-                    if trade:
-                        trades.append(trade)
-                except Exception:
-                    pass
-            return trades
-        except Exception as e:
-            result.missing_data.append(f"Trades unavailable for {market_source_id}: {e}")
-            return []
+
+# ── Shared adapter wiring (PR #3 P2) ───────────────────────────────────────
+#
+# ``run_scan`` and ``collect_smart_money_data`` MUST go through the SAME
+# PolymarketPublicAdapter construction path so they share settings, cache,
+# and normalization. We import lazily so ``scripts/run_scan.py`` stays
+# runnable without forcing scripts._live_ingest to be on sys.path at import
+# time when no live trade fetch is needed.
+_SCAN_TRADE_ADAPTER: "PolymarketPublicAdapter | None" = None
+
+
+def _get_scan_trade_adapter() -> "PolymarketPublicAdapter":
+    """Return the process-wide shared PolymarketPublicAdapter for run_scan.
+
+    Lazily constructs it on first use and reuses the same instance for the
+    rest of the process so the global-window cache (one HTTP fetch per scan)
+    is honored across all per-market ``_fetch_trades`` calls.
+    """
+    global _SCAN_TRADE_ADAPTER
+    if _SCAN_TRADE_ADAPTER is None:
+        from scripts._live_ingest import build_trade_adapter  # type: ignore[import-not-found]
+
+        _SCAN_TRADE_ADAPTER = build_trade_adapter()
+    return _SCAN_TRADE_ADAPTER
 
 
 def _parse_gamma_market(data: dict) -> Market:
@@ -544,37 +593,18 @@ def _parse_gamma_market(data: dict) -> Market:
 
 
 def _parse_clob_trade(data: dict, market_source_id: str) -> SourceTrade | None:
-    try:
-        side_raw = str(data.get("side", "")).lower()
-        if side_raw in ("buy", "1"):
-            side = OrderSide.BUY
-        elif side_raw in ("sell", "0"):
-            side = OrderSide.SELL
-        else:
-            return None
+    """DEPRECATED legacy CLOB-trade shim.
 
-        ts_raw = data.get("timestamp") or data.get("createdAt")
-        if ts_raw is None:
-            ts = datetime.now(timezone.utc)
-        elif isinstance(ts_raw, (int, float)):
-            ts = datetime.fromtimestamp(ts_raw / 1000.0 if ts_raw > 1e12 else ts_raw, tz=timezone.utc)
-        else:
-            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-
-        return SourceTrade(
-            source="polymarket_clob",
-            source_trade_id=str(data.get("id", data.get("trade_id", uuid.uuid4().hex))),
-            market_source_id=market_source_id,
-            side=side,
-            outcome=str(data.get("outcome", data.get("token", "Yes"))),
-            quantity=float(data.get("size", data.get("quantity", 0))),
-            price=float(data.get("price", 0)),
-            trader_address=str(data.get("maker", data.get("trader", "unknown"))),
-            timestamp=ts,
-            is_sample=False,
-        )
-    except (ValueError, TypeError):
-        return None
+    PR #3 P2 fix removed the live ``gamma_base_url + /trades`` call path
+    from ``_fetch_trades``; ``run_scan`` now uses the shared
+    ``PolymarketPublicAdapter`` (data-api), same as
+    ``collect_smart_money_data``. This shim is retained only as a
+    no-op safety net for any stray imports — it always returns ``None``
+    so it cannot accidentally synthesize trades from raw CLOB payloads.
+    New callers MUST go through the shared adapter path
+    (``scripts/_live_ingest.fetch_recent_trades_for_market``).
+    """
+    return None
 
 
 def _persist_market(db: Database, market: Market) -> None:

@@ -314,12 +314,24 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
             await _asyncio_sleep(remaining)
         self._last_data_call_at = time.monotonic()
 
-    async def _fetch_global_window(self, max_age_seconds: float = 30.0) -> list[dict]:
+    async def _fetch_global_window(
+        self, max_age_seconds: float = 30.0
+    ) -> tuple[list[dict], bool]:
         """Fetch a single global trades window from data-api.
 
-        Returns the list of raw trade dicts. Cached for `max_age_seconds`
-        within this adapter instance to avoid hammering the upstream.
-        On any HTTP error, returns the cached window (possibly empty) and logs.
+        Returns ``(window, fresh_fetch)`` where:
+          - ``window`` is the list of raw trade dicts (cached between calls).
+          - ``fresh_fetch`` is True iff a NEW HTTP fetch happened on this call.
+            False indicates a cache hit (a recent fetch is still within
+            ``max_age_seconds`` of validity). Callers MUST use ``fresh_fetch``
+            to avoid double-counting work that was already done (e.g. snapshot
+            provenance must be written exactly once per real upstream fetch,
+            not once per market that consumed the cached window).
+
+        Cached for ``max_age_seconds`` within this adapter instance to avoid
+        hammering the upstream. On any HTTP error, returns the cached window
+        (possibly empty) with ``fresh_fetch=False`` so callers can distinguish
+        a real fetch from a degraded fallback.
         """
         now = time.monotonic()
         if (
@@ -331,7 +343,7 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
                 len(self._window_trades),
                 now - self._window_lock_time,
             )
-            return list(self._window_trades)
+            return list(self._window_trades), False
 
         await self._throttle()
         client = await self._get_data_client()
@@ -358,11 +370,12 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
                 str(exc)[:300],
             )
             # Return last-good window (possibly empty); do NOT raise.
-            return list(self._window_trades)
+            # ``fresh_fetch=False`` so callers don't snapshot a degraded fallback.
+            return list(self._window_trades), False
 
         if not isinstance(data, list):
             logger.warning("data-api /trades returned non-list: %s", type(data).__name__)
-            return list(self._window_trades)
+            return list(self._window_trades), False
 
         self._window_trades = [t for t in data if isinstance(t, dict)]
         self._window_lock_time = time.monotonic()
@@ -372,7 +385,7 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
             len(self._window_trades),
             self.data_api_window_size,
         )
-        return list(self._window_trades)
+        return list(self._window_trades), True
 
     # ── Trade parsing (shared) ─────────────────────────────────────────────
 
@@ -576,7 +589,7 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
         `wallet_attribution_available` is therefore True whenever this method
         returns non-empty.
         """
-        window = await self._fetch_global_window()
+        window, _fresh = await self._fetch_global_window()
         if not window:
             logger.debug(
                 "get_recent_trades: empty global window for market %s", market_source_id
