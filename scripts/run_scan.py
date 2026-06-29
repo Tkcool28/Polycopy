@@ -542,9 +542,19 @@ async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[S
 #
 # ``run_scan`` and ``collect_smart_money_data`` MUST go through the SAME
 # PolymarketPublicAdapter construction path so they share settings, cache,
-# and normalization. We import lazily so ``scripts/run_scan.py`` stays
-# runnable without forcing scripts._live_ingest to be on sys.path at import
-# time when no live trade fetch is needed.
+# and normalization. ``build_trade_adapter`` is imported at module scope
+# above (see the ``try: from _live_ingest import build_trade_adapter`` block
+# near the top of this file). We reuse that single import below so the
+# module stays runnable via direct absolute-path execution
+# (``python scripts/run_scan.py`` from any cwd, no PYTHONPATH) AND via
+# package-style execution (``python -m scripts.run_scan``).
+#
+# IMPORTANT: do NOT add a second ``from scripts._live_ingest import …``
+# here. That package-style import requires ``scripts`` to be importable as
+# a package, which is only true when running ``python -m scripts.run_scan``
+# from the repo root — it fails for the direct-execution CLI startup path
+# with ``ModuleNotFoundError: No module named 'scripts'`` and for the
+# mocked live path the smoke test uses.
 _SCAN_TRADE_ADAPTER: "PolymarketPublicAdapter | None" = None
 
 
@@ -554,11 +564,21 @@ def _get_scan_trade_adapter() -> "PolymarketPublicAdapter":
     Lazily constructs it on first use and reuses the same instance for the
     rest of the process so the global-window cache (one HTTP fetch per scan)
     is honored across all per-market ``_fetch_trades`` calls.
+
+    Uses the module-scoped ``build_trade_adapter`` import — never re-imports
+    under a package-style name. See the comment above the constant.
     """
     global _SCAN_TRADE_ADAPTER
     if _SCAN_TRADE_ADAPTER is None:
-        from scripts._live_ingest import build_trade_adapter  # type: ignore[import-not-found]
-
+        if build_trade_adapter is None:  # pragma: no cover — defensive
+            # The module-scope ``try: from _live_ingest import …`` block fell
+            # back to a stub because scripts/ wasn't on sys.path. That only
+            # happens if someone has stripped ``sys.path`` to an extreme;
+            # we still refuse to crash here and surface a clear error.
+            raise RuntimeError(
+                "scripts/_live_ingest.build_trade_adapter is unavailable; "
+                "scripts/ must be importable to use the live trade path"
+            )
         _SCAN_TRADE_ADAPTER = build_trade_adapter()
     return _SCAN_TRADE_ADAPTER
 
