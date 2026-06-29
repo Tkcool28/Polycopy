@@ -193,26 +193,33 @@ async def run_scan(
     all_trades = []
     for market in markets:
         trades = await _fetch_trades(db, market.source_id, now, result, use_sample)
-        all_trades.extend(trades)
-
         # Round 7 (P2 fix): persist fetched trades into source_trades BEFORE
         # wallet scoring so that ``_compute_wallet_metrics`` actually sees
         # the live trade history. Anonymous and sentinel-attributed trades
         # persist with ``trader_address=None``; only attributed trades
-        # become wallet rows.
+        # become wallet rows. If persistence fails, the trade is excluded from
+        # wallet discovery/scoring so we never score against missing raw history.
+        persisted_trades: list[SourceTrade] = []
         for trade in trades:
             result.trades_fetched += 1
-            inserted = _persist_trade(db, trade)
-            if inserted:
+            persist_result = _persist_trade(db, trade)
+            if persist_result is None:
+                result.errors.append(
+                    f"Failed to persist trade {trade.source_trade_id}; skipped wallet scoring"
+                )
+                continue
+            if persist_result:
                 result.trades_persisted += 1
+            persisted_trades.append(trade)
             if is_sentinel_trader_address(trade.trader_address):
                 # Anonymous or sentinel — persists as NULL, never becomes a wallet.
                 result.anonymous_trades += 1
             else:
                 result.trades_attributed += 1
+        all_trades.extend(persisted_trades)
 
         # Discover wallets from attributed trades only
-        for trade in trades:
+        for trade in persisted_trades:
             # Sentinel filter: skip NULL and legacy sentinel trader_address
             # values so they never end up as wallet rows.
             if is_sentinel_trader_address(trade.trader_address):
@@ -564,7 +571,7 @@ async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[S
     )
 
 
-def _persist_trade(db: Database, trade: SourceTrade) -> bool:
+def _persist_trade(db: Database, trade: SourceTrade) -> bool | None:
     """Persist one ``SourceTrade`` into ``source_trades``.
 
     Round 7 (P2 fix): live scan must persist fetched trades BEFORE
@@ -575,9 +582,9 @@ def _persist_trade(db: Database, trade: SourceTrade) -> bool:
     ``deterministic_source_trade_id_v2``) both persist.
 
     Returns True if a new row was inserted, False if the row already
-    existed (idempotent retry) or the insertion failed. Failures are
-    recorded on the result so the orchestrator can decide whether to
-    skip downstream scoring.
+    existed (idempotent retry), and None if the insertion failed. Callers
+    MUST NOT score wallets for trades that return None because the raw
+    trade history is not available to ``_compute_wallet_metrics``.
     """
     try:
         cur = db.execute(
@@ -612,7 +619,7 @@ def _persist_trade(db: Database, trade: SourceTrade) -> bool:
             db.conn.rollback()
         except Exception:
             pass
-        return False
+        return None
 
 
 # ── Shared adapter wiring (PR #3 P2) ───────────────────────────────────────

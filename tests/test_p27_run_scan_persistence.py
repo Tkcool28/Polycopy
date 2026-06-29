@@ -147,3 +147,79 @@ async def test_run_scan_persists_raw_trades_before_wallet_metrics_and_scoring(
         assert wallet_addresses == [real_wallet]
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_run_scan_skips_wallet_scoring_when_trade_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed raw-trade insert must not proceed to false wallet scoring.
+
+    The scanner may continue processing other persisted/anonymous rows, but a
+    wallet from a trade that failed to persist must not be discovered, scored,
+    or included in attributed-trade processing.
+    """
+    market = _market()
+    real_wallet = "0xabcdef0000000000000000000000000000000001"
+    fetched = [
+        _trade(market.source_id, "p27-persist-fails", real_wallet),
+        _trade(market.source_id, "p27-anonymous-persists", None),
+    ]
+    metrics_called = False
+
+    async def fake_fetch_markets(db, settings, limit, result, use_sample):
+        return [market]
+
+    async def fake_fetch_trades(db, market_source_id, now, result, use_sample):
+        assert market_source_id == market.source_id
+        return fetched
+
+    def fake_generate_signals(db, markets, now):
+        return []
+
+    original_persist_trade = run_scan_module._persist_trade  # noqa: SLF001
+
+    def fail_attributed_trade(db, trade):
+        if trade.source_trade_id == "p27-persist-fails":
+            return None
+        return original_persist_trade(db, trade)
+
+    def fail_if_scoring_runs(db, address, now):
+        nonlocal metrics_called
+        metrics_called = True
+        raise AssertionError("wallet scoring must not run for an unpersisted trade")
+
+    monkeypatch.setattr(run_scan_module, "_fetch_markets", fake_fetch_markets)
+    monkeypatch.setattr(run_scan_module, "_fetch_trades", fake_fetch_trades)
+    monkeypatch.setattr(run_scan_module, "_generate_signals", fake_generate_signals)
+    monkeypatch.setattr(run_scan_module, "_persist_trade", fail_attributed_trade)
+    monkeypatch.setattr(run_scan_module, "_compute_wallet_metrics", fail_if_scoring_runs)
+    monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p27.sqlite"))
+
+    db = _db(tmp_path)
+    try:
+        result = await run_scan_module.run_scan(db, market_limit=1, use_sample=False)
+
+        assert metrics_called is False
+        assert result.trades_fetched == 2
+        assert result.trades_persisted == 1
+        assert result.trades_attributed == 0
+        assert result.anonymous_trades == 1
+        assert result.trades_processed == 0
+        assert result.wallets_discovered == 0
+        assert result.wallets_scored == 0
+        assert result.errors == [
+            "Failed to persist trade p27-persist-fails; skipped wallet scoring"
+        ]
+
+        persisted = db.fetchall(
+            "SELECT source_trade_id, trader_address FROM source_trades "
+            "ORDER BY source_trade_id"
+        )
+        assert [(r["source_trade_id"], r["trader_address"]) for r in persisted] == [
+            ("p27-anonymous-persists", None),
+        ]
+        assert db.fetchall("SELECT address FROM wallets") == []
+    finally:
+        db.close()
