@@ -264,9 +264,6 @@ class PolymarketCollector:
         except Exception as e:
             logger.debug("snapshot save skipped for market %s: %s", market_source_id, e)
 
-        if since is None:
-            since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
         try:
             trades = await adapter.fetch_trades_for_market(
                 market_source_id=market_source_id,
