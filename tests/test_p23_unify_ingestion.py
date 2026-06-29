@@ -641,10 +641,12 @@ class TestSharedHelper:
         assert isinstance(a, PolymarketPublicAdapter)
         assert a.data_api_base_url == "https://data-api.example.com"
 
-    def test_fetch_recent_trades_returns_empty_on_adapter_error(self):
-        """If the underlying adapter raises, the shared helper returns []."""
+    def test_fetch_recent_trades_returns_failed_on_adapter_error(self):
+        """If the underlying adapter raises, the shared helper returns a
+        :class:`MarketTradeFetchResult` with ``status="failed"`` (round-10
+        fetch-result contract)."""
         class _BoomAdapter:
-            async def get_recent_trades(self, **kwargs):
+            async def fetch_trades_for_market(self, **kwargs):
                 raise RuntimeError("network down")
 
         async def run():
@@ -655,7 +657,9 @@ class TestSharedHelper:
             )
 
         out = asyncio.run(run())
-        assert out == []
+        assert out.status == "failed"
+        assert len(out) == 0
+        assert out.error is not None and "network down" in out.error
 
 
 # ─── Adapter: _fetch_global_window now returns tuple with fresh flag ─────────

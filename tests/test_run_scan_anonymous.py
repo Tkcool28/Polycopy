@@ -39,6 +39,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.domain.order import OrderSide  # noqa: E402
 from polycopy.domain.source_trade import SourceTrade, is_sentinel_trader_address  # noqa: E402
+from polycopy.adapters.polymarket import MarketTradeFetchResult  # noqa: E402
 
 # Import AFTER env + sys.path are set so the script's relative-imports work.
 import scripts.run_scan as run_scan_module  # noqa: E402
@@ -70,10 +71,24 @@ def _make_trade(
 
 
 def _patched_fetch_trades(monkeypatch, trades_by_market: dict):
-    """Replace _fetch_trades so we control exactly what the scan sees."""
+    """Replace _fetch_trades so we control exactly what the scan sees.
+
+    Round-10 (fetch-result contract): the wrapper returns a
+    :class:`MarketTradeFetchResult` with ``status="complete"`` so the
+    legacy code path that expected ``list[SourceTrade]`` still works
+    under the unified contract. Tests that need to assert partial/failed
+    behavior mock ``_fetch_trades`` directly.
+    """
 
     async def fake_fetch_trades(db, market_source_id, now, result, use_sample):
-        return trades_by_market.get(market_source_id, [])
+        trades = trades_by_market.get(market_source_id, [])
+        return MarketTradeFetchResult(
+            trades=trades,
+            status="complete",
+            pages_fetched=1 if trades else 0,
+            rows_fetched=len(trades),
+            market_source_id=market_source_id,
+        )
 
     monkeypatch.setattr(run_scan_module, "_fetch_trades", fake_fetch_trades)
 

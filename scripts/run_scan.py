@@ -104,6 +104,10 @@ class ScanResult:
         self.signals: int = 0
         self.related_wallets: int = 0
         self.anonymous_trades_skipped: int = 0  # legacy alias, kept for back-compat
+        # Round-10 fetch-status counters (per-market, not per-row).
+        self.market_fetches_complete: int = 0
+        self.market_fetches_partial: int = 0
+        self.market_fetches_failed: int = 0
         self.missing_data: list[str] = []
         self.errors: list[str] = []
         self.started_at = datetime.now(timezone.utc)
@@ -112,6 +116,8 @@ class ScanResult:
     def summary(self) -> str:
         return (
             f"scan complete\n"
+            f"  market fetches: {self.market_fetches_complete} complete, "
+            f"{self.market_fetches_partial} partial, {self.market_fetches_failed} failed\n"
             f"  wallets discovered: {self.wallets_discovered}\n"
             f"  wallets scored: {self.wallets_scored}\n"
             f"    copy_candidates: {self.copy_candidates}\n"
@@ -206,7 +212,41 @@ async def run_scan(
     # wallet-dependent consumers below.
     all_trades = []
     for market in markets:
-        trades = await _fetch_trades(db, market.source_id, now, result, use_sample)
+        fetch_result = await _fetch_trades(
+            db, market.source_id, now, result, use_sample,
+        )
+        # Round-10 fetch-result contract: branch on the explicit status.
+        #   - "complete" → persist + discover
+        #   - "partial"  → discard prefix, do NOT discover, log + counter
+        #   - "failed"   → nothing to do
+        if fetch_result.status == "failed":
+            result.market_fetches_failed += 1
+            result.missing_data.append(
+                f"Market fetch FAILED for {market.source_id}: "
+                f"{fetch_result.error}"
+            )
+            logger.warning(
+                "Market %s fetch FAILED (%d rows): %s",
+                market.source_id, fetch_result.rows_fetched, fetch_result.error,
+            )
+            continue
+        if fetch_result.status == "partial":
+            result.market_fetches_partial += 1
+            result.missing_data.append(
+                f"Market fetch PARTIAL for {market.source_id} "
+                f"(pages={fetch_result.pages_fetched}, "
+                f"rows={fetch_result.rows_fetched}, "
+                f"error={fetch_result.error})"
+            )
+            logger.warning(
+                "Market %s fetch PARTIAL (%d pages, %d rows): %s — "
+                "prefix discarded (not persisted)",
+                market.source_id, fetch_result.pages_fetched,
+                fetch_result.rows_fetched, fetch_result.error,
+            )
+            continue
+        # status == "complete"
+        result.market_fetches_complete += 1
         # Round 7 (P2 fix): persist fetched trades into source_trades BEFORE
         # wallet scoring so that ``_compute_wallet_metrics`` actually sees
         # the live trade history. Anonymous and sentinel-attributed trades
@@ -214,7 +254,7 @@ async def run_scan(
         # become wallet rows. If persistence fails, the trade is excluded from
         # wallet discovery/scoring so we never score against missing raw history.
         persisted_trades: list[SourceTrade] = []
-        for trade in trades:
+        for trade in fetch_result.trades:
             result.trades_fetched += 1
             persist_result = _persist_trade(db, trade)
             if persist_result is None:
@@ -641,7 +681,7 @@ async def _fetch_markets(
             return []
 
 
-async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[SourceTrade]:
+async def _fetch_trades(db, market_source_id, now, result, use_sample):
     """Fetch trades for a market or return sample trades.
 
     P2 fix (PR #3): live ``use_sample=False`` mode used to hit a legacy
@@ -656,15 +696,30 @@ async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[S
 
     Behavior contract:
       - ``use_sample=True`` → returns the existing labeled sample trades
-        unchanged (no adapter call).
-      - ``use_sample=False`` → uses the shared adapter, returns [] on any
-        network/parse failure (graceful degradation; no crash).
+        unchanged (no adapter call). The caller still needs to see them
+        as ``complete`` for counter purposes; we wrap them as a
+        :class:`MarketTradeFetchResult` with status="complete" so the
+        sample path participates in the same accounting.
+      - ``use_sample=False`` → uses the shared adapter and returns a
+        :class:`MarketTradeFetchResult` whose ``status`` is
+        ``"complete"`` / ``"partial"`` / ``"failed"``. The caller MUST
+        branch on status before persisting or scoring.
       - Round 7: live fetches go through ``adapter.fetch_trades_for_market``
-        which uses ``GET /trades?market=<conditionId>`` (server-side filter,
-        bounded pagination, dedup across pages).
+        which uses ``GET /trades?market=<conditionId>&takerOnly=false``
+        (server-side filter, bounded pagination, dedup across pages).
     """
     if use_sample:
-        return _get_sample_trades(market_source_id)
+        # Wrap the legacy list-return in the new contract so the
+        # caller can use one code path for both branches.
+        from polycopy.adapters.polymarket import MarketTradeFetchResult
+        sample = _get_sample_trades(market_source_id)
+        return MarketTradeFetchResult(
+            trades=sample,
+            status="complete",
+            pages_fetched=1 if sample else 0,
+            rows_fetched=len(sample),
+            market_source_id=market_source_id,
+        )
 
     adapter = _get_scan_trade_adapter()
     # Pass epoch-zero as ``since`` so the adapter returns the FULL per-market

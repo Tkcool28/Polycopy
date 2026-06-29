@@ -24,6 +24,13 @@ Trade ingestion contract (verified 2026-06-28):
     Use the ``market=<conditionId>`` parameter for per-market fetches; callers
     still filter client-side defensively because upstream responses can contain
     malformed or stray rows.
+  - **Round-10 stabilization:** every per-market request explicitly passes
+    ``takerOnly=false`` so that maker-side fills (where the watched wallet
+    was the liquidity provider) are NOT silently dropped. Polymarket's
+    data-api defaults to ``takerOnly=true``, which would exclude any smart
+    wallet acting as a maker. The default is wrong for our use case
+    (smart-money discovery) and must be overridden on EVERY market-specific
+    request, including every pagination page.
   - Pagination: data-api uses offset+limit (limit hard-capped at ~1000).
   - Per trade, the response includes:
       proxyWallet      (real 0x address, identifies trader) — MAY be missing
@@ -58,6 +65,13 @@ cannot overwrite each other in ``source_trades``.
 The adapter fetches live trades per market with bounded offset pagination.
 Older global-window cache behavior is intentionally bypassed for the live
 ``fetch_trades_for_market`` path so separate markets cannot share stale rows.
+
+**Round-10 fetch-result contract**: :meth:`fetch_trades_for_market` returns
+a :class:`MarketTradeFetchResult` instead of a bare ``list[SourceTrade]``
+so callers can distinguish a complete fetch from a partial one. A partial
+fetch (some pages succeeded, a later page failed) MUST NOT be scored as
+complete — the caller must surface it explicitly. See
+:class:`MarketTradeFetchResult` for status semantics.
 """
 
 from __future__ import annotations
@@ -68,8 +82,9 @@ import logging
 import re
 import time
 import warnings
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional, cast
+from typing import Any, Iterator, Literal, Optional, cast
 
 import httpx
 
@@ -81,6 +96,93 @@ from polycopy.providers.resolution import ResolutionProvider
 from polycopy.providers.trade_feed import TradeFeedProvider
 
 logger = logging.getLogger(__name__)
+
+
+# ── Fetch-result contract ─────────────────────────────────────────────────────
+#
+# A multi-page market fetch can end in one of three states:
+#
+#   "complete" — every requested page was fetched successfully and the
+#                termination condition (short page, empty page, max_pages,
+#                max_rows) was legitimate. The trades list is safe for
+#                downstream persistence, scoring, and audit.
+#
+#   "partial"   — at least one page succeeded but a later page failed
+#                (timeout, HTTP 429, HTTP 5xx, invalid JSON, malformed
+#                response, network exception). The trades list is a prefix
+#                and MUST NOT be treated as a complete market history.
+#                Callers either persist with an explicit partial marker
+#                or discard it (PR #3 discards to keep the historical
+#                source_trades table deterministic).
+#
+#   "failed"    — the first page failed. No trustworthy page set exists.
+#                trades list is empty. Nothing should be persisted or
+#                scored from this attempt.
+#
+# ``MarketTradeFetchResult`` is a dataclass that ALSO acts as a list-
+# compatible iterable so existing call sites that did ``for t in result``
+# and ``len(result)`` continue to work unchanged. New callers should
+# branch on ``result.status`` before persisting/scoring.
+MarketFetchStatus = Literal["complete", "partial", "failed"]
+
+
+@dataclass(frozen=True)
+class MarketTradeFetchResult:
+    """Result of a multi-page market trade fetch.
+
+    Iterable + sized so legacy code that did ``len(result)`` and
+    ``for t in result`` continues to work; new code MUST branch on
+    ``status`` before treating ``trades`` as complete history.
+    """
+
+    trades: list[SourceTrade] = field(default_factory=list)
+    status: MarketFetchStatus = "complete"
+    pages_fetched: int = 0
+    rows_fetched: int = 0
+    error: Optional[str] = None
+    market_source_id: str = ""
+
+    def __post_init__(self) -> None:
+        # Frozen dataclass: must use object.__setattr__ to mutate.
+        if self.status == "complete" and self.error is not None:
+            raise ValueError("status=complete cannot have an error message")
+        if self.status == "failed" and self.trades:
+            raise ValueError(
+                "status=failed cannot carry trades (no trustworthy page set)"
+            )
+        if self.status == "partial" and not self.error:
+            raise ValueError(
+                "status=partial must carry an error explaining the truncation"
+            )
+
+    # Iterable interface so legacy ``for t in result`` / ``len(result)``
+    # / ``result[0]`` keep working. New code SHOULD branch on ``status``
+    # before iterating.
+    def __iter__(self) -> Iterator[SourceTrade]:
+        return iter(self.trades)
+
+    def __len__(self) -> int:
+        return len(self.trades)
+
+    def __getitem__(self, idx: int) -> SourceTrade:
+        return self.trades[idx]
+
+    def __bool__(self) -> bool:
+        return bool(self.trades)
+
+
+def _empty_complete(market_source_id: str) -> MarketTradeFetchResult:
+    """An empty page (no rows) on the first request is a complete result
+    with zero rows, not a failure. A clean "no trades for this market"
+    must look like success so the caller does not falsely treat the
+    market as failed."""
+    return MarketTradeFetchResult(
+        trades=[],
+        status="complete",
+        pages_fetched=0,
+        rows_fetched=0,
+        market_source_id=market_source_id,
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -658,105 +760,198 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
     # ── Per-market fetcher (round 7) ─────────────────────────────────────────
 
     async def fetch_trades_for_market(
-        self,
-        market_source_id: str,
-        *,
-        since: Optional[datetime] = None,
-        limit: int = 200,
-        max_pages: int = 5,
-        max_rows: int = 2000,
-        market: Optional[Market] = None,
-        asset_to_outcome: Optional[dict[str, str]] = None,
-    ) -> list[SourceTrade]:
-        """Fetch trades for a single market via the data-api server-side filter.
+            self,
+            market_source_id: str,
+            *,
+            since: Optional[datetime] = None,
+            limit: int = 200,
+            max_pages: int = 5,
+            max_rows: int = 2000,
+            market: Optional[Market] = None,
+            asset_to_outcome: Optional[dict[str, str]] = None,
+        ) -> MarketTradeFetchResult:
+            """Fetch trades for a single market via the data-api server-side filter.
 
-        Uses ``GET /trades?market=<conditionId>`` (verified live 2026-06-28:
-        the server DOES honor ``market=`` and returns ONLY trades for that
-        conditionId, with empty ``[]`` for unknown / inactive markets).
-        Pagination is via ``offset`` + ``limit``.
+            Uses ``GET /trades?market=<conditionId>&takerOnly=false`` (verified
+            live 2026-06-28: the server DOES honor ``market=`` and returns ONLY
+            trades for that conditionId, with empty ``[]`` for unknown / inactive
+            markets; ``takerOnly=false`` is REQUIRED to include maker-side
+            fills, otherwise the data-api defaults to taker-only and silently
+            drops any smart wallet acting as a liquidity provider).
 
-        Args:
-            market_source_id: hex ``conditionId`` for the market.
-            since: optional epoch-zero timestamp; trades with
-                ``timestamp < since`` are dropped client-side after the
-                fetch. Default is None (no lower bound; the API only
-                returns the most-recent ``~max_rows`` trades anyway).
-            limit: per-page size (the API caps each request at this many
-                rows).
-            max_pages: hard upper bound on pagination depth. The fetch
-                stops cleanly after this many pages even if the API keeps
-                returning full pages.
-            max_rows: hard upper bound on total rows retained. The fetch
-                stops as soon as we hit this many deduplicated rows.
-            market: optional :class:`Market` for outcome mapping.
-            asset_to_outcome: optional CLOB token_id → outcome label map.
+            Pagination is via ``offset`` + ``limit``. Every page sends
+            ``takerOnly=false`` so the contract holds across all pages.
 
-        Returns:
-            List of :class:`SourceTrade` for the market, deduplicated by
-            ``(source, source_trade_id)`` across pages, ordered as the API
-            served them (most-recent first). Empty on any error or for an
-            unknown market. Never raises.
-        """
-        if not market_source_id or not str(market_source_id).strip():
-            return []
-        cond_lower = str(market_source_id).lower()
-        since_ts = since.timestamp() if isinstance(since, datetime) else 0.0
+            Args:
+                market_source_id: hex ``conditionId`` for the market.
+                since: optional lower bound; trades with ``timestamp < since`` are
+                    dropped client-side after the fetch. Default is None.
+                limit: per-page size (the API caps each request at this many rows).
+                max_pages: hard upper bound on pagination depth.
+                max_rows: hard upper bound on total rows retained.
+                market: optional :class:`Market` for outcome mapping.
+                asset_to_outcome: optional CLOB token_id → outcome label map.
 
-        client = await self._get_data_client()
-        seen: set[str] = set()
-        out: list[SourceTrade] = []
+            Returns:
+                A :class:`MarketTradeFetchResult` with explicit status:
 
-        offset = 0
-        for page in range(max_pages):
-            try:
-                await self._throttle()
-                resp = await client.get(
-                    "/trades",
-                    params={
-                        "market": str(market_source_id),
-                        "limit": int(limit),
-                        "offset": int(offset),
-                    },
+                  * ``"complete"`` — every requested page fetched successfully;
+                    termination was legitimate (short/empty page, max_pages, or
+                    max_rows). Caller may persist + score.
+                  * ``"partial"`` — at least one page succeeded but a later page
+                    failed (timeout, HTTP 429, 5xx, invalid JSON, malformed
+                    response, network exception). The trades list is a prefix
+                    and MUST NOT be treated as complete. Caller decides whether
+                    to discard or persist-with-marker.
+                  * ``"failed"`` — the first page failed. trades is empty.
+                    Nothing should be persisted or scored.
+
+                Never raises. On first-page exception returns ``"failed"``;
+                on later-page exception returns ``"partial"`` with the prefix.
+            """
+            if not market_source_id or not str(market_source_id).strip():
+                return MarketTradeFetchResult(
+                    status="failed",
+                    market_source_id=market_source_id or "",
+                    error="empty market_source_id",
                 )
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as exc:
-                logger.warning(
-                    "fetch_trades_for_market: page=%d offset=%d failed: %s: %s",
-                    page, offset, type(exc).__name__, exc,
-                )
-                break
+            cond_lower = str(market_source_id).lower()
+            since_ts = since.timestamp() if isinstance(since, datetime) else 0.0
 
-            if not isinstance(data, list):
-                logger.warning(
-                    "fetch_trades_for_market: non-list response on page=%d: %s",
-                    page, type(data).__name__,
-                )
-                break
+            client = await self._get_data_client()
+            seen: set[str] = set()
+            out: list[SourceTrade] = []
+            pages_fetched = 0
+            rows_fetched = 0
+            last_error: Optional[str] = None
 
-            # Empty or short page → graceful termination.
-            if not data or len(data) < limit:
-                # Still parse the rows we got, then stop.
+            offset = 0
+            for page in range(max_pages):
+                try:
+                    await self._throttle()
+                    resp = await client.get(
+                        "/trades",
+                        params={
+                            "market": str(market_source_id),
+                            "limit": int(limit),
+                            "offset": int(offset),
+                            # Round-10 fix (Codex P1): explicitly request BOTH
+                            # taker and maker fills. The data-api defaults to
+                            # taker-only, which would silently exclude any smart
+                            # wallet that acted as a liquidity provider — exactly
+                            # the signal we want to capture.
+                            "takerOnly": "false",
+                        },
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as exc:
+                    last_error = (
+                        f"{type(exc).__name__}: {str(exc)[:300]}"
+                    )
+                    logger.warning(
+                        "fetch_trades_for_market: page=%d offset=%d failed: %s",
+                        page, offset, last_error,
+                    )
+                    # Round-10 fix (Codex P2): NEVER silently return a prefix as
+                    # if the fetch had completed. The caller MUST distinguish:
+                    #   - first page (page == 0) → "failed" (no trustworthy data)
+                    #   - later page (page >= 1) → "partial" (prefix exists)
+                    if page == 0:
+                        return MarketTradeFetchResult(
+                            trades=[],
+                            status="failed",
+                            pages_fetched=0,
+                            rows_fetched=0,
+                            error=last_error,
+                            market_source_id=cond_lower,
+                        )
+                    return MarketTradeFetchResult(
+                        trades=out,
+                        status="partial",
+                        pages_fetched=pages_fetched,
+                        rows_fetched=rows_fetched,
+                        error=last_error,
+                        market_source_id=cond_lower,
+                    )
+
+                if not isinstance(data, list):
+                    last_error = f"non-list response: {type(data).__name__}"
+                    logger.warning(
+                        "fetch_trades_for_market: non-list response on page=%d: %s",
+                        page, type(data).__name__,
+                    )
+                    if page == 0:
+                        return MarketTradeFetchResult(
+                            trades=[],
+                            status="failed",
+                            pages_fetched=0,
+                            rows_fetched=0,
+                            error=last_error,
+                            market_source_id=cond_lower,
+                        )
+                    return MarketTradeFetchResult(
+                        trades=out,
+                        status="partial",
+                        pages_fetched=pages_fetched,
+                        rows_fetched=rows_fetched,
+                        error=last_error,
+                        market_source_id=cond_lower,
+                    )
+
+                # Empty or short page → graceful complete termination.
+                pages_fetched += 1
+                if not data or len(data) < limit:
+                    for raw in data:
+                        absorbed = self._absorb_trade(
+                            raw, cond_lower, since_ts, seen, out,
+                            market=market, asset_to_outcome=asset_to_outcome,
+                        )
+                        if absorbed:
+                            rows_fetched += 1
+                        if len(out) >= max_rows:
+                            return MarketTradeFetchResult(
+                                trades=out,
+                                status="complete",
+                                pages_fetched=pages_fetched,
+                                rows_fetched=rows_fetched,
+                                market_source_id=cond_lower,
+                            )
+                    # Legitimate end-of-stream: short page AND max_rows not hit.
+                    return MarketTradeFetchResult(
+                        trades=out,
+                        status="complete",
+                        pages_fetched=pages_fetched,
+                        rows_fetched=rows_fetched,
+                        market_source_id=cond_lower,
+                    )
+
+                # Full page → parse and advance.
                 for raw in data:
-                    self._absorb_trade(
+                    absorbed = self._absorb_trade(
                         raw, cond_lower, since_ts, seen, out,
                         market=market, asset_to_outcome=asset_to_outcome,
                     )
+                    if absorbed:
+                        rows_fetched += 1
                     if len(out) >= max_rows:
-                        return out
-                break
+                        return MarketTradeFetchResult(
+                            trades=out,
+                            status="complete",
+                            pages_fetched=pages_fetched,
+                            rows_fetched=rows_fetched,
+                            market_source_id=cond_lower,
+                        )
+                offset += limit
 
-            # Full page → parse and advance.
-            for raw in data:
-                self._absorb_trade(
-                    raw, cond_lower, since_ts, seen, out,
-                    market=market, asset_to_outcome=asset_to_outcome,
-                )
-                if len(out) >= max_rows:
-                    return out
-            offset += limit
-
-        return out
+            # max_pages reached with every page returning a full page → complete.
+            return MarketTradeFetchResult(
+                trades=out,
+                status="complete",
+                pages_fetched=pages_fetched,
+                rows_fetched=rows_fetched,
+                market_source_id=cond_lower,
+            )
 
     def _absorb_trade(
         self,
@@ -768,35 +963,38 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
         *,
         market: Optional[Market],
         asset_to_outcome: Optional[dict[str, str]],
-    ) -> None:
+    ) -> bool:
         """Parse one raw trade row, dedup, and append to ``out``.
 
-        Used only by :meth:`fetch_trades_for_market`. Filters server-side
-        errors (row with the wrong ``conditionId`` from a future API
-        change) and the optional ``since`` lower bound.
+        Returns True if the row was appended to ``out``, False otherwise
+        (skipped for malformed/wrong-market/duplicate). Used only by
+        :meth:`fetch_trades_for_market` for accurate ``rows_fetched``
+        accounting. Filters server-side errors (row with the wrong
+        ``conditionId`` from a future API change) and the optional
+        ``since`` lower bound.
         """
         try:
             raw_cond = str(raw.get("conditionId") or "").lower()
             if raw_cond != cond_lower:
-                return
+                return False
             raw_ts = raw.get("timestamp")
             if raw_ts is None:
-                return
+                return False
             try:
                 raw_ts_f = float(raw_ts)
             except (TypeError, ValueError):
-                return
+                return False
             if since_ts and raw_ts_f < since_ts:
-                return
+                return False
 
             sid = deterministic_source_trade_id_v2(raw)
             if sid in seen:
-                return
+                return False
             seen.add(sid)
 
             parsed = self._parse_data_api_trade(raw, market=market)
             if parsed is None:
-                return
+                return False
 
             if asset_to_outcome:
                 asset = str(raw.get("asset") or "")
@@ -804,8 +1002,10 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
                     parsed = parsed.model_copy(update={"outcome": asset_to_outcome[asset]})
 
             out.append(parsed)
+            return True
         except Exception as exc:  # never raise from a single bad row
             logger.debug("fetch_trades_for_market row skipped: %s: %s", type(exc).__name__, exc)
+            return False
 
     async def get_trades_by_address(
         self,

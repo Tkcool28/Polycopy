@@ -12,6 +12,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT))
 
+from polycopy.adapters.polymarket import MarketTradeFetchResult  # noqa: E402
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.domain.market import Market, MarketOutcome  # noqa: E402
 from polycopy.domain.order import OrderSide  # noqa: E402
@@ -86,7 +87,13 @@ async def test_run_scan_persists_raw_trades_before_wallet_metrics_and_scoring(
 
     async def fake_fetch_trades(db, market_source_id, now, result, use_sample):
         assert market_source_id == market.source_id
-        return fetched
+        return MarketTradeFetchResult(
+            trades=fetched,
+            status="complete",
+            pages_fetched=1,
+            rows_fetched=len(fetched),
+            market_source_id=market.source_id,
+        )
 
     def fake_generate_signals(db, markets, now):
         return []
@@ -173,7 +180,13 @@ async def test_run_scan_skips_wallet_scoring_when_trade_persistence_fails(
 
     async def fake_fetch_trades(db, market_source_id, now, result, use_sample):
         assert market_source_id == market.source_id
-        return fetched
+        return MarketTradeFetchResult(
+            trades=fetched,
+            status="complete",
+            pages_fetched=1,
+            rows_fetched=len(fetched),
+            market_source_id=market.source_id,
+        )
 
     def fake_generate_signals(db, markets, now):
         return []

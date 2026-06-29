@@ -145,7 +145,14 @@ async def test_collect_trades_without_since_passes_none_through(tmp_path, monkey
         async def fetch_trades_for_market(self, **kwargs):
             nonlocal seen_since
             seen_since = kwargs["since"]
-            return []
+            from polycopy.adapters.polymarket import MarketTradeFetchResult
+            return MarketTradeFetchResult(
+                trades=[],
+                status="complete",
+                pages_fetched=0,
+                rows_fetched=0,
+                market_source_id=MARKET_A,
+            )
 
     db = _db(tmp_path)
     collector = collect_mod.PolymarketCollector(Settings())

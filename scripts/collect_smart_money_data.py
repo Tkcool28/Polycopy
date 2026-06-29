@@ -72,7 +72,24 @@ def setup_logging(verbosity: int = 0) -> None:
 # ── Data collection result ──────────────────────────────────────────────────────
 
 class CollectionResult:
-    """Tracks partial/failure state from a collection run."""
+    """Tracks partial/failure state from a collection run.
+
+    Round-10 fetch-result accounting adds three explicit per-market-fetch
+    counters in addition to the legacy per-market-row counters:
+
+      * ``market_fetches_complete`` — every requested page fetched; safe
+        for downstream wallet discovery + scoring.
+      * ``market_fetches_partial`` — at least one page succeeded but a
+        later page failed. The prefix is NOT persisted in PR #3; it is
+        surfaced so the caller knows scoring was skipped.
+      * ``market_fetches_failed`` — first page failed (or empty
+        market_source_id). Nothing persisted from this attempt.
+
+    These counters are the source of truth for "did the upstream
+    give us a trustworthy market history" and are independent of the
+    per-row ``trades_fetched`` counter (which counts successfully
+    persisted rows).
+    """
 
     def __init__(self) -> None:
         self.markets_fetched: int = 0
@@ -83,6 +100,10 @@ class CollectionResult:
         self.anonymous_trades_skipped: int = 0  # P2: trades with no attributable wallet
         self.snapshots_saved: int = 0
         self.signals_generated: int = 0
+        # Round-10 fetch-status counters (per-market, not per-row).
+        self.market_fetches_complete: int = 0
+        self.market_fetches_partial: int = 0
+        self.market_fetches_failed: int = 0
         self.missing_data_log: list[str] = []
         self.errors: list[str] = []
         self.started_at = datetime.now(timezone.utc)
@@ -90,9 +111,15 @@ class CollectionResult:
 
     @property
     def is_partial(self) -> bool:
-        return (self.markets_failed + self.trades_failed) > 0 and (
-            self.markets_fetched + self.trades_fetched
-        ) > 0
+        # Round-10: partial is true when any per-market fetch returned
+        # partial OR failed. Per-row trades_failed still contributes
+        # (e.g. when one persisted row later raises).
+        return (
+            self.market_fetches_partial > 0
+            or self.market_fetches_failed > 0
+            or self.markets_failed > 0
+            or self.trades_failed > 0
+        )
 
     @property
     def is_failure(self) -> bool:
@@ -107,6 +134,8 @@ class CollectionResult:
         return (
             f"status={status}\n"
             f"  markets: {self.markets_fetched} fetched, {self.markets_failed} failed\n"
+            f"  trade fetches: {self.market_fetches_complete} complete, "
+            f"{self.market_fetches_partial} partial, {self.market_fetches_failed} failed\n"
             f"  trades:  {self.trades_fetched} fetched, {self.trades_failed} failed\n"
             f"  wallets: {self.wallets_discovered} discovered\n"
             f"  anonymous trades skipped: {self.anonymous_trades_skipped}\n"
@@ -242,12 +271,27 @@ class PolymarketCollector:
         bounded by ``max_pages`` and ``max_rows`` and dedups across pages
         via ``deterministic_source_trade_id_v2``.
 
+        Round 10 (fetch-result contract): the adapter now returns a
+        :class:`MarketTradeFetchResult` with explicit ``status``. This
+        method branches on that status:
+
+          * ``"complete"`` — persist trades, increment
+            ``market_fetches_complete``, return the persisted list.
+          * ``"partial"`` — DO NOT persist the prefix. Increment
+            ``market_fetches_partial``, append a missing-data entry, log
+            the market ID + error. The prefix could be untrustworthy
+            and silently scoring on it would distort trade counts and
+            wallet discovery.
+          * ``"failed"`` — first page failed. Increment
+            ``market_fetches_failed``, append a missing-data entry.
+            Return [].
+
         Behavior:
-          - One HTTP request per market (not per run); the adapter's
-            data client is reused across markets in the same run.
+          - One HTTP request per page per market (not per run); the
+            adapter's data client is reused across markets in the same run.
           - Maps asset_id → outcome label using cached clobTokenIds ordering.
-          - Persists trades to source_trades with is_sample=0.
-          - On any error, logs and returns [] (graceful degradation).
+          - Persists trades to source_trades with is_sample=0 (complete only).
+          - On any adapter exception, logs and increments failed counters.
           - Never fabricates data: empty market → empty result.
           - Snapshot provenance is saved once per real upstream fetch.
         """
@@ -272,7 +316,7 @@ class PolymarketCollector:
             result.snapshots_saved += 1
 
         try:
-            trades = await adapter.fetch_trades_for_market(
+            fetch_result = await adapter.fetch_trades_for_market(
                 market_source_id=market_source_id,
                 since=since,
                 limit=limit,
@@ -282,14 +326,52 @@ class PolymarketCollector:
             )
         except Exception as e:
             result.trades_failed += 1
+            result.market_fetches_failed += 1
             result.missing_data_log.append(
-                f"Trades unavailable for market {market_source_id}: {e}"
+                f"Trade fetch exception for market {market_source_id}: {e}"
             )
             logger.warning("No trades for market %s: %s", market_source_id, e)
             return []
 
+        # Branch on the explicit fetch status — never silently treat a
+        # partial or failed fetch as complete.
+        if fetch_result.status == "failed":
+            result.market_fetches_failed += 1
+            result.trades_failed += 1
+            result.missing_data_log.append(
+                f"Market fetch FAILED for {market_source_id}: {fetch_result.error}"
+            )
+            logger.warning(
+                "Market %s fetch FAILED (%d pages, %d rows): %s",
+                market_source_id, fetch_result.pages_fetched,
+                fetch_result.rows_fetched, fetch_result.error,
+            )
+            return []
+
+        if fetch_result.status == "partial":
+            # Round-10 policy: discard the prefix. Persisting partial
+            # history would distort trade counts, scoring, and downstream
+            # wallet discovery (the next run would refetch from the same
+            # server-side cursor and double-count rows). The caller MUST
+            # NOT score from this prefix.
+            result.market_fetches_partial += 1
+            result.missing_data_log.append(
+                f"Market fetch PARTIAL for {market_source_id} "
+                f"(pages={fetch_result.pages_fetched}, rows={fetch_result.rows_fetched}, "
+                f"error={fetch_result.error})"
+            )
+            logger.warning(
+                "Market %s fetch PARTIAL (%d/%d pages ok, %d rows): %s — "
+                "prefix discarded (not persisted)",
+                market_source_id, fetch_result.pages_fetched,
+                max_pages, fetch_result.rows_fetched, fetch_result.error,
+            )
+            return []
+
+        # status == "complete": safe to persist.
+        result.market_fetches_complete += 1
         persisted = []
-        for trade in trades:
+        for trade in fetch_result.trades:
             try:
                 self._persist_trade(db, trade)
                 persisted.append(trade)

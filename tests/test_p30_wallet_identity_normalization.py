@@ -324,7 +324,14 @@ class TestComputeWalletMetricsCaseInsensitive:
             async def fake_fetch_trades(
                 db, market_source_id, now, result, use_sample
             ):
-                return []
+                from polycopy.adapters.polymarket import MarketTradeFetchResult
+                return MarketTradeFetchResult(
+                    trades=[],
+                    status="complete",
+                    pages_fetched=0,
+                    rows_fetched=0,
+                    market_source_id=market_source_id,
+                )
 
             def fake_generate_signals(db, markets, now):
                 return []
@@ -508,9 +515,17 @@ class TestEndToEndMixedCase:
             ):
                 # Return parsed SourceTrade objects; run_scan passes them
                 # straight into the persistence + discovery pipeline.
-                return [_adapter()._parse_data_api_trade(  # noqa: SLF001
+                from polycopy.adapters.polymarket import MarketTradeFetchResult
+                parsed = [_adapter()._parse_data_api_trade(  # noqa: SLF001
                     _raw_with_wallet(e2e_wallet)
                 )]
+                return MarketTradeFetchResult(
+                    trades=parsed,
+                    status="complete",
+                    pages_fetched=1,
+                    rows_fetched=len(parsed),
+                    market_source_id=market_source_id,
+                )
 
             def fake_generate_signals(db, markets, now):
                 return []
