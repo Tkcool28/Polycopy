@@ -258,11 +258,14 @@ class PolymarketCollector:
         # window strategy only saved one snapshot per run, but the new
         # per-market fetch gets a different upstream payload per market,
         # so a per-market snapshot is the honest equivalent.
-        try:
-            await self._snapshot_market_first_page(adapter, db, market_source_id, limit)
+        #
+        # Round 7 P3 audit fix: ``_snapshot_market_first_page`` returns
+        # True ONLY when an upstream payload was actually persisted to
+        # disk + raw_snapshots table. We increment ``snapshots_saved``
+        # ONLY on True so the counter stays honest across HTTP failures,
+        # empty responses, and ``_save_snapshot`` returning None.
+        if await self._snapshot_market_first_page(adapter, db, market_source_id, limit):
             result.snapshots_saved += 1
-        except Exception as e:
-            logger.debug("snapshot save skipped for market %s: %s", market_source_id, e)
 
         try:
             trades = await adapter.fetch_trades_for_market(
@@ -576,13 +579,20 @@ class PolymarketCollector:
         db: Database,
         market_source_id: str,
         limit: int,
-    ) -> None:
+    ) -> bool:
         """Snapshot the first page of a market's /trades fetch.
 
-        Best-effort: any error here is swallowed by the caller. Uses the
-        adapter's data client directly (we don't want to invoke the
-        paginated ``fetch_trades_for_market`` here because that already
-        parses and dedups — we just want the raw first page for
+        Best-effort: any error here is swallowed (the trade ingest path
+        must not be blocked by snapshot problems). Returns True only when
+        an upstream payload was actually persisted to disk AND to the
+        ``raw_snapshots`` table via ``_save_snapshot``. Returns False
+        for HTTP failures, empty responses, or any persistence failure
+        — the caller uses this boolean to keep ``result.snapshots_saved``
+        honest.
+
+        Uses the adapter's data client directly (we don't want to invoke
+        the paginated ``fetch_trades_for_market`` here because that
+        already parses and dedups — we just want the raw first page for
         provenance).
         """
         try:
@@ -594,16 +604,22 @@ class PolymarketCollector:
             )
             resp.raise_for_status()
             data = resp.json()
-            if isinstance(data, list) and data:
-                self._save_snapshot(
-                    db=db,
-                    source="polymarket_data_api",
-                    endpoint="/trades",
-                    params={"market": str(market_source_id), "limit": int(limit), "filter": "per_market"},
-                    data=data,
-                )
+            if not (isinstance(data, list) and data):
+                # Empty response — nothing to snapshot, but also not a
+                # failure. The caller's ``snapshots_saved`` MUST NOT
+                # increment for empty payloads.
+                return False
+            snapshot = self._save_snapshot(
+                db=db,
+                source="polymarket_data_api",
+                endpoint="/trades",
+                params={"market": str(market_source_id), "limit": int(limit), "filter": "per_market"},
+                data=data,
+            )
+            return snapshot is not None
         except Exception as e:
             logger.debug("per-market snapshot skipped: %s", e)
+            return False
 
     def _save_snapshot(
         self,
