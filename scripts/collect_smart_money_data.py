@@ -34,7 +34,10 @@ from pathlib import Path
 # Add src to path for inline execution
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from polycopy.adapters.polymarket import PolymarketPublicAdapter
+from polycopy.adapters.polymarket import (
+    PolymarketPublicAdapter,
+    build_market_trade_params,
+)
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
 from polycopy.db.wallet_identity import (
@@ -769,14 +772,29 @@ class PolymarketCollector:
         the paginated ``fetch_trades_for_market`` here because that
         already parses and dedups — we just want the raw first page for
         provenance).
+
+        Round-11 (Codex P2 PRRT_kwDOTG4Cf86M7BQV): the snapshot request
+        MUST use the SAME ``build_market_trade_params(...)`` helper as
+        the paginated fetch, so the saved raw payload is a faithful
+        representation of the maker-inclusive source data the
+        downstream persistence + scoring paths will see. The previous
+        code sent ``market``, ``limit``, ``offset`` but omitted
+        ``takerOnly=false``, recording a taker-only payload as
+        provenance while downstream persisted a maker-inclusive payload.
         """
         try:
             client = await adapter._get_data_client()  # noqa: SLF001 (intentional)
             await adapter._throttle()  # noqa: SLF001
-            resp = await client.get(
-                "/trades",
-                params={"market": str(market_source_id), "limit": int(limit), "offset": 0},
+            # Single source of truth — the same helper used by
+            # ``fetch_trades_for_market``. Any future change to the
+            # request shape must go through this helper so the snapshot
+            # and the ingested payload can never drift.
+            params = build_market_trade_params(
+                market_source_id,
+                limit=limit,
+                offset=0,
             )
+            resp = await client.get("/trades", params=params)
             resp.raise_for_status()
             data = resp.json()
             if not (isinstance(data, list) and data):
@@ -788,7 +806,15 @@ class PolymarketCollector:
                 db=db,
                 source="polymarket_data_api",
                 endpoint="/trades",
-                params={"market": str(market_source_id), "limit": int(limit), "filter": "per_market"},
+                # Persist the SAME params that were sent on the wire
+                # (with a stable ``filter=per_market`` tag for downstream
+                # discovery). Includes ``takerOnly=false`` so callers of
+                # the snapshot store can see the contract that produced
+                # this raw payload.
+                params={
+                    **params,
+                    "filter": "per_market",
+                },
                 data=data,
             )
             return snapshot is not None

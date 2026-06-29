@@ -185,6 +185,50 @@ def _empty_complete(market_source_id: str) -> MarketTradeFetchResult:
     )
 
 
+def build_market_trade_params(
+    market_source_id: str,
+    *,
+    limit: int,
+    offset: int,
+) -> dict[str, str]:
+    """Build the canonical request params for one ``GET /trades`` call.
+
+    Round-11 (Codex P2 PRRT_kwDOTG4Cf86M7BQV): every code path that asks
+    the data-api for a market's trade history must use the SAME params.
+    Previously the snapshot path omitted ``takerOnly=false`` and recorded
+    a taker-only payload as provenance while downstream persistence and
+    scoring received a maker-inclusive payload.
+
+    Required params:
+
+      * ``market``  — the conditionId (hex string, original case preserved
+        on the wire; the adapter filters rows client-side using lowercase
+        so cross-market rows can never contaminate the result).
+      * ``limit``   — max rows the upstream returns for this request.
+      * ``offset``  — pagination cursor; must be ``0`` for the first page.
+      * ``takerOnly=false`` — EXPLICITLY include both maker and taker
+        fills. Polymarket's data-api defaults to ``takerOnly=true``
+        and would silently exclude any smart wallet acting as a
+        liquidity provider. We never rely on that default.
+
+    This helper is the SINGLE source of truth for the per-market
+    ``/trades`` request shape. Both ``fetch_trades_for_market`` (the
+    persisted/scored path) and ``_snapshot_market_first_page`` (the
+    provenance path) use it. A future default change by the upstream
+    cannot drift them out of alignment.
+    """
+    # NOTE: ``takerOnly`` is sent as the string "false" because the
+    # data-api's URL parser accepts both ``"false"`` and ``"true"``
+    # only on the wire; an undeclared or boolean ``False`` token may be
+    # rejected or normalized by intermediate proxies.
+    return {
+        "market": str(market_source_id),
+        "limit": str(int(limit)),
+        "offset": str(int(offset)),
+        "takerOnly": "false",
+    }
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -831,17 +875,11 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
                     await self._throttle()
                     resp = await client.get(
                         "/trades",
-                        params={
-                            "market": str(market_source_id),
-                            "limit": int(limit),
-                            "offset": int(offset),
-                            # Round-10 fix (Codex P1): explicitly request BOTH
-                            # taker and maker fills. The data-api defaults to
-                            # taker-only, which would silently exclude any smart
-                            # wallet that acted as a liquidity provider — exactly
-                            # the signal we want to capture.
-                            "takerOnly": "false",
-                        },
+                        params=build_market_trade_params(
+                            market_source_id,
+                            limit=limit,
+                            offset=offset,
+                        ),
                     )
                     resp.raise_for_status()
                     data = resp.json()
