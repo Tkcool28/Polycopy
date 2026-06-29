@@ -287,7 +287,9 @@ class TestComputeWalletMetricsCaseInsensitive:
             db.close()
 
     @pytest.mark.asyncio
-    async def test_no_false_missing_data_for_legacy_mixed_case(self, tmp_path: Path):
+    async def test_no_false_missing_data_for_legacy_mixed_case(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """A legacy mixed-case row plus a freshly-discovered lowercase
         wallet must NOT produce a ``missing_data`` entry in the scan
         result. Pre-fix this was the symptom reported to Codex."""
@@ -319,10 +321,11 @@ class TestComputeWalletMetricsCaseInsensitive:
 
             # Stub fetchers so run_scan doesn't hit the network.
             async def fake_fetch_markets(db, settings, limit, result, use_sample):
-                return []
+                return [], {}
 
             async def fake_fetch_trades(
-                db, market_source_id, now, result, use_sample
+                db, market_source_id, now, result, use_sample,
+                *, asset_to_outcome=None,
             ):
                 from polycopy.adapters.polymarket import MarketTradeFetchResult
                 return MarketTradeFetchResult(
@@ -336,9 +339,9 @@ class TestComputeWalletMetricsCaseInsensitive:
             def fake_generate_signals(db, markets, now):
                 return []
 
-            run_scan_module._fetch_markets = fake_fetch_markets  # noqa: SLF001
-            run_scan_module._fetch_trades = fake_fetch_trades  # noqa: SLF001
-            run_scan_module._generate_signals = fake_generate_signals  # noqa: SLF001
+            monkeypatch.setattr(run_scan_module, "_fetch_markets", fake_fetch_markets)
+            monkeypatch.setattr(run_scan_module, "_fetch_trades", fake_fetch_trades)
+            monkeypatch.setattr(run_scan_module, "_generate_signals", fake_generate_signals)
 
             result = await run_scan_module.run_scan(  # noqa: SLF001
                 db, market_limit=1, use_sample=False
@@ -508,10 +511,11 @@ class TestEndToEndMixedCase:
             e2e_canonical = e2e_wallet.lower()
 
             async def fake_fetch_markets(db, settings, limit, result, use_sample):
-                return [e2e_market]
+                return [e2e_market], {}
 
             async def fake_fetch_trades(
-                db, market_source_id, now, result, use_sample
+                db, market_source_id, now, result, use_sample,
+                *, asset_to_outcome=None,
             ):
                 # Return parsed SourceTrade objects; run_scan passes them
                 # straight into the persistence + discovery pipeline.

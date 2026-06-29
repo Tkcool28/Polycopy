@@ -443,10 +443,21 @@ class TestWalletDiscovery:
         assert len(wallets) == 1
 
     def test_empty_address_raises(self):
-        """Empty address raises ValueError."""
+        """Empty / whitespace addresses are rejected via invalid-dict sentinel.
+
+        Round 11 (P3 PRRT_kwDOTG4Cf86M7Xbp): the discovery helpers
+        now return a dict with ``invalid=True`` for empty / whitespace /
+        sentinel inputs instead of raising, so callers (notably
+        ``run_scan``) can branch on the dict rather than wrap the
+        registration in a try/except. The wallet is NOT added to the
+        discovery registry in this case.
+        """
         disc = WalletDiscovery()
-        with pytest.raises(ValueError, match="empty"):
-            disc.add_from_polymarket("   ")
+        entry = disc.add_from_polymarket("   ")
+        assert entry.get("invalid") is True
+        assert entry.get("is_new") is False
+        assert entry.get("address") is None
+        assert disc.list_wallets() == []
 
     def test_list_wallets_returns_all(self):
         disc = WalletDiscovery()

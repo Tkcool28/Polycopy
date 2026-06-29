@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
+from polycopy.db.wallet_identity import canonical_wallet_address
 from polycopy.discovery.models import (
     DedupRecord,
     RelatedWalletCandidate,
@@ -24,6 +25,13 @@ from polycopy.discovery.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Import-safety note: ``polycopy.db.wallet_identity`` is pure Python — it
+# depends only on ``polycopy.domain.source_trade`` (which imports nothing
+# from discovery). Verified non-circular at PR #3 round 7 stabilization.
+# If a future refactor introduces a reverse import, move
+# ``canonical_wallet_address`` to ``polycopy.utils.identity`` and re-export
+# from ``wallet_identity`` for backwards compatibility.
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -86,35 +94,78 @@ class WalletDiscovery:
         """Register a wallet discovered via related-wallet detection."""
         return self._register(address, WalletSource.RELATED_DETECTION, label)
 
-    def _register(self, address: str, source: WalletSource, label: str) -> dict[str, Any]:
-        """Internal: register a wallet address from a given source."""
-        addr_lower = address.lower().strip()
-        if not addr_lower:
-            raise ValueError("wallet address must not be empty")
+    def _canonical_key(self, address: Any) -> str | None:
+        """Return the canonical key for ``address`` or ``None`` if invalid.
 
-        is_new = addr_lower not in self._wallets_by_address
+        Delegates to :func:`polycopy.db.wallet_identity.canonical_wallet_address`
+        so the in-memory discovery registry and the DB layer agree byte-for-byte
+        on identity (lowercase + strip ALL ASCII whitespace + sentinel rejection).
+        Returns ``None`` for ``None`` / empty / whitespace-only / sentinel inputs
+        so the caller can distinguish "invalid" from "real new wallet".
+        """
+        return canonical_wallet_address(address)
+
+    def _register(self, address: str, source: WalletSource, label: str) -> dict[str, Any]:
+        """Internal: register a wallet address from a given source.
+
+        Round-9 canonicalization: uses
+        :func:`canonical_wallet_address` (the shared
+        single-source-of-truth helper) for the internal key, so the
+        in-memory registry and ``wallets`` table agree on identity.
+        Mixed-case ``"0xAbCd..."`` and padded ``"  0xabcd...  "`` collapse
+        onto the same entry.
+
+        Returns the registered entry dict with an ``"is_new"`` boolean key
+        added: ``True`` iff this call added a new canonical address (not
+        previously known to the registry), ``False`` otherwise. Existing
+        tests that read other keys (e.g. ``entry["address"]``) continue to
+        work; the new key is purely additive so callers that do strict
+        equality ``entry == {...}`` would need to be updated.
+        """
+        canonical = self._canonical_key(address)
+        if canonical is None:
+            # Empty / whitespace / sentinel — reject explicitly. We don't
+            # raise (legacy behavior of callers that pass through raw
+            # strings); we return a sentinel "invalid" entry with
+            # ``is_new=False`` so downstream code that reads the dict sees
+            # a stable shape and knows it was rejected.
+            return {
+                "address": None,
+                "label": label if label else "auto-discovered",
+                "first_seen": datetime.now(timezone.utc).isoformat(),
+                "source_count": 0,
+                "sources": [],
+                "is_new": False,
+                "invalid": True,
+            }
+
+        is_new = canonical not in self._wallets_by_address
         if is_new:
-            self._wallets_by_address[addr_lower] = {
-                "address": addr_lower,
+            self._wallets_by_address[canonical] = {
+                "address": canonical,
                 "label": label if label else "auto-discovered",
                 "first_seen": datetime.now(timezone.utc).isoformat(),
                 "source_count": 0,
             }
 
-        entry = self._wallets_by_address[addr_lower]
-        self._sources_by_address[addr_lower].add(source)
-        entry["source_count"] = len(self._sources_by_address[addr_lower])
-        entry["sources"] = sorted(s.value for s in self._sources_by_address[addr_lower])
+        entry = self._wallets_by_address[canonical]
+        self._sources_by_address[canonical].add(source)
+        entry["source_count"] = len(self._sources_by_address[canonical])
+        entry["sources"] = sorted(s.value for s in self._sources_by_address[canonical])
 
         # Manual watchlist always wins for label
         if source == WalletSource.MANUAL_WATCHLIST and label:
             entry["label"] = label
 
+        # Additive key — existing readers (tests, callers) keep working.
+        entry["is_new"] = is_new
+
         logger.debug(
-            "Wallet %s registered from %s (total sources: %d)",
-            addr_lower[:12] + "...",
+            "Wallet %s registered from %s (total sources: %d, is_new=%s)",
+            canonical[:12] + "...",
             source.value,
             entry["source_count"],
+            is_new,
         )
         return entry
 
@@ -125,19 +176,29 @@ class WalletDiscovery:
     def is_known_wallet(self, address: str) -> bool:
         """Return True if ``address`` (canonical form) is already registered.
 
-        Uses the same canonicalization as :meth:`_register` so a caller
-        can ask "did I just add this wallet" without re-implementing the
-        canonicalization. This is the source of truth for in-memory
-        deduplication that backs ``wallets.address`` non-uniqueness.
+        Uses the same canonicalization as :meth:`_register` (via
+        :func:`canonical_wallet_address`) so a caller can ask "did I just
+        add this wallet" without re-implementing the canonicalization.
+        This is the source of truth for in-memory deduplication that
+        backs ``wallets.address`` non-uniqueness. Returns ``False`` for
+        empty / sentinel inputs (since they are not registered).
         """
-        if not isinstance(address, str):
+        canonical = self._canonical_key(address)
+        if canonical is None:
             return False
-        canonical = address.lower().strip()
         return canonical in self._wallets_by_address
 
     def get_sources(self, address: str) -> set[WalletSource]:
-        """Return the set of sources for a given wallet address."""
-        return self._sources_by_address.get(address.lower().strip(), set())
+        """Return the set of sources for a given wallet address.
+
+        Uses :func:`canonical_wallet_address` for the lookup key so mixed
+        case / padded variants resolve to the same set of sources.
+        Returns an empty set for empty / sentinel / unknown inputs.
+        """
+        canonical = self._canonical_key(address)
+        if canonical is None:
+            return set()
+        return self._sources_by_address.get(canonical, set())
 
 
 class RelatedWalletDetector:

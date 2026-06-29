@@ -745,10 +745,11 @@ async def test_run_scan_does_not_score_on_partial(monkeypatch):
             outcomes=[MarketOutcome(label="Yes", price=0.5)],
             fetched_at=datetime.now(timezone.utc),
         )
-        return [m]
+        return [m], {}
 
     async def fake_fetch_trades_partial(
-        db, market_source_id, now, result, use_sample
+        db, market_source_id, now, result, use_sample,
+        *, asset_to_outcome=None,
     ):
         return MarketTradeFetchResult(
             trades=[_raw_trade(market, "1")],
@@ -797,10 +798,11 @@ async def test_run_scan_does_not_persist_on_failed(monkeypatch):
                 outcomes=[MarketOutcome(label="Yes", price=0.5)],
                 fetched_at=datetime.now(timezone.utc),
             )
-        ]
+        ], {}
 
     async def fake_fetch_trades_failed(
-        db, market_source_id, now, result, use_sample
+        db, market_source_id, now, result, use_sample,
+        *, asset_to_outcome=None,
     ):
         return MarketTradeFetchResult(
             trades=[],

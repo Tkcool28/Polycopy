@@ -1,6 +1,5 @@
 """Tests for P03 scoring engine, discovery, and wallet detection."""
 
-import pytest
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
@@ -269,8 +268,14 @@ class TestWalletDiscovery:
 
     def test_empty_address_raises(self):
         disc = WalletDiscovery()
-        with pytest.raises(ValueError):
-            disc.add_from_polymarket("")
+        # Round 11: empty/sentinel inputs are rejected via a dict with
+        # ``invalid=True`` instead of raising. The caller MUST check
+        # ``entry["invalid"]`` (or the ``is_new`` flag) before assuming
+        # the address was added.
+        entry = disc.add_from_polymarket("")
+        assert entry.get("invalid") is True
+        assert entry.get("is_new") is False
+        assert entry.get("address") is None
 
     def test_list_wallets_returns_all(self):
         disc = WalletDiscovery()

@@ -82,9 +82,38 @@ def setup_logging(verbosity: int = 0) -> None:
 
 
 class ScanResult:
-    """Aggregated results from a full scan."""
+    """Aggregated results from a full scan.
+
+    Wallet counters (round 11 / P3 PRRT_kwDOTG4Cf86M7Xbp):
+
+      * ``wallets_loaded_existing`` — number of canonical wallets already
+        present in the ``wallets`` table and loaded into the in-memory
+        discovery registry at Step 1. Set once, never mutated.
+      * ``wallets_discovered_new`` — number of NEW canonical wallets added
+        to the in-memory discovery registry during this scan AND whose
+        ``wallets`` row persisted successfully. A wallet whose row insert
+        failed does NOT increment this counter. A repeated scan over the
+        same set of wallets increments this by zero.
+      * ``wallets_total_known`` — ``len(discovery.list_wallets())`` at the
+        end of Step 3. Always ``loaded_existing + discovered_new`` for
+        the discovery registry; downstream consumers can use this as
+        "how many canonical wallets does the run know about".
+      * ``wallets_discovered`` — back-compat alias. Set equal to
+        ``wallets_discovered_new`` so callers that read
+        ``result.wallets_discovered`` to mean "how many new wallets did
+        this run find" still get the right number. The pre-round-11
+        meaning ("total known in the discovery registry, including
+        pre-existing") is no longer the canonical interpretation; use
+        ``wallets_total_known`` for that.
+    """
 
     def __init__(self) -> None:
+        # Round 11 wallet counters (explicit, semantically distinct).
+        self.wallets_loaded_existing: int = 0
+        self.wallets_discovered_new: int = 0
+        self.wallets_total_known: int = 0
+        # Back-compat alias for callers that read .wallets_discovered
+        # to mean "new wallets this run". Defined to equal new.
         self.wallets_discovered: int = 0
         self.wallets_scored: int = 0
         self.trades_total: int = 0
@@ -118,7 +147,10 @@ class ScanResult:
             f"scan complete\n"
             f"  market fetches: {self.market_fetches_complete} complete, "
             f"{self.market_fetches_partial} partial, {self.market_fetches_failed} failed\n"
-            f"  wallets discovered: {self.wallets_discovered}\n"
+            f"  wallets: loaded_existing={self.wallets_loaded_existing}, "
+            f"discovered_new={self.wallets_discovered_new}, "
+            f"total_known={self.wallets_total_known}\n"
+            f"  wallets discovered (back-compat alias for new): {self.wallets_discovered}\n"
             f"  wallets scored: {self.wallets_scored}\n"
             f"    copy_candidates: {self.copy_candidates}\n"
             f"    watchlist: {self.watchlist}\n"
@@ -196,24 +228,44 @@ async def run_scan(
         # or padded form), normalize before registering in the discovery
         # object so the in-memory key and the canonical SQL form agree.
         discovery.add_to_watchlist(canonical or row["address"], row["label"])
-    result.wallets_discovered = len(discovery.list_wallets())
-    logger.info("  Loaded %d existing wallets", result.wallets_discovered)
+    # Round 11 (P3): snapshot the pre-existing count BEFORE Step 3 mutates
+    # the discovery registry. This is the denominator for the new-vs-existing
+    # counter split; pre-existing wallets must never increment the
+    # "discovered_new" counter even if they re-appear during Step 3.
+    result.wallets_loaded_existing = len(discovery.list_wallets())
+    # Back-compat alias is set to the pre-existing count at this point;
+    # at the end of Step 3 we reassign it to the new-wallet count for
+    # the back-compat "wallets discovered this run" reading.
+    result.wallets_discovered = 0
+    logger.info("  Loaded %d existing wallets", result.wallets_loaded_existing)
 
     # ── Step 2: Fetch active markets ───────────────────────────────────────
     logger.info("Step 2: Fetching active markets...")
-    markets = await _fetch_markets(db, settings, market_limit, result, use_sample)
-    logger.info("  Fetched %d markets", len(markets))
+    market_list, asset_to_outcome_map = await _fetch_markets(
+        db, settings, market_limit, result, use_sample,
+    )
+    logger.info("  Fetched %d markets", len(market_list))
 
     # ── Step 3: Fetch trades per market → discover wallets ────────────────
-    logger.info("Step 3: Fetching trades for %d markets...", len(markets))
+    logger.info("Step 3: Fetching trades for %d markets...", len(market_list))
     # `all_trades` retains every fetched trade (anonymous + attributed) for
     # provenance / market-level counts / persistence. Anonymous trades are
     # still persisted upstream via the ingest path; they simply don't reach
     # wallet-dependent consumers below.
     all_trades = []
-    for market in markets:
+    for market in market_list:
+        # Per-market asset → outcome map is the same one the collector
+        # uses (built from the Gamma clobTokenIds / outcomes payload).
+        # Threading it through `fetch_recent_trades_for_market` →
+        # `adapter.fetch_trades_for_market` → `_absorb_trade` ensures the
+        # scanner rewrites a denormalized raw ``outcome`` field identically
+        # to the collector BEFORE persistence, so source_trade_id,
+        # market_source_id, outcome, side, etc. are byte-equal across both
+        # paths for the same raw Data API row.
+        asset_to_outcome = asset_to_outcome_map.get(market.source_id) or {}
         fetch_result = await _fetch_trades(
             db, market.source_id, now, result, use_sample,
+            asset_to_outcome=asset_to_outcome,
         )
         # Round-10 fetch-result contract: branch on the explicit status.
         #   - "complete" → persist + discover
@@ -272,7 +324,13 @@ async def run_scan(
                 result.trades_attributed += 1
         all_trades.extend(persisted_trades)
 
-        # Discover wallets from attributed trades only
+        # Discover wallets from attributed trades only.
+        # Round 11 (P3 PRRT_kwDOTG4Cf86M7Xbp): persistence-before-discovery.
+        # The wallet must be persisted to ``wallets`` first; if the insert
+        # fails, the wallet MUST NOT enter the in-memory discovery registry
+        # and MUST NOT be counted as a new wallet or scored. Trade
+        # persistence is independent (raw market observation is still
+        # allowed) — only the wallet promotion is gated.
         for trade in persisted_trades:
             # Sentinel filter: skip NULL and legacy sentinel trader_address
             # values so they never end up as wallet rows.
@@ -288,29 +346,41 @@ async def run_scan(
                 # second guard is cheap and makes the invariant explicit.
                 result.anonymous_trades_skipped += 1
                 continue
-            discovery.add_from_polymarket(canonical_addr)
-            # Persist wallet to DB (idempotent find-or-create by canonical
-            # address — repeated calls for the same canonical address do
-            # NOT create duplicate rows; see ``_persist_wallet``).
             from polycopy.domain.wallet import Wallet
             wallet = Wallet(
                 address=canonical_addr,
                 label=f"discovered-polymarket-{canonical_addr[:8]}",
                 is_sample=trade.is_sample,
             )
+            # 1. Persist the wallet row FIRST (idempotent find-or-create
+            #    by canonical address). The returned id is the
+            #    source-of-truth signal that the wallet row is now in
+            #    the DB.
             wallet_id = _persist_wallet(db, wallet)
-            if wallet_id is not None:
-                # ``_persist_wallet`` returns the existing or new id —
-                # we use it as the source-of-truth signal that the wallet
-                # row is now present in the DB. Without an id, treat the
-                # wallet as not newly registered so the discovery counter
-                # is honest about what actually happened.
-                if not discovery.is_known_wallet(canonical_addr):
-                    # Newly registered in the in-memory discovery object
-                    # during this loop iteration — counter incremented
-                    # later when ``len(discovery.list_wallets())`` is
-                    # snapshotted.
-                    pass
+            if wallet_id is None:
+                # Persistence failed. Record the error, do NOT add the
+                # wallet to the in-memory discovery registry, do NOT
+                # increment the new-wallet counter, do NOT let it reach
+                # the scoring loop. The trade row itself is still in
+                # source_trades (raw market observation preserved).
+                result.errors.append(
+                    f"Wallet persist failed for {canonical_addr[:12]}; "
+                    f"skipped discovery/scoring"
+                )
+                logger.warning(
+                    "Wallet persist failed for %s; not added to discovery",
+                    canonical_addr[:12],
+                )
+                continue
+            # 2. Wallet row is in the DB. Safe to add to the in-memory
+            #    discovery registry. The discovery entry's ``is_new``
+            #    flag (added in round 9) is the source of truth for the
+            #    new-wallet counter — no separate pre/post lookup is
+            #    needed and the "wallets_discovered" alias never inflates
+            #    by counting a wallet that failed to persist.
+            entry = discovery.add_from_polymarket(canonical_addr)
+            if entry.get("is_new", False):
+                result.wallets_discovered_new += 1
 
     # Separate attributed trades (real wallet address) from anonymous ones.
     # Only attributed trades may enter wallet-dependent processing.
@@ -319,10 +389,21 @@ async def run_scan(
     ]
 
     result.trades_total = len(all_trades)
-    result.wallets_discovered = len(discovery.list_wallets())
+    # Round 11 (P3): truthful wallet counters. ``wallets_total_known`` is
+    # the in-memory discovery registry size after Step 3, i.e. the
+    # canonical "how many wallets does this run know about" answer.
+    # ``wallets_discovered`` is the back-compat alias for
+    # ``wallets_discovered_new`` (per-run new-wallet count).
+    result.wallets_total_known = len(discovery.list_wallets())
+    result.wallets_discovered = result.wallets_discovered_new
     logger.info(
-        "  Total wallets after discovery: %d (attributed trades: %d, anonymous: %d)",
-        result.wallets_discovered,
+        "  Total wallets after discovery: %d (loaded_existing=%d, "
+        "discovered_new=%d, total_known=%d, attributed trades: %d, "
+        "anonymous: %d)",
+        result.wallets_total_known,
+        result.wallets_loaded_existing,
+        result.wallets_discovered_new,
+        result.wallets_total_known,
         len(attributed_trades),
         result.anonymous_trades_skipped,
     )
@@ -414,7 +495,7 @@ async def run_scan(
 
     # ── Step 7: Generate signals for COPY_CANDIDATE wallets ───────────────
     logger.info("Step 7: Generating signals for copy candidates...")
-    signals = _generate_signals(db, markets, now)
+    signals = _generate_signals(db, market_list, now)
     result.signals = len(signals)
     logger.info("  Generated %d signals", result.signals)
 
@@ -645,12 +726,25 @@ def _persist_wallet(db: Database, wallet) -> str | None:
 
 async def _fetch_markets(
     db, settings, limit, result, use_sample
-) -> list[Market]:
-    """Fetch active markets from Polymarket or use sample data."""
+) -> tuple[list[Market], dict[str, dict[str, str]]]:
+    """Fetch active markets from Polymarket or use sample data.
+
+    Returns ``(markets, asset_to_outcome_map)`` where
+    ``asset_to_outcome_map`` maps ``market.source_id`` → a
+    ``{token_id: outcome_label}`` dict built from the same Gamma
+    ``clobTokenIds`` / ``outcomes`` payload the parser consumes. This
+    map is the input to the ``asset_to_outcome`` parameter threaded
+    through ``fetch_recent_trades_for_market`` so the scanner rewrites
+    a denormalized ``outcome`` field identically to the collector.
+
+    For sample markets the map is empty (sample trades already carry
+    correct outcome labels), so the parser falls back to the raw field.
+    """
     if use_sample:
-        return _get_sample_markets()
+        return _get_sample_markets(), {}
 
     import httpx
+    asset_map: dict[str, dict[str, str]] = {}
     async with httpx.AsyncClient(base_url=settings.gamma_base_url, timeout=settings.http_timeout_seconds) as client:
         try:
             resp = await client.get("/markets", params={
@@ -667,10 +761,16 @@ async def _fetch_markets(
                 try:
                     market = _parse_gamma_market(item)
                     _persist_market(db, market)
+                    # Build the asset-to-outcome map from the same raw
+                    # Gamma payload so a single market fetch serves
+                    # both the persistence path AND the trade-normalization
+                    # path. Reuses the same JSON-decode logic the
+                    # collector uses in PolymarketCollector.
+                    asset_map[market.source_id] = _build_asset_to_outcome_map(item)
                     markets.append(market)
                 except Exception as e:
                     result.errors.append(f"Market parse error: {e}")
-            return markets
+            return markets, asset_map
         except Exception as e:
             result.errors.append(f"Market fetch failed: {e}")
             logger.warning(
@@ -678,10 +778,13 @@ async def _fetch_markets(
                 "Sample markets are only used with --use-sample: %s",
                 e,
             )
-            return []
+            return [], {}
 
 
-async def _fetch_trades(db, market_source_id, now, result, use_sample):
+async def _fetch_trades(
+    db, market_source_id, now, result, use_sample,
+    *, asset_to_outcome: dict[str, str] | None = None,
+):
     """Fetch trades for a market or return sample trades.
 
     P2 fix (PR #3): live ``use_sample=False`` mode used to hit a legacy
@@ -726,11 +829,15 @@ async def _fetch_trades(db, market_source_id, now, result, use_sample):
     # history the API can serve (the data-api hard-caps the per-market
     # response at ``max_rows``). A scan run wants the complete recent
     # picture, not a per-call delta.
+    # ``asset_to_outcome`` is threaded through from run_scan → here → the
+    # shared adapter. Same map the collector uses, so scanner and collector
+    # rewrite a denormalized ``outcome`` field identically.
     return await fetch_recent_trades_for_market(
         adapter,
         market_source_id=market_source_id,
         since=datetime.fromtimestamp(0, tz=timezone.utc),
         limit=200,
+        asset_to_outcome=asset_to_outcome or {},
     )
 
 
@@ -843,8 +950,37 @@ def _get_scan_trade_adapter() -> "PolymarketPublicAdapter":
                 "scripts/_live_ingest.build_trade_adapter is unavailable; "
                 "scripts/ must be importable to use the live trade path"
             )
-        _SCAN_TRADE_ADAPTER = build_trade_adapter()
+        _SCAN_TRADE_ADAPTER = build_trade_adapter(get_settings())
     return _SCAN_TRADE_ADAPTER
+
+
+def _build_asset_to_outcome_map(data: dict) -> dict[str, str]:
+    """Build asset_id → outcome-label map for a Gamma market object.
+
+    Mirror of
+    :meth:`scripts.collect_smart_money_data.PolymarketCollector._build_asset_to_outcome_map`
+    so the scanner and the collector rewrite a denormalized raw ``outcome``
+    field identically for the same raw Gamma payload. The two functions
+    must stay in sync — they are the single source of truth for
+    ``{clobTokenId: outcomes_label}`` mapping used to fix the raw
+    data-api ``outcome`` string.
+
+    Gamma's ``clobTokenIds`` is a JSON-encoded array of token IDs in the
+    same order as the ``outcomes`` array. The two are zipped position-wise.
+    """
+    import json as _json
+    try:
+        outcomes = data.get("outcomes", "[]")
+        tokens = data.get("clobTokenIds", "[]")
+        if isinstance(outcomes, str):
+            outcomes = _json.loads(outcomes)
+        if isinstance(tokens, str):
+            tokens = _json.loads(tokens)
+        if not isinstance(outcomes, list) or not isinstance(tokens, list):
+            return {}
+        return {str(tok): str(lab) for tok, lab in zip(tokens, outcomes)}
+    except Exception:
+        return {}
 
 
 def _parse_gamma_market(data: dict) -> Market:

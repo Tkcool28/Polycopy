@@ -94,6 +94,7 @@ async def fetch_recent_trades_for_market(
     limit: int = 200,
     max_pages: int = 5,
     max_rows: int = 2000,
+    asset_to_outcome: Optional[dict[str, str]] = None,
 ) -> MarketTradeFetchResult:
     """Fetch recent trades for a single market via the shared adapter.
 
@@ -107,6 +108,17 @@ async def fetch_recent_trades_for_market(
     Callers MUST branch on ``result.status`` before persisting or scoring —
     a partial fetch must never be silently treated as a complete history.
 
+    Round 11 (P3 PRRT_kwDOTG4Cf86M7Xbp): the ``asset_to_outcome`` map is
+    threaded through here from the per-market ingestion context so the
+    scanner (``run_scan``) and the collector (``collect_smart_money_data``)
+    rewrite the raw ``outcome`` field identically. A ``None`` or empty map
+    falls back to the raw outcome label (same as the raw parser). The map
+    is the same one the collector builds from Gamma ``clobTokenIds`` and
+    the one the scanner builds in its own ``_fetch_markets`` from the same
+    Gamma payload, so a Data API row whose ``outcome`` is denormalized
+    (i.e. the wrong Yes/No for this market) is corrected identically by
+    both paths before persistence.
+
     Never raises; on any adapter error returns a ``MarketTradeFetchResult``
     with ``status="failed"`` and an ``error`` message. The shared adapter
     instance is reused so cached resources are shared across markets
@@ -119,6 +131,7 @@ async def fetch_recent_trades_for_market(
             limit=limit,
             max_pages=max_pages,
             max_rows=max_rows,
+            asset_to_outcome=asset_to_outcome or {},
         )
     except Exception as exc:
         # Adapter.fetch_trades_for_market never raises, but defensive:

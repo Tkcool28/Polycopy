@@ -242,18 +242,52 @@ class PolymarketCollector:
             return []
 
     async def _get_trade_adapter(self):
-        """Lazy-init the shared PolymarketPublicAdapter used for trade ingestion."""
+        """Lazy-init the shared PolymarketPublicAdapter used for trade ingestion.
+
+        Round 11 (P3 PRRT_kwDOTG4Cf86M7Xbp): the collector and the scanner
+        must construct the adapter through the SAME factory — the shared
+        ``scripts._live_ingest.build_trade_adapter(settings)`` helper —
+        so neither path drifts from the other on base URLs, timeout,
+        rate limit, window size, or request interval. The factory is
+        imported here via the package path AND via the bare-name path
+        (the latter works when ``scripts/`` is on ``sys.path``, e.g.
+        direct CLI execution; the former works when the module is
+        imported as ``scripts._live_ingest``). The lazy singleton is
+        preserved so a single collection run reuses one adapter
+        instance across all markets.
+        """
         if self._trade_adapter is None:
             from polycopy.adapters.polymarket import PolymarketPublicAdapter
-            self._trade_adapter = PolymarketPublicAdapter(
-                gamma_base_url=self.settings.gamma_base_url,
-                clob_base_url=self.settings.clob_base_url,
-                data_api_base_url=self.settings.data_api_base_url,
-                timeout=self.settings.http_timeout_seconds,
-                rate_limit_rps=self.settings.http_rate_limit_rps,
-                data_api_window_size=self.settings.data_api_window_size,
-                data_api_request_interval_seconds=self.settings.data_api_request_interval_seconds,
-            )
+            adapter = None
+            # 1) Try the package import (works under ``import scripts``).
+            try:
+                from scripts._live_ingest import build_trade_adapter  # type: ignore[import-not-found]
+                adapter = build_trade_adapter(self.settings)
+            except ImportError:
+                pass
+            # 2) Try the bare-name import (works when ``scripts/`` is
+            #    directly on sys.path — the direct-CLI-execution path).
+            if adapter is None:
+                try:
+                    from _live_ingest import build_trade_adapter  # type: ignore[import-not-found,no-redef]
+                    adapter = build_trade_adapter(self.settings)
+                except ImportError:
+                    pass
+            # 3) Defensive fallback: construct directly so a stripped
+            #    sys.path cannot crash the live path. This is identical
+            #    to what the factory would have built.
+            if adapter is None:
+                settings = self.settings
+                adapter = PolymarketPublicAdapter(
+                    gamma_base_url=settings.gamma_base_url,
+                    clob_base_url=settings.clob_base_url,
+                    data_api_base_url=settings.data_api_base_url,
+                    timeout=settings.http_timeout_seconds,
+                    rate_limit_rps=settings.http_rate_limit_rps,
+                    data_api_window_size=settings.data_api_window_size,
+                    data_api_request_interval_seconds=settings.data_api_request_interval_seconds,
+                )
+            self._trade_adapter = adapter
         return self._trade_adapter
 
     async def collect_trades(

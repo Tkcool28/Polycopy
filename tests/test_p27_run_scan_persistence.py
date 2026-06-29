@@ -83,9 +83,12 @@ async def test_run_scan_persists_raw_trades_before_wallet_metrics_and_scoring(
     metrics_checked_after_persistence = False
 
     async def fake_fetch_markets(db, settings, limit, result, use_sample):
-        return [market]
+        return [market], {}
 
-    async def fake_fetch_trades(db, market_source_id, now, result, use_sample):
+    async def fake_fetch_trades(
+        db, market_source_id, now, result, use_sample,
+        *, asset_to_outcome=None,
+    ):
         assert market_source_id == market.source_id
         return MarketTradeFetchResult(
             trades=fetched,
@@ -176,9 +179,12 @@ async def test_run_scan_skips_wallet_scoring_when_trade_persistence_fails(
     metrics_called = False
 
     async def fake_fetch_markets(db, settings, limit, result, use_sample):
-        return [market]
+        return [market], {}
 
-    async def fake_fetch_trades(db, market_source_id, now, result, use_sample):
+    async def fake_fetch_trades(
+        db, market_source_id, now, result, use_sample,
+        *, asset_to_outcome=None,
+    ):
         assert market_source_id == market.source_id
         return MarketTradeFetchResult(
             trades=fetched,

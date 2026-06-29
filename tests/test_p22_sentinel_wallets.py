@@ -509,7 +509,7 @@ class TestRunScanAfterV4Upgrade:
             # is that the startup loader must not crash and must not pick
             # up sentinel rows.
             async def fake_fetch_markets(db, settings, limit, result, use_sample):
-                return []
+                return [], {}
 
             def fake_generate_signals(db, ms, now):
                 return []
@@ -520,7 +520,18 @@ class TestRunScanAfterV4Upgrade:
             result = await rs.run_scan(db, market_limit=1, use_sample=False)
 
             # The real wallet is the only one loaded.
-            assert result.wallets_discovered == 1
+            # Round 11: with explicit counters,
+            #   - loaded_existing: 1 (the pre-existing "0xREAL_UPGRADE" row)
+            #   - discovered_new: 0 (no new wallets this run — no markets)
+            #   - total_known: 1 (= loaded_existing)
+            # ``wallets_discovered`` is the back-compat alias for
+            # ``wallets_discovered_new`` (per-run new-wallet count), so
+            # it is 0 here, not 1. The test previously conflated
+            # "loaded existing" with "discovered"; the new counters
+            # disambiguate the two.
+            assert result.wallets_loaded_existing == 1
+            assert result.wallets_discovered_new == 0
+            assert result.wallets_total_known == 1
             assert result.errors == []
             assert result.anonymous_trades_skipped == 0
 

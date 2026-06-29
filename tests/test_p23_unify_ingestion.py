@@ -102,7 +102,7 @@ def _empty_db(tmp_path: Path) -> Database:
 
 def _patched_fetch_markets(monkeypatch, markets):
     async def fake_fetch_markets(db, settings, limit, result, use_sample):
-        return markets
+        return markets, {}
 
     monkeypatch.setattr(run_scan_module, "_fetch_markets", fake_fetch_markets)
 

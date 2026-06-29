@@ -80,7 +80,10 @@ def _patched_fetch_trades(monkeypatch, trades_by_market: dict):
     behavior mock ``_fetch_trades`` directly.
     """
 
-    async def fake_fetch_trades(db, market_source_id, now, result, use_sample):
+    async def fake_fetch_trades(
+        db, market_source_id, now, result, use_sample,
+        *, asset_to_outcome=None,
+    ):
         trades = trades_by_market.get(market_source_id, [])
         return MarketTradeFetchResult(
             trades=trades,
@@ -95,7 +98,7 @@ def _patched_fetch_trades(monkeypatch, trades_by_market: dict):
 
 def _patched_fetch_markets(monkeypatch, markets):
     async def fake_fetch_markets(db, settings, limit, result, use_sample):
-        return markets
+        return markets, {}
 
     monkeypatch.setattr(run_scan_module, "_fetch_markets", fake_fetch_markets)
 
