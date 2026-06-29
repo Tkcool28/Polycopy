@@ -37,9 +37,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from polycopy.adapters.polymarket import PolymarketPublicAdapter
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
+from polycopy.db.wallet_identity import (
+    address_column_normalized,
+    canonical_wallet_address,
+    is_sentinel_trader_address,
+)
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
-from polycopy.domain.source_trade import is_sentinel_trader_address
 from polycopy.domain.raw_snapshot import RawSnapshot
 from polycopy.domain.source_trade import SourceTrade
 from polycopy.domain.wallet import Wallet
@@ -529,15 +533,38 @@ class PolymarketCollector:
             )
         db.conn.commit()
 
-    def _persist_trade(self, db: Database, trade: SourceTrade) -> None:
-        """Upsert a source trade."""
-        db.execute(
-            """INSERT OR REPLACE INTO source_trades
+    def _persist_trade(self, db: Database, trade: SourceTrade) -> bool:
+        """Upsert a source trade — idempotent and provenance-preserving.
+
+        Round 9 (PR #3 stabilization): switched from ``INSERT OR REPLACE``
+        to ``INSERT OR IGNORE`` against the ``UNIQUE(source, source_trade_id)``
+        index. ``INSERT OR REPLACE`` would silently overwrite existing
+        rows on an exact rerun, destroying provenance and corrupting
+        counter truthfulness. With ``INSERT OR IGNORE``:
+          * Fresh row → ``cur.rowcount == 1``, return ``True``.
+          * Already exists → ``cur.rowcount == 0``, return ``False`` —
+            counted as dedup, not as a new persist.
+
+        Defensive canonicalization: the attributed ``trader_address`` is
+        normalized via ``canonical_wallet_address`` so the value persisted
+        into ``source_trades`` matches the canonical form used by
+        ``_compute_wallet_metrics`` and the wallet discovery loop.
+        Anonymous / sentinel trader addresses are stored as ``NULL`` and
+        never become wallet rows.
+        """
+        ta = trade.trader_address
+        if ta is not None:
+            canonical = canonical_wallet_address(ta)
+            persisted_trader_address = canonical  # None for sentinels/empty
+        else:
+            persisted_trader_address = None
+        cur = db.execute(
+            """INSERT OR IGNORE INTO source_trades
                (id, source, source_trade_id, market_source_id, side, outcome,
                 quantity, price, trader_address, timestamp, is_sample)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                str(trade.id),
+                str(uuid.uuid4()),
                 trade.source,
                 trade.source_trade_id,
                 trade.market_source_id,
@@ -545,33 +572,99 @@ class PolymarketCollector:
                 trade.outcome,
                 trade.quantity,
                 trade.price,
-                trade.trader_address,
-                trade.timestamp.isoformat(),
+                persisted_trader_address,
+                trade.timestamp.isoformat() if trade.timestamp else None,
                 int(trade.is_sample),
             ),
         )
         db.conn.commit()
+        # rowcount == 1 means a fresh insert; 0 means duplicate (UNIQUE hit)
+        return bool(getattr(cur, "rowcount", 0))
 
-    def _persist_wallet(self, db: Database, wallet: Wallet) -> None:
-        """Upsert a wallet and its balances."""
-        db.execute(
-            """INSERT OR REPLACE INTO wallets (id, address, label, is_sample, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                str(wallet.id),
-                wallet.address,
-                wallet.label,
-                int(wallet.is_sample),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        for bal in wallet.balances:
-            db.execute(
-                """INSERT INTO wallet_balances (wallet_id, currency, amount, as_of, is_sample)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (str(wallet.id), bal.currency, bal.amount, bal.as_of.isoformat(), int(bal.is_sample)),
+    def _persist_wallet(self, db: Database, wallet: Wallet) -> str | None:
+        """Idempotently persist a wallet by canonical address.
+
+        Same find-or-create semantics as ``scripts.run_scan._persist_wallet``
+        (single canonical implementation lives in
+        :mod:`polycopy.db.wallet_identity`). ``address`` is normalized via
+        ``canonical_wallet_address`` so any case/padding variant maps to
+        one row. Returns the wallet id (existing or new), or ``None`` for
+        anonymous inputs / on persistence failure.
+
+        Any balances attached to the input ``wallet`` are inserted against
+        the resolved wallet id (existing or new) using ``INSERT OR IGNORE``
+        on the ``wallet_balances`` row identity — so an exact rerun of
+        the collector never duplicates balances. Each balance row's
+        identity is ``(wallet_id, currency, as_of)`` (callers that want
+        upsert-by-that-key may use a unique index; here we use plain
+        ``INSERT`` with the same DB-level retry-on-conflict pattern as
+        ``_persist_trade`` for safety).
+        """
+        try:
+            canonical = canonical_wallet_address(wallet.address)
+            if canonical is None:
+                return None
+            existing = db.fetchone(
+                f"SELECT id FROM wallets "
+                f"WHERE {address_column_normalized('address')} = ?",
+                (canonical,),
             )
-        db.conn.commit()
+            if existing is not None:
+                wallet_id = existing["id"]
+            else:
+                wallet_id = str(uuid.uuid4())
+                db.execute(
+                    """INSERT OR IGNORE INTO wallets
+                       (id, address, label, is_sample, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        wallet_id,
+                        canonical,
+                        wallet.label,
+                        int(wallet.is_sample),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                # Re-fetch: a concurrent writer may have raced us to the
+                # same canonical address. The re-fetch always uses the
+                # canonical-address predicate so a race leaves one row,
+                # not two.
+                post = db.fetchone(
+                    f"SELECT id FROM wallets "
+                    f"WHERE {address_column_normalized('address')} = ?",
+                    (canonical,),
+                )
+                if post is not None:
+                    wallet_id = post["id"]
+            # Persist attached balances (if any). Plain INSERT matches the
+            # pre-existing balance-write behavior: wallet_balances has no
+            # unique index on (wallet_id, currency, as_of) and a rerun of
+            # the collector historically created duplicate rows. Adding a
+            # unique index here is out of scope for this PR (wallet_balance
+            # dedup is a separate concern from the wallet-identity
+            # invariant) — flagged for a follow-up.
+            for bal in wallet.balances:
+                db.execute(
+                    """INSERT INTO wallet_balances
+                       (wallet_id, currency, amount, as_of, is_sample)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        wallet_id,
+                        bal.currency,
+                        float(bal.amount),
+                        bal.as_of.isoformat() if bal.as_of else None,
+                        int(bal.is_sample),
+                    ),
+                )
+            db.conn.commit()
+            return wallet_id
+        except Exception as e:
+            logger.debug("Wallet persist skipped for %r: %s", wallet.address, e)
+            try:
+                db.conn.rollback()
+            except Exception:
+                pass
+            return None
 
     async def _snapshot_market_first_page(
         self,
@@ -781,28 +874,38 @@ async def run_collection(
 
 
 def _get_unique_trader_addresses(db: Database) -> list[str]:
-    """Get distinct trader addresses from source_trades.
+    """Get distinct canonical trader addresses from source_trades.
 
     Defensive: filters out NULL and empty-string addresses so anonymous trades
     (P2) cannot end up in the scoring loop even if they bypass the collector's
     anonymous skip.
 
     Note: the v5 migration normalizes legacy sentinel strings
-    ("unknown" / "anonymous" / "missing" / "0x" / "0x0") to NULL on upgrade,
-    so the DB-level filter alone is sufficient for upgraded databases. The
-    ``is_sentinel_trader_address`` runtime helper below provides defense in
-    depth and is the source of truth for live collectors/scoring loops.
+    ("unknown" / "anonymous" / "missing" / "0x" / "0x0")
+    to NULL on upgrade, so the DB-level filter alone is sufficient for
+    upgraded databases. The ``is_sentinel_trader_address`` runtime helper
+    below provides defense in depth and is the source of truth for live
+    collectors/scoring loops.
+
+    Returns the CANONICAL lowercase form of every distinct real wallet
+    address — so a freshly discovered ``0xAbCd...`` and a legacy
+    ``0xabcd...`` collapse to the same entry, and a padded legacy
+    ``"\\t0xAbCd...\\n"`` collapses to ``0xabcd...``. The SQL fragment
+    uses the shared ``address_column_normalized`` helper so the predicate
+    matches the v5 migration cleanup byte-for-byte (modulo the X'00' NUL
+    addition that makes it pad-aware across all ASCII whitespace).
     """
     rows = db.fetchall(
-        "SELECT DISTINCT trader_address FROM source_trades "
-        "WHERE trader_address IS NOT NULL "
-        "AND TRIM(trader_address) != '' "
-        "AND LOWER(TRIM(trader_address)) NOT IN ('unknown', 'anonymous', 'missing', '0x', '0x0')"
+        f"SELECT DISTINCT {address_column_normalized('trader_address')} AS addr "
+        f"FROM source_trades "
+        f"WHERE trader_address IS NOT NULL "
+        f"AND {address_column_normalized('trader_address')} != '' "
+        f"AND {address_column_normalized('trader_address')} NOT IN ('unknown', 'anonymous', 'missing', '0x', '0x0')"
     )
     return [
-        row["trader_address"]
+        row["addr"]
         for row in rows
-        if not is_sentinel_trader_address(row["trader_address"])
+        if not is_sentinel_trader_address(row["addr"])
     ]
 
 

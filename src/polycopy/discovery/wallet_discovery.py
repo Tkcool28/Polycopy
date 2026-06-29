@@ -122,6 +122,19 @@ class WalletDiscovery:
         """Return all discovered wallets with their sources."""
         return list(self._wallets_by_address.values())
 
+    def is_known_wallet(self, address: str) -> bool:
+        """Return True if ``address`` (canonical form) is already registered.
+
+        Uses the same canonicalization as :meth:`_register` so a caller
+        can ask "did I just add this wallet" without re-implementing the
+        canonicalization. This is the source of truth for in-memory
+        deduplication that backs ``wallets.address`` non-uniqueness.
+        """
+        if not isinstance(address, str):
+            return False
+        canonical = address.lower().strip()
+        return canonical in self._wallets_by_address
+
     def get_sources(self, address: str) -> set[WalletSource]:
         """Return the set of sources for a given wallet address."""
         return self._sources_by_address.get(address.lower().strip(), set())

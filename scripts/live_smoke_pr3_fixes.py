@@ -46,7 +46,11 @@ from polycopy.adapters.polymarket import (  # noqa: E402
 )
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.db.schema import SCHEMA_VERSION  # noqa: E402
-from polycopy.domain.source_trade import is_sentinel_trader_address  # noqa: E402
+from polycopy.db.wallet_identity import (  # noqa: E402
+    address_column_normalized,
+    canonical_wallet_address,
+    is_sentinel_trader_address,
+)
 
 
 def banner(msg: str) -> None:
@@ -183,18 +187,19 @@ async def main() -> int:
     if bad:
         kv("  examples", bad[:3])
 
-    # 8. Simulate collector behavior: INSERT OR REPLACE + wallet discovery
+    # 8. Simulate collector behavior: idempotent insert + canonical wallet-discovery
     banner("End-to-end: insert trades, then mirror collector's wallet-discovery loop")
     n_inserted = 0
-    n_replaced = 0
+    n_skipped = 0
     for t in parsed_trades:
-        # Check pre-insert
-        pre = db.fetchone(
-            "SELECT id FROM source_trades WHERE source=? AND source_trade_id=?",
-            (t.source, t.source_trade_id),
-        )
-        db.execute(
-            """INSERT OR REPLACE INTO source_trades
+        # Defensive canonicalize the trader address on the persistence
+        # boundary so the DB row matches what ``_compute_wallet_metrics``
+        # expects (lowercase, all-whitespace-stripped). Sentinels/None
+        # store as NULL — same as the canonical run_scan/collector path.
+        ta = t.trader_address
+        persisted_ta = canonical_wallet_address(ta) if ta is not None else None
+        cur = db.execute(
+            """INSERT OR IGNORE INTO source_trades
                (id, source, source_trade_id, market_source_id, side, outcome,
                 quantity, price, trader_address, timestamp, is_sample)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -202,15 +207,20 @@ async def main() -> int:
                 str(t.id), t.source, t.source_trade_id, t.market_source_id,
                 t.side.value if hasattr(t.side, "value") else str(t.side),
                 t.outcome, t.quantity, t.price,
-                t.trader_address,
+                persisted_ta,
                 t.timestamp.isoformat(), int(t.is_sample),
             ),
         )
-        if pre is not None:
-            n_replaced += 1
-        else:
+        # rowcount==1 means a fresh insert; 0 means duplicate (UNIQUE hit)
+        if getattr(cur, "rowcount", 0):
             n_inserted += 1
+        else:
+            n_skipped += 1
     db.conn.commit()
+    # Alias for downstream kv() call: report dedup count under the legacy
+    # "n_replaced" name so older log greps still line up. (Dedup is the
+    # truth here — ``INSERT OR IGNORE`` skips, it does not overwrite.)
+    n_replaced = n_skipped
 
     n_distinct_in_db = db.fetchone("SELECT COUNT(DISTINCT source_trade_id) AS n FROM source_trades")["n"]
     n_rows_in_db = db.fetchone("SELECT COUNT(*) AS n FROM source_trades")["n"]
@@ -232,31 +242,42 @@ async def main() -> int:
     kv("same-tx distinct rows preserved (P1 proof)", same_tx_preserved)
 
     # 9. Wallet discovery mirroring collector's logic
-    # Filter out sentinels at the SQL layer (matches _get_unique_trader_addresses
-    # in scripts/collect_smart_money_data.py — keep in sync).
+    # Filter out sentinels at the SQL layer (matches
+    # ``_get_unique_trader_addresses`` in
+    # scripts/collect_smart_money_data.py — keep in sync via the shared
+    # ``address_column_normalized`` helper in polycopy.db.wallet_identity).
     unique_addrs = [
-        r["trader_address"]
+        r["addr"]
         for r in db.fetchall(
-            "SELECT DISTINCT trader_address FROM source_trades "
-            "WHERE trader_address IS NOT NULL "
-            "AND TRIM(trader_address) != '' "
-            "AND LOWER(TRIM(trader_address)) NOT IN ('unknown', 'anonymous', 'missing', '0x', '0x0')"
+            f"SELECT DISTINCT {address_column_normalized('trader_address')} AS addr "
+            f"FROM source_trades "
+            f"WHERE trader_address IS NOT NULL "
+            f"AND {address_column_normalized('trader_address')} != '' "
+            f"AND {address_column_normalized('trader_address')} NOT IN ('unknown', 'anonymous', 'missing', '0x', '0x0')"
         )
-        if not is_sentinel_trader_address(r["trader_address"])
+        if not is_sentinel_trader_address(r["addr"])
     ]
     kv("distinct non-NULL trader_addresses for scoring", len(unique_addrs))
     kv("  unique wallets to be discovered", len(set(unique_addrs)))
     n_wallets_real = 0
     for addr in unique_addrs:
-        db.execute(
-            """INSERT OR REPLACE INTO wallets
-               (id, address, label, is_sample, created_at)
-               VALUES (?, ?, ?, 0, ?)""",
-            (str(__import__("uuid").uuid4()), addr,
-             f"discovered-from-{a.data_api_base_url}",
-             datetime.now(timezone.utc).isoformat()),
+        # Canonical find-or-create so repeated identical inserts (or
+        # mixed-case/padded variants of the same address) collapse to a
+        # single wallet row.
+        existing = db.fetchone(
+            f"SELECT id FROM wallets WHERE {address_column_normalized('address')} = ?",
+            (addr,),
         )
-        n_wallets_real += 1
+        if existing is None:
+            db.execute(
+                """INSERT INTO wallets
+                   (id, address, label, is_sample, created_at)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (str(__import__("uuid").uuid4()), addr,
+                 f"discovered-from-{a.data_api_base_url}",
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            n_wallets_real += 1
     db.conn.commit()
     kv("wallets created (real)", n_wallets_real)
 

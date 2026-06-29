@@ -33,6 +33,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
+from polycopy.db.wallet_identity import (
+    address_column_normalized,
+    canonical_wallet_address,
+    is_sentinel_trader_address,
+)
 from polycopy.discovery.wallet_discovery import (
     RelatedWalletDetector,
     TradeDetector,
@@ -41,7 +46,7 @@ from polycopy.discovery.wallet_discovery import (
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.order import OrderSide
-from polycopy.domain.source_trade import SourceTrade, is_sentinel_trader_address
+from polycopy.domain.source_trade import SourceTrade
 from polycopy.engine.evaluate import evaluate_wallet
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
 
@@ -164,18 +169,27 @@ async def run_scan(
     # ── Step 1: Load existing wallets from DB ──────────────────────────────
     logger.info("Step 1: Loading existing wallets from database...")
     # Defensive: filter sentinel / empty / whitespace-only addresses in
-    # Python so a row that somehow slipped past the v5 migration cleanup
-    # (e.g. an upgrade interrupted before v5 finished, or rows inserted
-    # manually after the upgrade) never enters the watchlist / scoring
-    # loop. ``is_sentinel_trader_address`` is the single source of truth
-    # shared with the v5 migration's DELETE predicate.
+    # SQL (using the shared canonicalization fragment) AND in Python so a
+    # row that somehow slipped past the v5 migration cleanup (e.g. an
+    # upgrade interrupted before v5 finished, or rows inserted manually
+    # after the upgrade) never enters the watchlist / scoring loop. The
+    # SQL filter uses the SAME predicate as the v5 migration cleanup
+    # AND as ``address_column_normalized`` so every path agrees.
     wallet_rows = [
         row
-        for row in db.fetchall("SELECT address, label FROM wallets")
+        for row in db.fetchall(
+            f"""SELECT address, label FROM wallets
+                WHERE NOT ({address_column_normalized('address')} = ''
+                   OR {address_column_normalized('address')} IN ('unknown', 'anonymous', 'missing', '0x', '0x0'))"""
+        )
         if not is_sentinel_trader_address(row["address"])
     ]
     for row in wallet_rows:
-        discovery.add_to_watchlist(row["address"], row["label"])
+        canonical = canonical_wallet_address(row["address"])
+        # If the DB row's address is not yet canonical (legacy mixed-case
+        # or padded form), normalize before registering in the discovery
+        # object so the in-memory key and the canonical SQL form agree.
+        discovery.add_to_watchlist(canonical or row["address"], row["label"])
     result.wallets_discovered = len(discovery.list_wallets())
     logger.info("  Loaded %d existing wallets", result.wallets_discovered)
 
@@ -225,15 +239,38 @@ async def run_scan(
             if is_sentinel_trader_address(trade.trader_address):
                 result.anonymous_trades_skipped += 1
                 continue
-            discovery.add_from_polymarket(trade.trader_address)
-            # Persist wallet to DB
+            # Canonicalize before both registering in the in-memory
+            # discovery object AND persisting into ``wallets`` — the two
+            # MUST agree on identity for counters and for find-or-create.
+            canonical_addr = canonical_wallet_address(trade.trader_address)
+            if canonical_addr is None:
+                # Defensive: should already have been caught above, but a
+                # second guard is cheap and makes the invariant explicit.
+                result.anonymous_trades_skipped += 1
+                continue
+            discovery.add_from_polymarket(canonical_addr)
+            # Persist wallet to DB (idempotent find-or-create by canonical
+            # address — repeated calls for the same canonical address do
+            # NOT create duplicate rows; see ``_persist_wallet``).
             from polycopy.domain.wallet import Wallet
             wallet = Wallet(
-                address=trade.trader_address,
-                label=f"discovered-polymarket-{trade.trader_address[:8]}",
+                address=canonical_addr,
+                label=f"discovered-polymarket-{canonical_addr[:8]}",
                 is_sample=trade.is_sample,
             )
-            _persist_wallet(db, wallet)
+            wallet_id = _persist_wallet(db, wallet)
+            if wallet_id is not None:
+                # ``_persist_wallet`` returns the existing or new id —
+                # we use it as the source-of-truth signal that the wallet
+                # row is now present in the DB. Without an id, treat the
+                # wallet as not newly registered so the discovery counter
+                # is honest about what actually happened.
+                if not discovery.is_known_wallet(canonical_addr):
+                    # Newly registered in the in-memory discovery object
+                    # during this loop iteration — counter incremented
+                    # later when ``len(discovery.list_wallets())`` is
+                    # snapshotted.
+                    pass
 
     # Separate attributed trades (real wallet address) from anonymous ones.
     # Only attributed trades may enter wallet-dependent processing.
@@ -355,20 +392,22 @@ def _compute_wallet_metrics(
 ) -> dict | None:
     """Compute scoring metrics for a wallet from its trades in DB.
 
-    Round-8 fix: ``address`` is matched case-insensitively against
-    ``trader_address`` via ``LOWER(TRIM(...))``. The parser now
-    lowercases legitimate wallet addresses at the source-trade boundary,
-    but legacy rows that pre-date round-8 may still contain
-    mixed-case/checksum-style addresses. Normalizing both sides of the
-    comparison means a freshly-discovered (lowercase) wallet can find
-    trades persisted under any case variant of the same address.
+    Canonicalization invariant: ``address`` is matched case-insensitively
+    and against ANY surrounding ASCII whitespace (tab, LF, CR, VT, FF,
+    NUL, space) via the shared ``address_column_normalized`` SQL fragment
+    defined in :mod:`polycopy.db.wallet_identity`. A freshly-discovered
+    lowercase wallet will find trades persisted under any case variant
+    AND any whitespace-padded legacy variant of the same address.
+
+    Returns ``None`` for sentinel / empty / whitespace-only inputs so
+    they can never enter scoring.
     """
-    canonical = str(address).strip().lower()
-    if not canonical or is_sentinel_trader_address(canonical):
+    canonical = canonical_wallet_address(address)
+    if canonical is None:
         return None
     trades = db.fetchall(
-        """SELECT * FROM source_trades
-           WHERE LOWER(TRIM(trader_address)) = ?
+        f"""SELECT * FROM source_trades
+           WHERE {address_column_normalized('trader_address')} = ?
              AND trader_address IS NOT NULL
            ORDER BY timestamp DESC""",
         (canonical,),
@@ -489,23 +528,79 @@ def _generate_signals(db: Database, markets: list[Market], now: datetime) -> lis
     return signals
 
 
-def _persist_wallet(db: Database, wallet) -> None:
-    """Persist a wallet to the database (best-effort)."""
+def _persist_wallet(db: Database, wallet) -> str | None:
+    """Idempotently persist a wallet by canonical address.
+
+    Returns the existing or newly-inserted wallet ID (as a string), or
+    ``None`` on persistence failure. Same canonical address (case-insensitive,
+    whitespace-stripped) always maps to a single wallet row — even if the
+    caller hands us different casing/padding for the same wallet, or if
+    this function is invoked many times per scan.
+
+    The find-or-create is the application-level guarantee that backs the
+    ``wallets.address`` non-uniqueness constraint: callers MUST go through
+    this function (not raw ``INSERT OR IGNORE`` on the PK) so the address
+    stays the deduplication key.
+
+    Implementation:
+      1. Compute ``canonical`` via ``canonical_wallet_address``. If it
+         returns ``None`` (sentinel / empty / whitespace-only), this is
+         an anonymous trader address — do NOT insert into ``wallets``.
+         Return ``None``.
+      2. Look up an existing row by ``address_column_normalized(address)``.
+         If found, return its id (no-op write, no duplicate row created).
+      3. Otherwise, ``INSERT`` a new row using a fresh UUID and the
+         canonical address (so a later write with the same canonical
+         address hits the SELECT path, not the INSERT path).
+      4. ``INSERT OR IGNORE`` on PK provides a defense-in-depth guarantee
+         if two writers race; the canonical SELECT above still wins.
+    """
     try:
+        canonical = canonical_wallet_address(wallet.address)
+        if canonical is None:
+            # Anonymous / sentinel trader address — never an attributable
+            # wallet row. Return None so the caller's counters do not
+            # treat this as a newly-discovered wallet.
+            return None
+
+        existing = db.fetchone(
+            f"SELECT id FROM wallets "
+            f"WHERE {address_column_normalized('address')} = ?",
+            (canonical,),
+        )
+        if existing is not None:
+            return existing["id"]
+
+        new_id = str(uuid.uuid4())
         db.execute(
-            """INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at)
+            """INSERT OR IGNORE INTO wallets
+               (id, address, label, is_sample, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (
-                str(wallet.id),
-                wallet.address,
+                new_id,
+                canonical,
                 wallet.label,
                 int(wallet.is_sample),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        # Re-fetch the id: if a concurrent writer beat us to the same
+        # canonical address, INSERT OR IGNORE silently skipped and the
+        # original row's id is what we should return.
+        post = db.fetchone(
+            f"SELECT id FROM wallets "
+            f"WHERE {address_column_normalized('address')} = ?",
+            (canonical,),
+        )
         db.conn.commit()
+        return post["id"] if post else new_id
     except Exception as e:
-        logger.debug("Wallet persist skipped: %s", e)
+        logger.debug("Wallet persist skipped for %r: %s", wallet.address, e)
+        try:
+            db.conn.rollback()
+        except Exception:
+            pass
+        return None
 
 
 async def _fetch_markets(

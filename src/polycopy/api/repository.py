@@ -38,39 +38,25 @@ from polycopy.api.responses import (
 )
 from polycopy.config.settings import Settings
 from polycopy.db.database import Database, get_database
-from polycopy.domain.source_trade import is_sentinel_trader_address
+from polycopy.db.wallet_identity import (
+    address_is_sentinel_params,
+    address_is_sentinel_sql,
+    is_sentinel_trader_address,
+)
 
 SAMPLE_LABEL = "DEMO DATA / SAMPLE DATA"
 
 # Single source of truth for the SQL predicate that mirrors
 # ``is_sentinel_trader_address`` in :mod:`polycopy.domain.source_trade`.
 # The Python helper checks (None, non-string, whitespace-only, case-insensitive
-# match against ``LEGACY_TRADER_ADDRESS_SENTINELS`` after ``strip()``). The
-# SQL equivalent below replicates that exactly so the same predicate is used
-# by ``SELECT ... WHERE ...`` (rows) AND ``SELECT COUNT(*) ... WHERE ...``
-# (total_count) — guaranteeing count/list parity.
-#
-# Implementation notes:
-#   * SQLite's bare ``TRIM(x)`` only strips U+0020 space; Python's
-#     ``str.strip()`` strips all Unicode whitespace (tab, newline, CR,
-#     etc.). We normalize tabs/CR/newlines to space first via REPLACE
-#     so the SQL ``TRIM`` matches Python's behaviour byte-for-byte.
-#   * ``LOWER(TRIM(...)) IN (?, ?, ?, ?, ?)`` matches the helper's
-#     ``stripped.lower() in LEGACY_TRADER_ADDRESS_SENTINELS`` step.
-_SENTINEL_FRAGMENT: str = (
-    "NOT ("
-    "address IS NULL "
-    "OR TRIM(REPLACE(REPLACE(REPLACE(address, X'09', ' '), X'0A', ' '), X'0D', ' ')) = '' "
-    "OR LOWER(TRIM(REPLACE(REPLACE(REPLACE(address, X'09', ' '), X'0A', ' '), X'0D', ' '))) IN (?, ?, ?, ?, ?)"
-    ")"
-)
-_SENTINEL_PARAMS: tuple[str, ...] = (
-    "unknown",  # LEGACY_TRADER_ADDRESS_SENTINELS, sorted for stability
-    "anonymous",
-    "missing",
-    "0x",
-    "0x0",
-)
+# match against ``LEGACY_TRADER_ADDRESS_SENTINELS`` after stripping ASCII
+# whitespace). The SQL fragment is built once from
+# :func:`polycopy.db.wallet_identity.address_is_sentinel_sql` so EVERY
+# path (repository scans/wallets, migration cleanup, run_scan loader,
+# collect_smart_money dedup, live smoke) agrees byte-for-byte. Editing
+# the predicate in one place updates all of them.
+_SENTINEL_FRAGMENT: str = address_is_sentinel_sql("address")
+_SENTINEL_PARAMS: tuple[str, ...] = address_is_sentinel_params()
 
 SAMPLE_WALLET_ID = UUID("00000000-0000-0000-0000-000000000001")
 SAMPLE_MARKET_ID = UUID("00000000-0000-0000-0000-000000000010")

@@ -226,8 +226,8 @@ class TestRunScanAnonymousExclusion:
         assert "unknown" not in wallet_addresses
         assert "" not in wallet_addresses
         assert None not in wallet_addresses
-        assert "0xREAL_WALLET_A" in wallet_addresses
-        assert "0xREAL_WALLET_B" in wallet_addresses
+        assert "0xreal_wallet_a" in wallet_addresses
+        assert "0xreal_wallet_b" in wallet_addresses
         assert len(wallet_addresses) == 2
 
         # No errors → Step 4 didn't crash on None.

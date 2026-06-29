@@ -21,8 +21,21 @@ from polycopy.domain.order import OrderSide
 #
 # The set is intentionally lowercased and stripped before comparison; real
 # 0x addresses pass through ``is_sentinel_trader_address`` unchanged.
+#
+# Round-9 stabilization: also include the zero-address
+# ``0x0000000000000000000000000000000000000000`` (Ethereum's burn /
+# null-address). The data-api sometimes emits it as a stand-in for
+# "no attributable trader" — pre-v9 it passed through as a "real"
+# wallet and got scored.
 LEGACY_TRADER_ADDRESS_SENTINELS: frozenset[str] = frozenset(
-    {"unknown", "anonymous", "missing", "0x", "0x0"}
+    {
+        "unknown",
+        "anonymous",
+        "missing",
+        "0x",
+        "0x0",
+        "0x0000000000000000000000000000000000000000",
+    }
 )
 
 

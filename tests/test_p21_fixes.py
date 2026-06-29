@@ -1227,7 +1227,12 @@ def test_runtime_wallet_scoring_never_receives_sentinels(tmp_path: Path):
     ]
     scoring_inputs = [a for a in candidate_addrs if not is_sentinel_trader_address(a)]
 
-    # The scoring inputs list must contain ONLY real wallets.
+    # The scoring inputs list must contain ONLY real wallets. This test
+    # deliberately uses the RAW DB select (no canonicalization) to mirror
+    # what the pre-round-9 code path looked like — the original contract
+    # was "raw uppercase passes through", and this assertion preserves
+    # that historical behavior to prove the runtime filter still excludes
+    # sentinels without touching the wallet rows themselves.
     assert set(scoring_inputs) == {"0xREAL_WALLET_1", "0xREAL_WALLET_2"}
     for s in scoring_inputs:
         assert s.startswith("0x")
@@ -1311,8 +1316,12 @@ def test_mixed_real_null_empty_sentinel_window_produces_only_real_wallets(
     assert addrs == ["0xREAL_WALLET_1", "0xREAL_WALLET_2"]
 
     # Helper also returns only real wallets (after migration + filter).
+    # The shared canonicalization helper lowercases on the read path, so
+    # the helper returns the canonical form even when the raw DB row is
+    # mixed-case (a deliberately inherited legacy scenario this test
+    # exercises).
     unique = _get_unique_trader_addresses(db)
-    assert set(unique) == {"0xREAL_WALLET_1", "0xREAL_WALLET_2"}
+    assert set(unique) == {"0xreal_wallet_1", "0xreal_wallet_2"}
 
     # Counters: 2 attributed, 6 anonymous-skipped.
     assert result.wallets_discovered == 2
