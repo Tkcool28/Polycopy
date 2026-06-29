@@ -303,8 +303,8 @@ _V5_DDL: list[str] = [
         quantity, price,
         CASE
             WHEN trader_address IS NULL THEN NULL
-            WHEN LENGTH(TRIM(trader_address, ' \t\n\r\v\f')) = 0 THEN NULL
-            WHEN LOWER(TRIM(trader_address, ' \t\n\r\v\f')) IN (
+            WHEN LENGTH(TRIM(trader_address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 THEN NULL
+            WHEN LOWER(TRIM(trader_address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN (
                 'unknown', 'anonymous', 'missing', '0x', '0x0'
             ) THEN NULL
             ELSE trader_address
@@ -320,57 +320,80 @@ _V5_DDL: list[str] = [
     # dependent rows in the right order without the engine aborting the
     # statement mid-flight. We re-enable it immediately after and run
     # PRAGMA foreign_key_check to guarantee integrity.
+    #
+    # The deletion ORDER below is the correctness mechanism — it would
+    # work even with FK enforcement ENABLED. ``PRAGMA foreign_keys = OFF``
+    # is a defense-in-depth safety net only, not the thing the migration
+    # depends on.
+    #
+    # Child-before-parent FK graph this satisfies:
+    #   decision_log.order_id  → orders.id
+    #   decision_log.wallet_id → wallets.id   (NOT NULL)
+    #   orders.wallet_id       → wallets.id
+    #   positions.wallet_id    → wallets.id
+    #   wallet_balances.wallet_id → wallets.id
+    #   performance_summaries.wallet_id → wallets.id
+    #
+    # A naive delete (orders before decision_log) fails with FK
+    # violation when a decision_log row references an order belonging
+    # to a different (real) wallet. We delete the cross-references
+    # FIRST, then by-wallet dependents, then orders, then wallet rows.
     "PRAGMA foreign_keys = OFF;",
-    # Delete dependent rows that only make sense with a real wallet. The
-    # collector's loop also gates these out, but pre-v5 data may have
-    # written them for sentinel wallets. Best-effort cleanup, idempotent.
-    # We use the same explicit whitespace TRIM char set as the source_trades
-    # rewrite above so the two predicates are consistent.
-    *[
-        (
-            "DELETE FROM wallet_balances WHERE wallet_id IN ("
-            "SELECT id FROM wallets WHERE "
-            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
-            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
-            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
-        ),
-        (
-            "DELETE FROM positions WHERE wallet_id IN ("
-            "SELECT id FROM wallets WHERE "
-            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
-            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
-            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
-        ),
-        (
-            "DELETE FROM orders WHERE wallet_id IN ("
-            "SELECT id FROM wallets WHERE "
-            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
-            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
-            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
-        ),
-        (
-            "DELETE FROM decision_log WHERE wallet_id IN ("
-            "SELECT id FROM wallets WHERE "
-            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
-            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
-            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
-        ),
-        (
-            "DELETE FROM performance_summaries WHERE wallet_id IN ("
-            "SELECT id FROM wallets WHERE "
-            "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
-            "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
-            "('unknown', 'anonymous', 'missing', '0x', '0x0'));"
-        ),
-    ],
-    # Now the wallets themselves. Preserves any non-sentinel, non-empty
-    # value byte-for-byte (case-sensitive, whitespace-sensitive).
-    (
-        "DELETE FROM wallets WHERE "
-        "LENGTH(TRIM(address, ' \t\n\r\v\f')) = 0 "
-        "OR LOWER(TRIM(address, ' \t\n\r\v\f')) IN "
-        "('unknown', 'anonymous', 'missing', '0x', '0x0');"
-    ),
+    # 1. Child rows that reference sentinel-wallet orders. These MUST
+    #    be removed before the orders themselves, otherwise the next
+    #    DELETE fails with FOREIGN KEY constraint failed. Note we do
+    #    NOT limit this to sentinel-wallet decision_logs: any
+    #    decision_log row whose ``order_id`` points to a sentinel-wallet
+    #    order must go, even if its own ``wallet_id`` belongs to a
+    #    real wallet.
+    "DELETE FROM decision_log WHERE order_id IN ("
+    "SELECT o.id FROM orders o "
+    "JOIN wallets w ON w.id = o.wallet_id "
+    "WHERE LENGTH(TRIM(w.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(w.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # 2. Child rows that reference sentinel-wallet wallets. Delete ALL
+    #    dependents for sentinel wallets in child-before-parent order
+    #    so the orders delete (step 3) is not blocked by remaining
+    #    decision_log rows. We delete decision_log first since it can
+    #    also reference orders (which we haven't deleted yet).
+    "DELETE FROM decision_log WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # wallet_balances has no further dependents.
+    "DELETE FROM wallet_balances WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # performance_summaries has no further dependents.
+    "DELETE FROM performance_summaries WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # positions has no further dependents.
+    "DELETE FROM positions WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # 3. orders — safe now because ALL decision_log rows that could
+    #    reference sentinel-wallet orders are gone (deleted in step 1
+    #    and step 2 above).
+    "DELETE FROM orders WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # 4. The sentinel wallet rows themselves. By this point no dependent
+    #    rows reference them.
+    "DELETE FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0');",
     "PRAGMA foreign_keys = ON;",
     # Verify no orphan dependent rows remain. PRAGMA foreign_key_check
     # returns rows for any FK violation; on a clean DB it returns empty.

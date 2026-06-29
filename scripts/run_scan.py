@@ -353,12 +353,25 @@ def _compute_wallet_metrics(
     address: str,
     now: datetime,
 ) -> dict | None:
-    """Compute scoring metrics for a wallet from its trades in DB."""
+    """Compute scoring metrics for a wallet from its trades in DB.
+
+    Round-8 fix: ``address`` is matched case-insensitively against
+    ``trader_address`` via ``LOWER(TRIM(...))``. The parser now
+    lowercases legitimate wallet addresses at the source-trade boundary,
+    but legacy rows that pre-date round-8 may still contain
+    mixed-case/checksum-style addresses. Normalizing both sides of the
+    comparison means a freshly-discovered (lowercase) wallet can find
+    trades persisted under any case variant of the same address.
+    """
+    canonical = str(address).strip().lower()
+    if not canonical or is_sentinel_trader_address(canonical):
+        return None
     trades = db.fetchall(
         """SELECT * FROM source_trades
-           WHERE trader_address = ?
+           WHERE LOWER(TRIM(trader_address)) = ?
+             AND trader_address IS NOT NULL
            ORDER BY timestamp DESC""",
-        (address,),
+        (canonical,),
     )
     if not trades:
         return None
@@ -581,12 +594,29 @@ def _persist_trade(db: Database, trade: SourceTrade) -> bool | None:
     idempotent and distinct same-transaction rows (encoded via
     ``deterministic_source_trade_id_v2``) both persist.
 
+    Round-8 fix: defensively normalize ``trade.trader_address`` to
+    lowercase at the persistence boundary so even callers that bypass
+    the adapter's parser (legacy code paths, tests, future ingest
+    adapters) land the canonical form in ``source_trades``. Sentinels
+    and ``None`` pass through unchanged. Combined with the parser
+    lowercasing and the case-insensitive metric query, this guarantees
+    canonical identity from ingestion through scoring.
+
     Returns True if a new row was inserted, False if the row already
     existed (idempotent retry), and None if the insertion failed. Callers
     MUST NOT score wallets for trades that return None because the raw
     trade history is not available to ``_compute_wallet_metrics``.
     """
     try:
+        # Defensive normalization: None / sentinel pass through; legitimate
+        # addresses are stored in canonical lowercase form. This mirrors
+        # what the parser now does and keeps every persistence path
+        # consistent.
+        ta = trade.trader_address
+        if ta is not None and ta and not is_sentinel_trader_address(ta):
+            persisted_trader_address: str | None = str(ta).strip().lower() or None
+        else:
+            persisted_trader_address = None
         cur = db.execute(
             """INSERT OR IGNORE INTO source_trades
                (id, source, source_trade_id, market_source_id, side,
@@ -602,7 +632,7 @@ def _persist_trade(db: Database, trade: SourceTrade) -> bool | None:
                 trade.outcome,
                 float(trade.quantity),
                 float(trade.price),
-                trade.trader_address,  # may be None for anonymous/sentinel
+                persisted_trader_address,
                 trade.timestamp.isoformat() if trade.timestamp else None,
                 int(bool(trade.is_sample)),
             ),

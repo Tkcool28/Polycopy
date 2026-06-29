@@ -65,13 +65,18 @@ def test_parse_data_api_trade_normalizes_all_sentinel_wallets_to_none(wallet):
     assert trade.trader_address is None
 
 
-def test_parse_data_api_trade_preserves_real_wallets_byte_for_byte():
-    wallet = "  0xREAL_BUT_PADDED  "
+def test_parse_data_api_trade_preserves_real_wallets_in_canonical_lowercase():
+    # Round-8: legitimate wallets are normalized to canonical lowercase
+    # at the parser boundary so that discovery and scoring see a single
+    # identity. This supersedes the older "byte-for-byte" contract
+    # which produced mixed-case rows that didn't match the lowercase
+    # keys used by WalletDiscovery.
+    wallet = "  0xReal_But_Padded  "
 
     trade = _adapter()._parse_data_api_trade(_raw_with_wallet(wallet))  # noqa: SLF001
 
     assert trade is not None
-    assert trade.trader_address == wallet.strip()
+    assert trade.trader_address == "0xreal_but_padded"
 
 
 def test_parse_data_api_trade_uses_shared_sentinel_helper(monkeypatch):

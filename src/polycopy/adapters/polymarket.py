@@ -460,9 +460,18 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
             # addresses pass through unchanged. Anonymous trades persist
             # with ``trader_address=None`` and MUST NOT become wallet
             # rows downstream.
+            #
+            # Round-8 fix: normalize the canonical wallet identity to
+            # lowercase at the parser boundary so that downstream
+            # discovery (``WalletDiscovery._register`` already lowercases
+            # keys) and metric queries (now ``LOWER(TRIM(...))``) all see
+            # the same canonical value. Checksum-style 0x addresses from
+            # the data-api are EIP-55 mixed-case; lowercasing them here
+            # keeps ``source_trade_id`` (which already lowercases the
+            # wallet before hashing) stable across case variants.
             trader_address: Optional[str] = None
             if wallet and not is_sentinel_trader_address(wallet):
-                trader_address = wallet
+                trader_address = wallet.lower()
 
             # P1 fix: build a row-distinguishing source_trade_id from the WHOLE
             # raw dict. Previously we passed only (tx_hash, asset, ts, price,
