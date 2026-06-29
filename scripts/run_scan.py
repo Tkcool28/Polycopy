@@ -33,6 +33,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
+from polycopy.db.wallet_identity import (
+    address_column_normalized,
+    canonical_wallet_address,
+    is_sentinel_trader_address,
+)
 from polycopy.discovery.wallet_discovery import (
     RelatedWalletDetector,
     TradeDetector,
@@ -44,6 +49,21 @@ from polycopy.domain.order import OrderSide
 from polycopy.domain.source_trade import SourceTrade
 from polycopy.engine.evaluate import evaluate_wallet
 from polycopy.utils.concurrency import FileLock, LockError, lock_path
+
+# Shared live-trade ingestion helper (PR #3 P2 fix). Imports are at module
+# scope so both run_scan and collect_smart_money_data consume the SAME
+# PolymarketPublicAdapter construction path and the SAME normalization.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from _live_ingest import (  # type: ignore[import-not-found]
+        PolymarketPublicAdapter,  # re-exported for type annotations
+        build_trade_adapter,
+        fetch_recent_trades_for_market,
+    )
+except ImportError:  # pragma: no cover — defensive: fall back to direct adapter import
+    from polycopy.adapters.polymarket import PolymarketPublicAdapter  # type: ignore[no-redef]
+    fetch_recent_trades_for_market = None  # type: ignore[assignment]
+    build_trade_adapter = None  # type: ignore[assignment] 
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +82,47 @@ def setup_logging(verbosity: int = 0) -> None:
 
 
 class ScanResult:
-    """Aggregated results from a full scan."""
+    """Aggregated results from a full scan.
+
+    Wallet counters (round 11 / P3 PRRT_kwDOTG4Cf86M7Xbp):
+
+      * ``wallets_loaded_existing`` — number of canonical wallets already
+        present in the ``wallets`` table and loaded into the in-memory
+        discovery registry at Step 1. Set once, never mutated.
+      * ``wallets_discovered_new`` — number of NEW canonical wallets added
+        to the in-memory discovery registry during this scan AND whose
+        ``wallets`` row persisted successfully. A wallet whose row insert
+        failed does NOT increment this counter. A repeated scan over the
+        same set of wallets increments this by zero.
+      * ``wallets_total_known`` — ``len(discovery.list_wallets())`` at the
+        end of Step 3. Always ``loaded_existing + discovered_new`` for
+        the discovery registry; downstream consumers can use this as
+        "how many canonical wallets does the run know about".
+      * ``wallets_discovered`` — back-compat alias. Set equal to
+        ``wallets_discovered_new`` so callers that read
+        ``result.wallets_discovered`` to mean "how many new wallets did
+        this run find" still get the right number. The pre-round-11
+        meaning ("total known in the discovery registry, including
+        pre-existing") is no longer the canonical interpretation; use
+        ``wallets_total_known`` for that.
+    """
 
     def __init__(self) -> None:
+        # Round 11 wallet counters (explicit, semantically distinct).
+        self.wallets_loaded_existing: int = 0
+        self.wallets_discovered_new: int = 0
+        self.wallets_total_known: int = 0
+        # Back-compat alias for callers that read .wallets_discovered
+        # to mean "new wallets this run". Defined to equal new.
         self.wallets_discovered: int = 0
         self.wallets_scored: int = 0
+        self.trades_total: int = 0
+        # Round 7 counters — distinguish phases so we can verify the
+        # north-star flow (fetch → normalize → persist → discover → score).
+        self.trades_fetched: int = 0       # normalized trades returned by adapter
+        self.trades_persisted: int = 0     # actually inserted into source_trades
+        self.trades_attributed: int = 0    # with a real (non-sentinel) wallet
+        self.anonymous_trades: int = 0     # persisted with trader_address=NULL
         self.trades_processed: int = 0
         self.trades_deduped: int = 0
         self.trades_stale: int = 0
@@ -76,6 +132,11 @@ class ScanResult:
         self.incomplete: int = 0
         self.signals: int = 0
         self.related_wallets: int = 0
+        self.anonymous_trades_skipped: int = 0  # legacy alias, kept for back-compat
+        # Round-10 fetch-status counters (per-market, not per-row).
+        self.market_fetches_complete: int = 0
+        self.market_fetches_partial: int = 0
+        self.market_fetches_failed: int = 0
         self.missing_data: list[str] = []
         self.errors: list[str] = []
         self.started_at = datetime.now(timezone.utc)
@@ -84,15 +145,26 @@ class ScanResult:
     def summary(self) -> str:
         return (
             f"scan complete\n"
-            f"  wallets discovered: {self.wallets_discovered}\n"
+            f"  market fetches: {self.market_fetches_complete} complete, "
+            f"{self.market_fetches_partial} partial, {self.market_fetches_failed} failed\n"
+            f"  wallets: loaded_existing={self.wallets_loaded_existing}, "
+            f"discovered_new={self.wallets_discovered_new}, "
+            f"total_known={self.wallets_total_known}\n"
+            f"  wallets discovered (back-compat alias for new): {self.wallets_discovered}\n"
             f"  wallets scored: {self.wallets_scored}\n"
             f"    copy_candidates: {self.copy_candidates}\n"
             f"    watchlist: {self.watchlist}\n"
             f"    skipped: {self.skipped}\n"
             f"    incomplete: {self.incomplete}\n"
-            f"  trades processed: {self.trades_processed}\n"
-            f"    deduped: {self.trades_deduped}\n"
-            f"    stale: {self.trades_stale}\n"
+            f"  trades total: {self.trades_total}\n"
+            f"    fetched: {self.trades_fetched}\n"
+            f"    persisted: {self.trades_persisted}\n"
+            f"    attributed: {self.trades_attributed}\n"
+            f"    anonymous: {self.anonymous_trades}\n"
+            f"    processed: {self.trades_processed}\n"
+            f"      deduped: {self.trades_deduped}\n"
+            f"      stale: {self.trades_stale}\n"
+            f"    sentinel/anonymous skipped (legacy): {self.anonymous_trades_skipped}\n"
             f"  related wallets: {self.related_wallets}\n"
             f"  signals generated: {self.signals}\n"
             f"  missing data entries: {len(self.missing_data)}\n"
@@ -134,42 +206,215 @@ async def run_scan(
 
     # ── Step 1: Load existing wallets from DB ──────────────────────────────
     logger.info("Step 1: Loading existing wallets from database...")
-    wallet_rows = db.fetchall("SELECT address, label FROM wallets")
+    # Defensive: filter sentinel / empty / whitespace-only addresses in
+    # SQL (using the shared canonicalization fragment) AND in Python so a
+    # row that somehow slipped past the v5 migration cleanup (e.g. an
+    # upgrade interrupted before v5 finished, or rows inserted manually
+    # after the upgrade) never enters the watchlist / scoring loop. The
+    # SQL filter uses the SAME predicate as the v5 migration cleanup
+    # AND as ``address_column_normalized`` so every path agrees.
+    wallet_rows = [
+        row
+        for row in db.fetchall(
+            f"""SELECT address, label FROM wallets
+                WHERE NOT ({address_column_normalized('address')} = ''
+                   OR {address_column_normalized('address')} IN ('unknown', 'anonymous', 'missing', '0x', '0x0'))"""
+        )
+        if not is_sentinel_trader_address(row["address"])
+    ]
     for row in wallet_rows:
-        discovery.add_to_watchlist(row["address"], row["label"])
-    result.wallets_discovered = len(discovery.list_wallets())
-    logger.info("  Loaded %d existing wallets", result.wallets_discovered)
+        canonical = canonical_wallet_address(row["address"])
+        # If the DB row's address is not yet canonical (legacy mixed-case
+        # or padded form), normalize before registering in the discovery
+        # object so the in-memory key and the canonical SQL form agree.
+        discovery.add_to_watchlist(canonical or row["address"], row["label"])
+    # Round 11 (P3): snapshot the pre-existing count BEFORE Step 3 mutates
+    # the discovery registry. This is the denominator for the new-vs-existing
+    # counter split; pre-existing wallets must never increment the
+    # "discovered_new" counter even if they re-appear during Step 3.
+    result.wallets_loaded_existing = len(discovery.list_wallets())
+    # Back-compat alias is set to the pre-existing count at this point;
+    # at the end of Step 3 we reassign it to the new-wallet count for
+    # the back-compat "wallets discovered this run" reading.
+    result.wallets_discovered = 0
+    logger.info("  Loaded %d existing wallets", result.wallets_loaded_existing)
 
     # ── Step 2: Fetch active markets ───────────────────────────────────────
     logger.info("Step 2: Fetching active markets...")
-    markets = await _fetch_markets(db, settings, market_limit, result, use_sample)
-    logger.info("  Fetched %d markets", len(markets))
+    market_list, asset_to_outcome_map = await _fetch_markets(
+        db, settings, market_limit, result, use_sample,
+    )
+    logger.info("  Fetched %d markets", len(market_list))
 
     # ── Step 3: Fetch trades per market → discover wallets ────────────────
-    logger.info("Step 3: Fetching trades for %d markets...", len(markets))
+    logger.info("Step 3: Fetching trades for %d markets...", len(market_list))
+    # `all_trades` retains every fetched trade (anonymous + attributed) for
+    # provenance / market-level counts / persistence. Anonymous trades are
+    # still persisted upstream via the ingest path; they simply don't reach
+    # wallet-dependent consumers below.
     all_trades = []
-    for market in markets:
-        trades = await _fetch_trades(db, market.source_id, now, result, use_sample)
-        all_trades.extend(trades)
+    for market in market_list:
+        # Per-market asset → outcome map is the same one the collector
+        # uses (built from the Gamma clobTokenIds / outcomes payload).
+        # Threading it through `fetch_recent_trades_for_market` →
+        # `adapter.fetch_trades_for_market` → `_absorb_trade` ensures the
+        # scanner rewrites a denormalized raw ``outcome`` field identically
+        # to the collector BEFORE persistence, so source_trade_id,
+        # market_source_id, outcome, side, etc. are byte-equal across both
+        # paths for the same raw Data API row.
+        asset_to_outcome = asset_to_outcome_map.get(market.source_id) or {}
+        fetch_result = await _fetch_trades(
+            db, market.source_id, now, result, use_sample,
+            asset_to_outcome=asset_to_outcome,
+        )
+        # Round-10 fetch-result contract: branch on the explicit status.
+        #   - "complete" → persist + discover
+        #   - "partial"  → discard prefix, do NOT discover, log + counter
+        #   - "failed"   → nothing to do
+        if fetch_result.status == "failed":
+            result.market_fetches_failed += 1
+            result.missing_data.append(
+                f"Market fetch FAILED for {market.source_id}: "
+                f"{fetch_result.error}"
+            )
+            logger.warning(
+                "Market %s fetch FAILED (%d rows): %s",
+                market.source_id, fetch_result.rows_fetched, fetch_result.error,
+            )
+            continue
+        if fetch_result.status == "partial":
+            result.market_fetches_partial += 1
+            result.missing_data.append(
+                f"Market fetch PARTIAL for {market.source_id} "
+                f"(pages={fetch_result.pages_fetched}, "
+                f"rows={fetch_result.rows_fetched}, "
+                f"error={fetch_result.error})"
+            )
+            logger.warning(
+                "Market %s fetch PARTIAL (%d pages, %d rows): %s — "
+                "prefix discarded (not persisted)",
+                market.source_id, fetch_result.pages_fetched,
+                fetch_result.rows_fetched, fetch_result.error,
+            )
+            continue
+        # status == "complete"
+        result.market_fetches_complete += 1
+        # Round 7 (P2 fix): persist fetched trades into source_trades BEFORE
+        # wallet scoring so that ``_compute_wallet_metrics`` actually sees
+        # the live trade history. Anonymous and sentinel-attributed trades
+        # persist with ``trader_address=None``; only attributed trades
+        # become wallet rows. If persistence fails, the trade is excluded from
+        # wallet discovery/scoring so we never score against missing raw history.
+        persisted_trades: list[SourceTrade] = []
+        for trade in fetch_result.trades:
+            result.trades_fetched += 1
+            persist_result = _persist_trade(db, trade)
+            if persist_result is None:
+                result.errors.append(
+                    f"Failed to persist trade {trade.source_trade_id}; skipped wallet scoring"
+                )
+                continue
+            if persist_result:
+                result.trades_persisted += 1
+            persisted_trades.append(trade)
+            if is_sentinel_trader_address(trade.trader_address):
+                # Anonymous or sentinel — persists as NULL, never becomes a wallet.
+                result.anonymous_trades += 1
+            else:
+                result.trades_attributed += 1
+        all_trades.extend(persisted_trades)
 
-        # Discover wallets from trades
-        for trade in trades:
-            discovery.add_from_polymarket(trade.trader_address)
-            # Persist wallet to DB
+        # Discover wallets from attributed trades only.
+        # Round 11 (P3 PRRT_kwDOTG4Cf86M7Xbp): persistence-before-discovery.
+        # The wallet must be persisted to ``wallets`` first; if the insert
+        # fails, the wallet MUST NOT enter the in-memory discovery registry
+        # and MUST NOT be counted as a new wallet or scored. Trade
+        # persistence is independent (raw market observation is still
+        # allowed) — only the wallet promotion is gated.
+        for trade in persisted_trades:
+            # Sentinel filter: skip NULL and legacy sentinel trader_address
+            # values so they never end up as wallet rows.
+            if is_sentinel_trader_address(trade.trader_address):
+                result.anonymous_trades_skipped += 1
+                continue
+            # Canonicalize before both registering in the in-memory
+            # discovery object AND persisting into ``wallets`` — the two
+            # MUST agree on identity for counters and for find-or-create.
+            canonical_addr = canonical_wallet_address(trade.trader_address)
+            if canonical_addr is None:
+                # Defensive: should already have been caught above, but a
+                # second guard is cheap and makes the invariant explicit.
+                result.anonymous_trades_skipped += 1
+                continue
             from polycopy.domain.wallet import Wallet
             wallet = Wallet(
-                address=trade.trader_address,
-                label=f"discovered-polymarket-{trade.trader_address[:8]}",
+                address=canonical_addr,
+                label=f"discovered-polymarket-{canonical_addr[:8]}",
                 is_sample=trade.is_sample,
             )
-            _persist_wallet(db, wallet)
+            # 1. Persist the wallet row FIRST (idempotent find-or-create
+            #    by canonical address). The returned id is the
+            #    source-of-truth signal that the wallet row is now in
+            #    the DB.
+            wallet_id = _persist_wallet(db, wallet)
+            if wallet_id is None:
+                # Persistence failed. Record the error, do NOT add the
+                # wallet to the in-memory discovery registry, do NOT
+                # increment the new-wallet counter, do NOT let it reach
+                # the scoring loop. The trade row itself is still in
+                # source_trades (raw market observation preserved).
+                result.errors.append(
+                    f"Wallet persist failed for {canonical_addr[:12]}; "
+                    f"skipped discovery/scoring"
+                )
+                logger.warning(
+                    "Wallet persist failed for %s; not added to discovery",
+                    canonical_addr[:12],
+                )
+                continue
+            # 2. Wallet row is in the DB. Safe to add to the in-memory
+            #    discovery registry. The discovery entry's ``is_new``
+            #    flag (added in round 9) is the source of truth for the
+            #    new-wallet counter — no separate pre/post lookup is
+            #    needed and the "wallets_discovered" alias never inflates
+            #    by counting a wallet that failed to persist.
+            entry = discovery.add_from_polymarket(canonical_addr)
+            if entry.get("is_new", False):
+                result.wallets_discovered_new += 1
 
-    result.wallets_discovered = len(discovery.list_wallets())
-    logger.info("  Total wallets after discovery: %d", result.wallets_discovered)
+    # Separate attributed trades (real wallet address) from anonymous ones.
+    # Only attributed trades may enter wallet-dependent processing.
+    attributed_trades = [
+        t for t in all_trades if not is_sentinel_trader_address(t.trader_address)
+    ]
+
+    result.trades_total = len(all_trades)
+    # Round 11 (P3): truthful wallet counters. ``wallets_total_known`` is
+    # the in-memory discovery registry size after Step 3, i.e. the
+    # canonical "how many wallets does this run know about" answer.
+    # ``wallets_discovered`` is the back-compat alias for
+    # ``wallets_discovered_new`` (per-run new-wallet count).
+    result.wallets_total_known = len(discovery.list_wallets())
+    result.wallets_discovered = result.wallets_discovered_new
+    logger.info(
+        "  Total wallets after discovery: %d (loaded_existing=%d, "
+        "discovered_new=%d, total_known=%d, attributed trades: %d, "
+        "anonymous: %d)",
+        result.wallets_total_known,
+        result.wallets_loaded_existing,
+        result.wallets_discovered_new,
+        result.wallets_total_known,
+        len(attributed_trades),
+        result.anonymous_trades_skipped,
+    )
 
     # ── Step 4: Trade detection (dedup + staleness) ───────────────────────
+    # Only attributed trades reach the detector. The detector calls
+    # wallet_address.lower() inside make_dedup_key and TrackedTrade, so it
+    # would crash on anonymous trades. Anonymous trades are kept in
+    # `all_trades` for provenance but excluded here.
     logger.info("Step 4: Running trade detection...")
-    for trade in all_trades:
+    for trade in attributed_trades:
         tracked = trade_detector.process_trade(
             source=trade.source,
             source_trade_id=trade.source_trade_id,
@@ -250,7 +495,7 @@ async def run_scan(
 
     # ── Step 7: Generate signals for COPY_CANDIDATE wallets ───────────────
     logger.info("Step 7: Generating signals for copy candidates...")
-    signals = _generate_signals(db, markets, now)
+    signals = _generate_signals(db, market_list, now)
     result.signals = len(signals)
     logger.info("  Generated %d signals", result.signals)
 
@@ -266,12 +511,27 @@ def _compute_wallet_metrics(
     address: str,
     now: datetime,
 ) -> dict | None:
-    """Compute scoring metrics for a wallet from its trades in DB."""
+    """Compute scoring metrics for a wallet from its trades in DB.
+
+    Canonicalization invariant: ``address`` is matched case-insensitively
+    and against ANY surrounding ASCII whitespace (tab, LF, CR, VT, FF,
+    NUL, space) via the shared ``address_column_normalized`` SQL fragment
+    defined in :mod:`polycopy.db.wallet_identity`. A freshly-discovered
+    lowercase wallet will find trades persisted under any case variant
+    AND any whitespace-padded legacy variant of the same address.
+
+    Returns ``None`` for sentinel / empty / whitespace-only inputs so
+    they can never enter scoring.
+    """
+    canonical = canonical_wallet_address(address)
+    if canonical is None:
+        return None
     trades = db.fetchall(
-        """SELECT * FROM source_trades
-           WHERE trader_address = ?
+        f"""SELECT * FROM source_trades
+           WHERE {address_column_normalized('trader_address')} = ?
+             AND trader_address IS NOT NULL
            ORDER BY timestamp DESC""",
-        (address,),
+        (canonical,),
     )
     if not trades:
         return None
@@ -389,33 +649,102 @@ def _generate_signals(db: Database, markets: list[Market], now: datetime) -> lis
     return signals
 
 
-def _persist_wallet(db: Database, wallet) -> None:
-    """Persist a wallet to the database (best-effort)."""
+def _persist_wallet(db: Database, wallet) -> str | None:
+    """Idempotently persist a wallet by canonical address.
+
+    Returns the existing or newly-inserted wallet ID (as a string), or
+    ``None`` on persistence failure. Same canonical address (case-insensitive,
+    whitespace-stripped) always maps to a single wallet row — even if the
+    caller hands us different casing/padding for the same wallet, or if
+    this function is invoked many times per scan.
+
+    The find-or-create is the application-level guarantee that backs the
+    ``wallets.address`` non-uniqueness constraint: callers MUST go through
+    this function (not raw ``INSERT OR IGNORE`` on the PK) so the address
+    stays the deduplication key.
+
+    Implementation:
+      1. Compute ``canonical`` via ``canonical_wallet_address``. If it
+         returns ``None`` (sentinel / empty / whitespace-only), this is
+         an anonymous trader address — do NOT insert into ``wallets``.
+         Return ``None``.
+      2. Look up an existing row by ``address_column_normalized(address)``.
+         If found, return its id (no-op write, no duplicate row created).
+      3. Otherwise, ``INSERT`` a new row using a fresh UUID and the
+         canonical address (so a later write with the same canonical
+         address hits the SELECT path, not the INSERT path).
+      4. ``INSERT OR IGNORE`` on PK provides a defense-in-depth guarantee
+         if two writers race; the canonical SELECT above still wins.
+    """
     try:
+        canonical = canonical_wallet_address(wallet.address)
+        if canonical is None:
+            # Anonymous / sentinel trader address — never an attributable
+            # wallet row. Return None so the caller's counters do not
+            # treat this as a newly-discovered wallet.
+            return None
+
+        existing = db.fetchone(
+            f"SELECT id FROM wallets "
+            f"WHERE {address_column_normalized('address')} = ?",
+            (canonical,),
+        )
+        if existing is not None:
+            return existing["id"]
+
+        new_id = str(uuid.uuid4())
         db.execute(
-            """INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at)
+            """INSERT OR IGNORE INTO wallets
+               (id, address, label, is_sample, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (
-                str(wallet.id),
-                wallet.address,
+                new_id,
+                canonical,
                 wallet.label,
                 int(wallet.is_sample),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+        # Re-fetch the id: if a concurrent writer beat us to the same
+        # canonical address, INSERT OR IGNORE silently skipped and the
+        # original row's id is what we should return.
+        post = db.fetchone(
+            f"SELECT id FROM wallets "
+            f"WHERE {address_column_normalized('address')} = ?",
+            (canonical,),
+        )
         db.conn.commit()
+        return post["id"] if post else new_id
     except Exception as e:
-        logger.debug("Wallet persist skipped: %s", e)
+        logger.debug("Wallet persist skipped for %r: %s", wallet.address, e)
+        try:
+            db.conn.rollback()
+        except Exception:
+            pass
+        return None
 
 
 async def _fetch_markets(
     db, settings, limit, result, use_sample
-) -> list[Market]:
-    """Fetch active markets from Polymarket or use sample data."""
+) -> tuple[list[Market], dict[str, dict[str, str]]]:
+    """Fetch active markets from Polymarket or use sample data.
+
+    Returns ``(markets, asset_to_outcome_map)`` where
+    ``asset_to_outcome_map`` maps ``market.source_id`` → a
+    ``{token_id: outcome_label}`` dict built from the same Gamma
+    ``clobTokenIds`` / ``outcomes`` payload the parser consumes. This
+    map is the input to the ``asset_to_outcome`` parameter threaded
+    through ``fetch_recent_trades_for_market`` so the scanner rewrites
+    a denormalized ``outcome`` field identically to the collector.
+
+    For sample markets the map is empty (sample trades already carry
+    correct outcome labels), so the parser falls back to the raw field.
+    """
     if use_sample:
-        return _get_sample_markets()
+        return _get_sample_markets(), {}
 
     import httpx
+    asset_map: dict[str, dict[str, str]] = {}
     async with httpx.AsyncClient(base_url=settings.gamma_base_url, timeout=settings.http_timeout_seconds) as client:
         try:
             resp = await client.get("/markets", params={
@@ -432,10 +761,16 @@ async def _fetch_markets(
                 try:
                     market = _parse_gamma_market(item)
                     _persist_market(db, market)
+                    # Build the asset-to-outcome map from the same raw
+                    # Gamma payload so a single market fetch serves
+                    # both the persistence path AND the trade-normalization
+                    # path. Reuses the same JSON-decode logic the
+                    # collector uses in PolymarketCollector.
+                    asset_map[market.source_id] = _build_asset_to_outcome_map(item)
                     markets.append(market)
                 except Exception as e:
                     result.errors.append(f"Market parse error: {e}")
-            return markets
+            return markets, asset_map
         except Exception as e:
             result.errors.append(f"Market fetch failed: {e}")
             logger.warning(
@@ -443,36 +778,209 @@ async def _fetch_markets(
                 "Sample markets are only used with --use-sample: %s",
                 e,
             )
-            return []
+            return [], {}
 
 
-async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[SourceTrade]:
-    """Fetch trades for a market or return sample trades."""
+async def _fetch_trades(
+    db, market_source_id, now, result, use_sample,
+    *, asset_to_outcome: dict[str, str] | None = None,
+):
+    """Fetch trades for a market or return sample trades.
+
+    P2 fix (PR #3): live ``use_sample=False`` mode used to hit a legacy
+    ``settings.gamma_base_url + /trades`` endpoint, which has never existed
+    on Gamma (returns 404) and which silently fabricated ``polymarket_clob``
+    trades via the local ``_parse_clob_trade`` shim. The actual public,
+    unauthenticated trade source is the data-api
+    (``data-api.polymarket.com/trades``), wired through the shared
+    :class:`PolymarketPublicAdapter`. We now route BOTH ``run_scan`` and
+    ``collect_smart_money_data`` through the same adapter so the
+    normalization and snapshot provenance are identical.
+
+    Behavior contract:
+      - ``use_sample=True`` → returns the existing labeled sample trades
+        unchanged (no adapter call). The caller still needs to see them
+        as ``complete`` for counter purposes; we wrap them as a
+        :class:`MarketTradeFetchResult` with status="complete" so the
+        sample path participates in the same accounting.
+      - ``use_sample=False`` → uses the shared adapter and returns a
+        :class:`MarketTradeFetchResult` whose ``status`` is
+        ``"complete"`` / ``"partial"`` / ``"failed"``. The caller MUST
+        branch on status before persisting or scoring.
+      - Round 7: live fetches go through ``adapter.fetch_trades_for_market``
+        which uses ``GET /trades?market=<conditionId>&takerOnly=false``
+        (server-side filter, bounded pagination, dedup across pages).
+    """
     if use_sample:
-        return _get_sample_trades(market_source_id)
+        # Wrap the legacy list-return in the new contract so the
+        # caller can use one code path for both branches.
+        from polycopy.adapters.polymarket import MarketTradeFetchResult
+        sample = _get_sample_trades(market_source_id)
+        return MarketTradeFetchResult(
+            trades=sample,
+            status="complete",
+            pages_fetched=1 if sample else 0,
+            rows_fetched=len(sample),
+            market_source_id=market_source_id,
+        )
 
-    import httpx
-    settings = get_settings()
-    async with httpx.AsyncClient(base_url=settings.gamma_base_url, timeout=settings.http_timeout_seconds) as client:
+    adapter = _get_scan_trade_adapter()
+    # Pass epoch-zero as ``since`` so the adapter returns the FULL per-market
+    # history the API can serve (the data-api hard-caps the per-market
+    # response at ``max_rows``). A scan run wants the complete recent
+    # picture, not a per-call delta.
+    # ``asset_to_outcome`` is threaded through from run_scan → here → the
+    # shared adapter. Same map the collector uses, so scanner and collector
+    # rewrite a denormalized ``outcome`` field identically.
+    return await fetch_recent_trades_for_market(
+        adapter,
+        market_source_id=market_source_id,
+        since=datetime.fromtimestamp(0, tz=timezone.utc),
+        limit=200,
+        asset_to_outcome=asset_to_outcome or {},
+    )
+
+
+def _persist_trade(db: Database, trade: SourceTrade) -> bool | None:
+    """Persist one ``SourceTrade`` into ``source_trades``.
+
+    Round 7 (P2 fix): live scan must persist fetched trades BEFORE
+    ``_compute_wallet_metrics`` runs, otherwise every newly discovered
+    wallet will be marked missing-data. Uses ``INSERT OR IGNORE`` against
+    the ``UNIQUE(source, source_trade_id)`` index so an exact rerun is
+    idempotent and distinct same-transaction rows (encoded via
+    ``deterministic_source_trade_id_v2``) both persist.
+
+    Round-8 fix: defensively normalize ``trade.trader_address`` to
+    lowercase at the persistence boundary so even callers that bypass
+    the adapter's parser (legacy code paths, tests, future ingest
+    adapters) land the canonical form in ``source_trades``. Sentinels
+    and ``None`` pass through unchanged. Combined with the parser
+    lowercasing and the case-insensitive metric query, this guarantees
+    canonical identity from ingestion through scoring.
+
+    Returns True if a new row was inserted, False if the row already
+    existed (idempotent retry), and None if the insertion failed. Callers
+    MUST NOT score wallets for trades that return None because the raw
+    trade history is not available to ``_compute_wallet_metrics``.
+    """
+    try:
+        # Defensive normalization: None / sentinel pass through; legitimate
+        # addresses are stored in canonical lowercase form. This mirrors
+        # what the parser now does and keeps every persistence path
+        # consistent.
+        ta = trade.trader_address
+        if ta is not None and ta and not is_sentinel_trader_address(ta):
+            persisted_trader_address: str | None = str(ta).strip().lower() or None
+        else:
+            persisted_trader_address = None
+        cur = db.execute(
+            """INSERT OR IGNORE INTO source_trades
+               (id, source, source_trade_id, market_source_id, side,
+                outcome, quantity, price, trader_address, timestamp,
+                is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                trade.source,
+                trade.source_trade_id,
+                trade.market_source_id,
+                trade.side.value if hasattr(trade.side, "value") else str(trade.side),
+                trade.outcome,
+                float(trade.quantity),
+                float(trade.price),
+                persisted_trader_address,
+                trade.timestamp.isoformat() if trade.timestamp else None,
+                int(bool(trade.is_sample)),
+            ),
+        )
+        db.conn.commit()
+        # rowcount == 1 means a fresh insert; 0 means duplicate (UNIQUE hit)
+        return bool(getattr(cur, "rowcount", 0))
+    except Exception as e:
+        logger.warning(
+            "persist_trade failed (%s @ %s): %s",
+            trade.source_trade_id, trade.market_source_id, e,
+        )
         try:
-            resp = await client.get("/trades", params={"condition_id": market_source_id})
-            resp.raise_for_status()
-            data = resp.json()
-            if not isinstance(data, list):
-                data = [data] if data else []
+            db.conn.rollback()
+        except Exception:
+            pass
+        return None
 
-            trades = []
-            for item in data:
-                try:
-                    trade = _parse_clob_trade(item, market_source_id)
-                    if trade:
-                        trades.append(trade)
-                except Exception:
-                    pass
-            return trades
-        except Exception as e:
-            result.missing_data.append(f"Trades unavailable for {market_source_id}: {e}")
-            return []
+
+# ── Shared adapter wiring (PR #3 P2) ───────────────────────────────────────
+#
+# ``run_scan`` and ``collect_smart_money_data`` MUST go through the SAME
+# PolymarketPublicAdapter construction path so they share settings, cache,
+# and normalization. ``build_trade_adapter`` is imported at module scope
+# above (see the ``try: from _live_ingest import build_trade_adapter`` block
+# near the top of this file). We reuse that single import below so the
+# module stays runnable via direct absolute-path execution
+# (``python scripts/run_scan.py`` from any cwd, no PYTHONPATH) AND via
+# package-style execution (``python -m scripts.run_scan``).
+#
+# IMPORTANT: do NOT add a second ``from scripts._live_ingest import …``
+# here. That package-style import requires ``scripts`` to be importable as
+# a package, which is only true when running ``python -m scripts.run_scan``
+# from the repo root — it fails for the direct-execution CLI startup path
+# with ``ModuleNotFoundError: No module named 'scripts'`` and for the
+# mocked live path the smoke test uses.
+_SCAN_TRADE_ADAPTER: "PolymarketPublicAdapter | None" = None
+
+
+def _get_scan_trade_adapter() -> "PolymarketPublicAdapter":
+    """Return the process-wide shared PolymarketPublicAdapter for run_scan.
+
+    Lazily constructs it on first use and reuses the same instance for the
+    rest of the process so all per-market ``_fetch_trades`` calls share the
+    same adapter configuration, parsing, throttling, and snapshot behavior.
+
+    Uses the module-scoped ``build_trade_adapter`` import — never re-imports
+    under a package-style name. See the comment above the constant.
+    """
+    global _SCAN_TRADE_ADAPTER
+    if _SCAN_TRADE_ADAPTER is None:
+        if build_trade_adapter is None:  # pragma: no cover — defensive
+            # The module-scope ``try: from _live_ingest import …`` block fell
+            # back to a stub because scripts/ wasn't on sys.path. That only
+            # happens if someone has stripped ``sys.path`` to an extreme;
+            # we still refuse to crash here and surface a clear error.
+            raise RuntimeError(
+                "scripts/_live_ingest.build_trade_adapter is unavailable; "
+                "scripts/ must be importable to use the live trade path"
+            )
+        _SCAN_TRADE_ADAPTER = build_trade_adapter(get_settings())
+    return _SCAN_TRADE_ADAPTER
+
+
+def _build_asset_to_outcome_map(data: dict) -> dict[str, str]:
+    """Build asset_id → outcome-label map for a Gamma market object.
+
+    Mirror of
+    :meth:`scripts.collect_smart_money_data.PolymarketCollector._build_asset_to_outcome_map`
+    so the scanner and the collector rewrite a denormalized raw ``outcome``
+    field identically for the same raw Gamma payload. The two functions
+    must stay in sync — they are the single source of truth for
+    ``{clobTokenId: outcomes_label}`` mapping used to fix the raw
+    data-api ``outcome`` string.
+
+    Gamma's ``clobTokenIds`` is a JSON-encoded array of token IDs in the
+    same order as the ``outcomes`` array. The two are zipped position-wise.
+    """
+    import json as _json
+    try:
+        outcomes = data.get("outcomes", "[]")
+        tokens = data.get("clobTokenIds", "[]")
+        if isinstance(outcomes, str):
+            outcomes = _json.loads(outcomes)
+        if isinstance(tokens, str):
+            tokens = _json.loads(tokens)
+        if not isinstance(outcomes, list) or not isinstance(tokens, list):
+            return {}
+        return {str(tok): str(lab) for tok, lab in zip(tokens, outcomes)}
+    except Exception:
+        return {}
 
 
 def _parse_gamma_market(data: dict) -> Market:
@@ -505,37 +1013,18 @@ def _parse_gamma_market(data: dict) -> Market:
 
 
 def _parse_clob_trade(data: dict, market_source_id: str) -> SourceTrade | None:
-    try:
-        side_raw = str(data.get("side", "")).lower()
-        if side_raw in ("buy", "1"):
-            side = OrderSide.BUY
-        elif side_raw in ("sell", "0"):
-            side = OrderSide.SELL
-        else:
-            return None
+    """DEPRECATED legacy CLOB-trade shim.
 
-        ts_raw = data.get("timestamp") or data.get("createdAt")
-        if ts_raw is None:
-            ts = datetime.now(timezone.utc)
-        elif isinstance(ts_raw, (int, float)):
-            ts = datetime.fromtimestamp(ts_raw / 1000.0 if ts_raw > 1e12 else ts_raw, tz=timezone.utc)
-        else:
-            ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-
-        return SourceTrade(
-            source="polymarket_clob",
-            source_trade_id=str(data.get("id", data.get("trade_id", uuid.uuid4().hex))),
-            market_source_id=market_source_id,
-            side=side,
-            outcome=str(data.get("outcome", data.get("token", "Yes"))),
-            quantity=float(data.get("size", data.get("quantity", 0))),
-            price=float(data.get("price", 0)),
-            trader_address=str(data.get("maker", data.get("trader", "unknown"))),
-            timestamp=ts,
-            is_sample=False,
-        )
-    except (ValueError, TypeError):
-        return None
+    PR #3 P2 fix removed the live ``gamma_base_url + /trades`` call path
+    from ``_fetch_trades``; ``run_scan`` now uses the shared
+    ``PolymarketPublicAdapter`` (data-api), same as
+    ``collect_smart_money_data``. This shim is retained only as a
+    no-op safety net for any stray imports — it always returns ``None``
+    so it cannot accidentally synthesize trades from raw CLOB payloads.
+    New callers MUST go through the shared adapter path
+    (``scripts/_live_ingest.fetch_recent_trades_for_market``).
+    """
+    return None
 
 
 def _persist_market(db: Database, market: Market) -> None:
@@ -642,9 +1131,11 @@ def _record_experiment(db: Database, result: ScanResult, settings) -> None:
             "watchlist": result.watchlist,
             "skipped": result.skipped,
             "incomplete": result.incomplete,
+            "trades_total": result.trades_total,
             "trades_processed": result.trades_processed,
             "trades_deduped": result.trades_deduped,
             "trades_stale": result.trades_stale,
+            "anonymous_trades_skipped": result.anonymous_trades_skipped,
             "signals": result.signals,
             "related_wallets": result.related_wallets,
             "errors": len(result.errors),

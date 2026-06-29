@@ -1,0 +1,260 @@
+{
+  "generated_utc": "2026-06-28T08:55:19.199049+00:00",
+  "probe": "data-api.polymarket.com/trades global window limit=1000",
+  "global_window_size": 1000,
+  "markets_tested": 10,
+  "markets_with_nonzero_trades": 1,
+  "wallet_identity_available": true,
+  "rows": [
+    {
+      "question": "Will Algeria win the 2026 FIFA World Cup?",
+      "slug": "will-algeria-win-the-2026-fifa-world-cup",
+      "gamma_id": "558969",
+      "condition_id": "0x5a59d269c2b5108cd2f64c624e46ee2c8b5cfd88b882582565f927918315b6aa",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "58392024727359233794992635293106675983094683080284912908526627785964160484939",
+        "49871252661742427315226109307954871479267113637891510501334531720454017709951"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 6375487.689,
+      "liquidity": 13337812.58982,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Benjamin Netanyahu enter Iran by June 30?",
+      "slug": "will-benjamin-netanyahu-enter-iran-by-june-30",
+      "gamma_id": "1478016",
+      "condition_id": "0x83f38b0110a93a4e68d2391dc70868ab1f8a9a074de58b0ef50d5312e3fcfcf7",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "13265448810970451421006542393165618576926964649374055337580146768273870202113",
+        "68249379252158272330152360947287312377399677973226451012595725236812305578666"
+      ],
+      "best_bid": null,
+      "best_ask": 0.999,
+      "volume_24h": 5911267.555998,
+      "liquidity": 80903.94033,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Colombia win the 2026 FIFA World Cup?",
+      "slug": "will-colombia-win-the-2026-fifa-world-cup-734",
+      "gamma_id": "558947",
+      "condition_id": "0xe99cc59f32b10d23acf196d1a0e8264ea30fca198428acadd3464b06ff60e771",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "98803390175521456712653678280474920637934596234667490983228578374641217211132",
+        "66826965351166675155887515167306086307412332225034738589879767944935462342380"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 4983944.133942992,
+      "liquidity": 2230487.42951,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Portugal win the 2026 FIFA World Cup?",
+      "slug": "will-portugal-win-the-2026-fifa-world-cup-912",
+      "gamma_id": "558940",
+      "condition_id": "0x4f3421fb2daf5cca7430ed8d8132463963081572d75434393a1808fdb8829fe8",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "45415751658241142530386585138386640503488308219341470020075667342738719018629",
+        "31940783580344558651011323787577288681658737625185216525249046282994042503801"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 4377366.365497973,
+      "liquidity": 3783334.5928,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Ghana win the 2026 FIFA World Cup?",
+      "slug": "will-ghana-win-the-2026-fifa-world-cup",
+      "gamma_id": "558967",
+      "condition_id": "0x881a3ffa618b6ae0ab95a5637e310afb1afc2d99c921bfe3235b15eccfce0344",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "43907673646206657865778036957293730446366626078011238443367990170655175896145",
+        "10398766811303655595339782235864350348828881761515262235130136230008770201075"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 4325184.35,
+      "liquidity": 14976273.43189,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Argentina win the 2026 FIFA World Cup?",
+      "slug": "will-argentina-win-the-2026-fifa-world-cup-245",
+      "gamma_id": "558938",
+      "condition_id": "0x0c4cd2055d6ea89354ffddc55d6dbcef9355748112ea952fc925f3db6a5c457f",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "18812649149814341758733697580460697418474693998558159483117100240528657629879",
+        "115428153746996892211798999366308897078723117634059783423375188043903703749062"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 3949646.7710329858,
+      "liquidity": 5462711.81082,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Mexico win the 2026 FIFA World Cup?",
+      "slug": "will-mexico-win-the-2026-fifa-world-cup-529",
+      "gamma_id": "558945",
+      "condition_id": "0x5ccfe1b69a582d2985db08a8481a0d74c314b1fce9b4711ae2efb2c6467fe6aa",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "22587775301869146748237913050505932485648958481571808324285560650057390882036",
+        "89041006475364789358805026139650677807087698981377208157664917554760333198878"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 3943925.326376007,
+      "liquidity": 6333535.17051,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Canada win the 2026 FIFA World Cup?",
+      "slug": "will-canada-win-the-2026-fifa-world-cup-755",
+      "gamma_id": "558952",
+      "condition_id": "0x67443cb1ffb2bf180f7df5b6ca7adff63f7e8e933c7e41405ba118f3e9f8befb",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "99303605181956827630838461879484468077121754034387765735989859308848389894408",
+        "69727421603231227453181655442677441322028725849495647325726292556190704508348"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 3668653.851996999,
+      "liquidity": 14875640.7902,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    },
+    {
+      "question": "Will Croatia win the 2026 FIFA World Cup?",
+      "slug": "will-croatia-win-the-2026-fifa-world-cup",
+      "gamma_id": "558976",
+      "condition_id": "0xe5bd80313b8859e3f5761568ac9498866ea9d4419e4d1b6a877a9a9bd2754cb4",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "106593539437032467615148553707998472829334050617128244920821917025746481184109",
+        "22335540631248526397385139154377717431237265005174891396662761131414559126312"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 3637005.8218579968,
+      "liquidity": 7372849.77395,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 1,
+      "first_trade_ts": 1782636484,
+      "last_trade_ts": 1782636484,
+      "wallet_identity_available": true,
+      "notes": "ok"
+    },
+    {
+      "question": "Will Gedion Timothewos be the next Prime Minister of Ethiopia?",
+      "slug": "will-gedion-timothewos-be-the-next-prime-minister-of-ethiopia",
+      "gamma_id": "2063135",
+      "condition_id": "0xb6d6f15a1b5d08753653f1867ccd6126badfbe182a75159a330dc7b15336b309",
+      "outcomes": [
+        "Yes",
+        "No"
+      ],
+      "token_ids": [
+        "26485245961222313575373928818655498088613748810606082451526412785977121014592",
+        "88478075820276880294718721941038251506706678823987773177467218098225985186038"
+      ],
+      "best_bid": 0.001,
+      "best_ask": 0.999,
+      "volume_24h": 3635887.98,
+      "liquidity": 25021.54073,
+      "trade_endpoint_queried": "https://data-api.polymarket.com/trades?conditionId=<cond>&limit=100",
+      "http_status": 200,
+      "trades_returned_for_market": 0,
+      "first_trade_ts": null,
+      "last_trade_ts": null,
+      "wallet_identity_available": null,
+      "notes": "no trades in last-1000 global window"
+    }
+  ]
+}

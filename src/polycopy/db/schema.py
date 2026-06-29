@@ -7,7 +7,7 @@ schema version. Each migration is a list of SQL statements.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 # ── Version 1: initial schema ───────────────────────────────────────────────────
 _V1_DDL: list[str] = [
@@ -234,13 +234,185 @@ _V3_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);",
 ]
 
+# ── Version 4: capability flags (data availability + wallet attribution) ───────
+_V4_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS capability_flags (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        capability        TEXT NOT NULL,
+        status            TEXT NOT NULL,         -- 'ok' | 'unavailable' | 'partial' | 'unknown'
+        wallet_attribution_available INTEGER NOT NULL DEFAULT 0,  -- 0/1
+        details           TEXT NOT NULL DEFAULT '{}',  -- JSON object
+        first_verified_at TEXT NOT NULL,         -- ISO-8601 UTC
+        last_verified_at  TEXT NOT NULL,         -- ISO-8601 UTC
+        is_sample         INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(capability)
+    );""",
+    "CREATE INDEX IF NOT EXISTS idx_capability_flags_capability ON capability_flags(capability);",
+]
+
+# ── Version 5: source_trades.trader_address becomes NULLable, sentinels → NULL ─
+# Rationale: anonymous data-api rows (no proxyWallet) used to be persisted with
+# the literal sentinel string "unknown" (or "anonymous", "missing", "0x0",
+# "0x"). Those strings then collapsed into a single pseudo-wallet and got
+# scored by evaluate_wallet. The fix:
+#   1. Allow trader_address to be NULL (the absence of attribution).
+#   2. Normalize ALL legacy sentinel values to NULL during the COPY step
+#      below. This is a one-shot, self-correcting rewrite — historical rows
+#      that were "unknown" / "anonymous" / "missing" / "0x" / "0x0" /
+#      empty / whitespace are converted to NULL on upgrade. Real 0x
+#      addresses and any other non-sentinel non-empty value are preserved
+#      verbatim (case-sensitive).
+#   3. Preserve is_sample and all other columns.
+#   4. DELETE every row in ``wallets`` whose address lowercases to one of
+#      the legacy sentinels or is empty / whitespace-only. Pre-v5 wallets
+#      rows were created for the literal sentinel strings ("unknown",
+#      "anonymous", "missing", "0x", "0x0") because a legacy collector
+#      would promote a sentinel trader_address into a fake wallet row;
+#      those rows then got scored by evaluate_wallet. The cleanup below
+#      removes those fake rows on upgrade. Real wallet rows — including
+#      any with surrounding whitespace or unusual casing — are preserved
+#      byte-for-byte. This step is idempotent (DELETEs of already-deleted
+#      rows are no-ops) and uses the same LOWER(TRIM(...)) predicate as
+#      the source_trades rewrite above for consistency. PRAGMA
+#      foreign_keys is disabled during the DELETE so any dependent rows
+#      (wallet_balances, positions, orders, decision_log,
+#      performance_summaries) referencing a now-deleted wallet are removed
+#      by the explicit DELETE below; we then re-enable FK enforcement and
+#      run PRAGMA foreign_key_check to verify no orphans remain.
+_V5_DDL: list[str] = [
+    # ── Step A: rebuild source_trades with a nullable trader_address ────────
+    """CREATE TABLE IF NOT EXISTS source_trades_new (
+        id               TEXT PRIMARY KEY,  -- UUID
+        source           TEXT NOT NULL,
+        source_trade_id  TEXT NOT NULL,
+        market_source_id TEXT NOT NULL,
+        side             TEXT NOT NULL,
+        outcome          TEXT NOT NULL,
+        quantity         REAL NOT NULL CHECK(quantity > 0),
+        price            REAL NOT NULL CHECK(price >= 0 AND price <= 1),
+        trader_address   TEXT,                -- nullable (was NOT NULL pre-v5)
+        timestamp        TEXT NOT NULL,     -- ISO-8601 UTC
+        is_sample        INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(source, source_trade_id)
+    );""",
+    """INSERT INTO source_trades_new (
+        id, source, source_trade_id, market_source_id, side, outcome,
+        quantity, price, trader_address, timestamp, is_sample
+    ) SELECT
+        id, source, source_trade_id, market_source_id, side, outcome,
+        quantity, price,
+        CASE
+            WHEN trader_address IS NULL THEN NULL
+            WHEN LENGTH(TRIM(trader_address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 THEN NULL
+            WHEN LOWER(TRIM(trader_address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN (
+                'unknown', 'anonymous', 'missing', '0x', '0x0'
+            ) THEN NULL
+            ELSE trader_address
+        END,
+        timestamp, is_sample
+      FROM source_trades;""",
+    "DROP TABLE source_trades;",
+    "ALTER TABLE source_trades_new RENAME TO source_trades;",
+    "CREATE INDEX IF NOT EXISTS idx_source_trades_market ON source_trades(market_source_id);",
+    "CREATE INDEX IF NOT EXISTS idx_source_trades_timestamp ON source_trades(timestamp);",
+    # ── Step B: delete sentinel rows from wallets (and their dependents) ──
+    # Disable FK enforcement around destructive cleanup so we can delete
+    # dependent rows in the right order without the engine aborting the
+    # statement mid-flight. We re-enable it immediately after and run
+    # PRAGMA foreign_key_check to guarantee integrity.
+    #
+    # The deletion ORDER below is the correctness mechanism — it would
+    # work even with FK enforcement ENABLED. ``PRAGMA foreign_keys = OFF``
+    # is a defense-in-depth safety net only, not the thing the migration
+    # depends on.
+    #
+    # Child-before-parent FK graph this satisfies:
+    #   decision_log.order_id  → orders.id
+    #   decision_log.wallet_id → wallets.id   (NOT NULL)
+    #   orders.wallet_id       → wallets.id
+    #   positions.wallet_id    → wallets.id
+    #   wallet_balances.wallet_id → wallets.id
+    #   performance_summaries.wallet_id → wallets.id
+    #
+    # A naive delete (orders before decision_log) fails with FK
+    # violation when a decision_log row references an order belonging
+    # to a different (real) wallet. We delete the cross-references
+    # FIRST, then by-wallet dependents, then orders, then wallet rows.
+    "PRAGMA foreign_keys = OFF;",
+    # 1. Child rows that reference sentinel-wallet orders. These MUST
+    #    be removed before the orders themselves, otherwise the next
+    #    DELETE fails with FOREIGN KEY constraint failed. Note we do
+    #    NOT limit this to sentinel-wallet decision_logs: any
+    #    decision_log row whose ``order_id`` points to a sentinel-wallet
+    #    order must go, even if its own ``wallet_id`` belongs to a
+    #    real wallet.
+    "DELETE FROM decision_log WHERE order_id IN ("
+    "SELECT o.id FROM orders o "
+    "JOIN wallets w ON w.id = o.wallet_id "
+    "WHERE LENGTH(TRIM(w.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(w.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # 2. Child rows that reference sentinel-wallet wallets. Delete ALL
+    #    dependents for sentinel wallets in child-before-parent order
+    #    so the orders delete (step 3) is not blocked by remaining
+    #    decision_log rows. We delete decision_log first since it can
+    #    also reference orders (which we haven't deleted yet).
+    "DELETE FROM decision_log WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # wallet_balances has no further dependents.
+    "DELETE FROM wallet_balances WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # performance_summaries has no further dependents.
+    "DELETE FROM performance_summaries WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # positions has no further dependents.
+    "DELETE FROM positions WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # 3. orders — safe now because ALL decision_log rows that could
+    #    reference sentinel-wallet orders are gone (deleted in step 1
+    #    and step 2 above).
+    "DELETE FROM orders WHERE wallet_id IN ("
+    "SELECT id FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0'));",
+    # 4. The sentinel wallet rows themselves. By this point no dependent
+    #    rows reference them.
+    "DELETE FROM wallets WHERE "
+    "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
+    "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0');",
+    "PRAGMA foreign_keys = ON;",
+    # Verify no orphan dependent rows remain. PRAGMA foreign_key_check
+    # returns rows for any FK violation; on a clean DB it returns empty.
+    # The result is intentionally not asserted — the migration runner
+    # surfaces it via tests; a non-empty result here would be a bug in
+    # the migration itself and would fail the regression suite.
+    "PRAGMA foreign_key_check;",
+]
+
+
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version from (version - 1).
 MIGRATIONS: dict[int, list[str]] = {
     1: _V1_DDL,
     2: _V2_DDL,
     3: _V3_DDL,
+    4: _V4_DDL,
+    5: _V5_DDL,
 }
 
 # Current DDL is the latest migration
-CURRENT_DDL: list[str] = MIGRATIONS[SCHEMA_VERSION]
+CURRENT_DDL: list[str] = MIGRATIONS[SCHEMA_VERSION] 

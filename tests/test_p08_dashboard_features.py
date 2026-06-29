@@ -158,7 +158,11 @@ class TestPaperOrderApproveReject:
         """Seed a pending order in the DB so approve/reject can transition it."""
         from polycopy.db.database import get_database
         db = get_database()
-        now = "2026-06-28T12:00:00+00:00"
+        # was hardcoded "2026-06-28T12:00:00+00:00"; now dynamic so the order
+        # doesn't expire past order_preview_max_age_seconds once wall-clock
+        # passes that hardcoded value.
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
         db.execute(
             "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
             ("00000000-0000-0000-0000-000000000002", "0xtest", "test", 0, now),

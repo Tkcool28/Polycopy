@@ -443,10 +443,21 @@ class TestWalletDiscovery:
         assert len(wallets) == 1
 
     def test_empty_address_raises(self):
-        """Empty address raises ValueError."""
+        """Empty / whitespace addresses are rejected via invalid-dict sentinel.
+
+        Round 11 (P3 PRRT_kwDOTG4Cf86M7Xbp): the discovery helpers
+        now return a dict with ``invalid=True`` for empty / whitespace /
+        sentinel inputs instead of raising, so callers (notably
+        ``run_scan``) can branch on the dict rather than wrap the
+        registration in a try/except. The wallet is NOT added to the
+        discovery registry in this case.
+        """
         disc = WalletDiscovery()
-        with pytest.raises(ValueError, match="empty"):
-            disc.add_from_polymarket("   ")
+        entry = disc.add_from_polymarket("   ")
+        assert entry.get("invalid") is True
+        assert entry.get("is_new") is False
+        assert entry.get("address") is None
+        assert disc.list_wallets() == []
 
     def test_list_wallets_returns_all(self):
         disc = WalletDiscovery()
@@ -1460,7 +1471,11 @@ class TestAPIValidation:
         """Seed a pending order in the DB so approve/reject can transition it."""
         from polycopy.db.database import get_database
         db = get_database()
-        now = "2026-06-28T12:00:00+00:00"
+        # was hardcoded "2026-06-28T12:00:00+00:00"; now dynamic so the order
+        # doesn't expire past order_preview_max_age_seconds once wall-clock
+        # passes that hardcoded value.
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
         db.execute(
             "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
             ("00000000-0000-0000-0000-000000000002", "0xtest", "test", 0, now),

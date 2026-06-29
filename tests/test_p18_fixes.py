@@ -2,9 +2,9 @@
 
 Covers all five Codex review findings plus required regression tests A-E.
 """
-
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -14,7 +14,10 @@ from polycopy.api.app import app
 
 MARKET_ID = "00000000-0000-0000-0000-000000000001"
 WALLET_ID = "00000000-0000-0000-0000-000000000002"
-NOW = "2026-06-28T12:00:00+00:00"
+# Was hardcoded "2026-06-28T12:00:00+00:00"; now dynamic so seeded orders
+# never expire past order_preview_max_age_seconds once wall-clock passes
+# that hardcoded value.
+NOW = datetime.now(timezone.utc).isoformat()
 
 
 def _reset_app_state(monkeypatch, tmp_path):

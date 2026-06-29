@@ -38,8 +38,25 @@ from polycopy.api.responses import (
 )
 from polycopy.config.settings import Settings
 from polycopy.db.database import Database, get_database
+from polycopy.db.wallet_identity import (
+    address_is_sentinel_params,
+    address_is_sentinel_sql,
+    is_sentinel_trader_address,
+)
 
 SAMPLE_LABEL = "DEMO DATA / SAMPLE DATA"
+
+# Single source of truth for the SQL predicate that mirrors
+# ``is_sentinel_trader_address`` in :mod:`polycopy.domain.source_trade`.
+# The Python helper checks (None, non-string, whitespace-only, case-insensitive
+# match against ``LEGACY_TRADER_ADDRESS_SENTINELS`` after stripping ASCII
+# whitespace). The SQL fragment is built once from
+# :func:`polycopy.db.wallet_identity.address_is_sentinel_sql` so EVERY
+# path (repository scans/wallets, migration cleanup, run_scan loader,
+# collect_smart_money dedup, live smoke) agrees byte-for-byte. Editing
+# the predicate in one place updates all of them.
+_SENTINEL_FRAGMENT: str = address_is_sentinel_sql("address")
+_SENTINEL_PARAMS: tuple[str, ...] = address_is_sentinel_params()
 
 SAMPLE_WALLET_ID = UUID("00000000-0000-0000-0000-000000000001")
 SAMPLE_MARKET_ID = UUID("00000000-0000-0000-0000-000000000010")
@@ -117,19 +134,29 @@ class DashboardRepository:
         return bool(self.settings and self.settings.enable_demo_data)
 
     def scans(self, page: Page) -> ScanResponse:
+        # Sentinel / empty / whitespace-only wallet addresses are excluded
+        # in SQL — BEFORE LIMIT/OFFSET — so paging semantics are correct
+        # (limit means "N real wallets per page", not "N rows that may
+        # include sentinels") AND the total_count matches what the page
+        # query would return. The Python helper ``is_sentinel_trader_address``
+        # is still consulted as a defensive belt-and-braces check on the
+        # rows returned by the DB (in case the schema ever drifts).
+        where = f" WHERE {_SENTINEL_FRAGMENT}"
+        total = self._count("wallets", where, _SENTINEL_PARAMS)
         rows = self.db.fetchall(
-            """
+            f"""
             SELECT w.id, w.address, w.label, w.is_sample,
                    COALESCE(ps.trade_count, 0) AS source_count,
                    ps.total_pnl, ps.win_rate
               FROM wallets w
               LEFT JOIN performance_summaries ps ON ps.wallet_id = w.id
+            {where}
              ORDER BY w.created_at DESC, w.id
              LIMIT ? OFFSET ?
             """,
-            (page.limit, page.offset),
+            _SENTINEL_PARAMS + (page.limit, page.offset),
         )
-        total = self._count("wallets")
+        rows = [r for r in rows if not is_sentinel_trader_address(r["address"])]
         if total == 0 and self.demo_enabled:
             return ScanResponse(scans=self._sample_scans()[page.offset : page.offset + page.limit], total_count=1, is_sample_data=True)
         scans = [
@@ -147,11 +174,19 @@ class DashboardRepository:
         return ScanResponse(scans=scans, total_count=total, is_sample_data=any(s.is_sample for s in scans))
 
     def wallets(self, page: Page) -> WalletsResponse:
+        # Same predicate as scans(): sentinel exclusion happens in SQL,
+        # BEFORE LIMIT/OFFSET, using the SAME WHERE clause as the count.
+        # This guarantees count/list parity even when the page boundary
+        # cuts across the non-sentinel region.
+        where = f" WHERE {_SENTINEL_FRAGMENT}"
+        total = self._count("wallets", where, _SENTINEL_PARAMS)
         rows = self.db.fetchall(
-            "SELECT id, address, label, is_sample FROM wallets ORDER BY created_at DESC, id LIMIT ? OFFSET ?",
-            (page.limit, page.offset),
+            f"SELECT id, address, label, is_sample FROM wallets{where} ORDER BY created_at DESC, id LIMIT ? OFFSET ?",
+            _SENTINEL_PARAMS + (page.limit, page.offset),
         )
-        total = self._count("wallets")
+        # Defensive Python filter on top of SQL: guards against schema drift
+        # or a buggy migration that reintroduces sentinel rows.
+        rows = [r for r in rows if not is_sentinel_trader_address(r["address"])]
         if total == 0 and self.demo_enabled:
             sample = self._sample_wallets()[page.offset : page.offset + page.limit]
             return WalletsResponse(wallets=sample, total_count=1, is_sample_data=True)
@@ -160,7 +195,11 @@ class DashboardRepository:
 
     def wallet(self, wallet_id: UUID) -> WalletDetailView | None:
         row = self.db.fetchone("SELECT id, address, label, is_sample FROM wallets WHERE id = ?", (str(wallet_id),))
-        if row is not None:
+        # Defensive: refuse to return a sentinel / empty / whitespace-only
+        # wallet even if its UUID somehow exists. The v5 migration deletes
+        # such rows on upgrade, but a manual post-upgrade INSERT could
+        # reintroduce them.
+        if row is not None and not is_sentinel_trader_address(row["address"]):
             return self._wallet_from_row(row)
         if self.demo_enabled and wallet_id == SAMPLE_WALLET_ID:
             return self._sample_wallets()[0]

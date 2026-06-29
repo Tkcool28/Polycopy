@@ -236,9 +236,15 @@ class TestRunScan:
         monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: FailingAsyncClient())
 
         result = ScanResult()
-        markets = await _fetch_markets(db, settings, limit=5, result=result, use_sample=False)
+        # Round 11 (P3 PRRT_kwDOTG4Cf86M7Xbp): ``_fetch_markets`` now returns
+        # ``(markets, asset_to_outcome_map)``. The map is the same shape
+        # used by ``run_scan``'s Step 3 loop.
+        markets, asset_map = await _fetch_markets(
+            db, settings, limit=5, result=result, use_sample=False
+        )
 
         assert markets == []
+        assert asset_map == {}
         assert result.errors
         assert not any(m.is_sample for m in markets)
 
