@@ -310,8 +310,12 @@ class TestRunScanAnonymousExclusion:
         result = await run_scan_module.run_scan(db, market_limit=1, use_sample=False)
         summary = result.summary()
         assert "trades total: 2" in summary
-        assert "trades processed: 1" in summary
-        assert "anonymous (sentinel) skipped: 1" in summary
+        assert "fetched: 2" in summary
+        assert "persisted: 2" in summary
+        assert "attributed: 1" in summary
+        assert "anonymous: 1" in summary
+        assert "processed: 1" in summary
+        assert "sentinel/anonymous skipped (legacy): 1" in summary
         db.close()
 
 

@@ -20,10 +20,10 @@ Endpoints used:
 Trade ingestion contract (verified 2026-06-28):
   - CLOB /trades requires authentication (HTTP 401 even without headers). It is
     NOT a public endpoint.
-  - data-api /trades is unauthenticated and returns full wallet-attributed
-    trades. The conditionId filter parameter is IGNORED by the server — it
-    always returns the most-recent N global trades. Callers MUST filter
-    client-side.
+  - data-api /trades is unauthenticated and returns wallet-attributed trades.
+    Use the ``market=<conditionId>`` parameter for per-market fetches; callers
+    still filter client-side defensively because upstream responses can contain
+    malformed or stray rows.
   - Pagination: data-api uses offset+limit (limit hard-capped at ~1000).
   - Per trade, the response includes:
       proxyWallet      (real 0x address, identifies trader) — MAY be missing
@@ -55,9 +55,9 @@ every distinguishing row field (``transactionHash``, ``asset``,
 do not collide on the ``UNIQUE(source, source_trade_id)`` constraint and
 cannot overwrite each other in ``source_trades``.
 
-The adapter caches a single global window per process and slices it per
-conditionId; this matches the server's actual behavior (no per-market filter)
-and minimizes network roundtrips.
+The adapter fetches live trades per market with bounded offset pagination.
+Older global-window cache behavior is intentionally bypassed for the live
+``fetch_trades_for_market`` path so separate markets cannot share stale rows.
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ import httpx
 
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.order import OrderSide
-from polycopy.domain.source_trade import SourceTrade
+from polycopy.domain.source_trade import SourceTrade, is_sentinel_trader_address
 from polycopy.providers.market_data import MarketDataProvider
 from polycopy.providers.resolution import ResolutionProvider
 from polycopy.providers.trade_feed import TradeFeedProvider
@@ -450,14 +450,18 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
 
             wallet = raw.get("proxyWallet") or raw.get("maker") or raw.get("trader") or ""
             wallet = str(wallet).strip()
-            # On the data-api, proxyWallet is a real 0x address. If empty/null
-            # we record trader_address=None (P2 fix: anonymous trades MUST NOT
-            # be promoted to a fake "unknown" wallet — they remain in
-            # source_trades as market-level observations but are excluded
-            # from wallet discovery and scoring).
-            if not wallet or wallet.lower() in ("none", "null", "0x"):
-                trader_address: Optional[str] = None
-            else:
+            # P2 fix (round 7): normalize ALL sentinel/empty/whitespace-only
+            # wallet attribution to ``None`` via the shared
+            # ``is_sentinel_trader_address`` helper — the SAME source of
+            # truth used by the v5 migration, ``repository.py``, and
+            # ``scripts/run_scan.py``. This covers ``unknown`` /
+            # ``anonymous`` / ``missing`` / ``0x`` / ``0x0`` plus empty,
+            # whitespace-only, case, and padded variants. Real 0x
+            # addresses pass through unchanged. Anonymous trades persist
+            # with ``trader_address=None`` and MUST NOT become wallet
+            # rows downstream.
+            trader_address: Optional[str] = None
+            if wallet and not is_sentinel_trader_address(wallet):
                 trader_address = wallet
 
             # P1 fix: build a row-distinguishing source_trade_id from the WHOLE
@@ -588,6 +592,14 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
         method IS the wallet-discovery path. The capability flag
         `wallet_attribution_available` is therefore True whenever this method
         returns non-empty.
+
+        .. note::
+           Round 7 change: per-market collection now uses
+           :meth:`fetch_trades_for_market` (server-side ``?market=<id>``
+           filter with bounded pagination) instead of slicing a cached
+           global window. This method is retained as a fallback / global
+           snapshot path and is NOT used by the per-market collector or
+           run_scan paths anymore.
         """
         window, _fresh = await self._fetch_global_window()
         if not window:
@@ -633,6 +645,158 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
                 continue
 
         return out
+
+    # ── Per-market fetcher (round 7) ─────────────────────────────────────────
+
+    async def fetch_trades_for_market(
+        self,
+        market_source_id: str,
+        *,
+        since: Optional[datetime] = None,
+        limit: int = 200,
+        max_pages: int = 5,
+        max_rows: int = 2000,
+        market: Optional[Market] = None,
+        asset_to_outcome: Optional[dict[str, str]] = None,
+    ) -> list[SourceTrade]:
+        """Fetch trades for a single market via the data-api server-side filter.
+
+        Uses ``GET /trades?market=<conditionId>`` (verified live 2026-06-28:
+        the server DOES honor ``market=`` and returns ONLY trades for that
+        conditionId, with empty ``[]`` for unknown / inactive markets).
+        Pagination is via ``offset`` + ``limit``.
+
+        Args:
+            market_source_id: hex ``conditionId`` for the market.
+            since: optional epoch-zero timestamp; trades with
+                ``timestamp < since`` are dropped client-side after the
+                fetch. Default is None (no lower bound; the API only
+                returns the most-recent ``~max_rows`` trades anyway).
+            limit: per-page size (the API caps each request at this many
+                rows).
+            max_pages: hard upper bound on pagination depth. The fetch
+                stops cleanly after this many pages even if the API keeps
+                returning full pages.
+            max_rows: hard upper bound on total rows retained. The fetch
+                stops as soon as we hit this many deduplicated rows.
+            market: optional :class:`Market` for outcome mapping.
+            asset_to_outcome: optional CLOB token_id → outcome label map.
+
+        Returns:
+            List of :class:`SourceTrade` for the market, deduplicated by
+            ``(source, source_trade_id)`` across pages, ordered as the API
+            served them (most-recent first). Empty on any error or for an
+            unknown market. Never raises.
+        """
+        if not market_source_id or not str(market_source_id).strip():
+            return []
+        cond_lower = str(market_source_id).lower()
+        since_ts = since.timestamp() if isinstance(since, datetime) else 0.0
+
+        client = await self._get_data_client()
+        seen: set[str] = set()
+        out: list[SourceTrade] = []
+
+        offset = 0
+        for page in range(max_pages):
+            try:
+                await self._throttle()
+                resp = await client.get(
+                    "/trades",
+                    params={
+                        "market": str(market_source_id),
+                        "limit": int(limit),
+                        "offset": int(offset),
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                logger.warning(
+                    "fetch_trades_for_market: page=%d offset=%d failed: %s: %s",
+                    page, offset, type(exc).__name__, exc,
+                )
+                break
+
+            if not isinstance(data, list):
+                logger.warning(
+                    "fetch_trades_for_market: non-list response on page=%d: %s",
+                    page, type(data).__name__,
+                )
+                break
+
+            # Empty or short page → graceful termination.
+            if not data or len(data) < limit:
+                # Still parse the rows we got, then stop.
+                for raw in data:
+                    self._absorb_trade(
+                        raw, cond_lower, since_ts, seen, out,
+                        market=market, asset_to_outcome=asset_to_outcome,
+                    )
+                    if len(out) >= max_rows:
+                        return out
+                break
+
+            # Full page → parse and advance.
+            for raw in data:
+                self._absorb_trade(
+                    raw, cond_lower, since_ts, seen, out,
+                    market=market, asset_to_outcome=asset_to_outcome,
+                )
+                if len(out) >= max_rows:
+                    return out
+            offset += limit
+
+        return out
+
+    def _absorb_trade(
+        self,
+        raw: Any,
+        cond_lower: str,
+        since_ts: float,
+        seen: set[str],
+        out: list[SourceTrade],
+        *,
+        market: Optional[Market],
+        asset_to_outcome: Optional[dict[str, str]],
+    ) -> None:
+        """Parse one raw trade row, dedup, and append to ``out``.
+
+        Used only by :meth:`fetch_trades_for_market`. Filters server-side
+        errors (row with the wrong ``conditionId`` from a future API
+        change) and the optional ``since`` lower bound.
+        """
+        try:
+            raw_cond = str(raw.get("conditionId") or "").lower()
+            if raw_cond != cond_lower:
+                return
+            raw_ts = raw.get("timestamp")
+            if raw_ts is None:
+                return
+            try:
+                raw_ts_f = float(raw_ts)
+            except (TypeError, ValueError):
+                return
+            if since_ts and raw_ts_f < since_ts:
+                return
+
+            sid = deterministic_source_trade_id_v2(raw)
+            if sid in seen:
+                return
+            seen.add(sid)
+
+            parsed = self._parse_data_api_trade(raw, market=market)
+            if parsed is None:
+                return
+
+            if asset_to_outcome:
+                asset = str(raw.get("asset") or "")
+                if asset in asset_to_outcome:
+                    parsed = parsed.model_copy(update={"outcome": asset_to_outcome[asset]})
+
+            out.append(parsed)
+        except Exception as exc:  # never raise from a single bad row
+            logger.debug("fetch_trades_for_market row skipped: %s: %s", type(exc).__name__, exc)
 
     async def get_trades_by_address(
         self,

@@ -34,6 +34,7 @@ from pathlib import Path
 # Add src to path for inline execution
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from polycopy.adapters.polymarket import PolymarketPublicAdapter
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
@@ -226,54 +227,53 @@ class PolymarketCollector:
         result: CollectionResult | None = None,
         since: datetime | None = None,
         limit: int = 200,
+        max_pages: int = 5,
+        max_rows: int = 2000,
     ) -> list[SourceTrade]:
         """Fetch recent trades for a market from the public data-api.
 
-        v0.4 (P21 fix): Replaces the broken `client.get("/trades")` calls
-        against gamma/clob with the data-api global-window strategy. See
-        reports/polymarket_trade_ingestion_audit.md for live evidence.
+        Round 7 (P1 fix): Replaces the global-window-then-slice strategy
+        with a per-market request to ``GET /trades?market=<conditionId>``
+        (server-side filter, verified live 2026-06-28). Pagination is
+        bounded by ``max_pages`` and ``max_rows`` and dedups across pages
+        via ``deterministic_source_trade_id_v2``.
 
         Behavior:
-          - Uses the adapter's shared global-window cache (one HTTP call
-            across all markets in a run).
-          - Slices client-side by conditionId.
+          - One HTTP request per market (not per run); the adapter's
+            data client is reused across markets in the same run.
           - Maps asset_id → outcome label using cached clobTokenIds ordering.
           - Persists trades to source_trades with is_sample=0.
           - On any error, logs and returns [] (graceful degradation).
-          - Never fabricates data: empty window → empty result + warning.
+          - Never fabricates data: empty market → empty result.
+          - Snapshot provenance is saved once per real upstream fetch.
         """
         if result is None:
             result = CollectionResult()
 
-        # Save snapshot of the global window (best-effort) — captures provenance.
-        # P3 fix (PR #3): only snapshot on a REAL upstream fetch, not on every
-        # per-market call that hits the cached window. Otherwise an N-market run
-        # inflates ``snapshots_saved`` by N even though only one HTTP call was made.
+        asset_to_outcome = self._asset_to_outcome.get(market_source_id) or {}
+        adapter = await self._get_trade_adapter()
+
+        # Snapshot provenance is now per-market and best-effort: save the
+        # first page (limit rows) once per market. The previous global-
+        # window strategy only saved one snapshot per run, but the new
+        # per-market fetch gets a different upstream payload per market,
+        # so a per-market snapshot is the honest equivalent.
         try:
-            adapter = await self._get_trade_adapter()
-            window, fresh = await adapter._fetch_global_window()
-            if window and fresh:
-                self._save_snapshot(
-                    db=db,
-                    source="polymarket_data_api",
-                    endpoint="/trades",
-                    params={"limit": self.settings.data_api_window_size, "filter": "global_window"},
-                    data=window,
-                )
-                result.snapshots_saved += 1
+            await self._snapshot_market_first_page(adapter, db, market_source_id, limit)
+            result.snapshots_saved += 1
         except Exception as e:
-            logger.debug("snapshot save skipped: %s", e)
-            adapter = await self._get_trade_adapter()
+            logger.debug("snapshot save skipped for market %s: %s", market_source_id, e)
 
         if since is None:
             since = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-        asset_to_outcome = self._asset_to_outcome.get(market_source_id) or {}
         try:
-            trades = await adapter.get_recent_trades(
+            trades = await adapter.fetch_trades_for_market(
                 market_source_id=market_source_id,
                 since=since,
                 limit=limit,
+                max_pages=max_pages,
+                max_rows=max_rows,
                 asset_to_outcome=asset_to_outcome,
             )
         except Exception as e:
@@ -572,6 +572,41 @@ class PolymarketCollector:
                 (str(wallet.id), bal.currency, bal.amount, bal.as_of.isoformat(), int(bal.is_sample)),
             )
         db.conn.commit()
+
+    async def _snapshot_market_first_page(
+        self,
+        adapter: PolymarketPublicAdapter,
+        db: Database,
+        market_source_id: str,
+        limit: int,
+    ) -> None:
+        """Snapshot the first page of a market's /trades fetch.
+
+        Best-effort: any error here is swallowed by the caller. Uses the
+        adapter's data client directly (we don't want to invoke the
+        paginated ``fetch_trades_for_market`` here because that already
+        parses and dedups — we just want the raw first page for
+        provenance).
+        """
+        try:
+            client = await adapter._get_data_client()  # noqa: SLF001 (intentional)
+            await adapter._throttle()  # noqa: SLF001
+            resp = await client.get(
+                "/trades",
+                params={"market": str(market_source_id), "limit": int(limit), "offset": 0},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and data:
+                self._save_snapshot(
+                    db=db,
+                    source="polymarket_data_api",
+                    endpoint="/trades",
+                    params={"market": str(market_source_id), "limit": int(limit), "filter": "per_market"},
+                    data=data,
+                )
+        except Exception as e:
+            logger.debug("per-market snapshot skipped: %s", e)
 
     def _save_snapshot(
         self,

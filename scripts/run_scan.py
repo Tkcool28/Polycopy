@@ -83,6 +83,12 @@ class ScanResult:
         self.wallets_discovered: int = 0
         self.wallets_scored: int = 0
         self.trades_total: int = 0
+        # Round 7 counters — distinguish phases so we can verify the
+        # north-star flow (fetch → normalize → persist → discover → score).
+        self.trades_fetched: int = 0       # normalized trades returned by adapter
+        self.trades_persisted: int = 0     # actually inserted into source_trades
+        self.trades_attributed: int = 0    # with a real (non-sentinel) wallet
+        self.anonymous_trades: int = 0     # persisted with trader_address=NULL
         self.trades_processed: int = 0
         self.trades_deduped: int = 0
         self.trades_stale: int = 0
@@ -92,7 +98,7 @@ class ScanResult:
         self.incomplete: int = 0
         self.signals: int = 0
         self.related_wallets: int = 0
-        self.anonymous_trades_skipped: int = 0
+        self.anonymous_trades_skipped: int = 0  # legacy alias, kept for back-compat
         self.missing_data: list[str] = []
         self.errors: list[str] = []
         self.started_at = datetime.now(timezone.utc)
@@ -108,10 +114,14 @@ class ScanResult:
             f"    skipped: {self.skipped}\n"
             f"    incomplete: {self.incomplete}\n"
             f"  trades total: {self.trades_total}\n"
-            f"  trades processed: {self.trades_processed}\n"
-            f"    deduped: {self.trades_deduped}\n"
-            f"    stale: {self.trades_stale}\n"
-            f"    anonymous (sentinel) skipped: {self.anonymous_trades_skipped}\n"
+            f"    fetched: {self.trades_fetched}\n"
+            f"    persisted: {self.trades_persisted}\n"
+            f"    attributed: {self.trades_attributed}\n"
+            f"    anonymous: {self.anonymous_trades}\n"
+            f"    processed: {self.trades_processed}\n"
+            f"      deduped: {self.trades_deduped}\n"
+            f"      stale: {self.trades_stale}\n"
+            f"    sentinel/anonymous skipped (legacy): {self.anonymous_trades_skipped}\n"
             f"  related wallets: {self.related_wallets}\n"
             f"  signals generated: {self.signals}\n"
             f"  missing data entries: {len(self.missing_data)}\n"
@@ -184,6 +194,22 @@ async def run_scan(
     for market in markets:
         trades = await _fetch_trades(db, market.source_id, now, result, use_sample)
         all_trades.extend(trades)
+
+        # Round 7 (P2 fix): persist fetched trades into source_trades BEFORE
+        # wallet scoring so that ``_compute_wallet_metrics`` actually sees
+        # the live trade history. Anonymous and sentinel-attributed trades
+        # persist with ``trader_address=None``; only attributed trades
+        # become wallet rows.
+        for trade in trades:
+            result.trades_fetched += 1
+            inserted = _persist_trade(db, trade)
+            if inserted:
+                result.trades_persisted += 1
+            if is_sentinel_trader_address(trade.trader_address):
+                # Anonymous or sentinel — persists as NULL, never becomes a wallet.
+                result.anonymous_trades += 1
+            else:
+                result.trades_attributed += 1
 
         # Discover wallets from attributed trades only
         for trade in trades:
@@ -518,24 +544,75 @@ async def _fetch_trades(db, market_source_id, now, result, use_sample) -> list[S
         unchanged (no adapter call).
       - ``use_sample=False`` → uses the shared adapter, returns [] on any
         network/parse failure (graceful degradation; no crash).
-      - The global window is fetched ONCE per scan and reused for every
-        market in the run, courtesy of the adapter's in-process cache.
+      - Round 7: live fetches go through ``adapter.fetch_trades_for_market``
+        which uses ``GET /trades?market=<conditionId>`` (server-side filter,
+        bounded pagination, dedup across pages).
     """
     if use_sample:
         return _get_sample_trades(market_source_id)
 
     adapter = _get_scan_trade_adapter()
-    # Pass epoch-zero as ``since`` so the adapter returns the FULL global
-    # window (the data-api hard-caps at ~1000 trades). A scan run wants the
-    # complete recent picture, not a per-call delta. The collector uses
-    # ``since=start_of_today`` for incremental ingestion — run_scan is
-    # deliberately different: it's a snapshot of current state.
+    # Pass epoch-zero as ``since`` so the adapter returns the FULL per-market
+    # history the API can serve (the data-api hard-caps the per-market
+    # response at ``max_rows``). A scan run wants the complete recent
+    # picture, not a per-call delta.
     return await fetch_recent_trades_for_market(
         adapter,
         market_source_id=market_source_id,
         since=datetime.fromtimestamp(0, tz=timezone.utc),
         limit=200,
     )
+
+
+def _persist_trade(db: Database, trade: SourceTrade) -> bool:
+    """Persist one ``SourceTrade`` into ``source_trades``.
+
+    Round 7 (P2 fix): live scan must persist fetched trades BEFORE
+    ``_compute_wallet_metrics`` runs, otherwise every newly discovered
+    wallet will be marked missing-data. Uses ``INSERT OR IGNORE`` against
+    the ``UNIQUE(source, source_trade_id)`` index so an exact rerun is
+    idempotent and distinct same-transaction rows (encoded via
+    ``deterministic_source_trade_id_v2``) both persist.
+
+    Returns True if a new row was inserted, False if the row already
+    existed (idempotent retry) or the insertion failed. Failures are
+    recorded on the result so the orchestrator can decide whether to
+    skip downstream scoring.
+    """
+    try:
+        cur = db.execute(
+            """INSERT OR IGNORE INTO source_trades
+               (id, source, source_trade_id, market_source_id, side,
+                outcome, quantity, price, trader_address, timestamp,
+                is_sample)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                trade.source,
+                trade.source_trade_id,
+                trade.market_source_id,
+                trade.side.value if hasattr(trade.side, "value") else str(trade.side),
+                trade.outcome,
+                float(trade.quantity),
+                float(trade.price),
+                trade.trader_address,  # may be None for anonymous/sentinel
+                trade.timestamp.isoformat() if trade.timestamp else None,
+                int(bool(trade.is_sample)),
+            ),
+        )
+        db.conn.commit()
+        # rowcount == 1 means a fresh insert; 0 means duplicate (UNIQUE hit)
+        return bool(getattr(cur, "rowcount", 0))
+    except Exception as e:
+        logger.warning(
+            "persist_trade failed (%s @ %s): %s",
+            trade.source_trade_id, trade.market_source_id, e,
+        )
+        try:
+            db.conn.rollback()
+        except Exception:
+            pass
+        return False
 
 
 # ── Shared adapter wiring (PR #3 P2) ───────────────────────────────────────
@@ -562,8 +639,8 @@ def _get_scan_trade_adapter() -> "PolymarketPublicAdapter":
     """Return the process-wide shared PolymarketPublicAdapter for run_scan.
 
     Lazily constructs it on first use and reuses the same instance for the
-    rest of the process so the global-window cache (one HTTP fetch per scan)
-    is honored across all per-market ``_fetch_trades`` calls.
+    rest of the process so all per-market ``_fetch_trades`` calls share the
+    same adapter configuration, parsing, throttling, and snapshot behavior.
 
     Uses the module-scoped ``build_trade_adapter`` import — never re-imports
     under a package-style name. See the comment above the constant.

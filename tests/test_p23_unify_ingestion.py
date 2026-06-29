@@ -467,8 +467,13 @@ class TestSharedNormalization:
 
 
 class TestCollectorSnapshotSemantics:
-    """P3 fix: collector snapshots on real upstream fetches only, not on
-    per-market cache hits."""
+    """Round 7: collector fetches per market via ``GET /trades?market=<id>``.
+    Each per-market request that hits the upstream is a real fetch and
+    triggers one snapshot. Repeated calls for the SAME market hit the
+    data-api again (no in-memory cache for per-market fetches) and each
+    produces one snapshot — that is the honest accounting for the new
+    fetch path.
+    """
 
     def _wire_collector(self, handler):
         adapter = _make_adapter_with_transport(handler)
@@ -476,108 +481,83 @@ class TestCollectorSnapshotSemantics:
         collector._trade_adapter = adapter
         return collector, adapter
 
-    def test_collector_snapshots_once_for_two_markets(self, tmp_path, monkeypatch):
-        """A 2-market run that shares one cached window must produce
-        exactly 1 snapshot (1 fresh fetch)."""
+    def _market_filter_handler(self):
+        """Return a handler that filters _TWO_MARKETS by the ``market`` query param."""
         async def handler(request):
             import httpx
-            return httpx.Response(200, json=_TWO_MARKETS)
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(str(request.url)).query)
+            market = (qs.get("market") or [""])[0].lower()
+            data = [
+                r for r in _TWO_MARKETS
+                if str(r.get("conditionId", "")).lower() == market
+            ]
+            return httpx.Response(200, json=data)
+        return handler
 
+    def test_collector_snapshots_once_per_market(self, tmp_path, monkeypatch):
+        """A 2-market run produces 2 snapshots — one per per-market request."""
         monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p23.sqlite"))
         monkeypatch.setenv("POLYCOPY_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
         db = _empty_db(tmp_path)
-        collector, _adapter = self._wire_collector(handler)
+        collector, _adapter = self._wire_collector(self._market_filter_handler())
 
         async def run():
             result = collect_mod.CollectionResult()
             await collector.collect_trades(db, "0xMARKET_A", result=result)
-            # Second market: cache hit → no new snapshot.
             await collector.collect_trades(db, "0xMARKET_B", result=result)
-            return result
-
-        result = asyncio.run(run())
-        assert result.snapshots_saved == 1, (
-            f"expected exactly 1 snapshot for 2 markets sharing cached window, "
-            f"got {result.snapshots_saved}"
-        )
-        n_snap = db.fetchone("SELECT COUNT(*) AS n FROM raw_snapshots")["n"]
-        assert n_snap == 1, f"expected 1 snapshot row, got {n_snap}"
-        db.close()
-
-    def test_collector_cache_hit_no_snapshot(self, tmp_path, monkeypatch):
-        """Within the cache window, the second call to ``collect_trades`` MUST
-        NOT increment ``snapshots_saved``."""
-        async def handler(request):
-            import httpx
-            return httpx.Response(200, json=_TWO_MARKETS)
-
-        monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p23.sqlite"))
-        monkeypatch.setenv("POLYCOPY_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
-        db = _empty_db(tmp_path)
-        collector, _adapter = self._wire_collector(handler)
-
-        async def run():
-            result = collect_mod.CollectionResult()
-            await collector.collect_trades(db, "0xMARKET_A", result=result)
-            before = result.snapshots_saved
-            await collector.collect_trades(db, "0xMARKET_B", result=result)
-            after = result.snapshots_saved
-            return result, before, after
-
-        result, before, after = asyncio.run(run())
-        assert before == 1, f"first call should snapshot; got {before}"
-        assert after == 1, (
-            f"second call within cache window must NOT snapshot; got {after}"
-        )
-        n_snap = db.fetchone("SELECT COUNT(*) AS n FROM raw_snapshots")["n"]
-        assert n_snap == 1
-        db.close()
-
-    def test_collector_forced_refresh_creates_one_snapshot(self, tmp_path, monkeypatch):
-        """A forced cache invalidation between two ``collect_trades`` calls
-        MUST increment ``snapshots_saved`` by exactly 1 — the second call
-        observes a cache miss and triggers a fresh snapshot."""
-        async def handler(request):
-            import httpx
-            return httpx.Response(200, json=_TWO_MARKETS)
-
-        monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p23.sqlite"))
-        monkeypatch.setenv("POLYCOPY_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
-        db = _empty_db(tmp_path)
-        collector, adapter = self._wire_collector(handler)
-
-        async def run():
-            result = collect_mod.CollectionResult()
-            # First market: fresh fetch → snapshot 1.
-            await collector.collect_trades(db, "0xMARKET_A", result=result)
-            # Cache hit → no new snapshot.
-            await collector.collect_trades(db, "0xMARKET_B", result=result)
-            # Invalidate the cache by zeroing the lock time.
-            adapter._window_lock_time = 0.0
-            # Next market: cache miss → snapshot 2.
-            await collector.collect_trades(db, "0xMARKET_A", result=result)
             return result
 
         result = asyncio.run(run())
         assert result.snapshots_saved == 2, (
-            f"expected 2 snapshots after a forced refresh, got {result.snapshots_saved}"
+            f"expected 1 snapshot per market (2 markets), got {result.snapshots_saved}"
         )
-        n_snap = db.fetchone("SELECT COUNT(*) AS n FROM raw_snapshots")
-        n_snap_n = n_snap["n"] if n_snap else 0
-        assert n_snap_n == 2, f"expected 2 snapshot rows, got {n_snap_n}"
+        n_snap = db.fetchone("SELECT COUNT(*) AS n FROM raw_snapshots")["n"]
+        assert n_snap == 2, f"expected 2 snapshot rows, got {n_snap}"
         db.close()
 
-    def test_collector_repeated_run_idempotent(self, tmp_path, monkeypatch):
-        """Running ``collect_trades`` for the same market twice in a row
-        produces the same trade list and does not double-count snapshots."""
+    def test_collector_per_market_request_shape(self, tmp_path, monkeypatch):
+        """Round 7 (P1 fix): the collector's request MUST include
+        ``?market=<conditionId>``. Captured here for the new path."""
+        captured: list[str] = []
+        from urllib.parse import urlparse, parse_qs
+
         async def handler(request):
             import httpx
-            return httpx.Response(200, json=_TWO_MARKETS)
+            qs = parse_qs(urlparse(str(request.url)).query)
+            captured.append((qs.get("market") or [""])[0])
+            market = (qs.get("market") or [""])[0].lower()
+            data = [
+                r for r in _TWO_MARKETS
+                if str(r.get("conditionId", "")).lower() == market
+            ]
+            return httpx.Response(200, json=data)
 
         monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p23.sqlite"))
         monkeypatch.setenv("POLYCOPY_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
         db = _empty_db(tmp_path)
         collector, _adapter = self._wire_collector(handler)
+
+        async def run():
+            result = collect_mod.CollectionResult()
+            await collector.collect_trades(db, "0xMARKET_A", result=result)
+            await collector.collect_trades(db, "0xMARKET_B", result=result)
+            return result
+
+        asyncio.run(run())
+        assert captured, "expected at least one request"
+        assert all(c for c in captured), f"every request must include market=<id>: {captured}"
+        assert "0xMARKET_A" in captured, f"expected 0xMARKET_A in requests: {captured}"
+        assert "0xMARKET_B" in captured, f"expected 0xMARKET_B in requests: {captured}"
+        db.close()
+
+    def test_collector_repeated_market_one_snapshot_each(self, tmp_path, monkeypatch):
+        """Each call to ``collect_trades`` for the same market hits the API
+        again (no global cache) and produces one snapshot per call."""
+        monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p23.sqlite"))
+        monkeypatch.setenv("POLYCOPY_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
+        db = _empty_db(tmp_path)
+        collector, _adapter = self._wire_collector(self._market_filter_handler())
 
         async def run():
             result = collect_mod.CollectionResult()
@@ -589,19 +569,28 @@ class TestCollectorSnapshotSemantics:
         assert [t.source_trade_id for t in t_first] == [
             t.source_trade_id for t in t_second
         ]
-        # Only one snapshot for both runs (cache hit on the second).
-        assert result.snapshots_saved == 1
+        # Two calls → two snapshots. No global cache in round 7.
+        assert result.snapshots_saved == 2, (
+            f"expected 2 snapshots for 2 calls, got {result.snapshots_saved}"
+        )
         db.close()
 
-    def test_collector_snapshot_payload_is_raw_window(self, tmp_path, monkeypatch):
-        """The snapshot file written by ``collect_trades`` must contain the
-        EXACT list of raw dicts returned by the adapter on the fresh fetch."""
-        captured_windows: list[list[dict]] = []
+    def test_collector_snapshot_payload_is_market_window(self, tmp_path, monkeypatch):
+        """The snapshot file written by ``collect_trades`` must contain
+        only the rows for the requested market (round 7 per-market fetch)."""
+        captured_payloads: list[list[dict]] = []
+        from urllib.parse import urlparse, parse_qs
 
         async def handler(request):
             import httpx
-            captured_windows.append(_TWO_MARKETS)
-            return httpx.Response(200, json=_TWO_MARKETS)
+            qs = parse_qs(urlparse(str(request.url)).query)
+            market = (qs.get("market") or [""])[0].lower()
+            data = [
+                r for r in _TWO_MARKETS
+                if str(r.get("conditionId", "")).lower() == market
+            ]
+            captured_payloads.append(data)
+            return httpx.Response(200, json=data)
 
         monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p23.sqlite"))
         snap_dir = tmp_path / "snapshots"
@@ -611,8 +600,6 @@ class TestCollectorSnapshotSemantics:
 
         async def run():
             result = collect_mod.CollectionResult()
-            # Drive collect_trades; the first call triggers a fresh fetch
-            # AND a snapshot.
             await collector.collect_trades(db, "0xMARKET_A", result=result)
             return result
 
@@ -625,11 +612,13 @@ class TestCollectorSnapshotSemantics:
         file_path = Path(rows[0]["file_path"])
         assert file_path.exists(), f"snapshot file missing: {file_path}"
         persisted_payload = json.loads(file_path.read_text())
-        # The snapshot file contains the same payload that the adapter served.
-        assert persisted_payload == captured_windows[0], (
-            "snapshot file content does not match the raw window returned by the adapter"
+        assert persisted_payload == captured_payloads[0], (
+            "snapshot file content does not match the per-market payload"
         )
-        assert len(persisted_payload) == len(_TWO_MARKETS) == 2
+        assert all(
+            str(r.get("conditionId", "")).lower() == "0xmarket_a"
+            for r in persisted_payload
+        ), f"snapshot must contain only 0xMARKET_A rows: {persisted_payload}"
         db.close()
 
 

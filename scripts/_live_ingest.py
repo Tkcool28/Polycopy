@@ -2,28 +2,30 @@
 
 Both ``scripts/run_scan.py`` (P2 fix) and ``scripts/collect_smart_money_data.py``
 need to ingest live trades from the public data-api. They MUST consume the
-SAME adapter code path (single fetch per scan, cached window, identical
-normalization) so that:
+SAME adapter code path (single shared ``PolymarketPublicAdapter`` instance,
+identical normalization, identical ``source_trade_id``) so that:
 
   * ``source_trade_id`` is the same whether a row came in via run_scan or the
     collector (P1 invariant — keep in sync with
     ``polycopy.adapters.polymarket.deterministic_source_trade_id_v2``).
-  * ``run_scan`` and the collector don't make duplicate HTTP calls against
-    the data-api.
-  * The snapshot provenance is written exactly once per real upstream fetch
-    (P3 invariant — keep in sync with ``PolymarketPublicAdapter._fetch_global_window``).
+  * ``run_scan`` and the collector share one per-market data-api fetch path
+    instead of maintaining divergent parsing/snapshot behavior.
+  * The snapshot provenance is written once per real upstream per-market fetch
+    (P3 invariant — keep in sync with ``PolymarketPublicAdapter.fetch_trades_for_market``).
 
 This module is a thin wrapper:
 
   * :func:`build_trade_adapter` returns a single shared
     :class:`PolymarketPublicAdapter` constructed from the active ``Settings``.
   * :func:`fetch_recent_trades_for_market` calls the adapter's
-    ``_fetch_global_window`` (which handles the cache) and then
-    ``get_recent_trades`` to slice per market.
+    ``fetch_trades_for_market`` (round 7: server-side ``?market=<id>``
+    filter with bounded pagination) and is the SINGLE entry point used by
+    both the per-market collector and the run_scan live path.
 
 The actual fetching and parsing live in
 ``polycopy.adapters.polymarket.PolymarketPublicAdapter`` — this helper exists
-only so both scripts share a SINGLE construction path.
+only so both scripts share a SINGLE construction path AND a SINGLE per-market
+fetch implementation.
 """
 from __future__ import annotations
 
@@ -51,7 +53,7 @@ __all__ = [
     "build_trade_adapter",
     "fetch_recent_trades_for_market",
     "get_settings",
-] 
+]
 
 
 def build_trade_adapter(settings: Optional[Settings] = None) -> PolymarketPublicAdapter:
@@ -77,21 +79,30 @@ async def fetch_recent_trades_for_market(
     adapter: PolymarketPublicAdapter,
     *,
     market_source_id: str,
-    since: datetime,
+    since: Optional[datetime] = None,
     limit: int = 200,
+    max_pages: int = 5,
+    max_rows: int = 2000,
 ) -> list[SourceTrade]:
     """Fetch recent trades for a single market via the shared adapter.
 
+    Round 7: this delegates to ``adapter.fetch_trades_for_market`` which
+    uses ``GET /trades?market=<conditionId>`` (server-side filter,
+    verified live 2026-06-28) with bounded pagination and dedup across
+    pages. It is the SINGLE per-market entry point used by both
+    ``scripts/run_scan.py`` and ``scripts/collect_smart_money_data.py``.
+
     Returns an empty list on any adapter error — never raises. The shared
-    adapter's ``_fetch_global_window`` is the single source of truth for
-    upstream calls, so this is safe to invoke in a tight loop across many
+    adapter instance is reused so cached resources are shared across
     markets within a single run.
     """
     try:
-        return await adapter.get_recent_trades(
+        return await adapter.fetch_trades_for_market(
             market_source_id=market_source_id,
             since=since,
             limit=limit,
+            max_pages=max_pages,
+            max_rows=max_rows,
         )
     except Exception:
         # Adapter already logs the underlying error; return [] for the
