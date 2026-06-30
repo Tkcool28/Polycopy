@@ -117,19 +117,23 @@ def seed_demo_data(db: Database, force: bool = False) -> None:
 def _clear_sample_data(db: Database) -> None:
     """Remove all existing sample data for a clean re-seed."""
     logger.info("Clearing existing sample data...")
+    # Delete child rows before parent rows so this remains valid with
+    # SQLite foreign-key enforcement enabled. In particular:
+    # decision_log -> orders/wallets/markets, orders/positions/signals ->
+    # wallets/markets, wallet_balances/performance_summaries -> wallets,
+    # and market_outcomes -> markets.
     tables_with_is_sample = [
-        "wallets", "markets", "source_trades", "signals",
-        "orders", "positions", "decision_log", "performance_summaries",
-        "raw_snapshots", "experiment_runs", "wallet_balances",
+        "decision_log", "signals", "positions", "orders",
+        "wallet_balances", "performance_summaries", "source_trades",
+        "raw_snapshots", "experiment_runs", "wallets", "markets",
     ]
     tables_without_is_sample = [
-        "market_outcomes",  # no is_sample column; cleared via CASCADE-like delete
+        "market_outcomes",  # no is_sample column; cleared before markets
     ]
-    for table in tables_with_is_sample:
-        db.execute(f"DELETE FROM {table} WHERE is_sample = 1")
-    # For tables without is_sample, delete all rows (they're always sample data)
     for table in tables_without_is_sample:
         db.execute(f"DELETE FROM {table}")
+    for table in tables_with_is_sample:
+        db.execute(f"DELETE FROM {table} WHERE is_sample = 1")
     db.conn.commit()
 
 

@@ -31,6 +31,7 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA foreign_keys = ON")
         if self.echo:
             self._conn.set_trace_callback(lambda sql: logger.debug("SQL: %s", sql))
         self._run_migrations()

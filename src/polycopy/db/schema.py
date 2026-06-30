@@ -316,15 +316,10 @@ _V5_DDL: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_source_trades_market ON source_trades(market_source_id);",
     "CREATE INDEX IF NOT EXISTS idx_source_trades_timestamp ON source_trades(timestamp);",
     # ── Step B: delete sentinel rows from wallets (and their dependents) ──
-    # Disable FK enforcement around destructive cleanup so we can delete
-    # dependent rows in the right order without the engine aborting the
-    # statement mid-flight. We re-enable it immediately after and run
-    # PRAGMA foreign_key_check to guarantee integrity.
-    #
-    # The deletion ORDER below is the correctness mechanism — it would
-    # work even with FK enforcement ENABLED. ``PRAGMA foreign_keys = OFF``
-    # is a defense-in-depth safety net only, not the thing the migration
-    # depends on.
+    # The deletion ORDER below is the correctness mechanism. FK
+    # enforcement stays ON throughout — the migration must satisfy
+    # child-before-parent ordering so SQLite never raises
+    # FOREIGN KEY constraint failed.
     #
     # Child-before-parent FK graph this satisfies:
     #   decision_log.order_id  → orders.id
@@ -338,7 +333,6 @@ _V5_DDL: list[str] = [
     # violation when a decision_log row references an order belonging
     # to a different (real) wallet. We delete the cross-references
     # FIRST, then by-wallet dependents, then orders, then wallet rows.
-    "PRAGMA foreign_keys = OFF;",
     # 1. Child rows that reference sentinel-wallet orders. These MUST
     #    be removed before the orders themselves, otherwise the next
     #    DELETE fails with FOREIGN KEY constraint failed. Note we do
@@ -394,7 +388,6 @@ _V5_DDL: list[str] = [
     "LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 "
     "OR LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
     "('unknown', 'anonymous', 'missing', '0x', '0x0');",
-    "PRAGMA foreign_keys = ON;",
     # Verify no orphan dependent rows remain. PRAGMA foreign_key_check
     # returns rows for any FK violation; on a clean DB it returns empty.
     # The result is intentionally not asserted — the migration runner
