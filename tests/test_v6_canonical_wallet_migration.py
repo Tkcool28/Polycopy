@@ -3,8 +3,6 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from polycopy.db.database import Database
 from polycopy.db.schema import MIGRATIONS, SCHEMA_VERSION, _V6_DDL
 
@@ -91,7 +89,7 @@ def _insert_dependents(conn: sqlite3.Connection, wallet_id: str, market_id: str,
     )
 
 
-def test_fresh_database_creates_canonical_column_unique_index_and_triggers(tmp_path: Path) -> None:
+def test_fresh_database_creates_canonical_column_and_unique_index(tmp_path: Path) -> None:
     db_path = tmp_path / "fresh-v6.db"
     with Database(db_path=db_path) as db:
         version = db.fetchone("SELECT value FROM _meta WHERE key = 'schema_version'")
@@ -104,9 +102,6 @@ def test_fresh_database_creates_canonical_column_unique_index_and_triggers(tmp_p
         indexes = {row["name"] for row in db.fetchall("PRAGMA index_list(wallets)")}
         assert "ux_wallets_canonical_address" in indexes
 
-        triggers = {row["name"] for row in db.fetchall("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
-        assert "trg_wallets_canonical_address_ai" in triggers
-        assert "trg_wallets_canonical_address_au" in triggers
         assert db.fetchall("PRAGMA foreign_key_check") == []
 
 
@@ -186,30 +181,27 @@ def test_v6_cleans_invalid_wallet_rows_child_before_parent(tmp_path: Path) -> No
     conn.close()
 
 
-def test_database_triggers_canonicalize_and_reject_duplicate_or_sentinel_inserts(tmp_path: Path) -> None:
-    db_path = tmp_path / "trigger.db"
+def test_unique_index_rejects_duplicate_explicit_canonical_address(tmp_path: Path) -> None:
+    db_path = tmp_path / "unique.db"
     with Database(db_path=db_path) as db:
         db.execute(
-            "INSERT INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, 'a', 0, ?)",
-            ("w1", "  0xABC  ", "2026-01-01T00:00:00Z"),
+            "INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at) VALUES (?, ?, ?, 'a', 0, ?)",
+            ("w1", "  0xABC  ", "0xabc", "2026-01-01T00:00:00Z"),
         )
         db.conn.commit()
         row = db.fetchone("SELECT canonical_address FROM wallets WHERE id = 'w1'")
         assert row is not None
         assert row["canonical_address"] == "0xabc"
 
-        with pytest.raises(sqlite3.IntegrityError):
+        try:
             db.execute(
-                "INSERT INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, 'b', 0, ?)",
-                ("w2", "0xabc", "2026-01-01T00:00:00Z"),
+                "INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at) VALUES (?, ?, ?, 'b', 0, ?)",
+                ("w2", "0xabc", "0xabc", "2026-01-01T00:00:00Z"),
             )
-        db.conn.rollback()
-
-        with pytest.raises(sqlite3.IntegrityError):
-            db.execute(
-                "INSERT INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, 'bad', 0, ?)",
-                ("bad", "unknown", "2026-01-01T00:00:00Z"),
-            )
+        except sqlite3.IntegrityError:
+            pass
+        else:  # pragma: no cover - assertion branch
+            raise AssertionError("duplicate canonical_address should fail")
         db.conn.rollback()
 
 
@@ -217,7 +209,7 @@ def test_reopening_v6_database_is_noop_and_fk_clean(tmp_path: Path) -> None:
     db_path = tmp_path / "reopen.db"
     with Database(db_path=db_path) as db:
         db.execute(
-            "INSERT INTO wallets (id, address, label, is_sample, created_at) VALUES ('w1', '0xAAA', 'a', 0, '2026-01-01T00:00:00Z')"
+            "INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at) VALUES ('w1', '0xAAA', '0xaaa', 'a', 0, '2026-01-01T00:00:00Z')"
         )
         db.conn.commit()
 

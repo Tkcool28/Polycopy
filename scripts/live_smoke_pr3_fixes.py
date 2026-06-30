@@ -271,9 +271,9 @@ async def main() -> int:
         if existing is None:
             db.execute(
                 """INSERT INTO wallets
-                   (id, address, label, is_sample, created_at)
-                   VALUES (?, ?, ?, 0, ?)""",
-                (str(__import__("uuid").uuid4()), addr,
+                   (id, address, canonical_address, label, is_sample, created_at)
+                   VALUES (?, ?, ?, ?, 0, ?)""",
+                (str(__import__("uuid").uuid4()), addr, addr,
                  f"discovered-from-{a.data_api_base_url}",
                  datetime.now(timezone.utc).isoformat()),
             )

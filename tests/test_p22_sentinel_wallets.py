@@ -217,9 +217,9 @@ class TestFreshSchemaHasNoSentinels:
                 )
             db.conn.commit()
 
-            # Now run the v5 wallets DELETE block manually (the migration
-            # won't re-run because we're already at v5).
-            assert SCHEMA_VERSION == 5
+            # We're at the latest schema. Re-apply the v5 cleanup block
+            # directly to prove the legacy delete predicate still catches
+            # manually inserted sentinel rows after later migrations.
             for stmt in _V5_DDL:
                 # Skip the source_trades rebuild (those tables already
                 # have the right shape at v5). Just execute the wallets

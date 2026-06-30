@@ -855,14 +855,14 @@ def test_schema_v4_to_v5_migration(tmp_path: Path):
 
 def test_schema_version_after_migration(tmp_path: Path):
     """After fresh init via Database, the schema_version row in _meta must
-    equal the SCHEMA_VERSION constant (currently 5)."""
+    equal the SCHEMA_VERSION constant (currently 6)."""
     db_path = tmp_path / "fresh.db"
     db = Database(db_path=db_path).connect()
     row = db.fetchone("SELECT value FROM _meta WHERE key = 'schema_version'")
     assert row is not None
     assert int(row["value"]) == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 5, (
-        "SCHEMA_VERSION constant should be 5 after the v5 migration"
+    assert SCHEMA_VERSION == 6, (
+        "SCHEMA_VERSION constant should be 6 after the v6 canonical-wallet migration"
     )
     db.close()
 

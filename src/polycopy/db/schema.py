@@ -459,30 +459,6 @@ _V6_DDL: list[str] = [
     "DELETE FROM wallets WHERE id IN (SELECT duplicate_id FROM wallet_merge_map);",
     "DROP TABLE IF EXISTS temp.wallet_merge_map;",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_wallets_canonical_address ON wallets(canonical_address);",
-    # Keep the persisted canonical key authoritative for callers that bypass
-    # application find-or-create logic or omit canonical_address entirely.
-    "CREATE TRIGGER IF NOT EXISTS trg_wallets_canonical_address_ai "
-    "AFTER INSERT ON wallets BEGIN "
-    "UPDATE wallets SET canonical_address = CASE "
-    "WHEN LENGTH(TRIM(NEW.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 THEN NULL "
-    "WHEN LOWER(TRIM(NEW.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
-    "('unknown', 'anonymous', 'missing', '0x', '0x0') THEN NULL "
-    "ELSE LOWER(TRIM(NEW.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) END "
-    "WHERE id = NEW.id; "
-    "SELECT CASE WHEN (SELECT canonical_address FROM wallets WHERE id = NEW.id) IS NULL "
-    "THEN RAISE(ABORT, 'invalid wallet address') END; "
-    "END;",
-    "CREATE TRIGGER IF NOT EXISTS trg_wallets_canonical_address_au "
-    "AFTER UPDATE OF address ON wallets BEGIN "
-    "UPDATE wallets SET canonical_address = CASE "
-    "WHEN LENGTH(TRIM(NEW.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 THEN NULL "
-    "WHEN LOWER(TRIM(NEW.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
-    "('unknown', 'anonymous', 'missing', '0x', '0x0') THEN NULL "
-    "ELSE LOWER(TRIM(NEW.address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) END "
-    "WHERE id = NEW.id; "
-    "SELECT CASE WHEN (SELECT canonical_address FROM wallets WHERE id = NEW.id) IS NULL "
-    "THEN RAISE(ABORT, 'invalid wallet address') END; "
-    "END;",
     "PRAGMA foreign_key_check;",
 ]
 
