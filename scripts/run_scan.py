@@ -791,7 +791,7 @@ async def _fetch_trades(
     P2 fix (PR #3): live ``use_sample=False`` mode used to hit a legacy
     ``settings.gamma_base_url + /trades`` endpoint, which has never existed
     on Gamma (returns 404) and which silently fabricated ``polymarket_clob``
-    trades via the local ``_parse_clob_trade`` shim. The actual public,
+    trades through a local legacy parser. The actual public,
     unauthenticated trade source is the data-api
     (``data-api.polymarket.com/trades``), wired through the shared
     :class:`PolymarketPublicAdapter`. We now route BOTH ``run_scan`` and
@@ -1011,21 +1011,6 @@ def _parse_gamma_market(data: dict) -> Market:
         fetched_at=datetime.now(timezone.utc),
         is_sample=False,
     )
-
-
-def _parse_clob_trade(data: dict, market_source_id: str) -> SourceTrade | None:
-    """DEPRECATED legacy CLOB-trade shim.
-
-    PR #3 P2 fix removed the live ``gamma_base_url + /trades`` call path
-    from ``_fetch_trades``; ``run_scan`` now uses the shared
-    ``PolymarketPublicAdapter`` (data-api), same as
-    ``collect_smart_money_data``. This shim is retained only as a
-    no-op safety net for any stray imports — it always returns ``None``
-    so it cannot accidentally synthesize trades from raw CLOB payloads.
-    New callers MUST go through the shared adapter path
-    (``scripts/_live_ingest.fetch_recent_trades_for_market``).
-    """
-    return None
 
 
 def _persist_market(db: Database, market: Market) -> None:
