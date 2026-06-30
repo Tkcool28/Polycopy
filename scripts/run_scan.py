@@ -741,7 +741,10 @@ async def _fetch_markets(
     correct outcome labels), so the parser falls back to the raw field.
     """
     if use_sample:
-        return _get_sample_markets(), {}
+        markets = _get_sample_markets()
+        for market in markets:
+            _persist_market(db, market)
+        return markets, {}
 
     import httpx
     asset_map: dict[str, dict[str, str]] = {}
