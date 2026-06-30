@@ -5,6 +5,9 @@ from pathlib import Path
 
 from polycopy.db.database import Database
 from polycopy.db.schema import MIGRATIONS, SCHEMA_VERSION, _V6_DDL
+from polycopy.domain.wallet import Wallet
+from scripts.run_scan import _persist_wallet
+from scripts.seed_demo_data import _seed_wallets
 
 
 def _init_db_at_version(db_path: Path, target: int) -> sqlite3.Connection:
@@ -216,4 +219,34 @@ def test_reopening_v6_database_is_noop_and_fk_clean(tmp_path: Path) -> None:
     with Database(db_path=db_path) as db:
         wallets = db.fetchall("SELECT id, canonical_address FROM wallets")
         assert [(row["id"], row["canonical_address"]) for row in wallets] == [("w1", "0xaaa")]
+        assert db.fetchall("PRAGMA foreign_key_check") == []
+
+
+def test_seed_demo_wallets_populate_canonical_address(tmp_path: Path) -> None:
+    db_path = tmp_path / "seed-demo.db"
+    with Database(db_path=db_path) as db:
+        _seed_wallets(db)
+
+        null_canonical_count = db.fetchone(
+            "SELECT COUNT(*) AS c FROM wallets WHERE canonical_address IS NULL"
+        )
+        assert null_canonical_count is not None
+        assert null_canonical_count["c"] == 0
+
+        seeded = db.fetchone(
+            "SELECT id, canonical_address FROM wallets ORDER BY created_at, id LIMIT 1"
+        )
+        assert seeded is not None
+        persisted_id = _persist_wallet(
+            db,
+            Wallet(address="  " + seeded["canonical_address"].upper() + "  ", label="same"),
+        )
+        assert persisted_id == seeded["id"]
+
+        duplicates = db.fetchone(
+            "SELECT COUNT(*) AS c FROM wallets WHERE canonical_address = ?",
+            (seeded["canonical_address"],),
+        )
+        assert duplicates is not None
+        assert duplicates["c"] == 1
         assert db.fetchall("PRAGMA foreign_key_check") == []
