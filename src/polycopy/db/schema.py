@@ -7,7 +7,7 @@ schema version. Each migration is a list of SQL statements.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # ── Version 1: initial schema ───────────────────────────────────────────────────
 _V1_DDL: list[str] = [
@@ -397,6 +397,71 @@ _V5_DDL: list[str] = [
 ]
 
 
+# ── Version 6: canonical wallet identity ───────────────────────────────────────
+# Adds a persisted database key for wallet identity. Duplicate canonical groups
+# are collapsed by deterministic survivor policy: oldest created_at, then lowest
+# wallet id. All wallet_id FK dependents are re-homed before duplicate wallet
+# rows are deleted, so the migration is valid with FK enforcement enabled.
+_V6_DDL: list[str] = [
+    "ALTER TABLE wallets ADD COLUMN canonical_address TEXT;",
+    "UPDATE wallets SET canonical_address = CASE "
+    "WHEN LENGTH(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) = 0 THEN NULL "
+    "WHEN LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) IN "
+    "('unknown', 'anonymous', 'missing', '0x', '0x0') THEN NULL "
+    "ELSE LOWER(TRIM(address, X'09' || X'0A' || X'0D' || X'0B' || X'0C' || ' ')) END;",
+    # Remove any invalid/sentinel wallet rows inserted after v5, child-first.
+    "DELETE FROM decision_log WHERE order_id IN ("
+    "SELECT o.id FROM orders o JOIN wallets w ON w.id = o.wallet_id "
+    "WHERE w.canonical_address IS NULL);",
+    "DELETE FROM decision_log WHERE wallet_id IN (SELECT id FROM wallets WHERE canonical_address IS NULL);",
+    "DELETE FROM wallet_balances WHERE wallet_id IN (SELECT id FROM wallets WHERE canonical_address IS NULL);",
+    "DELETE FROM performance_summaries WHERE wallet_id IN (SELECT id FROM wallets WHERE canonical_address IS NULL);",
+    "DELETE FROM positions WHERE wallet_id IN (SELECT id FROM wallets WHERE canonical_address IS NULL);",
+    "DELETE FROM orders WHERE wallet_id IN (SELECT id FROM wallets WHERE canonical_address IS NULL);",
+    "DELETE FROM wallets WHERE canonical_address IS NULL;",
+    # Build a duplicate->survivor map. Survivor = oldest created_at, then lowest id.
+    "DROP TABLE IF EXISTS temp.wallet_merge_map;",
+    "CREATE TEMP TABLE wallet_merge_map AS "
+    "WITH ranked AS ("
+    "  SELECT id, canonical_address, "
+    "         FIRST_VALUE(id) OVER ("
+    "           PARTITION BY canonical_address ORDER BY created_at ASC, id ASC"
+    "         ) AS survivor_id, "
+    "         ROW_NUMBER() OVER ("
+    "           PARTITION BY canonical_address ORDER BY created_at ASC, id ASC"
+    "         ) AS rn "
+    "  FROM wallets WHERE canonical_address IS NOT NULL"
+    ") "
+    "SELECT id AS duplicate_id, survivor_id FROM ranked WHERE rn > 1;",
+    # Preserve useful metadata on the survivor.
+    "UPDATE wallets SET label = COALESCE(("
+    "  SELECT w2.label FROM wallets w2 "
+    "  WHERE w2.canonical_address = wallets.canonical_address "
+    "    AND TRIM(w2.label) <> '' AND LOWER(TRIM(w2.label)) <> 'default' "
+    "  ORDER BY w2.created_at ASC, w2.id ASC LIMIT 1"
+    "), label) WHERE id IN (SELECT survivor_id FROM wallet_merge_map);",
+    "UPDATE wallets SET is_sample = CASE WHEN EXISTS ("
+    "  SELECT 1 FROM wallets w2 "
+    "  WHERE w2.canonical_address = wallets.canonical_address AND w2.is_sample = 0"
+    ") THEN 0 ELSE is_sample END "
+    "WHERE id IN (SELECT survivor_id FROM wallet_merge_map);",
+    # Re-home wallet-linked dependent rows to survivors.
+    "UPDATE wallet_balances SET wallet_id = (SELECT survivor_id FROM wallet_merge_map WHERE duplicate_id = wallet_balances.wallet_id) "
+    "WHERE wallet_id IN (SELECT duplicate_id FROM wallet_merge_map);",
+    "UPDATE positions SET wallet_id = (SELECT survivor_id FROM wallet_merge_map WHERE duplicate_id = positions.wallet_id) "
+    "WHERE wallet_id IN (SELECT duplicate_id FROM wallet_merge_map);",
+    "UPDATE orders SET wallet_id = (SELECT survivor_id FROM wallet_merge_map WHERE duplicate_id = orders.wallet_id) "
+    "WHERE wallet_id IN (SELECT duplicate_id FROM wallet_merge_map);",
+    "UPDATE decision_log SET wallet_id = (SELECT survivor_id FROM wallet_merge_map WHERE duplicate_id = decision_log.wallet_id) "
+    "WHERE wallet_id IN (SELECT duplicate_id FROM wallet_merge_map);",
+    "UPDATE performance_summaries SET wallet_id = (SELECT survivor_id FROM wallet_merge_map WHERE duplicate_id = performance_summaries.wallet_id) "
+    "WHERE wallet_id IN (SELECT duplicate_id FROM wallet_merge_map);",
+    "DELETE FROM wallets WHERE id IN (SELECT duplicate_id FROM wallet_merge_map);",
+    "DROP TABLE IF EXISTS temp.wallet_merge_map;",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_wallets_canonical_address ON wallets(canonical_address);",
+    "PRAGMA foreign_key_check;",
+]
+
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version from (version - 1).
 MIGRATIONS: dict[int, list[str]] = {
@@ -405,6 +470,7 @@ MIGRATIONS: dict[int, list[str]] = {
     3: _V3_DDL,
     4: _V4_DDL,
     5: _V5_DDL,
+    6: _V6_DDL,
 }
 
 # Current DDL is the latest migration

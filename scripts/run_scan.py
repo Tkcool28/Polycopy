@@ -650,31 +650,26 @@ def _generate_signals(db: Database, markets: list[Market], now: datetime) -> lis
 
 
 def _persist_wallet(db: Database, wallet) -> str | None:
-    """Idempotently persist a wallet by canonical address.
+    """Persist a wallet row, idempotent find-or-create by canonical address.
 
-    Returns the existing or newly-inserted wallet ID (as a string), or
-    ``None`` on persistence failure. Same canonical address (case-insensitive,
-    whitespace-stripped) always maps to a single wallet row — even if the
-    caller hands us different casing/padding for the same wallet, or if
-    this function is invoked many times per scan.
+    Steps:
+      1. Compute canonical address using the single-source-of-truth helper
+         ``canonical_wallet_address`` so discovery and the database agree.
+      2. If canonical is None (sentinel / empty / whitespace-only), return None
+         to indicate the address is anonymous and should never become a wallet row.
+      3. Look up an existing row by ``canonical_address`` (new v6 column) — no
+         need for the historic ``address_column_normalized('address')`` predicate
+         because the new schema guarantees :column:`wallets.canonical_address`
+         already contains the normalized form for *all* non-sentinel wallets.
+      4. If found, return its id (no-op write, no duplicate row created).
+      5. Otherwise, insert a new row using a fresh UUID, the canonical address,
+         and the new canonical_address column. The ON CONFLICT clause
+         provides defensive conflict handling against concurrent inserts for
+         the same canonical address — a writer race still leaves a single row.
+      6. Return the inserted-or-updated row's id.
 
-    The find-or-create is the application-level guarantee that backs the
-    ``wallets.address`` non-uniqueness constraint: callers MUST go through
-    this function (not raw ``INSERT OR IGNORE`` on the PK) so the address
-    stays the deduplication key.
-
-    Implementation:
-      1. Compute ``canonical`` via ``canonical_wallet_address``. If it
-         returns ``None`` (sentinel / empty / whitespace-only), this is
-         an anonymous trader address — do NOT insert into ``wallets``.
-         Return ``None``.
-      2. Look up an existing row by ``address_column_normalized(address)``.
-         If found, return its id (no-op write, no duplicate row created).
-      3. Otherwise, ``INSERT`` a new row using a fresh UUID and the
-         canonical address (so a later write with the same canonical
-         address hits the SELECT path, not the INSERT path).
-      4. ``INSERT OR IGNORE`` on PK provides a defense-in-depth guarantee
-         if two writers race; the canonical SELECT above still wins.
+    This is the v6-fix implementation that finally uses the persisted
+    ``canonical_address`` column as the canonical identity source.
     """
     try:
         canonical = canonical_wallet_address(wallet.address)
@@ -685,38 +680,41 @@ def _persist_wallet(db: Database, wallet) -> str | None:
             return None
 
         existing = db.fetchone(
-            f"SELECT id FROM wallets "
-            f"WHERE {address_column_normalized('address')} = ?",
+            "SELECT id FROM wallets WHERE canonical_address = ?",
             (canonical,),
         )
         if existing is not None:
             return existing["id"]
 
         new_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
         db.execute(
-            """INSERT OR IGNORE INTO wallets
-               (id, address, label, is_sample, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO wallets
+               (id, address, canonical_address, label, is_sample, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(canonical_address) DO UPDATE SET
+                 label = excluded.label,
+                 is_sample = CASE WHEN excluded.is_sample = 0 AND is_sample = 1
+                                  THEN 0
+                                  ELSE is_sample END
+               RETURNING id""",
             (
                 new_id,
                 canonical,
+                canonical,
                 wallet.label,
                 int(wallet.is_sample),
-                datetime.now(timezone.utc).isoformat(),
+                now,
             ),
         )
         # Re-fetch the id: if a concurrent writer beat us to the same
-        # canonical address, INSERT OR IGNORE silently skipped and the
-        # original row's id is what we should return.
-        post = db.fetchone(
-            f"SELECT id FROM wallets "
-            f"WHERE {address_column_normalized('address')} = ?",
-            (canonical,),
-        )
+        # canonical address, the ON CONFLICT DO UPDATE will have updated
+        # the existing row and returned its id.
+        row = db.fetchone("SELECT id FROM wallets WHERE canonical_address = ?", (canonical,))
         db.conn.commit()
-        return post["id"] if post else new_id
+        return row["id"] if row else new_id
     except Exception as e:
-        logger.debug("Wallet persist skipped for %r: %s", wallet.address, e)
+        logger.warning("Wallet persist skipped for %r: %s", wallet.address, e)
         try:
             db.conn.rollback()
         except Exception:

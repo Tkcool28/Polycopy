@@ -704,11 +704,10 @@ class PolymarketCollector:
         """Idempotently persist a wallet by canonical address.
 
         Same find-or-create semantics as ``scripts.run_scan._persist_wallet``
-        (single canonical implementation lives in
-        :mod:`polycopy.db.wallet_identity`). ``address`` is normalized via
-        ``canonical_wallet_address`` so any case/padding variant maps to
-        one row. Returns the wallet id (existing or new), or ``None`` for
-        anonymous inputs / on persistence failure.
+        (single canonical implementation lives in :mod:`polycopy.db.wallet_identity`).
+        ``address`` is normalized via ``canonical_wallet_address`` so any
+        case/padding variant maps to one row. Returns the wallet id (existing or new),
+        or ``None`` for anonymous inputs / on persistence failure.
 
         Any balances attached to the input ``wallet`` are inserted against
         the resolved wallet id (existing or new) using ``INSERT OR IGNORE``
@@ -722,39 +721,45 @@ class PolymarketCollector:
         try:
             canonical = canonical_wallet_address(wallet.address)
             if canonical is None:
+                # Anonymous / sentinel trader address — never an attributable
+                # wallet row. Return None so the caller's counters do not
+                # treat this as a newly-discovered wallet.
                 return None
+
             existing = db.fetchone(
-                f"SELECT id FROM wallets "
-                f"WHERE {address_column_normalized('address')} = ?",
+                "SELECT id FROM wallets WHERE canonical_address = ?",
                 (canonical,),
             )
             if existing is not None:
                 wallet_id = existing["id"]
             else:
                 wallet_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc).isoformat()
                 db.execute(
-                    """INSERT OR IGNORE INTO wallets
-                       (id, address, label, is_sample, created_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+                    """INSERT INTO wallets
+                       (id, address, canonical_address, label, is_sample, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(canonical_address) DO UPDATE SET
+                         label = excluded.label,
+                         is_sample = CASE WHEN excluded.is_sample = 0 AND is_sample = 1
+                                          THEN 0
+                                          ELSE is_sample END
+                       RETURNING id""",
                     (
                         wallet_id,
                         canonical,
+                        canonical,
                         wallet.label,
                         int(wallet.is_sample),
-                        datetime.now(timezone.utc).isoformat(),
+                        now,
                     ),
                 )
-                # Re-fetch: a concurrent writer may have raced us to the
-                # same canonical address. The re-fetch always uses the
-                # canonical-address predicate so a race leaves one row,
-                # not two.
-                post = db.fetchone(
-                    f"SELECT id FROM wallets "
-                    f"WHERE {address_column_normalized('address')} = ?",
-                    (canonical,),
-                )
-                if post is not None:
-                    wallet_id = post["id"]
+                # Re-fetch: if a concurrent writer beat us to the same
+                # canonical address, the ON CONFLICT DO UPDATE will have updated
+                # the existing row and returned its id.
+                row = db.fetchone("SELECT id FROM wallets WHERE canonical_address = ?", (canonical,))
+                if row is not None:
+                    wallet_id = row["id"]
             # Persist attached balances (if any). Plain INSERT matches the
             # pre-existing balance-write behavior: wallet_balances has no
             # unique index on (wallet_id, currency, as_of) and a rerun of
@@ -778,7 +783,7 @@ class PolymarketCollector:
             db.conn.commit()
             return wallet_id
         except Exception as e:
-            logger.debug("Wallet persist skipped for %r: %s", wallet.address, e)
+            logger.warning("Wallet persist skipped for %r: %s", wallet.address, e)
             try:
                 db.conn.rollback()
             except Exception:

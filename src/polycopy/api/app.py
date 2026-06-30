@@ -53,6 +53,7 @@ from polycopy.api.responses import (
 from polycopy.api.repository import DashboardRepository, Page
 from polycopy.config.settings import get_settings
 from polycopy.db.database import get_database
+from polycopy.db.wallet_identity import canonical_wallet_address
 from polycopy.providers.bidask import BidAskProvider
 from polycopy.risk.idempotency import IdempotencyStore
 
@@ -106,9 +107,10 @@ def _persist_paper_result(result: dict[str, object], decision_type: str, rationa
     filled_quantity = float(result["filled_quantity"])  # type: ignore[arg-type]
     is_sample = 1 if bool(result.get("is_sample", True)) else 0
 
+    canonical = canonical_wallet_address("0xPAPER_ONLY_SAMPLE_WALLET")
     db.execute(
-        "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
-        (wallet_id, "0xPAPER_ONLY_SAMPLE_WALLET", "paper-wallet [DEMO DATA / SAMPLE DATA]", is_sample, now),
+        "INSERT OR IGNORE INTO wallets (id, address, canonical_address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (wallet_id, "0xPAPER_ONLY_SAMPLE_WALLET", canonical, "paper-wallet [DEMO DATA / SAMPLE DATA]", is_sample, now),
     )
     db.execute(
         "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",

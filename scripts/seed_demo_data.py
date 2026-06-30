@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
+from polycopy.db.wallet_identity import canonical_wallet_address
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.order import Order, OrderSide, OrderStatus, OrderType
@@ -204,16 +205,25 @@ def _seed_wallets(db: Database) -> None:
     ]
 
     for wallet in wallets:
+        canonical = canonical_wallet_address(wallet.address)
+        if canonical is None:  # pragma: no cover - sample wallet constants are all real addresses
+            logger.warning("Skipping invalid demo wallet address: %r", wallet.address)
+            continue
         db.execute(
-            """INSERT OR REPLACE INTO wallets (id, address, label, is_sample, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (str(wallet.id), wallet.address, wallet.label, 1, NOW.isoformat()),
+            """INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(canonical_address) DO UPDATE SET
+                 label = excluded.label,
+                 is_sample = excluded.is_sample""",
+            (str(wallet.id), canonical, canonical, wallet.label, 1, NOW.isoformat()),
         )
+        row = db.fetchone("SELECT id FROM wallets WHERE canonical_address = ?", (canonical,))
+        wallet_id = row["id"] if row is not None else str(wallet.id)
         for bal in wallet.balances:
             db.execute(
                 """INSERT INTO wallet_balances (wallet_id, currency, amount, as_of, is_sample)
                    VALUES (?, ?, ?, ?, ?)""",
-                (str(wallet.id), bal.currency, bal.amount, bal.as_of.isoformat(), 1),
+                (wallet_id, bal.currency, bal.amount, bal.as_of.isoformat(), 1),
             )
 
     db.conn.commit()
