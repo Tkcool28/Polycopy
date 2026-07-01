@@ -36,12 +36,15 @@ qualified wallet → specific source trade → persisted token/outcome mapping �
 - No invented probability model. The product's measurable quantity is the trade's price movement between source trade and expected paper fill, plus spread, slippage, trade age, and remaining market duration. Use honest names reflecting what is actually measured (see §11).
 
 ## 3. PR sequence overview
-- PR 1 — Persist source-trade identity and outcome mapping
-- PR 2 — Persist evaluated copy candidates
-- PR 3 — Obtain fresh current-price and slippage inputs
-- PR 4 — Build the real signal generator
-- PR 5 — Manual paper-order preview and approval path
-- PR 6 — Pilot-readiness verification
+
+| # | PR | Status (as of 2026-07-01) | Companion doc |
+|---|---|---|---|
+| 1 | Persist source-trade identity and outcome mapping | **MERGED + DEPLOYED** (`main` @ `fa3f2101`) | `smart_wallet_signal_path_audit.md` |
+| 2 | Persist evaluated copy candidates | **DRAFT — NOT MERGED, NOT DEPLOYED** (`feat/persist-copy-candidates`) | `copy_candidate_contract.md` |
+| 3 | Obtain fresh current-price and slippage inputs | NOT STARTED | — |
+| 4 | Build the real signal generator | NOT STARTED | — |
+| 5 | Manual paper-order preview and approval path | NOT STARTED | — |
+| 6 | Pilot-readiness verification | NOT STARTED | — |
 
 ## 4. PR 1 — Persist source-trade identity and outcome mapping
 
