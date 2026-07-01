@@ -40,6 +40,7 @@ from polycopy.adapters.polymarket import (
 )
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
+from polycopy.db.market_persistence import persist_market_preserving_identity
 from polycopy.db.wallet_identity import (
     address_column_normalized,
     canonical_wallet_address,
@@ -623,34 +624,7 @@ class PolymarketCollector:
 
     def _persist_market(self, db: Database, market: Market) -> None:
         """Upsert a market record."""
-        db.execute(
-            """INSERT OR REPLACE INTO markets
-               (id, source_id, source, question, active, closed, resolved,
-                resolution_outcome, volume_24h, fetched_at, is_sample)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(market.id),
-                market.source_id,
-                market.source,
-                market.question,
-                int(market.active),
-                int(market.closed),
-                int(market.resolved),
-                market.resolution_outcome,
-                market.volume_24h,
-                market.fetched_at.isoformat(),
-                int(market.is_sample),
-            ),
-        )
-        # Upsert outcomes
-        db.execute("DELETE FROM market_outcomes WHERE market_id = ?", (str(market.id),))
-        for outcome in market.outcomes:
-            db.execute(
-                """INSERT INTO market_outcomes (market_id, label, price, volume)
-                   VALUES (?, ?, ?, ?)""",
-                (str(market.id), outcome.label, outcome.price, outcome.volume),
-            )
-        db.conn.commit()
+        persist_market_preserving_identity(db, market)
 
     def _persist_trade(self, db: Database, trade: SourceTrade) -> bool:
         """Upsert a source trade — idempotent and provenance-preserving.

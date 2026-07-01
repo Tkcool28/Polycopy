@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
+from polycopy.db.market_persistence import persist_market_preserving_identity
 from polycopy.db.wallet_identity import (
     address_column_normalized,
     canonical_wallet_address,
@@ -1015,25 +1016,7 @@ def _parse_gamma_market(data: dict) -> Market:
 
 def _persist_market(db: Database, market: Market) -> None:
     try:
-        db.execute(
-            """INSERT OR REPLACE INTO markets
-               (id, source_id, source, question, active, closed, resolved,
-                resolution_outcome, volume_24h, fetched_at, is_sample)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(market.id), market.source_id, market.source, market.question,
-                int(market.active), int(market.closed), int(market.resolved),
-                market.resolution_outcome, market.volume_24h,
-                market.fetched_at.isoformat(), int(market.is_sample),
-            ),
-        )
-        db.execute("DELETE FROM market_outcomes WHERE market_id = ?", (str(market.id),))
-        for outcome in market.outcomes:
-            db.execute(
-                "INSERT INTO market_outcomes (market_id, label, price, volume) VALUES (?, ?, ?, ?)",
-                (str(market.id), outcome.label, outcome.price, outcome.volume),
-            )
-        db.conn.commit()
+        persist_market_preserving_identity(db, market)
     except Exception as e:
         logger.debug("Market persist skipped: %s", e)
 
