@@ -637,6 +637,12 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
                 trader_address=trader_address,
                 timestamp=ts,
                 is_sample=False,
+                # PR-1: persist the upstream CLOB token id verbatim so the
+                # canonical mapping helper can join ``source_trades.token_id``
+                # to ``market_outcomes.clob_token_id`` without re-parsing the
+                # raw payload. Empty/None becomes None (legacy fallback path
+                # in resolve_trade_to_outcome).
+                token_id=str(asset) if asset not in (None, "") else None,
             )
         except Exception as exc:
             logger.debug("unparseable trade skipped: %s: %s", type(exc).__name__, exc)
@@ -1194,7 +1200,15 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
     def _parse_gamma_market(data: dict) -> Market:
         """Parse a Gamma API market JSON object into our Market domain model.
 
-        Gamma returns outcomes/outcomePrices as JSON-encoded strings.
+        Gamma returns outcomes/outcomePrices/clobTokenIds as JSON-encoded strings.
+        PR-1: the positional ``clobTokenIds`` array is parsed via the SHARED
+        :func:`parse_clob_token_ids` + :func:`zip_outcomes_with_tokens` helpers
+        so the same identity normalization applies here as in every other
+        Gamma parser in the codebase (``scripts/run_scan._parse_gamma_market``,
+        ``scripts.collect_smart_money_data.PolymarketCollector._parse_market``,
+        ``scripts/update_paper_portfolio``). Length mismatches or missing
+        arrays produce ``clob_token_id=None`` for every outcome (INCOMPLETE),
+        never a silent positional mapping.
         """
         outcomes_raw = data.get("outcomes", "[]")
         prices_raw = data.get("outcomePrices", "[]")
@@ -1203,10 +1217,26 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
         if isinstance(prices_raw, str):
             prices_raw = json.loads(prices_raw)
 
-        outcomes = []
+        # PR-1: parse clobTokenIds + zip with outcomes via the shared helpers.
+        # Same source of truth used by every other parser.
+        tokens = parse_clob_token_ids(data)
+        zipped = zip_outcomes_with_tokens(
+            outcomes_raw, tokens, source_label="polymarket.adapter"
+        )
+        # Map outcome index -> token id (None when the helper returned INCOMPLETE).
+        token_by_index: dict[int, Optional[str]] = {
+            idx: tok for idx, _, tok in zipped
+        }
+        outcomes: list[MarketOutcome] = []
         for i, label in enumerate(outcomes_raw):
             price = float(prices_raw[i]) if i < len(prices_raw) else 0.5
-            outcomes.append(MarketOutcome(label=str(label), price=price))
+            outcomes.append(
+                MarketOutcome(
+                    label=str(label),
+                    price=price,
+                    clob_token_id=token_by_index.get(i),
+                )
+            )
 
         return Market(
             source_id=data.get("conditionId", data.get("id", "")),
@@ -1258,3 +1288,114 @@ def _parse_optional_dt(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(value_str)
     except (ValueError, TypeError):
         return None
+
+
+# ── Shared CLOB-token parsing (PR-1) ─────────────────────────────────────────
+# Gamma emits ``clobTokenIds`` as a JSON-encoded array (or a bare list) whose
+# entries are positionally aligned with the ``outcomes`` and ``outcomePrices``
+# arrays in the same payload. Persisting this identity into
+# ``market_outcomes.clob_token_id`` is the foundation that PR-2's
+# ``copy_candidates`` (signal candidates) and the canonical
+# ``resolve_trade_to_outcome`` helper depend on. The function below is the
+# single source of truth used by every Gamma parser in the codebase
+# (``PolymarketPublicAdapter._parse_gamma_market``,
+# ``scripts.run_scan._parse_gamma_market``,
+# ``scripts.collect_smart_money_data.PolymarketCollector._parse_market``)
+# so they all normalize the same way.
+#
+# Behavior (PR-1 spec):
+#  * Missing ``data`` / missing ``clobTokenIds`` key  → empty list (no warning)
+#  * Present but malformed JSON                       → empty list, warn
+#  * List-type mismatches (dict, scalar, ...)         → empty list, warn
+#  * Empty list                                       → empty list, no warn
+#  * Any other shape                                   → empty list, warn
+#
+# Each entry is normalized to a Python ``str`` (``str(t)``). Numeric tokens
+# are kept as their string form so SQLite ``TEXT`` comparisons match
+# exactly what the data-api emits in its ``asset`` field — any deviation
+# would defeat the join.
+_MODULE_LOGGER = logging.getLogger(__name__)
+
+
+def parse_clob_token_ids(data: dict) -> list[str]:
+    """Return Gamma's ``clobTokenIds`` as a list of strings.
+
+    PR-1 contract: returns ``[]`` whenever the field is absent, malformed,
+    or shaped unlike a list. The caller is expected to treat ``len(tokens)
+    != len(outcomes)`` as INCOMPLETE — see :func:`zip_outcomes_with_tokens`.
+    """
+    raw = data.get("clobTokenIds")
+    if raw is None:
+        return []
+    parsed: Any = raw
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except (ValueError, TypeError) as exc:
+            _MODULE_LOGGER.warning(
+                "parse_clob_token_ids: malformed clobTokenIds JSON (%s); treating as empty",
+                type(exc).__name__,
+            )
+            return []
+    if not isinstance(parsed, list):
+        _MODULE_LOGGER.warning(
+            "parse_clob_token_ids: unexpected clobTokenIds shape %s; treating as empty",
+            type(parsed).__name__,
+        )
+        return []
+    out: list[str] = []
+    for i, entry in enumerate(parsed):
+        if entry is None:
+            out.append("")
+            continue
+        try:
+            out.append(str(entry))
+        except Exception as exc:
+            _MODULE_LOGGER.warning(
+                "parse_clob_token_ids: unstringifiable token at index %d (%s); treating as empty string",
+                i, type(exc).__name__,
+            )
+            out.append("")
+    return out
+
+
+def zip_outcomes_with_tokens(
+    outcomes_raw: list, tokens: list[str], *, source_label: str
+) -> list[tuple[int, str, Optional[str]]]:
+    """Zip outcomes with their CLOB tokens positionally.
+
+    Returns a list of ``(index, label, clob_token_id_or_None)`` tuples, one
+    per outcome, in the input order. The token for outcome ``i`` is
+    ``tokens[i]`` ONLY when the array lengths match; otherwise EVERY outcome
+    gets ``token=None`` (INCOMPLETE) and a structured warning is emitted.
+
+    This is the single place the spec's "do NOT silently map by position
+    when lengths differ" rule is enforced. Callers should pass the parsed
+    ``outcomes`` list (already decoded from JSON) and the result of
+    :func:`parse_clob_token_ids` for the same payload.
+    """
+    n_out = len(outcomes_raw)
+    n_tok = len(tokens)
+    if n_out == 0:
+        return []
+    if n_tok == 0:
+        _MODULE_LOGGER.warning(
+            "zip_outcomes_with_tokens[%s]: clobTokenIds missing/empty for %d outcomes; "
+            "INCOMPLETE — clob_token_id will be NULL for every outcome (no silent position mapping)",
+            source_label, n_out,
+        )
+        return [(i, str(label), None) for i, label in enumerate(outcomes_raw)]
+    if n_tok != n_out:
+        _MODULE_LOGGER.warning(
+            "zip_outcomes_with_tokens[%s]: length mismatch (outcomes=%d, tokens=%d); "
+            "INCOMPLETE — clob_token_id will be NULL for every outcome (no silent position mapping)",
+            source_label, n_out, n_tok,
+        )
+        return [(i, str(label), None) for i, label in enumerate(outcomes_raw)]
+    # Lengths match — zip positionally. NULL/empty-string token entries are
+    # preserved as None so the column is normalized at the SQL boundary.
+    zipped: list[tuple[int, str, Optional[str]]] = []
+    for i, label in enumerate(outcomes_raw):
+        tok = tokens[i]
+        zipped.append((i, str(label), tok if tok else None))
+    return zipped

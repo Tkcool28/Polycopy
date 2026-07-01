@@ -93,11 +93,18 @@ def _insert_dependents(conn: sqlite3.Connection, wallet_id: str, market_id: str,
 
 
 def test_fresh_database_creates_canonical_column_and_unique_index(tmp_path: Path) -> None:
+    """A fresh database migrates to the current SCHEMA_VERSION (PR-1 → v7)
+    and still produces the v6-introduced ``canonical_address`` column + the
+    v6-introduced ``ux_wallets_canonical_address`` unique index.
+
+    The version assertion is now ``>= 6`` (was ``== 6``) to track the
+    additive-only schema bumps introduced by PR-1 of the recovery sequence.
+    """
     db_path = tmp_path / "fresh-v6.db"
     with Database(db_path=db_path) as db:
         version = db.fetchone("SELECT value FROM _meta WHERE key = 'schema_version'")
         assert version is not None
-        assert int(version["value"]) == 6
+        assert int(version["value"]) >= 6
 
         columns = {row["name"] for row in db.fetchall("PRAGMA table_info(wallets)")}
         assert "canonical_address" in columns

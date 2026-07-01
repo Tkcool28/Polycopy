@@ -90,3 +90,16 @@ class SourceTrade(BaseModel):
     )
     timestamp: datetime = Field(description="Trade timestamp (UTC).")
     is_sample: bool = Field(default=False, description="True if this is sample/fixture data, not live.")
+    token_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Polymarket CLOB token id for the traded outcome, taken from the "
+            "data-api 'asset' field. PR-1: this is the upstream identifier "
+            "that the canonical mapping helper joins to "
+            "market_outcomes.clob_token_id. None means the upstream payload "
+            "did not include an 'asset' field (or it was empty); such trades "
+            "fall back to the legacy label-based join in resolve_trade_to_outcome. "
+            "Do NOT derive from the outcome label — persist the real "
+            "upstream value so multi-outcome markets map unambiguously."
+        ),
+    )

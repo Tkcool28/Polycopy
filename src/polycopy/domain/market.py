@@ -10,11 +10,30 @@ from pydantic import BaseModel, Field
 
 
 class MarketOutcome(BaseModel):
-    """A single outcome in a prediction market."""
+    """A single outcome in a prediction market.
+
+    ``clob_token_id`` is the upstream CLOB token identifier (from Gamma's
+    ``clobTokenIds`` JSON-array field, zipped positionally with
+    ``outcomes``/``outcomePrices``). It is the persistence-side identity
+    that lets ``source_trades.token_id`` be joined to ``market_outcomes``
+    by token instead of by denormalized label. Optional because legacy
+    payloads may not carry ``clobTokenIds`` and an absent / malformed
+    array produces ``clob_token_id=None`` for every outcome (treated as
+    INCOMPLETE by the canonical mapping helper, not silently mapped).
+    """
 
     label: str = Field(description="Outcome text, e.g. 'Yes' or 'No'.")
     price: float = Field(ge=0.0, le=1.0, description="Current implied probability [0, 1].")
     volume: float = Field(default=0.0, ge=0.0, description="Volume on this outcome.")
+    clob_token_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Polymarket CLOB token id for this outcome, taken from the "
+            "positionally-indexed Gamma clobTokenIds array. None means the "
+            "Gamma payload did not include clobTokenIds (or it was "
+            "malformed / length-mismatched) for this outcome."
+        ),
+    )
 
 
 class Market(BaseModel):
