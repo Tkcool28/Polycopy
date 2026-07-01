@@ -13,7 +13,9 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path("/root/Polycopy")
+# Derive REPO from this test file's location so tests work in any checkout
+# (CI runs at /home/runner/work/Polycopy/Polycopy, local dev at /root/Polycopy).
+REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "paper_pilot_status.py"
 
 
