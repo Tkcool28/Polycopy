@@ -1,0 +1,14 @@
+[Unit]
+Description=Polycopy pilot evening status report (~19:00 Denver, offset to avoid settle overlap)
+
+[Timer]
+# Evening report — 19:32 America/Denver.
+# Offset chosen so the report does not fire at exactly :30 (when polycopy-settle.timer
+# fires hourly). 19:32 sits between settle and update (:45) cycles.
+OnCalendar=*-*-* 19:32:00 America/Denver
+Persistent=true
+AccuracySec=60s
+Unit=polycopy-pilot-report.service
+
+[Install]
+WantedBy=timers.target

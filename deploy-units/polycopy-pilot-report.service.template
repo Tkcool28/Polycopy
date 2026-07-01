@@ -1,0 +1,19 @@
+[Unit]
+Description=Polycopy paper-pilot status report
+After=network-online.target polycopy-api.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Polycopy
+EnvironmentFile=/root/Polycopy/.env
+Environment=TZ=America/Denver
+ExecStart=/root/mlb-ev-model-lab/.venv/bin/python3 /root/Polycopy/scripts/paper_pilot_status.py --write-latest
+TimeoutStartSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+# No [Install] section — this is a service template, not a deployable unit.
+# The companion timer units (.morning.timer, .evening.timer) carry the
+# [Install] section that enables the schedule.

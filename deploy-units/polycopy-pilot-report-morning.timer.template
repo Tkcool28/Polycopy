@@ -1,0 +1,14 @@
+[Unit]
+Description=Polycopy pilot morning status report (~08:00 Denver, offset to avoid collect overlap)
+
+[Timer]
+# Morning report — 08:02 America/Denver.
+# Offset chosen so the report does not fire at exactly :00 (when polycopy-collect.timer
+# also fires every 15 minutes). 08:02 sits between collect cycles.
+OnCalendar=*-*-* 08:02:00 America/Denver
+Persistent=true
+AccuracySec=60s
+Unit=polycopy-pilot-report.service
+
+[Install]
+WantedBy=timers.target
