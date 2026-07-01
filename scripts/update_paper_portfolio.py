@@ -29,6 +29,10 @@ from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from polycopy.adapters.polymarket import (
+    parse_clob_token_ids,
+    zip_outcomes_with_tokens,
+)
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
@@ -258,19 +262,38 @@ async def _fetch_market_prices(
             resp.raise_for_status()
             data = resp.json()
 
-            # Parse outcomes
-            import json as _json
+            # Parse outcomes. PR-1: use the shared helpers so the same
+            # positional-normalization + length-mismatch INCOMPLETE semantics
+            # apply here as in every other Gamma parser (run_scan._parse_gamma_market,
+            # PolymarketPublicAdapter._parse_gamma_market,
+            # PolymarketCollector._parse_market). Missing clobTokenIds or
+            # length mismatch ⇒ clob_token_id=None for every outcome.
             outcomes_raw = data.get("outcomes", "[]")
             prices_raw = data.get("outcomePrices", "[]")
             if isinstance(outcomes_raw, str):
-                outcomes_raw = _json.loads(outcomes_raw)
+                outcomes_raw = json.loads(outcomes_raw)
             if isinstance(prices_raw, str):
-                prices_raw = _json.loads(prices_raw)
-
+                prices_raw = json.loads(prices_raw)
+            if not isinstance(outcomes_raw, list) or not isinstance(prices_raw, list):
+                outcomes_raw = []
+                prices_raw = []
+            tokens = parse_clob_token_ids(data)
+            zipped = zip_outcomes_with_tokens(
+                outcomes_raw, tokens, source_label="update_paper_portfolio._fetch_live_market"
+            )
+            token_by_index: dict[int, str | None] = {
+                idx: tok for idx, _, tok in zipped
+            }
             outcomes = []
             for i, label in enumerate(outcomes_raw):
                 price = float(prices_raw[i]) if i < len(prices_raw) else 0.5
-                outcomes.append(MarketOutcome(label=str(label), price=price))
+                outcomes.append(
+                    MarketOutcome(
+                        label=str(label),
+                        price=price,
+                        clob_token_id=token_by_index.get(i),
+                    )
+                )
 
             return Market(
                 id=UUID(market_id),

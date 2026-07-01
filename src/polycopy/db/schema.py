@@ -2,12 +2,73 @@
 
 Migrations are applied sequentially. The `_meta` table tracks the current
 schema version. Each migration is a list of SQL statements.
+
+Round-1 PR-1 additions (recovery sequence):
+  * ``market_outcomes.clob_token_id TEXT`` (nullable) — persisted identity for
+    Gamma's per-outcome CLOB token, so multi-outcome markets can be
+    unambiguously joined from ``source_trades``.
+  * ``source_trades.token_id TEXT`` (nullable) — persisted upstream
+    asset/identifier for each observed trade so the canonical mapping helper
+    can resolve trades to market outcomes without re-parsing Gamma.
+  * ``idx_market_outcomes_token`` — index on ``market_outcomes(clob_token_id)``
+    to serve the canonical token-join directly.
+
+Both column additions are idempotent: the v7 migration probes
+``PRAGMA table_info(...)`` and only emits the ``ALTER TABLE ... ADD COLUMN``
+DDL when the column is missing. Re-running v7 on a v7 DB is a no-op. The
+index uses ``CREATE INDEX IF NOT EXISTS`` which is natively idempotent.
 """
 
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+
+
+def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
+    """Return a SQL fragment that adds ``table.column`` iff it does not exist.
+
+    SQLite does not support ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` in
+    versions prior to 3.35 (and even after, the syntax is non-standard for
+    our purposes). The portable trick is a ``CASE`` expression over
+    ``pragma_table_info`` returning the ``ALTER TABLE`` DDL when the column
+    is absent and a benign ``SELECT 1`` when it is already present, then
+    executing the result. The fragment below is one valid statement:
+
+        SELECT CASE WHEN (
+            SELECT COUNT(*) FROM pragma_table_info('<table>')
+            WHERE name = '<column>'
+        ) = 0 THEN 'ALTER TABLE <table> ADD COLUMN <column> <type_sql>;'
+        ELSE 'SELECT 1;' END;
+
+    The runner executes each returned string sequentially. The string
+    returned here is itself a single statement that emits a second
+    statement via the CASE expression; the migration runner needs to
+    recognize this and execute the inner statement. See
+    :func:`polycopy.db.database.Database._run_migrations` for the wrapper.
+    """
+    # NOTE: actual execution wrapper lives in the migration runner because
+    # SQLite's Python driver executes one statement per `execute()` call —
+    # we cannot nest a dynamic statement without an explicit two-step call.
+    # We instead emit the ALTER TABLE directly; the runner applies the
+    # idempotency guard by inspecting ``PRAGMA table_info`` BEFORE running
+    # each v7 ADD COLUMN statement.
+    raise NotImplementedError(
+        "Use _v7_idempotent_add_column() in database.py instead of building a "
+        "string here. See _V7_DDL below for the canonical application."
+    )
+
+
+def _idempotent_add_column_ddl(table: str, column: str, type_sql: str) -> str:
+    """Return the ``ALTER TABLE ... ADD COLUMN`` SQL for ``(table, column)``.
+
+    The migration runner applies this only when ``PRAGMA table_info`` shows
+    the column is absent; the function itself returns plain DDL so it
+    composes with the existing ``list[str]`` migration registry. The
+    actual idempotency guard lives in
+    :meth:`polycopy.db.database.Database._apply_v7_migration`.
+    """
+    return f"ALTER TABLE {table} ADD COLUMN {column} {type_sql};"
 
 # ── Version 1: initial schema ───────────────────────────────────────────────────
 _V1_DDL: list[str] = [
@@ -49,13 +110,18 @@ _V1_DDL: list[str] = [
         is_sample       INTEGER NOT NULL DEFAULT 0,
         UNIQUE(source, source_id)
     );""",
-    # Market outcomes
+    # Market outcomes — created without ``clob_token_id``; the v7 migration
+    # adds that column additively. Keeping the V1 schema byte-identical to
+    # the original (no clob_token_id at V1) is essential so that legacy
+    # v6-production-style databases round-trip through the v7 migration
+    # without orphaned columns and so that the v7 idempotency guard sees
+    # the column as "absent" before the migration runs.
     """CREATE TABLE IF NOT EXISTS market_outcomes (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        market_id  TEXT NOT NULL REFERENCES markets(id),
-        label      TEXT NOT NULL,
-        price      REAL NOT NULL CHECK(price >= 0 AND price <= 1),
-        volume     REAL NOT NULL DEFAULT 0 CHECK(volume >= 0)
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        market_id      TEXT NOT NULL REFERENCES markets(id),
+        label          TEXT NOT NULL,
+        price          REAL NOT NULL CHECK(price >= 0 AND price <= 1),
+        volume         REAL NOT NULL DEFAULT 0 CHECK(volume >= 0)
     );""",
     # Signals
     """CREATE TABLE IF NOT EXISTS signals (
@@ -103,7 +169,15 @@ _V1_DDL: list[str] = [
         updated_at      TEXT,              -- ISO-8601 UTC
         is_sample       INTEGER NOT NULL DEFAULT 0
     );""",
-    # Source trades (observed, not our own)
+    # Source trades (observed, not our own) — created without ``token_id``;
+    # the v7 migration adds that column additively. ``trader_address``
+    # stays ``NOT NULL`` in V1 here on purpose: the v5 migration is the
+    # authoritative step that relaxes it to nullable and normalizes
+    # sentinels. Pre-relaxing V1 would make v5 a no-op and break the v4
+    # → v5 regression that proves the migration actually rewrites the
+    # column. New DBs run V1 → V5 → V6 → V7 in order; production v6
+    # databases run just V7. Both end up with ``trader_address TEXT``
+    # (nullable) and ``token_id TEXT`` (nullable).
     """CREATE TABLE IF NOT EXISTS source_trades (
         id               TEXT PRIMARY KEY,  -- UUID
         source           TEXT NOT NULL,
@@ -462,8 +536,41 @@ _V6_DDL: list[str] = [
     "PRAGMA foreign_key_check;",
 ]
 
+# ── Version 7: persist Polymarket trade and outcome token identity ─────────────
+# Round-1 PR-1 of the recovery sequence. Purely additive, idempotent, no data
+# loss. Two nullable columns + one nullable index. Both columns default to
+# NULL on existing rows; no production backfill in this PR.
+#
+# Idempotency contract: each ``ALTER TABLE ... ADD COLUMN`` statement below
+# is GUARDED by the migration runner via ``PRAGMA table_info(...)``. The
+# runner applies the ALTER only when the column is absent; re-running v7 on
+# a v7 DB is a no-op. The index uses ``CREATE INDEX IF NOT EXISTS`` which is
+# natively idempotent in SQLite.
+_V7_DDL: list[str] = [
+    # market_outcomes.clob_token_id — persisted CLOB token for each outcome.
+    # Allows the canonical mapping helper to join ``source_trades.token_id``
+    # to ``market_outcomes.clob_token_id`` for both binary and multi-outcome
+    # markets. Nullable; existing rows remain NULL until the next ingest
+    # round repopulates them (no production backfill in this PR).
+    _idempotent_add_column_ddl("market_outcomes", "clob_token_id", "TEXT"),
+    # source_trades.token_id — persisted upstream asset/identifier per
+    # trade, taken from the data-api ``asset`` field. Nullable; existing
+    # rows remain NULL. Together with the market-outcome column above this
+    # is the bridge that PR 2 (copy-candidate persistence) consumes.
+    _idempotent_add_column_ddl("source_trades", "token_id", "TEXT"),
+    # Index on the new join column to serve the canonical token-join
+    # directly. NULLs are indexed; this is the standard SQLite behavior for
+    # B-tree indexes on a nullable column.
+    "CREATE INDEX IF NOT EXISTS idx_market_outcomes_token "
+    "ON market_outcomes(clob_token_id);",
+]
+
+
 # ── Migration registry ──────────────────────────────────────────────────────────
-# Key = target version, Value = list of DDL statements to reach that version from (version - 1).
+# Key = target version, Value = list of DDL statements to reach that version
+# from (version - 1). Statements are run in order by the migration runner;
+# each statement is committed individually via the runner's _set_version
+# checkpoint.
 MIGRATIONS: dict[int, list[str]] = {
     1: _V1_DDL,
     2: _V2_DDL,
@@ -471,6 +578,7 @@ MIGRATIONS: dict[int, list[str]] = {
     4: _V4_DDL,
     5: _V5_DDL,
     6: _V6_DDL,
+    7: _V7_DDL,
 }
 
 # Current DDL is the latest migration

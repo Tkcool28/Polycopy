@@ -30,6 +30,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 # Add src to path for inline execution
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -37,6 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from polycopy.adapters.polymarket import (
     PolymarketPublicAdapter,
     build_market_trade_params,
+    parse_clob_token_ids,
+    zip_outcomes_with_tokens,
 )
 from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
@@ -508,6 +511,18 @@ class PolymarketCollector:
 
     @staticmethod
     def _parse_market(data: dict) -> Market:
+        """Parse a Gamma API market payload into our :class:`Market` model.
+
+        PR-1: outcomes are zipped with the positional ``clobTokenIds`` array
+        via the SAME shared helpers used by every other Gamma parser in the
+        codebase (``PolymarketPublicAdapter._parse_gamma_market``,
+        ``scripts/run_scan._parse_gamma_market``,
+        ``scripts/update_paper_portfolio``). Missing / malformed /
+        length-mismatched token arrays produce ``clob_token_id=None`` for every
+        outcome (INCOMPLETE), never a silent positional mapping. The shared
+        helper also emits a structured warning that shows up in the
+        collector's logs.
+        """
         import json as _json
 
         outcomes_raw = data.get("outcomes", "[]")
@@ -517,10 +532,26 @@ class PolymarketCollector:
         if isinstance(prices_raw, str):
             prices_raw = _json.loads(prices_raw)
 
+        # PR-1: shared helpers — single source of truth for clob-token pairing.
+        tokens = parse_clob_token_ids(data)
+        zipped = zip_outcomes_with_tokens(
+            outcomes_raw,
+            tokens,
+            source_label="collect_smart_money_data._parse_market",
+        )
+        token_by_index: dict[int, Optional[str]] = {
+            idx: tok for idx, _, tok in zipped
+        }
         outcomes = []
         for i, label in enumerate(outcomes_raw):
             price = float(prices_raw[i]) if i < len(prices_raw) else 0.5
-            outcomes.append(MarketOutcome(label=str(label), price=price))
+            outcomes.append(
+                MarketOutcome(
+                    label=str(label),
+                    price=price,
+                    clob_token_id=token_by_index.get(i),
+                )
+            )
 
         return Market(
             source_id=data.get("conditionId", data.get("id", "")),
@@ -654,8 +685,9 @@ class PolymarketCollector:
         cur = db.execute(
             """INSERT OR IGNORE INTO source_trades
                (id, source, source_trade_id, market_source_id, side, outcome,
-                quantity, price, trader_address, timestamp, is_sample)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                quantity, price, trader_address, timestamp, is_sample,
+                token_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 str(uuid.uuid4()),
                 trade.source,
@@ -668,6 +700,10 @@ class PolymarketCollector:
                 persisted_trader_address,
                 trade.timestamp.isoformat() if trade.timestamp else None,
                 int(trade.is_sample),
+                # PR-1: persist upstream CLOB token id verbatim. None when
+                # upstream payload didn't carry an asset field (legacy
+                # fallback path in resolve_trade_to_outcome).
+                trade.token_id,
             ),
         )
         db.conn.commit()

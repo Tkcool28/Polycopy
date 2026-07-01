@@ -66,9 +66,16 @@ def persist_market_preserving_identity(db: Database, market: Market) -> str:
         db.execute("DELETE FROM market_outcomes WHERE market_id = ?", (persisted_id,))
         for outcome in market.outcomes:
             db.execute(
-                """INSERT INTO market_outcomes (market_id, label, price, volume)
-                   VALUES (?, ?, ?, ?)""",
-                (persisted_id, outcome.label, outcome.price, outcome.volume),
+                """INSERT INTO market_outcomes
+                   (market_id, label, price, volume, clob_token_id)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    persisted_id,
+                    outcome.label,
+                    outcome.price,
+                    outcome.volume,
+                    outcome.clob_token_id,
+                ),
             )
         if started_transaction:
             db.conn.commit()

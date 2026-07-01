@@ -855,15 +855,17 @@ def test_schema_v4_to_v5_migration(tmp_path: Path):
 
 def test_schema_version_after_migration(tmp_path: Path):
     """After fresh init via Database, the schema_version row in _meta must
-    equal the SCHEMA_VERSION constant (currently 6)."""
+    equal the SCHEMA_VERSION constant. PR-1 of the recovery sequence bumped
+    SCHEMA_VERSION from 6 → 7 (additive nullable columns on
+    market_outcomes + source_trades). The constant-equals-6 assertion was
+    removed because it locked the v6 milestone in place; the actual
+    invariant is "the DB row equals the code constant".
+    """
     db_path = tmp_path / "fresh.db"
     db = Database(db_path=db_path).connect()
     row = db.fetchone("SELECT value FROM _meta WHERE key = 'schema_version'")
     assert row is not None
     assert int(row["value"]) == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 6, (
-        "SCHEMA_VERSION constant should be 6 after the v6 canonical-wallet migration"
-    )
     db.close()
 
 
