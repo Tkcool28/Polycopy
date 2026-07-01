@@ -34,10 +34,18 @@ sudo systemctl enable --now polycopy-pilot-report-morning.timer
 sudo systemctl enable --now polycopy-pilot-report-evening.timer
 ```
 
-The automation service templates in `automation-services.template.md`
-are reference material — they are already deployed on the running host
-and were edited by hand during pilot setup. Re-applying them is optional;
-the live units at `/etc/systemd/system/` are the source of truth.
+The automation service definitions in
+[`automation-services.template.md`](./automation-services.template.md) are
+reference material for a future, separately approved deployment step. The
+current live units under `/etc/systemd/system/` do **not** yet contain
+the `OnFailure=polycopy-pilot-report.service` line shown in these templates.
+Installing that hook on the live services is **not** part of PR #12.
+
+PR #12 provides source-controlled templates and documentation only. It
+does **not** alter the live units; the live units remain operational
+without the `OnFailure=` hook. Adding the hook to the live services is
+optional and will require a separate, explicitly approved deployment
+step at a later time.
 
 ## Why `.template` suffix?
 
