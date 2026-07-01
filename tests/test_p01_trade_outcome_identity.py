@@ -38,8 +38,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-import pytest
-
 from polycopy.adapters.polymarket import (
     PolymarketPublicAdapter,
     parse_clob_token_ids,
@@ -188,7 +186,7 @@ def test_migration_from_v6_adds_columns_without_data_loss(tmp_path: Path) -> Non
 
         # Both new columns must be present and NULL on pre-existing rows.
         outcome_rows = db.conn.execute(
-            f"SELECT clob_token_id FROM market_outcomes WHERE market_id = ?",
+            "SELECT clob_token_id FROM market_outcomes WHERE market_id = ?",
             (sentinel_id,),
         ).fetchall()
         assert len(outcome_rows) == 2
