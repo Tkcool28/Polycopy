@@ -428,7 +428,9 @@ def test_exact_token_join_resolves_one_outcome(tmp_path: Path) -> None:
         )
         db.conn.commit()
 
-        result = resolve_trade_to_outcome(db, "kbo-ssg-001")
+        result = resolve_trade_to_outcome(
+            db, source="polymarket_data_api", source_trade_id="kbo-ssg-001",
+        )
         assert result.status is ResolveStatus.OK
         assert result.fallback_used is False
         assert result.token_id == ssg_token
@@ -488,7 +490,9 @@ def test_legacy_label_fallback_only_when_token_null(tmp_path: Path) -> None:
         )
         db.conn.commit()
 
-        result = resolve_trade_to_outcome(db, "algeria-yes-legacy-001")
+        result = resolve_trade_to_outcome(
+            db, source="polymarket_data_api", source_trade_id="algeria-yes-legacy-001",
+        )
         assert result.status is ResolveStatus.OK
         assert result.fallback_used is True
         assert result.token_id is None
@@ -544,7 +548,9 @@ def test_conflicting_token_and_label_token_wins(tmp_path: Path) -> None:
         )
         db.conn.commit()
 
-        result = resolve_trade_to_outcome(db, "conflict-001")
+        result = resolve_trade_to_outcome(
+            db, source="polymarket_data_api", source_trade_id="conflict-001",
+        )
         assert result.status is ResolveStatus.OK
         assert result.fallback_used is False
         assert result.outcome_label == "Hanwha Eagles"  # token wins
@@ -593,7 +599,9 @@ def test_unknown_token_yields_incomplete(tmp_path: Path) -> None:
         )
         db.conn.commit()
 
-        result = resolve_trade_to_outcome(db, "unknown-tok-001")
+        result = resolve_trade_to_outcome(
+            db, source="polymarket_data_api", source_trade_id="unknown-tok-001",
+        )
         assert result.status is ResolveStatus.INCOMPLETE
         assert result.fallback_used is False  # token was non-NULL
         assert result.candidate_market_outcome_ids == []
@@ -668,7 +676,9 @@ def test_ambiguous_data_yields_explicit_ambiguous(tmp_path: Path) -> None:
         )
         db.conn.commit()
 
-        result = resolve_trade_to_outcome(db, "ambiguous-001")
+        result = resolve_trade_to_outcome(
+            db, source="polymarket_data_api", source_trade_id="ambiguous-001",
+        )
         assert result.status is ResolveStatus.AMBIGUOUS
         assert result.fallback_used is False
         assert result.market_outcome_id is None  # never auto-pick
@@ -969,7 +979,11 @@ def test_pr1_end_to_end_acceptance_replay(tmp_path: Path) -> None:
 
         # Query the canonical mapping path. Exactly one OK result, the
         # SSG Landers outcome, with matching IDs/labels/tokens.
-        result_ssg = resolve_trade_to_outcome(db, ssg_trade_id)
+        result_ssg = resolve_trade_to_outcome(
+            db,
+            source=ssg_trade.source,
+            source_trade_id=ssg_trade_id,
+        )
         assert result_ssg.status is ResolveStatus.OK
         assert result_ssg.fallback_used is False
         assert result_ssg.outcome_label == "SSG Landers"
@@ -1038,7 +1052,11 @@ def test_pr1_end_to_end_acceptance_replay(tmp_path: Path) -> None:
         )
         db.conn.commit()
 
-        result_algeria = resolve_trade_to_outcome(db, algeria_trade_id)
+        result_algeria = resolve_trade_to_outcome(
+            db,
+            source=algeria_trade.source,
+            source_trade_id=algeria_trade_id,
+        )
         assert result_algeria.status is ResolveStatus.OK
         assert result_algeria.fallback_used is False
         assert result_algeria.market_source_id == str(algeria["conditionId"])
@@ -1097,5 +1115,197 @@ def test_pr1_end_to_end_acceptance_replay(tmp_path: Path) -> None:
                 # fine — PR-1 only writes to markets / market_outcomes /
                 # source_trades / _meta.
                 pass
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Cross-source identity regression (added per PR-13 review):
+# source_trades is unique on (source, source_trade_id). The resolver
+# must qualify every lookup by source; passing only source_trade_id
+# would silently resolve the wrong row if two providers emit the same
+# id string. These tests lock that behavior down.
+# ---------------------------------------------------------------------------
+
+
+def test_cross_source_collision_same_source_trade_id_different_sources(
+    tmp_path,
+):
+    """Two providers emit identical source_trade_id; resolver must
+    distinguish them and never silently pick one.
+
+    Builds two ``source_trades`` rows with the same ``source_trade_id``
+    but different ``source`` values, each pointing at a different
+    outcome, and asserts the resolver returns only the row matching the
+    requested ``source``.
+    """
+    db = _make_db(tmp_path, name="polycopy.db")
+    try:
+        # Two distinct markets with distinct outcomes — one row per
+        # source. Each market has one Yes / No outcome so the join is
+        # trivial.
+        market_a_id = str(uuid4())
+        market_b_id = str(uuid4())
+        market_rows = [
+            (market_a_id, "cond-provider-a-outcome", "polymarket",
+             "Question for Provider A Outcome", 0.0),
+            (market_b_id, "cond-provider-b-outcome", "other-provider",
+             "Question for Provider B Outcome", 0.0),
+        ]
+        for mid, source_id, source, question, vol_24h in market_rows:
+            db.conn.execute(
+                "INSERT INTO markets (id, source_id, source, question, "
+                "active, closed, resolved, volume_24h, fetched_at, is_sample) "
+                "VALUES (?, ?, ?, ?, 1, 0, 0, ?, ?, 0)",
+                (mid, source_id, source, question, vol_24h,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+        outcome_rows = [
+            (market_a_id, "Provider A Outcome", "token-provider-a-outcome"),
+            (market_b_id, "Provider B Outcome", "token-provider-b-outcome"),
+        ]
+        for mid, label, token in outcome_rows:
+            db.conn.execute(
+                "INSERT INTO market_outcomes (market_id, label, price, "
+                "volume, clob_token_id) VALUES (?, ?, 0.5, 0.0, ?)",
+                (mid, label, token),
+            )
+        db.conn.commit()
+
+        shared_id = "shared-trade-123"
+        # Polymarket row — points at Provider A's outcome.
+        db.conn.execute(
+            "INSERT INTO source_trades (id, source, source_trade_id, "
+            "market_source_id, side, outcome, quantity, price, "
+            "trader_address, timestamp, is_sample, token_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid4()), "polymarket", shared_id, "cond-provider-a-outcome",
+             "BUY", "Provider A Outcome", 1.0, 0.5, None,
+             datetime.now(timezone.utc).isoformat(), 0,
+             "token-provider-a-outcome"),
+        )
+        # Other-provider row — same source_trade_id, different source,
+        # points at Provider B's outcome.
+        db.conn.execute(
+            "INSERT INTO source_trades (id, source, source_trade_id, "
+            "market_source_id, side, outcome, quantity, price, "
+            "trader_address, timestamp, is_sample, token_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid4()), "other-provider", shared_id, "cond-provider-b-outcome",
+             "BUY", "Provider B Outcome", 1.0, 0.5, None,
+             datetime.now(timezone.utc).isoformat(), 0,
+             "token-provider-b-outcome"),
+        )
+        db.conn.commit()
+
+        # Resolve the Polymarket identity — must return Provider A's
+        # outcome only.
+        res_poly = resolve_trade_to_outcome(
+            db, source="polymarket", source_trade_id=shared_id,
+        )
+        assert res_poly.status is ResolveStatus.OK
+        assert res_poly.source == "polymarket"
+        assert res_poly.source_trade_id == shared_id
+        assert res_poly.outcome_label == "Provider A Outcome"
+        assert res_poly.token_id == "token-provider-a-outcome"
+        assert res_poly.market_source_id == "cond-provider-a-outcome"
+
+        # Resolve the other-provider identity — must return Provider B's
+        # outcome only.
+        res_other = resolve_trade_to_outcome(
+            db, source="other-provider", source_trade_id=shared_id,
+        )
+        assert res_other.status is ResolveStatus.OK
+        assert res_other.source == "other-provider"
+        assert res_other.source_trade_id == shared_id
+        assert res_other.outcome_label == "Provider B Outcome"
+        assert res_other.token_id == "token-provider-b-outcome"
+        assert res_other.market_source_id == "cond-provider-b-outcome"
+
+        # Neither call returned the other source's outcome — i.e. there
+        # is no cross-source leakage.
+        assert res_poly.market_outcome_id != res_other.market_outcome_id
+        assert res_poly.market_outcome_id in (
+            r["id"] for r in db.conn.execute(
+                "SELECT id FROM market_outcomes WHERE label = ?",
+                ("Provider A Outcome",),
+            ).fetchall()
+        )
+        assert res_other.market_outcome_id in (
+            r["id"] for r in db.conn.execute(
+                "SELECT id FROM market_outcomes WHERE label = ?",
+                ("Provider B Outcome",),
+            ).fetchall()
+        )
+
+        # No arbitrary selection — both rows still exist.
+        n_source_rows = db.conn.execute(
+            "SELECT COUNT(*) AS n FROM source_trades "
+            "WHERE source_trade_id = ?",
+            (shared_id,),
+        ).fetchone()["n"]
+        assert n_source_rows == 2, (
+            "resolver must not delete or rewrite source_trades rows"
+        )
+    finally:
+        db.close()
+
+
+def test_not_found_under_wrong_source_returns_incomplete(tmp_path):
+    """Asking for an existing source_trade_id under the wrong source
+    must return INCOMPLETE — never silently return the row that lives
+    under another source.
+    """
+    db = _make_db(tmp_path, name="polycopy-notfound.db")
+    try:
+        # Seed one market and one outcome so a valid Polymarket trade can
+        # be persisted.
+        market_id = str(uuid4())
+        db.conn.execute(
+            "INSERT INTO markets (id, source_id, source, question, "
+            "active, closed, resolved, volume_24h, fetched_at, is_sample) "
+            "VALUES (?, ?, ?, ?, 1, 0, 0, 0.0, ?, 0)",
+            (market_id, "cond-only", "polymarket", "Question",
+             datetime.now(timezone.utc).isoformat()),
+        )
+        db.conn.execute(
+            "INSERT INTO market_outcomes (market_id, label, price, "
+            "volume, clob_token_id) VALUES (?, ?, 0.5, 0.0, ?)",
+            (market_id, "Yes", "token-only"),
+        )
+        db.conn.commit()
+
+        existing_id = "existing-id-under-polymarket"
+        db.conn.execute(
+            "INSERT INTO source_trades (id, source, source_trade_id, "
+            "market_source_id, side, outcome, quantity, price, "
+            "trader_address, timestamp, is_sample, token_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid4()), "polymarket", existing_id, "cond-only",
+             "BUY", "Yes", 1.0, 0.5, None,
+             datetime.now(timezone.utc).isoformat(), 0, "token-only"),
+        )
+        db.conn.commit()
+
+        # Sanity: the row resolves correctly under its own source.
+        sanity = resolve_trade_to_outcome(
+            db, source="polymarket", source_trade_id=existing_id,
+        )
+        assert sanity.status is ResolveStatus.OK
+        assert sanity.outcome_label == "Yes"
+
+        # Wrong source must NOT return the Polymarket row.
+        wrong = resolve_trade_to_outcome(
+            db, source="missing-source", source_trade_id=existing_id,
+        )
+        assert wrong.status is ResolveStatus.INCOMPLETE
+        assert wrong.source == "missing-source"
+        assert wrong.source_trade_id == existing_id
+        assert wrong.market_outcome_id is None
+        assert wrong.outcome_label is None
+        assert wrong.token_id is None
+        assert "source_trades row not found" in wrong.reason
+        assert "missing-source" in wrong.reason
+        assert existing_id in wrong.reason
     finally:
         db.close()

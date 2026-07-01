@@ -23,6 +23,13 @@ qualified wallet → specific source trade → persisted token/outcome mapping �
 - One PR closes one well-defined gap.
 - Each PR has a single acceptance test the reviewer can run.
 - Each PR leaves the system in a state where every prior PR still works and the pilot is still safe.
+
+## 2.1 Stable identity contract (applies to every PR)
+
+- The schema's real uniqueness on `source_trades` is `UNIQUE(source, source_trade_id)`. `source_trade_id` is **NOT** globally unique — two providers can legitimately emit the same string.
+- The stable upstream identity for any trade is the pair `(source, source_trade_id)`. Any resolver, candidate-key, signal-key, or idempotency check that reads or derives from a source trade MUST qualify by both fields unless it has switched to the internal `source_trades.id` UUID.
+- Future copy-candidate idempotency (`PR 2`) MUST preserve both fields; the recommended key is `(wallet_id, source, source_trade_id)` so that two providers with the same `source_trade_id` but different `source` do not collide.
+- The canonical helper `resolve_trade_to_outcome(db, *, source, source_trade_id)` enforces this contract today.
 - Each PR must NOT approve orders, disable the kill switch, enable live trading, change broker_mode, or change paper_mode.
 - All rejection decisions are logged via decision_log with typed decision_type strings.
 - Idempotency is established at the earliest layer that has a stable identity (source_trades → copy_candidates → signals).
@@ -88,8 +95,19 @@ Persist the stable identity needed to map a source trade to its market outcome, 
 2. Run the new migration that adds `market_outcomes.clob_token_id` and `source_trades.token_id`.
 3. Replay a recorded Gamma payload containing a sports multi-outcome market (≥3 outcomes, non-Yes/No labels).
 4. Replay a recorded data-api trade payload for that market with `outcome="Seattle Mariners"`.
-5. Run: `SELECT mo.market_id, mo.label, mo.clob_token_id, st.source_trade_id, st.token_id FROM source_trades st JOIN market_outcomes mo ON st.market_source_id = mo.market_source_id AND (st.token_id = mo.clob_token_id OR st.outcome = mo.label) WHERE st.source_trade_id = 'polymarket:<txhash>';` and verify exactly one row with the correct `label` ("Seattle Mariners") and matching `token_id`.
+5. Run the canonical helper against the source-qualified identity, e.g. `resolve_trade_to_outcome(db, source="polymarket_data_api", source_trade_id="polymarket:<txhash>")`, and verify exactly one OK result with the correct `label` ("Seattle Mariners") and matching `token_id`. The acceptance query in the implementation guide is equivalent:
+   ```sql
+   SELECT mo.market_id, mo.label, mo.clob_token_id, st.source_trade_id, st.token_id
+   FROM source_trades st
+   JOIN market_outcomes mo
+     ON st.market_source_id = mo.market_source_id
+    AND (st.token_id = mo.clob_token_id OR st.outcome = mo.label)
+   WHERE st.source = 'polymarket_data_api'
+     AND st.source_trade_id = 'polymarket:<txhash>';
+   ```
+   The `AND st.source = ?` clause is **mandatory** — `source_trades` is unique on `(source, source_trade_id)`, not on `source_trade_id` alone.
 6. Repeat with a binary market and confirm the label-based join still returns exactly one row.
+7. (Cross-source regression) Insert two `source_trades` rows with the same `source_trade_id` under two different `source` values pointing at different outcomes. Confirm each `(source, source_trade_id)` resolves to only its own outcome.
 
 ### 4.10 Explicit out-of-scope items
 - Any change to the scoring formula (`formula_version`), thresholds (`MAX_SHARPE`, `WEIGHTS`, `CRITICAL_FIELDS`, verdict boundaries), or kill switch.

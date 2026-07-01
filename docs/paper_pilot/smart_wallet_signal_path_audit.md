@@ -134,9 +134,10 @@
 
 ## PART 3.7 — Best idempotency identity
 - Stable identifiers that already exist in collected data:
-  - `source_trades.source_trade_id` (text, e.g. `polymarket:<txhash>`) — globally unique per source.
-  - `source_trades.id` (UUID, internal) — already UNIQUE by PK.
-  - `UNIQUE(source, source_trade_id)` on `source_trades` — already prevents duplicate upstream trades.
+  - `source_trades.source_trade_id` (text, e.g. `polymarket:<txhash>`) — unique **within** a `source` value, NOT globally unique. Two providers can legitimately emit the same `source_trade_id` string.
+  - `source_trades.source` (e.g. `"polymarket_data_api"`) — the provider identity.
+  - **The stable upstream identity is `(source, source_trade_id)`**, enforced by `UNIQUE(source, source_trade_id)` on `source_trades`. Any downstream consumer (resolver, candidate layer, signal idempotency) MUST qualify lookups by both fields unless it has switched to the internal UUID.
+  - `source_trades.id` (UUID, internal) — already UNIQUE by PK. Safe to use as a global internal key; carries no upstream semantics.
 - Can duplicate upstream trades exist in `source_trades`? **No** — the UNIQUE index on `(source, source_trade_id)` plus `INSERT OR IGNORE` in `_persist_trade` enforces dedup at ingestion.
 - **Narrowest correct uniqueness rule for the candidate layer:** `(wallet_id, source_trade_id)` where `wallet_id` = canonical lowercase trader_address. This is correct because: (a) `source_trade_id` is the upstream-stable identifier; (b) a sentinel/NULL trader_address cannot become a wallet_id; (c) if the same upstream trade is observed twice with two distinct trader_address spellings, `canonical_wallet_address()` collapses them to one canonical form, so the same source_trade_id with the same canonical wallet is a single candidate.
 - Alternatives considered:
