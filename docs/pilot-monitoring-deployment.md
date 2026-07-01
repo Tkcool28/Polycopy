@@ -146,7 +146,10 @@ There is **no external notification channel** configured for this pilot:
 - No changes to DuckDNS token or hostname.
 - No edits to `/root/Polycopy/.env`.
 - No edits to the live `polycopy-{api,dashboard,collect,scan,health,settle,update}.service`
-  unit files (only adds `OnFailure=` lines per the spec).
+  unit files. The recommended `OnFailure=polycopy-pilot-report.service` line for
+  the 5 automation service units is documented in
+  `deploy-units/automation-services.template.md` for a future, separately
+  approved deployment step; it is **not** applied to the live units in this PR.
 - No mutation of `/root/Polycopy/data/polycopy.db`.
 - No order placement; no `/paper/preview` or `/paper/approve` calls.
 
