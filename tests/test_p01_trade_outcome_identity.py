@@ -83,7 +83,11 @@ def _make_market_from_gamma_payload(payload: dict, *, source: str = "polymarket"
 def test_new_db_schema_includes_both_nullable_columns(tmp_path: Path) -> None:
     db = _make_db(tmp_path)
     try:
-        assert SCHEMA_VERSION == 7
+        # PR-2 (recovery) bumped SCHEMA_VERSION 7 → 8 (additive: new
+        # copy_candidates table + indexes). The version pin is now
+        # ``>= 7`` so additive-only bumps introduced by later PRs of
+        # the recovery sequence don't break this assertion.
+        assert SCHEMA_VERSION >= 7
         outcome_cols = _table_columns(db, "market_outcomes")
         trade_cols = _table_columns(db, "source_trades")
         assert "clob_token_id" in outcome_cols, (
@@ -174,12 +178,15 @@ def test_migration_from_v6_adds_columns_without_data_loss(tmp_path: Path) -> Non
             runner(stmt)
         db.conn.commit()
 
-        # Schema version MUST still be 7 and row counts MUST be
+        # Schema version MUST be >= 7 and row counts MUST be
         # unchanged — no data loss, no duplicate columns.
+        # PR-2 of the recovery sequence bumped SCHEMA_VERSION to 8; the
+        # version pin is now ``>= 7`` so additive-only bumps don't break
+        # this idempotency assertion.
         meta = db.conn.execute(
             "SELECT value FROM _meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert int(meta["value"]) == 7
+        assert int(meta["value"]) >= 7
         assert db.conn.execute("SELECT COUNT(*) AS n FROM markets").fetchone()["n"] == pre_market_count
         assert db.conn.execute("SELECT COUNT(*) AS n FROM market_outcomes").fetchone()["n"] == pre_outcome_count
         assert db.conn.execute("SELECT COUNT(*) AS n FROM source_trades").fetchone()["n"] == pre_trade_count

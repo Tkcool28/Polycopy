@@ -3,7 +3,7 @@
 Migrations are applied sequentially. The `_meta` table tracks the current
 schema version. Each migration is a list of SQL statements.
 
-Round-1 PR-1 additions (recovery sequence):
+Round-1 PR-1 additions (recovery sequence, v6 → v7):
   * ``market_outcomes.clob_token_id TEXT`` (nullable) — persisted identity for
     Gamma's per-outcome CLOB token, so multi-outcome markets can be
     unambiguously joined from ``source_trades``.
@@ -13,16 +13,24 @@ Round-1 PR-1 additions (recovery sequence):
   * ``idx_market_outcomes_token`` — index on ``market_outcomes(clob_token_id)``
     to serve the canonical token-join directly.
 
-Both column additions are idempotent: the v7 migration probes
-``PRAGMA table_info(...)`` and only emits the ``ALTER TABLE ... ADD COLUMN``
-DDL when the column is missing. Re-running v7 on a v7 DB is a no-op. The
-index uses ``CREATE INDEX IF NOT EXISTS`` which is natively idempotent.
+Round-1 PR-2 additions (recovery sequence, v7 → v8):
+  * New ``copy_candidates`` table — bounded, persisted artifact of
+    evaluating one (wallet, source_trade) pair through the canonical
+    resolver + basic eligibility checks. UNIQUE
+    ``(wallet_id, source, source_trade_id)`` is the idempotency key.
+    Indexes on status / wallet / source_trade_internal_id /
+    market_outcome_id. No destructive change to any existing table.
+
+All column / table additions are idempotent: the migration runner uses
+``PRAGMA table_info(...)`` to gate ``ALTER TABLE ... ADD COLUMN`` and
+``CREATE TABLE IF NOT EXISTS`` / ``CREATE INDEX IF NOT EXISTS`` are
+natively idempotent in SQLite.
 """
 
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -566,6 +574,74 @@ _V7_DDL: list[str] = [
 ]
 
 
+# ── Version 8: persist evaluated copy candidates (PR-2 of recovery) ───────────
+# Round-1 PR-2 of the recovery sequence. Purely additive, idempotent, no
+# data loss. One new table + four indexes. No existing column is altered.
+#
+# Identity contract: the candidate layer's idempotency key is the triple
+# ``(wallet_id, source, source_trade_id)`` — ``source_trade_id`` is NOT
+# globally unique (two providers can legitimately emit the same string),
+# and ``wallet_id`` alone is insufficient because a wallet may have trades
+# from multiple sources (e.g. polymarket_data_api vs. a future ingest
+# path). The bounded source-qualified key is enforced via UNIQUE on the
+# table itself.
+#
+# All FK columns are nullable on purpose: a candidate row may be
+# REJECTED at upstream stages (resolver INCOMPLETE, market closed,
+# invalid trade fields) where the market_id / market_outcome_id / etc.
+# have no value. The constraints still apply — SQLite enforces them
+# only when ``PRAGMA foreign_keys=ON`` is set, which the Database class
+# does on connect.
+#
+# Idempotency contract: ``CREATE TABLE IF NOT EXISTS`` and
+# ``CREATE INDEX IF NOT EXISTS`` are natively idempotent in SQLite; re-
+# running v8 on a v8 DB is a no-op.
+_V8_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS copy_candidates (
+        id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet_id                   TEXT    NOT NULL REFERENCES wallets(id),
+        source                      TEXT    NOT NULL,
+        source_trade_id             TEXT    NOT NULL,
+        source_trade_internal_id    TEXT    REFERENCES source_trades(id),
+        market_id                   TEXT    REFERENCES markets(id),
+        market_outcome_id           INTEGER REFERENCES market_outcomes(id),
+        market_source_id            TEXT,
+        token_id                    TEXT,
+        outcome_label               TEXT,
+        side                        TEXT    NOT NULL,
+        source_trade_price          REAL    NOT NULL,
+        source_trade_quantity       REAL    NOT NULL,
+        source_trade_notional       REAL,
+        source_trade_timestamp      TEXT    NOT NULL,
+        observed_at                 TEXT    NOT NULL,
+        wallet_score_version        TEXT    NOT NULL,
+        wallet_score                REAL    NOT NULL,
+        wallet_verdict              TEXT    NOT NULL,
+        status                      TEXT    NOT NULL,
+        status_reason               TEXT,
+        metrics_json                TEXT,
+        created_at                  TEXT    NOT NULL,
+        updated_at                  TEXT    NOT NULL,
+        UNIQUE(wallet_id, source, source_trade_id)
+    );""",
+    # Status-index for the bounded workflow queries
+    # ("what is pending?" / "what was rejected and why?"). Indexed even
+    # though the table is empty in production until PR-3+ wires up scan
+    # persistence; the cost is negligible and PR-3 will rely on it.
+    "CREATE INDEX IF NOT EXISTS idx_copy_candidates_status "
+    "ON copy_candidates(status);",
+    # Wallet-side lookup ("all candidates for wallet X").
+    "CREATE INDEX IF NOT EXISTS idx_copy_candidates_wallet "
+    "ON copy_candidates(wallet_id);",
+    # Reverse lookup ("what candidates reference source_trade Y?").
+    "CREATE INDEX IF NOT EXISTS idx_copy_candidates_source_trade_internal "
+    "ON copy_candidates(source_trade_internal_id);",
+    # Outcome-side lookup ("all candidates for outcome X").
+    "CREATE INDEX IF NOT EXISTS idx_copy_candidates_market_outcome "
+    "ON copy_candidates(market_outcome_id);",
+]
+
+
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version
 # from (version - 1). Statements are run in order by the migration runner;
@@ -579,6 +655,7 @@ MIGRATIONS: dict[int, list[str]] = {
     5: _V5_DDL,
     6: _V6_DDL,
     7: _V7_DDL,
+    8: _V8_DDL,
 }
 
 # Current DDL is the latest migration
