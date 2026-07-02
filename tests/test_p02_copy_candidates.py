@@ -366,12 +366,13 @@ def test_v7_to_v8_migration_preserves_data(tmp_path: Path) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
 
-    # Apply v1..(SCHEMA_VERSION-1) manually so the DB starts exactly
-    # one migration behind the current head. This still exercises the
-    # real v8 transition (the v8 DDL runs) plus any later additive
-    # PRs that shipped before this test runs (e.g. v9).
-    pre_version = SCHEMA_VERSION - 1
-    for version in range(1, pre_version + 1):  # v1..pre_version
+    # Apply v1..v7 manually so the DB starts at exactly v7 with seed
+    # rows. This test is the literal v7 -> v8 -> v9 path: the
+    # pre-state is the real PR-1 production endpoint, the v8 DDL is
+    # the unit under test (PR 2's contract), and the v9 DDL is
+    # exercised on the same disposable DB to prove the bridge is
+    # additive on top of a real PR 2 result.
+    for version in range(1, 8):  # v1..v7
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)
         conn.execute(
@@ -406,17 +407,15 @@ def test_v7_to_v8_migration_preserves_data(tmp_path: Path) -> None:
     )
     conn.commit()
 
-    # Sanity: pre-migration version is exactly one behind the current
-    # head. PR-2 of the recovery sequence expects 7; later PRs may
-    # shift this baseline.
+    # Sanity: pre-migration version is exactly 7 (PR-1 endpoint).
     pre = conn.execute(
         "SELECT value FROM _meta WHERE key='schema_version'"
     ).fetchone()["value"]
-    assert pre == str(pre_version)
+    assert pre == "7"
 
-    # Now open via the Database class so the migration runner advances
-    # the rest of the way. The runner will apply the v8 DDL (the unit
-    # under test) plus any later additive PRs (v9 in this branch).
+    # Close the raw connection and re-open via the Database class so
+    # the migration runner applies v8 (the PR 2 unit under test) and
+    # then v9 (the additive bridge) in order.
     conn.close()  # open fresh via Database so the runner runs.
     db = Database(db_path=db_path).connect()
     try:
