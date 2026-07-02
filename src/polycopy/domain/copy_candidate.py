@@ -66,7 +66,16 @@ class CandidateStatus(str, enum.Enum):
         trade fields. Awaiting fresh price/spread evaluation in PR-3.
 
     ``REJECTED_WALLET``
-        Wallet verdict ∈ {WATCHLIST, SKIP, INCOMPLETE}. Not a candidate.
+        Wallet verdict ∈ {WATCHLIST, SKIP, INCOMPLETE} (or any
+        unknown / non-enum verdict string). Not a candidate.
+
+    ``REJECTED_WALLET_TRADE_MISMATCH``
+        The evaluated trade's ``trader_address`` does not canonically
+        match the supplied wallet's ``address`` (after both are passed
+        through ``polycopy.db.wallet_identity.canonical_wallet_address``),
+        or the trade has no ``trader_address`` at all. This is a
+        hard rejection — a trade from Wallet A can never become a
+        candidate for Wallet B.
 
     ``REJECTED_UNRESOLVED_OUTCOME``
         Resolver returned ``INCOMPLETE`` — the source trade cannot be
@@ -97,6 +106,7 @@ class CandidateStatus(str, enum.Enum):
 
     PENDING_PRICE_CHECK = "PENDING_PRICE_CHECK"
     REJECTED_WALLET = "REJECTED_WALLET"
+    REJECTED_WALLET_TRADE_MISMATCH = "REJECTED_WALLET_TRADE_MISMATCH"
     REJECTED_UNRESOLVED_OUTCOME = "REJECTED_UNRESOLVED_OUTCOME"
     REJECTED_AMBIGUOUS_OUTCOME = "REJECTED_AMBIGUOUS_OUTCOME"
     REJECTED_MARKET_CLOSED = "REJECTED_MARKET_CLOSED"
@@ -114,8 +124,8 @@ class CandidateStatus(str, enum.Enum):
 CANDIDATE_DECISION_TYPES: frozenset[str] = frozenset(
     {
         "COPY_CANDIDATE_CREATED",
-        "COPY_CANDIDATE_DUPLICATE_SKIPPED",
         "COPY_CANDIDATE_REJECTED_WALLET",
+        "COPY_CANDIDATE_REJECTED_WALLET_TRADE_MISMATCH",
         "COPY_CANDIDATE_REJECTED_UNRESOLVED_OUTCOME",
         "COPY_CANDIDATE_REJECTED_AMBIGUOUS_OUTCOME",
         "COPY_CANDIDATE_REJECTED_MARKET_CLOSED",
@@ -123,6 +133,11 @@ CANDIDATE_DECISION_TYPES: frozenset[str] = frozenset(
         "COPY_CANDIDATE_REJECTED_INVALID_TRADE",
     }
 )
+# COPY_CANDIDATE_DUPLICATE_SKIPPED is intentionally NOT in the persisted
+# vocabulary: a duplicate rerun does NOT append a decision_log row (that
+# would flood the table on every scheduled scan). See
+# ``copy_candidate_persistence.record_candidate_decision_log`` for the
+# bounded behavior.
 
 
 # ── Domain object ─────────────────────────────────────────────────────────────

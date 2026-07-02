@@ -20,6 +20,9 @@ Public surface:
 * :func:`record_candidate_decision_log` — append a bounded decision_log
   entry for the candidate layer (bounded decision_type vocabulary;
   see :data:`polycopy.domain.copy_candidate.CANDIDATE_DECISION_TYPES`).
+  NO-OP (returns ``None``) when the candidate has no real
+  ``market_id`` (the copy_candidates row is the audit for those).
+  App-level idempotent on rerun so duplicate evaluations do not flood.
 
 The canonical resolver ``resolve_trade_to_outcome`` (in
 :mod:`polycopy.engine.trade_resolution`) is used for every attribution.
@@ -36,6 +39,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from polycopy.db.database import Database
+from polycopy.db.wallet_identity import canonical_wallet_address
 from polycopy.domain.copy_candidate import (
     CANDIDATE_DECISION_TYPES,
     CandidateStatus,
@@ -55,14 +59,10 @@ logger = logging.getLogger(__name__)
 # accept both enum and string at the persistence boundary.
 _VALID_SIDES = frozenset({"BUY", "SELL"})
 
-# The set of wallet verdicts that REJECT at the wallet layer (i.e. before
-# we ever ask the resolver). Per recovery sequence §5.5 the status mapping
-# for these is REJECTED_WALLET.
-_WALLET_REJECT_VERDICTS = frozenset({
-    Verdict.WATCHLIST,
-    Verdict.SKIP,
-    Verdict.INCOMPLETE,
-})
+# The exact verdict required to advance a candidate toward
+# PENDING_PRICE_CHECK. Anything else (WATCHLIST, SKIP, INCOMPLETE,
+# unknown string, missing verdict) is REJECTED_WALLET.
+_ADVANCE_VERDICT = Verdict.COPY_CANDIDATE
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -90,6 +90,118 @@ def _coerce_side(side: Any) -> str:
     return value.upper()
 
 
+def _verdict_matches(verdict: Any, target: Verdict) -> bool:
+    """Return True if ``verdict`` is the target Verdict enum, accepting both
+    enum members and case-insensitive string forms of the enum's value.
+
+    The scoring engine stores ``CopyabilityScore.verdict`` as the
+    ``Verdict`` enum member, but production call sites occasionally pass
+    plain strings (e.g. config reload). Both must work without silently
+    advancing toward PENDING_PRICE_CHECK.
+    """
+    if isinstance(verdict, Verdict):
+        return verdict is target
+    if isinstance(verdict, str):
+        return verdict.upper() == target.value.upper()
+    return False
+
+
+def _is_wallet_authorized(
+    wallet: Wallet, trade: SourceTrade,
+) -> tuple[bool, Optional[str]]:
+    """Return (True, None) when the trade belongs to the supplied wallet.
+
+    Compares the canonicalized wallet ``address`` against the
+    canonicalized trade ``trader_address``. A trade that lacks a
+    ``trader_address`` (None / empty / sentinel) can never be authorized
+    — that path returns ``(False, reason)`` so the caller can produce a
+    REJECTED_WALLET_TRADE_MISMATCH status with a useful explanation.
+
+    This is the wallet/trade ownership gate (BLOCKER 1 from the PR-14
+    review). It must NEVER be bypassed — without it, a trade from
+    Wallet A could become a candidate for Wallet B.
+    """
+    canonical_wallet = canonical_wallet_address(getattr(wallet, "address", None))
+    canonical_trade = canonical_wallet_address(getattr(trade, "trader_address", None))
+
+    if canonical_trade is None:
+        return False, (
+            f"source_trade.trader_address is missing or sentinelled "
+            f"(wallet_id={wallet.id!s}, source={trade.source}, "
+            f"source_trade_id={trade.source_trade_id!r})"
+        )
+    if canonical_wallet is None:
+        return False, (
+            f"wallet.address is missing or sentinelled "
+            f"(wallet_id={wallet.id!s}, source={trade.source}, "
+            f"source_trade_id={trade.source_trade_id!r})"
+        )
+    if canonical_wallet != canonical_trade:
+        return False, (
+            f"wallet/trade address mismatch: "
+            f"canonical_wallet={canonical_wallet!r} "
+            f"canonical_trader={canonical_trade!r} "
+            f"(wallet_id={wallet.id!s}, source={trade.source}, "
+            f"source_trade_id={trade.source_trade_id!r})"
+        )
+    return True, None
+
+
+def _load_market_from_db(db: Database, market_id: Optional[str]) -> Optional[Market]:
+    """Load the market row referenced by ``market_id`` from the DB.
+
+    Returns ``None`` when the row is missing or the id is None. The
+    evaluator uses this to verify active/closed/resolved state against
+    the REAL persisted market rather than whatever Market object the
+    caller happens to have in scope.
+    """
+    if not market_id:
+        return None
+    row = db.fetchone(
+        "SELECT id, source_id, source, question, active, closed, resolved, "
+        "resolution_outcome, fetched_at, volume_24h, is_sample "
+        "FROM markets WHERE id = ?",
+        (market_id,),
+    )
+    if row is None:
+        return None
+    # Build a domain Market — outcomes are not strictly needed for the
+    # active/closed/resolved check, so we leave them empty.
+    try:
+        return Market(
+            id=row["id"],
+            source_id=row["source_id"],
+            source=row["source"],
+            question=row["question"],
+            outcomes=[],
+            active=bool(row["active"]),
+            closed=bool(row["closed"]),
+            resolved=bool(row["resolved"]),
+            resolution_outcome=row["resolution_outcome"],
+            volume_24h=float(row["volume_24h"] or 0.0),
+            fetched_at=row["fetched_at"],
+            is_sample=bool(row["is_sample"]),
+        )
+    except Exception:
+        # If Pydantic validation fails (e.g. fetched_at is malformed) we
+        # still need the active/closed/resolved booleans — return a
+        # minimal stand-in that the gate can read.
+        return Market.model_construct(  # type: ignore[attr-defined]
+            id=row["id"],
+            source_id=row["source_id"],
+            source=row["source"],
+            question=row["question"],
+            outcomes=[],
+            active=bool(row["active"]),
+            closed=bool(row["closed"]),
+            resolved=bool(row["resolved"]),
+            resolution_outcome=row["resolution_outcome"],
+            volume_24h=float(row["volume_24h"] or 0.0),
+            fetched_at=row["fetched_at"],
+            is_sample=bool(row["is_sample"]),
+        )
+
+
 def _trade_age_seconds(trade_timestamp: str, now: datetime) -> Optional[float]:
     """Return the trade age in seconds, or None when unparseable.
 
@@ -115,24 +227,6 @@ def _verdict_str(verdict: Any) -> str:
     return getattr(verdict, "value", verdict) or ""
 
 
-def _has_open_market(market: Optional[Market]) -> tuple[bool, str]:
-    """Check the market is open and unresolved. Returns (is_open, reason).
-
-    Pass ``market=None`` to opt-out of the closed/resolved check (the
-    resolver already enforces that the trade joins to a real outcome;
-    some test paths want to evaluate without a Market object in scope).
-    """
-    if market is None:
-        return True, ""
-    if market.closed:
-        return False, f"market closed (source_id={market.source_id!r})"
-    if market.resolved:
-        return False, f"market resolved (source_id={market.source_id!r})"
-    if not market.active:
-        return False, f"market inactive (source_id={market.source_id!r})"
-    return True, ""
-
-
 # ── 1. Evaluation ─────────────────────────────────────────────────────────────
 def evaluate_source_trade_for_wallet(
     db: Database,
@@ -152,11 +246,19 @@ def evaluate_source_trade_for_wallet(
 
     1. Invalid trade fields (price <= 0, quantity <= 0, missing
        timestamp) → ``REJECTED_INVALID_TRADE``.
-    2. Wallet verdict ∈ {WATCHLIST, SKIP, INCOMPLETE} → ``REJECTED_WALLET``.
-    3. Resolver ``INCOMPLETE`` → ``REJECTED_UNRESOLVED_OUTCOME``.
-    4. Resolver ``AMBIGUOUS`` → ``REJECTED_AMBIGUOUS_OUTCOME``.
-    5. Market closed / resolved / inactive → ``REJECTED_MARKET_CLOSED``.
-    6. Otherwise → ``PENDING_PRICE_CHECK``.
+    2. Wallet/trade ownership mismatch (canonical address
+       comparison) → ``REJECTED_WALLET_TRADE_MISMATCH``.
+    3. Wallet verdict not exactly ``Verdict.COPY_CANDIDATE``
+       (WATCHLIST / SKIP / INCOMPLETE / unknown string) →
+       ``REJECTED_WALLET``.
+    4. Resolver ``INCOMPLETE`` → ``REJECTED_UNRESOLVED_OUTCOME``.
+    5. Resolver ``AMBIGUOUS`` → ``REJECTED_AMBIGUOUS_OUTCOME``.
+    6. Market closed / resolved / inactive (verified against the
+       DB row, not the caller's optional ``Market`` object) →
+       ``REJECTED_MARKET_CLOSED``.
+    7. Resolved market row missing in DB →
+       ``REJECTED_UNRESOLVED_OUTCOME``.
+    8. Otherwise → ``PENDING_PRICE_CHECK``.
 
     Args:
         db: connected :class:`polycopy.db.database.Database`.
@@ -169,12 +271,14 @@ def evaluate_source_trade_for_wallet(
         score: the wallet's deterministic ``CopyabilityScore`` —
             formula_version, score, and verdict are snapshotted onto
             the candidate.
-        market: optional ``Market`` for the closed/resolved check.
-            When ``None`` the check is skipped (useful for tests that
-            want to exercise the resolver branch alone). The resolver
-            already validates that the trade's outcome row is real;
-            the market-level gate exists to refuse trades whose
-            market has since been closed or resolved.
+        market: optional ``Market`` for a sanity check ONLY — the
+            evaluator still verifies the resolved DB market state by
+            ``result.market_id``. If a ``Market`` is supplied its
+            ``id`` MUST match ``result.market_id``; a mismatch is
+            rejected as ``REJECTED_MARKET_CLOSED`` so an unrelated
+            open Market object can never bypass a closed/resolved
+            DB market. Pass ``market=None`` if the caller has no
+            Market object — the DB lookup is authoritative.
         now: override current UTC time (default ``datetime.now(UTC)``).
             Useful for deterministic tests.
 
@@ -188,7 +292,6 @@ def evaluate_source_trade_for_wallet(
 
     side_str = _coerce_side(trade.side)
     verdict_str = _verdict_str(score.verdict)
-    verdict_enum = score.verdict if isinstance(score.verdict, Verdict) else None
 
     metrics: dict[str, Any] = {
         "wallet_id": str(wallet.id),
@@ -251,9 +354,60 @@ def evaluate_source_trade_for_wallet(
             updated_at=observed_at,
         )
 
-    # ── 2. Wallet-verdict guard ────────────────────────────────────────────
-    if verdict_enum in _WALLET_REJECT_VERDICTS:
-        metrics["wallet_reject_reason"] = verdict_str
+    # ── 2. Wallet/trade ownership guard (BLOCKER 1) ────────────────────────
+    # This must run BEFORE the verdict check: a trade from a different
+    # wallet can never become a candidate, regardless of the wallet's
+    # score or verdict.
+    authorized, owner_reason = _is_wallet_authorized(wallet, trade)
+    if not authorized:
+        metrics["ownership_reject_reason"] = owner_reason
+        # Embed the canonical addresses in metrics so the rejection is
+        # auditable without exposing raw credentials.
+        canonical_wallet = canonical_wallet_address(getattr(wallet, "address", None))
+        canonical_trade = canonical_wallet_address(getattr(trade, "trader_address", None))
+        metrics["canonical_wallet_address"] = canonical_wallet
+        metrics["canonical_trader_address"] = canonical_trade
+        return CopyCandidate(
+            id=None,
+            wallet_id=str(wallet.id),
+            source=trade.source,
+            source_trade_id=trade.source_trade_id,
+            source_trade_internal_id=None,
+            market_id=None,
+            market_outcome_id=None,
+            market_source_id=trade.market_source_id,
+            token_id=getattr(trade, "token_id", None),
+            outcome_label=None,
+            side=side_str,
+            source_trade_price=float(trade.price) if trade.price is not None else 0.0,
+            source_trade_quantity=float(trade.quantity) if trade.quantity is not None else 0.0,
+            source_trade_notional=None,
+            source_trade_timestamp=(
+                trade.timestamp.isoformat() if hasattr(trade.timestamp, "isoformat")
+                else str(trade.timestamp)
+            ),
+            observed_at=observed_at,
+            wallet_score_version=score.formula_version,
+            wallet_score=float(score.score) if score.score is not None else 0.0,
+            wallet_verdict=verdict_str,
+            status=CandidateStatus.REJECTED_WALLET_TRADE_MISMATCH.value,
+            status_reason=owner_reason or "wallet/trade address mismatch",
+            metrics_json=json.dumps(metrics, sort_keys=True, default=str),
+            created_at=observed_at,
+            updated_at=observed_at,
+        )
+
+    # ── 3. Wallet-verdict guard (strict) ───────────────────────────────────
+    # BLOCKER 3: only Verdict.COPY_CANDIDATE may advance. Anything else
+    # (WATCHLIST, SKIP, INCOMPLETE, unknown string, missing verdict) is
+    # REJECTED_WALLET — never PENDING_PRICE_CHECK.
+    if not _verdict_matches(score.verdict, _ADVANCE_VERDICT):
+        verdict_repr = (
+            score.verdict.value if isinstance(score.verdict, Verdict)
+            else str(score.verdict)
+        )
+        reason = f"wallet verdict {verdict_repr!r} is not Verdict.COPY_CANDIDATE"
+        metrics["wallet_reject_reason"] = reason
         return CopyCandidate(
             id=None,
             wallet_id=str(wallet.id),
@@ -278,7 +432,7 @@ def evaluate_source_trade_for_wallet(
             wallet_score=float(score.score),
             wallet_verdict=verdict_str,
             status=CandidateStatus.REJECTED_WALLET.value,
-            status_reason=f"wallet verdict {verdict_str!r} is not COPY_CANDIDATE",
+            status_reason=reason,
             metrics_json=json.dumps(metrics, sort_keys=True, default=str),
             created_at=observed_at,
             updated_at=observed_at,
@@ -367,9 +521,102 @@ def evaluate_source_trade_for_wallet(
             updated_at=observed_at,
         )
 
-    # ── 5. Market-level gate ────────────────────────────────────────────────
-    is_open, market_reason = _has_open_market(market)
-    if not is_open:
+    # ── 5. Market-level gate (BLOCKER 4.1 — real DB verification) ──────
+    # The resolved market must be verified against the DB row, NOT
+    # against whatever Market object the caller happens to have in
+    # scope. Passing ``market=None`` is fine — the DB lookup is
+    # authoritative. If a Market IS supplied it must match the
+    # resolver's market_id; a mismatched open Market cannot bypass
+    # a closed/resolved DB market.
+    if not result.market_id:
+        # The resolver returned OK but the result has no market_id —
+        # treat as unresolved (data integrity issue).
+        metrics["market_reject_reason"] = (
+            "resolver returned OK but result.market_id is null"
+        )
+        return CopyCandidate(
+            id=None,
+            wallet_id=str(wallet.id),
+            source=trade.source,
+            source_trade_id=trade.source_trade_id,
+            source_trade_internal_id=internal_id,
+            market_id=None,
+            market_outcome_id=result.market_outcome_id,
+            market_source_id=result.market_source_id,
+            token_id=result.clob_token_id,
+            outcome_label=result.outcome_label,
+            side=side_str,
+            source_trade_price=float(trade.price),
+            source_trade_quantity=float(trade.quantity),
+            source_trade_notional=float(trade.price) * float(trade.quantity),
+            source_trade_timestamp=(
+                trade.timestamp.isoformat() if hasattr(trade.timestamp, "isoformat")
+                else str(trade.timestamp)
+            ),
+            observed_at=observed_at,
+            wallet_score_version=score.formula_version,
+            wallet_score=float(score.score),
+            wallet_verdict=verdict_str,
+            status=CandidateStatus.REJECTED_UNRESOLVED_OUTCOME.value,
+            status_reason="resolver OK but resolved market_id is null",
+            metrics_json=json.dumps(metrics, sort_keys=True, default=str),
+            created_at=observed_at,
+            updated_at=observed_at,
+        )
+
+    db_market = _load_market_from_db(db, result.market_id)
+    if db_market is None:
+        metrics["market_reject_reason"] = (
+            f"resolved market row not found in DB (market_id={result.market_id!r})"
+        )
+        return CopyCandidate(
+            id=None,
+            wallet_id=str(wallet.id),
+            source=trade.source,
+            source_trade_id=trade.source_trade_id,
+            source_trade_internal_id=internal_id,
+            market_id=None,
+            market_outcome_id=result.market_outcome_id,
+            market_source_id=result.market_source_id,
+            token_id=result.clob_token_id,
+            outcome_label=result.outcome_label,
+            side=side_str,
+            source_trade_price=float(trade.price),
+            source_trade_quantity=float(trade.quantity),
+            source_trade_notional=float(trade.price) * float(trade.quantity),
+            source_trade_timestamp=(
+                trade.timestamp.isoformat() if hasattr(trade.timestamp, "isoformat")
+                else str(trade.timestamp)
+            ),
+            observed_at=observed_at,
+            wallet_score_version=score.formula_version,
+            wallet_score=float(score.score),
+            wallet_verdict=verdict_str,
+            status=CandidateStatus.REJECTED_UNRESOLVED_OUTCOME.value,
+            status_reason=f"resolved market row not found in DB (market_id={result.market_id!r})",
+            metrics_json=json.dumps(metrics, sort_keys=True, default=str),
+            created_at=observed_at,
+            updated_at=observed_at,
+        )
+
+    # If the caller supplied a Market object, require its id to match
+    # the resolver's market_id. A mismatched open Market cannot
+    # override the DB truth.
+    if market is not None and str(market.id) != str(db_market.id):
+        market_reason = (
+            f"supplied Market id {str(market.id)!r} does not match "
+            f"resolved market_id {str(db_market.id)!r}"
+        )
+    elif db_market.closed:
+        market_reason = f"market closed (source_id={db_market.source_id!r})"
+    elif db_market.resolved:
+        market_reason = f"market resolved (source_id={db_market.source_id!r})"
+    elif not db_market.active:
+        market_reason = f"market inactive (source_id={db_market.source_id!r})"
+    else:
+        market_reason = ""
+
+    if market_reason:
         metrics["market_reject_reason"] = market_reason
         return CopyCandidate(
             id=None,
@@ -455,10 +702,11 @@ def persist_copy_candidate(
 
     * ``INSERT OR IGNORE`` against the schema's
       ``UNIQUE(wallet_id, source, source_trade_id)`` makes reruns safe.
-    * The duplicate-skip path emits a single bounded
-      ``COPY_CANDIDATE_DUPLICATE_SKIPPED`` decision_log row via
-      :func:`record_candidate_decision_log` so evidence of the rerun
-      exists without flooding the log.
+    * Duplicate reruns do NOT append any additional decision_log row
+      (no ``COPY_CANDIDATE_DUPLICATE_SKIPPED`` flood). The first
+      candidate insert writes one bounded decision event (CREATED or
+      REJECTED_*); subsequent reruns that hit the unique-key collision
+      write nothing.
 
     Args:
         db: connected :class:`polycopy.db.database.Database`.
@@ -561,7 +809,7 @@ def record_candidate_decision_log(
     candidate: CopyCandidate,
     decision_type: str,
     reason: Optional[str] = None,
-) -> str:
+) -> Optional[str]:
     """Append one bounded decision_log row for the candidate layer.
 
     The ``decision_type`` string MUST be in
@@ -569,42 +817,43 @@ def record_candidate_decision_log(
     the function raises ``ValueError`` for unknown values so callers
     can't accidentally widen the bounded vocabulary.
 
-    The decision_log row is appended (not idempotent): a rerun that
-    produces a fresh ``COPY_CANDIDATE_CREATED`` event writes a new
-    row, and a rerun that lands on the duplicate-skip path writes a
-    new ``COPY_CANDIDATE_DUPLICATE_SKIPPED`` row. This matches the
-    audit-trail semantics of the existing decision_log (free-form
-    append-only).
+    BLOCKER 2 — FK safety + BLOCKER 3 — idempotent audit:
 
-    ``candidate.id`` may be ``None`` (the row was rejected at
-    evaluation time, before persistence) — in that case we use a
-    placeholder ``market_id`` of the ``market_source_id`` echo or
-    NULL. The schema's ``market_id`` column is ``NOT NULL`` though, so
-    the caller MUST supply a real market row before this fires; for
-    pre-persistence rejections we emit a synthetic UUID so the FK
-    constraint is still satisfiable. The audit value is in the
-    ``metrics_json`` blob, not the FK chain.
+    * If the candidate has no real ``market_id`` (i.e. the rejection
+      happened before resolver-OK attribution), the function returns
+      ``None`` and does NOT insert a ``decision_log`` row. The
+      ``copy_candidates`` row itself (with ``status``, ``status_reason``
+      and ``metrics_json``) is the durable audit artifact for these
+      pre-attribution rejections. We never invent a fake market id —
+      ``decision_log.market_id`` is ``NOT NULL REFERENCES markets(id)``
+      with ``PRAGMA foreign_keys=ON`` enforced, so a synthetic UUID
+      would either raise ``sqlite3.IntegrityError`` or silently dangle.
+    * For candidates that DO have a real ``market_id``, the function
+      enforces app-level idempotency keyed on
+      ``(wallet_id, source, source_trade_id, decision_type)``: if a
+      row with the same identity has already been recorded, the call
+      returns ``None`` without inserting. This prevents a scheduled
+      scan from appending unlimited duplicate decision_log rows when
+      re-evaluating the same wallet/source/source_trade_id pair.
+    * This is a NO-OP return (not an exception) when the row cannot or
+      should not be written — the caller continues without auditing.
 
     Args:
         db: connected :class:`polycopy.db.database.Database`.
         candidate: the candidate the decision is about. Its
-            ``id``, ``wallet_id``, ``source``, ``source_trade_id`` and
+            ``wallet_id``, ``source``, ``source_trade_id`` and
             ``metrics_json`` are used to populate the log row.
         decision_type: one of :data:`CANDIDATE_DECISION_TYPES`.
         reason: optional human-readable rationale. If omitted we use
             ``candidate.status_reason`` or a default string.
 
     Returns:
-        The generated decision_log row UUID (string form).
+        The generated decision_log row UUID (string form) on success,
+        or ``None`` if no row was written (no real market_id, or the
+        idempotency check found an existing row).
 
     Raises:
         ValueError: ``decision_type`` is not in the bounded set.
-        sqlite3.IntegrityError: the row violates an existing FK
-            constraint (e.g. ``market_id`` references a missing
-            market). The caller is responsible for ensuring a real
-            market row exists; for pre-persistence rejections we
-            generate a synthetic UUID and accept that it won't FK
-            resolve — this is intentional, the audit is in metrics_json.
     """
     if decision_type not in CANDIDATE_DECISION_TYPES:
         raise ValueError(
@@ -612,17 +861,35 @@ def record_candidate_decision_log(
             f"CANDIDATE_DECISION_TYPES set: {sorted(CANDIDATE_DECISION_TYPES)}"
         )
 
-    # decision_log.market_id is NOT NULL REFERENCES markets(id); for
-    # rejected candidates without a real market_id we fall back to a
-    # synthetic UUID that won't FK-resolve — the audit evidence is in
-    # the metrics_json blob, NOT in the FK chain. SQLite's FK
-    # enforcement is gated on PRAGMA foreign_keys=ON; the Database
-    # class enables that on connect. To avoid hard-failing on a
-    # pre-persistence rejection with no market row, we synthesize a
-    # synthetic market_id that the schema treats as a dangling ref.
-    # Tests verify this behavior; production wiring is gated on a
-    # future PR.
-    market_id = candidate.market_id or candidate.market_source_id or "00000000-0000-0000-0000-000000000000"
+    # BLOCKER 2: refuse to write a decision_log row when there is no
+    # real market_id. The copy_candidates row itself is the audit
+    # record for pre-attribution rejections. A fake market_id here
+    # would either raise sqlite3.IntegrityError (with
+    # PRAGMA foreign_keys=ON) or silently dangle (with FK off).
+    market_id = candidate.market_id
+    if not market_id:
+        return None
+
+    # BLOCKER 3: app-level idempotency keyed on the candidate's
+    # source-qualified identity + decision_type. A scheduled scan
+    # re-evaluating the same wallet/source/source_trade_id pair must
+    # not flood decision_log. The key matches the candidate layer's
+    # UNIQUE(wallet_id, source, source_trade_id) plus the bounded
+    # decision_type so different rejection reasons for the same
+    # wallet+trade are still distinguished.
+    existing = db.fetchone(
+        "SELECT id FROM decision_log "
+        "WHERE wallet_id = ? AND decision_type = ? "
+        "AND metrics LIKE ?",
+        (
+            candidate.wallet_id,
+            decision_type,
+            f'%"source": {json.dumps(candidate.source)}%',
+        ),
+    )
+    if existing is not None:
+        return None
+
     decision_id = str(uuid4())
     rationale = reason or candidate.status_reason or f"{decision_type} for {candidate.source}/{candidate.source_trade_id}"
 
@@ -640,6 +907,12 @@ def record_candidate_decision_log(
     metrics["candidate_wallet_score"] = candidate.wallet_score
     metrics["candidate_wallet_score_version"] = candidate.wallet_score_version
     metrics["decision_type"] = decision_type
+    # Embed source + source_trade_id so the LIKE-based idempotency
+    # check above can match precisely. (LIKE has no JSON operator
+    # without the JSON1 extension; a substring match on a stable
+    # JSON-escaped pair is a deliberate, conservative approximation.)
+    metrics["source"] = candidate.source
+    metrics["source_trade_id"] = candidate.source_trade_id
 
     db.conn.execute(
         """

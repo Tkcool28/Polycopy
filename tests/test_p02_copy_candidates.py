@@ -642,55 +642,633 @@ def test_same_trade_id_different_source_two_rows(tmp_path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Same source_trade observed for different wallets.
 # ─────────────────────────────────────────────────────────────────────────────
-def test_same_trade_different_wallets_two_rows(tmp_path: Path) -> None:
-    """Scenario 7: two distinct wallets (canonical addresses) observing
-    the same upstream source_trade_id each get their own candidate row,
-    referencing the same source_trade_internal_id (since the source
-    row itself is unique on (source, source_trade_id))."""
-    db = Database(db_path=tmp_path / "p02-s7.db").connect()
-    try:
-        w1 = _seed_wallet(db, address="0xWALLET_A")
-        w2 = _seed_wallet(db, address="0xWALLET_B")
-        _seed_market_with_outcome(db, source_id="cond-1", label="Yes", token="tok-1")
+def test_trade_owner_match_can_be_pending(tmp_path: Path) -> None:
+    """BLOCKER 1 / Step 7 test 1.
 
-        # Single source_trade row (shared).
+    Wallet A + Wallet A's trade, COPY_CANDIDATE verdict, market
+    open → PENDING_PRICE_CHECK. The ownership check passes when
+    canonical addresses match.
+    """
+    db = Database(db_path=tmp_path / "owner-match.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        market_id, _ = _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        assert cand.status == CandidateStatus.PENDING_PRICE_CHECK.value
+        assert cand.market_id == market_id
+    finally:
+        db.close()
+
+
+def test_trade_owner_mismatch_is_rejected(tmp_path: Path) -> None:
+    """BLOCKER 1 / Step 7 test 2.
+
+    Wallet B evaluating Wallet A's trade → REJECTED_WALLET_TRADE_MISMATCH.
+    Never PENDING_PRICE_CHECK.
+    """
+    db = Database(db_path=tmp_path / "owner-mismatch.db").connect()
+    try:
+        _seed_wallet(db, address="0xWALLET_A")
+        wallet_b_id = _seed_wallet(db, address="0xWALLET_B")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
+        # Trade belongs to Wallet A by trader_address.
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_b_id)
+        wallet_b = _make_wallet(address="0xWALLET_B", wallet_id=wallet_b_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet_b, trade=trade, score=score,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_WALLET_TRADE_MISMATCH.value
+        assert cand.is_pending_price_check is False
+        # The mismatch reason should reference the canonical addresses.
+        assert "0xwallet_a" in (cand.status_reason or "")
+        assert "0xwallet_b" in (cand.status_reason or "")
+        # Mismatch rejection must NOT carry a market_id (no resolver OK).
+        assert cand.market_id is None
+    finally:
+        db.close()
+
+
+def test_same_trade_cannot_create_pending_for_two_unrelated_wallets(
+    tmp_path: Path,
+) -> None:
+    """BLOCKER 1 / Step 7 test 3.
+
+    Same source_trade, two unrelated wallets: only the wallet whose
+    canonical address matches trader_address can produce a PENDING
+    (or any non-mismatch status). The other gets
+    REJECTED_WALLET_TRADE_MISMATCH.
+    """
+    db = Database(db_path=tmp_path / "same-trade-two-wallets.db").connect()
+    try:
+        wallet_a_id = _seed_wallet(db, address="0xWALLET_A")
+        wallet_b_id = _seed_wallet(db, address="0xWALLET_B")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
         trade = _seed_source_trade(
             db,
             source="polymarket_data_api",
             source_trade_id="tx-shared",
-            trader_address="0xWALLET_A",  # first observation
+            trader_address="0xWALLET_A",
             token_id="tok-1",
             market_source_id="cond-1",
         )
-
-        score_a = _make_copy_candidate_score(wallet_id=w1)
-        score_b = _make_copy_candidate_score(wallet_id=w2)
-        wallet_a = _make_wallet(address="0xWALLET_A", wallet_id=w1)
-        wallet_b = _make_wallet(address="0xWALLET_B", wallet_id=w2)
+        score_a = _make_copy_candidate_score(wallet_id=wallet_a_id)
+        score_b = _make_copy_candidate_score(wallet_id=wallet_b_id)
+        wallet_a = _make_wallet(address="0xWALLET_A", wallet_id=wallet_a_id)
+        wallet_b = _make_wallet(address="0xWALLET_B", wallet_id=wallet_b_id)
 
         cand_a = evaluate_source_trade_for_wallet(
             db, wallet=wallet_a, trade=trade, score=score_a,
         )
-        # Wallet B observed the same source_trade via a different trader_address
-        # — in this minimal test we use the same SourceTrade domain object but
-        # evaluate as wallet B (a second observation). The resolver does NOT
-        # gate on trader_address; it returns OK on token/label match.
         cand_b = evaluate_source_trade_for_wallet(
             db, wallet=wallet_b, trade=trade, score=score_b,
         )
 
-        persist_copy_candidate(db, cand_a)
-        persist_copy_candidate(db, cand_b)
+        assert cand_a.status == CandidateStatus.PENDING_PRICE_CHECK.value
+        assert cand_b.status == CandidateStatus.REJECTED_WALLET_TRADE_MISMATCH.value
 
-        rows = db.fetchall(
-            "SELECT wallet_id, source_trade_internal_id FROM copy_candidates "
-            "ORDER BY wallet_id"
+        # Persist the matching one only; the mismatch is rejected at
+        # evaluation time so we never insert it.
+        persist_copy_candidate(db, cand_a)
+        rows = db.fetchall("SELECT wallet_id, status FROM copy_candidates")
+        assert len(rows) == 1
+        assert rows[0]["wallet_id"] == wallet_a_id
+    finally:
+        db.close()
+
+
+def test_canonical_wallet_alias_matches(tmp_path: Path) -> None:
+    """BLOCKER 1 / Step 7 test 4.
+
+    The repository's canonical helper
+    (``polycopy.db.wallet_identity.canonical_wallet_address``)
+    normalizes: lowercase + strip whitespace + reject sentinels.
+    Two wallets whose addresses normalize to the same canonical
+    value must be treated as the same wallet for ownership
+    purposes.
+    """
+    db = Database(db_path=tmp_path / "canonical-alias.db").connect()
+    try:
+        wallet_id = _seed_wallet(
+            db, address="0xABC123",  # uppercase variant
         )
-        assert len(rows) == 2
-        # Both rows reference the same internal source_trades.id (single row).
-        internal_ids = {r["source_trade_internal_id"] for r in rows}
-        assert len(internal_ids) == 1
-        assert rows[0]["wallet_id"] != rows[1]["wallet_id"]
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
+        # Lower-case padded variant in trader_address — canonical
+        # form is the same string.
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="  0xabc123\n",  # whitespace + lowercase
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xABC123", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        # The canonical helper lower-cases both sides → match → not a
+        # mismatch rejection.
+        assert cand.status != CandidateStatus.REJECTED_WALLET_TRADE_MISMATCH.value
+        # And since the resolver succeeds and the market is open, the
+        # candidate should reach PENDING_PRICE_CHECK.
+        assert cand.status == CandidateStatus.PENDING_PRICE_CHECK.value
+    finally:
+        db.close()
+
+
+def test_missing_trade_owner_is_rejected(tmp_path: Path) -> None:
+    """BLOCKER 1 / Step 7 test 5.
+
+    A trade whose trader_address is missing (None / empty /
+    sentinel) must be explicitly rejected — never silently
+    become PENDING_PRICE_CHECK.
+    """
+    db = Database(db_path=tmp_path / "missing-owner.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
+        # Seed with a non-sentinel trader_address so the DB accepts
+        # the row, then override the domain object's trader_address
+        # to None to exercise the missing-owner path.
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        trade = trade.model_construct(  # type: ignore[attr-defined]
+            **{**trade.__dict__, "trader_address": None},
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_WALLET_TRADE_MISMATCH.value
+        assert cand.is_pending_price_check is False
+        assert "missing or sentinelled" in (cand.status_reason or "")
+    finally:
+        db.close()
+
+
+def test_unknown_verdict_never_advances(tmp_path: Path) -> None:
+    """BLOCKER 3 / Step 7 test for unknown verdicts.
+
+    An unknown verdict string (e.g. ``'HOT_PICK'``) must NEVER
+    become PENDING_PRICE_CHECK. Status must be REJECTED_WALLET.
+    """
+    db = Database(db_path=tmp_path / "unknown-verdict.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        score.verdict = "HOT_PICK"  # type: ignore[assignment]
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_WALLET.value
+        assert cand.is_pending_price_check is False
+        assert "HOT_PICK" in (cand.status_reason or "")
+    finally:
+        db.close()
+
+
+def test_market_none_does_not_bypass_closed_market(tmp_path: Path) -> None:
+    """BLOCKER 4.1 / Step 7 test for market=None.
+
+    When the caller passes ``market=None`` the evaluator must
+    STILL verify the resolved DB market state — it cannot treat
+    ``None`` as 'open market'. A closed DB market → REJECTED_MARKET_CLOSED.
+    """
+    db = Database(db_path=tmp_path / "market-none-closed.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        # Closed market.
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1", closed=True,
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        # Pass market=None explicitly. The DB market is closed →
+        # must still be REJECTED_MARKET_CLOSED.
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score, market=None,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_MARKET_CLOSED.value
+        assert cand.is_pending_price_check is False
+    finally:
+        db.close()
+
+
+def test_unrelated_market_object_cannot_override_resolved_market(
+    tmp_path: Path,
+) -> None:
+    """BLOCKER 4.1 / Step 7 test for mismatched Market objects.
+
+    Caller passes an open Market with a DIFFERENT id than the
+    resolver's market_id → rejected. An unrelated open Market
+    cannot override a closed/resolved DB market.
+    """
+    db = Database(db_path=tmp_path / "unrelated-market.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        # Two markets: one open (the trap), one closed (the resolved truth).
+        _seed_market_with_outcome(
+            db, source_id="cond-open", label="Yes", token="tok-open",
+        )
+        closed_market_id, _ = _seed_market_with_outcome(
+            db, source_id="cond-closed", label="Yes", token="tok-1", closed=True,
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-closed",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        # Caller passes the OPEN Market object as a decoy. The
+        # resolver + DB lookup use market_source_id="cond-closed"
+        # which resolves to the CLOSED market. The decoy must not
+        # bypass the check.
+        decoy = _make_market(str(uuid4()))  # open, unrelated
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score, market=decoy,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_MARKET_CLOSED.value
+        assert cand.is_pending_price_check is False
+        assert cand.market_id == closed_market_id
+    finally:
+        db.close()
+
+
+def test_closed_market_blocks_pending_price_check(tmp_path: Path) -> None:
+    """BLOCKER 4.1 / Step 7 test for closed DB market."""
+    db = Database(db_path=tmp_path / "closed-market.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1", closed=True,
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_MARKET_CLOSED.value
+    finally:
+        db.close()
+
+
+def test_inactive_market_blocks_pending(tmp_path: Path) -> None:
+    """BLOCKER 4.1 / Step 7 test for active=0 DB market."""
+    db = Database(db_path=tmp_path / "inactive-market.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1", active=False,
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_MARKET_CLOSED.value
+    finally:
+        db.close()
+
+
+def test_resolved_market_blocks_pending(tmp_path: Path) -> None:
+    """BLOCKER 4.1 / Step 7 test for resolved=1 DB market."""
+    db = Database(db_path=tmp_path / "resolved-market.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1", resolved=True,
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        assert cand.status == CandidateStatus.REJECTED_MARKET_CLOSED.value
+    finally:
+        db.close()
+
+
+def test_missing_market_row_blocks_pending(tmp_path: Path) -> None:
+    """BLOCKER 4.1 / Step 7 test for missing DB market row.
+
+    The resolver may report a market_id that doesn't exist in the
+    markets table. The evaluator must reject this as
+    REJECTED_UNRESOLVED_OUTCOME, not PENDING_PRICE_CHECK.
+    """
+    db = Database(db_path=tmp_path / "missing-market-row.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        # Seed a market but use a DIFFERENT source_id on the trade so
+        # the resolver's token/label match returns no outcome row.
+        _seed_market_with_outcome(
+            db, source_id="cond-real", label="Yes", token="tok-1",
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-1",
+            trader_address="0xWALLET_A",
+            token_id="tok-nonexistent",  # different token
+            market_source_id="cond-fictional",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        cand = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score,
+        )
+
+        # Resolver returns INCOMPLETE → REJECTED_UNRESOLVED_OUTCOME.
+        assert cand.status == CandidateStatus.REJECTED_UNRESOLVED_OUTCOME.value
+        assert cand.is_pending_price_check is False
+    finally:
+        db.close()
+
+
+def test_rejected_without_market_does_not_write_fake_decision_fk(
+    tmp_path: Path,
+) -> None:
+    """BLOCKER 2 — FK safety per status with PRAGMA foreign_keys=ON.
+
+    For every rejection status, the helper must NOT insert a
+    fake market_id into decision_log. The copy_candidates row is
+    the durable audit artifact for these.
+    """
+    db = Database(db_path=tmp_path / "fk-safety.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        def _record(status_value: str, candidate: CopyCandidate) -> None:
+            decision_type = CopyCandidate.decision_type_for_status(
+                CandidateStatus(status_value), created=True,
+            )
+            result = record_candidate_decision_log(
+                db, candidate=candidate, decision_type=decision_type,
+            )
+            # No fake market_id was inserted; either a real row was
+            # written (when candidate has market_id) or None (no row).
+            assert result is None or isinstance(result, str)
+
+        # 1. REJECTED_WALLET (verdict=SKIP) — no market_id
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-wallet",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score_skip = _make_copy_candidate_score(
+            wallet_id=wallet_id, verdict_str="skip",
+        )
+        cand_skip = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade, score=score_skip,
+        )
+        assert cand_skip.status == CandidateStatus.REJECTED_WALLET.value
+        _record(cand_skip.status, cand_skip)
+
+        # 2. REJECTED_WALLET_TRADE_MISMATCH — no market_id
+        trade_mismatch = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-mismatch",
+            trader_address="0xWALLET_B",  # not this wallet
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        cand_mismatch = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade_mismatch, score=score,
+        )
+        assert cand_mismatch.status == CandidateStatus.REJECTED_WALLET_TRADE_MISMATCH.value
+        _record(cand_mismatch.status, cand_mismatch)
+
+        # 3. REJECTED_INVALID_TRADE — no market_id
+        trade_invalid = trade.model_construct(  # type: ignore[attr-defined]
+            **{**trade.__dict__, "price": 0.0},
+        )
+        cand_invalid = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade_invalid, score=score,
+        )
+        assert cand_invalid.status == CandidateStatus.REJECTED_INVALID_TRADE.value
+        _record(cand_invalid.status, cand_invalid)
+
+        # 4. REJECTED_UNRESOLVED_OUTCOME — no market_id
+        trade_unresolved = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-unresolved",
+            trader_address="0xWALLET_A",
+            token_id="tok-nonexistent",
+            market_source_id="cond-fictional",
+        )
+        cand_unresolved = evaluate_source_trade_for_wallet(
+            db, wallet=wallet, trade=trade_unresolved, score=score,
+        )
+        assert cand_unresolved.status == CandidateStatus.REJECTED_UNRESOLVED_OUTCOME.value
+        _record(cand_unresolved.status, cand_unresolved)
+
+        # 5. REJECTED_AMBIGUOUS_OUTCOME — covered by existing test
+        # test_resolver_ambiguous_rejected_ambiguous. We verify the
+        # helper accepts the decision_type without raising.
+        decision_type = "COPY_CANDIDATE_REJECTED_AMBIGUOUS_OUTCOME"
+        result = record_candidate_decision_log(
+            db, candidate=cand_unresolved, decision_type=decision_type,
+        )
+        assert result is None  # no real market_id → no row
+
+        # FK check clean.
+        fk_violations = db.conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert fk_violations == []
+
+        # Verify NO fake market_id was ever written: every row in
+        # decision_log (if any) must have a real market_id from the
+        # markets table.
+        bad_rows = db.conn.execute(
+            "SELECT id, market_id FROM decision_log "
+            "WHERE market_id IS NULL OR market_id = "
+            "'00000000-0000-0000-0000-000000000000'"
+        ).fetchall()
+        assert bad_rows == []
+    finally:
+        db.close()
+
+
+def test_ten_reruns_do_not_flood_decision_log(tmp_path: Path) -> None:
+    """BLOCKER 3 — duplicate logging is genuinely idempotent.
+
+    Run the same candidate evaluation + persistence 10 times.
+    The first run writes one CREATED decision; the remaining 9
+    reruns write ZERO additional decision_log rows.
+    """
+    db = Database(db_path=tmp_path / "ten-reruns.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        _seed_market_with_outcome(
+            db, source_id="cond-1", label="Yes", token="tok-1"
+        )
+        trade = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-rerun",
+            trader_address="0xWALLET_A",
+            token_id="tok-1",
+            market_source_id="cond-1",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        for _ in range(10):
+            cand = evaluate_source_trade_for_wallet(
+                db, wallet=wallet, trade=trade, score=score,
+            )
+            assert cand.status == CandidateStatus.PENDING_PRICE_CHECK.value
+            persist_copy_candidate(db, cand)
+            # Mirror the real scan flow: also write the bounded
+            # decision_log event on each evaluation.
+            record_candidate_decision_log(
+                db,
+                candidate=cand,
+                decision_type="COPY_CANDIDATE_CREATED",
+            )
+
+        n_candidates = db.conn.execute(
+            "SELECT COUNT(*) FROM copy_candidates"
+        ).fetchone()[0]
+        n_decisions = db.conn.execute(
+            "SELECT COUNT(*) FROM decision_log WHERE decision_type = "
+            "'COPY_CANDIDATE_CREATED'"
+        ).fetchone()[0]
+        assert n_candidates == 1, f"expected 1 candidate row, got {n_candidates}"
+        assert n_decisions == 1, (
+            f"expected exactly 1 created decision row after 10 reruns, got "
+            f"{n_decisions}"
+        )
+        # No copy_candidate_duplicate_skipped rows at all.
+        dup_rows = db.conn.execute(
+            "SELECT COUNT(*) FROM decision_log WHERE decision_type = "
+            "'COPY_CANDIDATE_DUPLICATE_SKIPPED'"
+        ).fetchone()[0]
+        assert dup_rows == 0
+
+        # signals/orders/positions remain zero.
+        for table in ("signals", "orders", "positions"):
+            n = db.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            assert n == 0, f"{table} unexpectedly has {n} rows"
+
+        # FK check clean.
+        fk_violations = db.conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert fk_violations == []
     finally:
         db.close()
 

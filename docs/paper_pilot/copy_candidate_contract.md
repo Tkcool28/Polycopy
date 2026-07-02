@@ -35,15 +35,25 @@ The schema enforces this with:
 UNIQUE(wallet_id, source, source_trade_id)
 ```
 
-Persistence uses `INSERT OR IGNORE`. Reruns are safe; the duplicate path
-emits exactly one `COPY_CANDIDATE_DUPLICATE_SKIPPED` decision-log row
-rather than flooding.
+Persistence uses `INSERT OR IGNORE`. Reruns are safe; the duplicate
+path is a complete NO-OP for the audit log — see §5.
 
-A single source-trade row in `source_trades` may belong to multiple wallets
-only when two wallets share the same `trader_address` (effectively the same
-wallet under a spelling variant); see PR 1's canonical-wallet contract.
-Across two distinct wallets, each wallet gets its own candidate row
-referencing the same `source_trade_internal_id`.
+**Wallet ownership is canonically verified.** Before resolver success
+can produce `PENDING_PRICE_CHECK`, the evaluator MUST confirm that
+the candidate trade's `trader_address` matches the wallet's
+`address` after both are passed through
+`polycopy.db.wallet_identity.canonical_wallet_address` (lowercase,
+strip whitespace, reject sentinel values). A trade from a different
+wallet can NEVER become a candidate for that wallet — the candidate
+status is `REJECTED_WALLET_TRADE_MISMATCH`.
+
+This means a single source-trade row in `source_trades` may produce
+candidate rows only for the wallets that canonically own the trade
+(by `trader_address`). Two wallets with the same canonical address
+(aliases) share the same `trader_address` and each can produce a
+candidate row referencing the same `source_trade_internal_id`; two
+distinct canonical addresses (truly different wallets) can never
+share a candidate row for the same trade.
 
 ---
 
@@ -55,10 +65,11 @@ exactly one status from this set:
 | Status | Meaning |
 |---|---|
 | `PENDING_PRICE_CHECK` | COPY_CANDIDATE verdict, resolver OK, market active, trade valid. Awaiting PR 3's fresh-price/slippage stage. |
-| `REJECTED_WALLET` | Wallet verdict ∈ {WATCHLIST, SKIP, INCOMPLETE}. Source trade is auditable but not actionable. |
+| `REJECTED_WALLET` | Wallet verdict ∈ {WATCHLIST, SKIP, INCOMPLETE}, OR an unknown / non-enum verdict string. Strict: only `Verdict.COPY_CANDIDATE` advances toward PENDING. |
+| `REJECTED_WALLET_TRADE_MISMATCH` | Trade's canonical `trader_address` does not match the wallet's canonical `address` (or the trade has no `trader_address`). Hard rejection — a trade from Wallet A can never become a candidate for Wallet B. |
 | `REJECTED_UNRESOLVED_OUTCOME` | Resolver returned INCOMPLETE (token not found, market unknown, etc.). |
 | `REJECTED_AMBIGUOUS_OUTCOME` | Resolver returned AMBIGUOUS (multiple outcomes match the same token). |
-| `REJECTED_MARKET_CLOSED` | `markets.closed = 1` or `markets.resolved = 1` or `markets.active = 0`. |
+| `REJECTED_MARKET_CLOSED` | The actual DB row for the resolved market indicates `closed = 1`, `resolved = 1`, or `active = 0`. The supplied `Market` object's id MUST match the resolver's `market_id` — a mismatched Market is also rejected. |
 | `REJECTED_STALE_TRADE` | Reserved for future use; not emitted yet. PR 2 does NOT invent a recency threshold. |
 | `REJECTED_INVALID_TRADE` | `price <= 0`, `quantity <= 0`, missing `timestamp`, or invalid `side`. |
 
@@ -130,13 +141,13 @@ which is the correct behavior for a persistent audit log.
 
 ## 5. Decision-log behavior
 
-PR 2 emits bounded decision types via the existing `decision_log` table.
-The full vocabulary:
+PR 2 emits bounded decision types via the existing `decision_log`
+table. The full vocabulary:
 
 ```
 COPY_CANDIDATE_CREATED
-COPY_CANDIDATE_DUPLICATE_SKIPPED
 COPY_CANDIDATE_REJECTED_WALLET
+COPY_CANDIDATE_REJECTED_WALLET_TRADE_MISMATCH
 COPY_CANDIDATE_REJECTED_UNRESOLVED_OUTCOME
 COPY_CANDIDATE_REJECTED_AMBIGUOUS_OUTCOME
 COPY_CANDIDATE_REJECTED_MARKET_CLOSED
@@ -144,22 +155,71 @@ COPY_CANDIDATE_REJECTED_STALE_TRADE
 COPY_CANDIDATE_REJECTED_INVALID_TRADE
 ```
 
-Each decision_log row carries a `metrics_json` payload with relevant
-evidence: source, source_trade_id, timestamp, age, price, quantity,
-market/outcome identity, wallet score, formula version, verdict,
-resolver status.
+`COPY_CANDIDATE_DUPLICATE_SKIPPED` was removed from the persisted
+vocabulary in this revision. A duplicate rerun does NOT append any
+additional `decision_log` row — that was previously claimed to be
+"no flood" but in practice still wrote one row per scheduled scan.
+The current behavior is genuinely idempotent.
 
-**No flood on rerun**: the persistence layer emits
-`COPY_CANDIDATE_DUPLICATE_SKIPPED` exactly once per rerun for an
-already-persisted candidate. Rejected candidates also emit one row per
-rejection event (not per rerun if the rejection was already logged).
+**FK safety.** `decision_log.market_id` is `NOT NULL REFERENCES
+markets(id)` with `PRAGMA foreign_keys=ON` enforced. For rejected
+evaluations that have no real `market_id` (i.e. the rejection
+happened before resolver-OK attribution — ownership mismatch,
+invalid trade, unresolved outcome, ambiguous outcome), the helper
+`record_candidate_decision_log` returns `None` and does NOT insert a
+`decision_log` row. The `copy_candidates` row itself (with
+`status`, `status_reason`, `metrics_json`) is the durable audit
+artifact for these pre-attribution rejections. We never invent a
+fake market id.
 
-The `decision_type_for_status()` helper is the single source of truth
-that maps each CandidateStatus to its decision_type string.
+For candidates that DO have a real `market_id` (PENDING_PRICE_CHECK
+and REJECTED_MARKET_CLOSED), the helper enforces app-level
+idempotency keyed on `(wallet_id, source, source_trade_id,
+decision_type)`: if a row with the same identity has already been
+recorded, the call returns `None` without inserting. The first
+candidate insert writes one bounded decision event (CREATED or
+REJECTED_*); subsequent reruns that hit the unique-key collision
+write nothing.
+
+Each persisted decision_log row carries a `metrics_json` payload
+with relevant evidence: source, source_trade_id, timestamp, age,
+price, quantity, market/outcome identity, wallet score, formula
+version, verdict, resolver status.
+
+The `decision_type_for_status()` helper is the single source of
+truth that maps each CandidateStatus to its decision_type string.
 
 ---
 
-## 6. What this PR does NOT calculate
+## 6. Market-state verification (real DB lookup)
+
+The candidate can only become `PENDING_PRICE_CHECK` after the
+actual resolved market row in the database is verified as open.
+Concretely:
+
+- The canonical resolver returns `market_id` (or `INCOMPLETE` /
+  `AMBIGUOUS`, which short-circuit earlier).
+- The evaluator loads the market row from `markets` by that
+  `market_id` and verifies `active = 1`, `closed = 0`,
+  `resolved = 0`.
+- If a `Market` object is also supplied by the caller, the
+  evaluator verifies the supplied `Market.id` matches the
+  resolver's `market_id` — a mismatched open Market cannot
+  override a closed/resolved DB market.
+- Passing `market=None` is allowed and the DB lookup is
+  authoritative. `market=None` does NOT silently mean "open market".
+- If the resolved market row is missing in the DB (data integrity
+  issue), the candidate is `REJECTED_UNRESOLVED_OUTCOME`.
+
+Tests covering this gate: `test_closed_market_blocks_pending_price_check`,
+`test_inactive_market_blocks_pending`, `test_resolved_market_blocks_pending`,
+`test_unrelated_market_object_cannot_override_resolved_market`,
+`test_market_none_does_not_bypass_closed_market`,
+`test_missing_market_row_blocks_pending`.
+
+---
+
+## 7. What this PR does NOT calculate
 
 PR 2 is a persistence layer, not a pricing layer. It deliberately does
 NOT compute or persist:
@@ -186,7 +246,7 @@ PR 2 also does NOT:
 
 ---
 
-## 7. Boundary between PR 2 and PR 3
+## 8. Boundary between PR 2 and PR 3
 
 | Concern | PR 2 (this) | PR 3 (future) |
 |---|---|---|
