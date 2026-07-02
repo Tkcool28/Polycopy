@@ -21,6 +21,19 @@ Round-1 PR-2 additions (recovery sequence, v7 → v8):
     Indexes on status / wallet / source_trade_internal_id /
     market_outcome_id. No destructive change to any existing table.
 
+Schema-bridge (v8 → v9) — see incident disclosure:
+  * New ``candidate_price_snapshots`` table — append-only audit log of
+    fresh CLOB-book fetches for PENDING_PRICE_CHECK candidates. UNIQUE
+    ``(candidate_id, snapshot_run_id)`` is the per-run idempotency key.
+    No destructive change. No pointer column on ``copy_candidates``; the
+    "latest snapshot" is a query, not a foreign key. The PR-3 market-end
+    metadata reuses the existing ``markets.end_date`` (populated from
+    Gamma's ``endDate`` field); no new market column is added.
+
+    This bridge PR contains the schema change ONLY. The CLOB adapter,
+    snapshot engine, persistence helpers, config keys, and feature tests
+    ship in a separate PR after this bridge merges.
+
 All column / table additions are idempotent: the migration runner uses
 ``PRAGMA table_info(...)`` to gate ``ALTER TABLE ... ADD COLUMN`` and
 ``CREATE TABLE IF NOT EXISTS`` / ``CREATE INDEX IF NOT EXISTS`` are
@@ -30,7 +43,7 @@ natively idempotent in SQLite.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -642,6 +655,110 @@ _V8_DDL: list[str] = [
 ]
 
 
+# ── Version 9: candidate price snapshots (schema-bridge) ─────────────────────
+# This is the v8 → v9 schema-bridge migration. Purely additive, idempotent,
+# no data loss. One new table + three indexes. No existing column is altered;
+# no new column is added to ``copy_candidates`` (the "latest snapshot" is a
+# query, not a foreign key).
+#
+# Identity contract: the per-run idempotency key is the pair
+# ``(candidate_id, snapshot_run_id)``. ``snapshot_run_id`` is a UUID chosen
+# by the caller of the snapshot engine; rerunning with the same id is a
+# no-op (INSERT OR IGNORE). A NEW run-id creates a NEW observation. The
+# append-only history is preserved.
+#
+# All book/snapshot fields are nullable: an OK snapshot populates them, but
+# a non-OK snapshot (EMPTY_BOOK, ONE_SIDED_BOOK, MISSING_TOKEN,
+# NOT_PENDING, MARKET_NOT_OPEN, RATE_LIMITED, HTTP_ERROR, TIMEOUT,
+# PARSE_ERROR) leaves them NULL and records the bounded reason in
+# ``fetch_status`` + ``fetch_error_code`` + ``fetch_error_message``. The
+# source-trade fields (``source_trade_price``, ``source_trade_quantity``,
+# ``source_trade_timestamp``) and the ``side`` are always populated (they
+# come from the underlying ``copy_candidates`` row, which has them as
+# NOT NULL); this guarantees the table never holds a row that cannot be
+# joined back to its candidate.
+#
+# The market-end metadata is COPIED from ``markets.end_date`` (already
+# populated by the existing Gamma ingestion path) into
+# ``market_end_at`` + ``market_metadata_fetched_at`` at snapshot time.
+# This makes the snapshot a self-contained historical observation. The
+# bridge does NOT add a new column to ``markets`` — the existing
+# ``markets.end_date`` is the authoritative declared-end field.
+#
+# ``seconds_to_market_end`` is an INTEGER (epoch-second deltas are
+# always integers). Negative values are valid audit evidence and are
+# preserved; the table does not cap or rewrite them.
+_V9_DDL: list[str] = [
+    """CREATE TABLE IF NOT EXISTS candidate_price_snapshots (
+        id                          TEXT PRIMARY KEY,
+        candidate_id                INTEGER NOT NULL
+                                        REFERENCES copy_candidates(id),
+
+        snapshot_run_id             TEXT NOT NULL,
+        fetch_status                TEXT NOT NULL,
+        fetch_endpoint              TEXT,
+        fetch_http_status           INTEGER,
+        fetch_latency_ms            INTEGER,
+        request_attempts            INTEGER NOT NULL DEFAULT 1,
+        fetch_error_code            TEXT,
+        fetch_error_message         TEXT,
+
+        token_id                    TEXT,
+        side                        TEXT NOT NULL,
+        source_trade_price          REAL NOT NULL,
+        source_trade_quantity       REAL NOT NULL,
+        source_trade_timestamp      TEXT NOT NULL,
+
+        best_bid                    REAL,
+        best_bid_size               REAL,
+        best_ask                    REAL,
+        best_ask_size               REAL,
+        mid_price                   REAL,
+        spread                      REAL,
+
+        executable_price            REAL,
+        executable_side_depth       REAL,
+        expected_fill_price         REAL,
+
+        price_deterioration         REAL,
+        price_deterioration_pct     REAL,
+        mid_change                  REAL,
+        mid_change_pct              REAL,
+
+        trade_age_seconds           INTEGER,
+        market_end_at               TEXT,
+        seconds_to_market_end       INTEGER,
+        market_metadata_fetched_at  TEXT,
+
+        market_active_at_fetch      INTEGER,
+        market_closed_at_fetch      INTEGER,
+        market_resolved_at_fetch    INTEGER,
+
+        bid_level_count             INTEGER,
+        ask_level_count             INTEGER,
+        book_summary_json           TEXT,
+        book_hash                   TEXT,
+
+        fetched_at                  TEXT NOT NULL,
+        created_at                  TEXT NOT NULL,
+
+        UNIQUE(candidate_id, snapshot_run_id)
+    );""",
+    # Latest-snapshot lookup ("what is the most recent snapshot for this
+    # candidate?"). Uses DESC ordering on (fetched_at, id) so the query
+    # plan can serve the answer directly from the index without a sort.
+    "CREATE INDEX IF NOT EXISTS idx_cps_candidate_fetched "
+    "ON candidate_price_snapshots(candidate_id, fetched_at DESC, id DESC);",
+    # Status-side filter ("show me every EMPTY_BOOK / RATE_LIMITED
+    # snapshot in the run").
+    "CREATE INDEX IF NOT EXISTS idx_cps_status "
+    "ON candidate_price_snapshots(fetch_status);",
+    # Run-side filter ("all rows for snapshot run X").
+    "CREATE INDEX IF NOT EXISTS idx_cps_run "
+    "ON candidate_price_snapshots(snapshot_run_id);",
+]
+
+
 # ── Migration registry ──────────────────────────────────────────────────────────
 # Key = target version, Value = list of DDL statements to reach that version
 # from (version - 1). Statements are run in order by the migration runner;
@@ -656,6 +773,7 @@ MIGRATIONS: dict[int, list[str]] = {
     6: _V6_DDL,
     7: _V7_DDL,
     8: _V8_DDL,
+    9: _V9_DDL,
 }
 
 # Current DDL is the latest migration
