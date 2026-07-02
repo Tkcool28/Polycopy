@@ -20,20 +20,15 @@ Tests cover:
 
 from __future__ import annotations
 
-import json
 from decimal import Decimal
 
 import pytest
 
 from polycopy.scoring.depth_normalization import (
     NormalizedLevel,
-    DepthWalkResult,
     normalize_book_levels,
     compute_book_hash,
     walk_depth,
-    DEFAULT_MAX_LEVELS_PER_SIDE,
-    DEFAULT_MAX_NOTIONAL_PER_SIDE,
-    DEPTH_NOT_CAPTURED,
     DEPTH_INSUFFICIENT_FOR_STAKE,
     DEPTH_LEVELS_MALFORMED,
 )
@@ -46,13 +41,13 @@ class TestLevelOrdering:
         raw_asks = [("0.20", "10"), ("0.10", "10"), ("0.15", "10")]
         bids, asks, err = normalize_book_levels([], raw_asks)
         assert err is None
-        assert [float(l.price) for l in asks] == [0.10, 0.15, 0.20]
+        assert [float(level.price) for level in asks] == [0.10, 0.15, 0.20]
 
     def test_bids_descending(self):
         raw_bids = [("0.50", "10"), ("0.60", "10"), ("0.55", "10")]
         bids, asks, err = normalize_book_levels(raw_bids, [])
         assert err is None
-        assert [float(l.price) for l in bids] == [0.60, 0.55, 0.50]
+        assert [float(level.price) for level in bids] == [0.60, 0.55, 0.50]
 
     def test_empty_book(self):
         bids, asks, err = normalize_book_levels([], [])

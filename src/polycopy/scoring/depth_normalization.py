@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -102,10 +102,10 @@ def compute_book_hash(bids: list[NormalizedLevel], asks: list[NormalizedLevel]) 
     """Deterministic SHA-256 hash of normalized levels."""
     data = {
         "bids": [
-            {"price": str(l.price), "size": str(l.size)} for l in bids
+            {"price": str(level.price), "size": str(level.size)} for level in bids
         ],
         "asks": [
-            {"price": str(l.price), "size": str(l.size)} for l in asks
+            {"price": str(level.price), "size": str(level.size)} for level in asks
         ],
     }
     raw = json.dumps(data, sort_keys=True, separators=(",", ":"))
@@ -239,7 +239,7 @@ def _normalize_side_levels(
             # unless we have no levels yet
             break
 
-        cum_size = sum(l.size for l in levels) + size
+        cum_size = sum(level.size for level in levels) + size
         levels.append(NormalizedLevel(
             price=price,
             size=size,

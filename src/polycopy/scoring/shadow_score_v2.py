@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from polycopy.scoring.helpers import clamp, linear_score
+from polycopy.scoring.helpers import clamp, linear_score, inverse_score
 
 
 class ShadowVerdict(str, enum.Enum):

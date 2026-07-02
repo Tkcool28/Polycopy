@@ -340,7 +340,6 @@ def compute_wallet_score_v1(
     gate_failures: list[str] = []
 
     # Check essential evidence
-    essential_fields = ["trade_count", "win_rate"]
     if trade_count is None:
         missing_essentials.append("trade_count")
     if win_rate is None:

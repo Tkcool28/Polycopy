@@ -27,7 +27,6 @@ from typing import Optional
 from polycopy.scoring.wallet_score_v1 import WalletVerdict
 from polycopy.scoring.trade_score_v1 import TradeVerdict
 from polycopy.scoring.behavior_classification import (
-    BehaviorClassification,
     BehaviorClassificationResult,
 )
 

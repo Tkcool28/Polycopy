@@ -40,9 +40,7 @@ All HTTP tests mocked.
 
 from __future__ import annotations
 
-import json
 import pytest
-from datetime import datetime, timezone
 
 from polycopy.scoring.helpers import linear_score, inverse_score, clamp
 from polycopy.scoring.behavior_classification import (
@@ -53,20 +51,11 @@ from polycopy.scoring.behavior_classification import (
 from polycopy.scoring.wallet_score_v1 import (
     WalletVerdict,
     compute_wallet_score_v1,
-    GLOBAL_MIN_RESOLVED_MARKETS,
-    GLOBAL_MIN_ACTIVE_TRADING_DAYS,
-    GLOBAL_MIN_DISTINCT_EVENTS,
-    CATEGORY_MIN_RESOLVED_MARKETS,
-    CATEGORY_MIN_DISTINCT_EVENTS,
-    CATEGORY_MIN_ACTIVE_DAYS,
     VERDICT_COPY_CANDIDATE_MIN,
-    VERDICT_WATCHLIST_MIN,
 )
 from polycopy.scoring.trade_score_v1 import (
     TradeVerdict,
     compute_trade_score_v1,
-    VERDICT_COPY_CANDIDATE_MIN as TRADE_VERDICT_COPY_MIN,
-    VERDICT_WATCHLIST_MIN as TRADE_VERDICT_WATCH_MIN,
 )
 from polycopy.scoring.shadow_score_v2 import (
     ShadowVerdict,

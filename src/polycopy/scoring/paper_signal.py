@@ -13,27 +13,20 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
 from polycopy.db.copy_candidate_persistence import CandidateStatus
 from polycopy.db.price_snapshot_persistence import get_latest_snapshot_for_candidate
-from polycopy.domain.copy_candidate import CopyCandidate
 from polycopy.scoring.behavior_classification import (
-    BehaviorClassification,
-    BehaviorClassificationResult,
     BehaviorEvidence,
     classify_wallet_behavior,
 )
 from polycopy.scoring.wallet_score_v1 import (
-    WalletVerdict,
     compute_wallet_score_v1,
 )
 from polycopy.scoring.trade_score_v1 import (
-    TradeVerdict,
     compute_trade_score_v1,
 )
 from polycopy.scoring.shadow_score_v2 import (
-    ShadowVerdict,
     compute_shadow_score_v2,
 )
 from polycopy.scoring.verdict_generation import (
@@ -42,7 +35,6 @@ from polycopy.scoring.verdict_generation import (
     generate_signal_verdict,
 )
 from polycopy.scoring.score_serialization import (
-    generate_idempotency_key,
     persist_wallet_score_v1,
     persist_trade_score_v1,
     persist_shadow_score_v2,
@@ -125,8 +117,6 @@ def generate_paper_signals(
         "incomplete": 0,
         "errors": [],
     }
-
-    settings = get_settings()
 
     # Load pending candidates (PENDING_PRICE_CHECK status)
     candidates = db.fetchall(

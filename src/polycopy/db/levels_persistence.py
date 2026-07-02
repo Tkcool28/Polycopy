@@ -13,18 +13,16 @@ Public surface:
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Optional
 
 from polycopy.db.database import Database
 from polycopy.scoring.depth_normalization import (
     NormalizedLevel,
     DepthWalkResult,
     normalize_book_levels,
-    compute_book_hash,
     walk_depth,
     DEFAULT_MAX_LEVELS_PER_SIDE,
     DEFAULT_MAX_NOTIONAL_PER_SIDE,
