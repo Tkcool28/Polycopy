@@ -64,6 +64,52 @@ class Settings(BaseSettings):
         description="Seconds to sleep between per-market trade fetches.",
     )
 
+    # ── CLOB order-book adapter (PR-3, read-only, disabled by default) ─────
+    # ``clob_enabled`` is the runtime gate. When False, no production code
+    # path instantiates ``PolymarketClobClient`` — the live book adapter is
+    # only constructed explicitly by tests with a mocked transport. This
+    # default of False is the load-bearing safety invariant for PR-3:
+    # deploying PR-3 must not start hitting clob.polymarket.com.
+    clob_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master gate for the live CLOB order-book adapter. MUST remain "
+            "False in production until PR-3's runtime wiring is approved. "
+            "Tests can override to True locally; no production code path "
+            "consults this flag to make a network call without an explicit "
+            "factory call that the caller controls."
+        ),
+    )
+    clob_base_url: str = Field(
+        default="https://clob.polymarket.com",
+        description=(
+            "Base URL for the public Polymarket CLOB HTTP API. The adapter "
+            "appends ``/book?token=<id>`` at request time. No trailing slash "
+            "is assumed; the adapter strips a single trailing slash defensively."
+        ),
+    )
+    clob_timeout_seconds: float = Field(
+        default=10.0,
+        description="HTTP timeout for CLOB /book calls (seconds).",
+    )
+    clob_max_retries: int = Field(
+        default=3,
+        description=(
+            "Max retry attempts for transient CLOB /book failures (5xx, "
+            "timeout). 429s are classified RATE_LIMITED and surfaced as "
+            "bounded fetch status, not retried beyond this cap."
+        ),
+    )
+    clob_rpm: int = Field(
+        default=30,
+        description=(
+            "Polycopy safety rate limit for the CLOB /book endpoint "
+            "(requests per minute). NOT the platform's documented rate "
+            "limit — it is a conservative Polycopy-side ceiling to bound "
+            "blast radius during a future scan pass."
+        ),
+    )
+
     # ── Polymarket credentials (ONLY for broker_mode=polymarket) ───────────
     polymarket_private_key: Optional[str] = Field(default=None, description="Wallet private key. NEVER set in paper mode.")
 
@@ -207,6 +253,38 @@ class Settings(BaseSettings):
         if v not in allowed:
             raise ValueError(f"paper_mode must be one of {allowed}, got {v!r}")
         return v
+
+    @field_validator("clob_base_url")
+    @classmethod
+    def _validate_clob_base_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("clob_base_url must be a non-empty URL")
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("clob_base_url must start with http:// or https://")
+        # Strip a single trailing slash defensively; the adapter does the same.
+        return v.rstrip("/") if v.endswith("/") else v
+
+    @field_validator("clob_timeout_seconds")
+    @classmethod
+    def _validate_clob_timeout_seconds(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"clob_timeout_seconds must be > 0, got {v!r}")
+        return float(v)
+
+    @field_validator("clob_max_retries")
+    @classmethod
+    def _validate_clob_max_retries(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"clob_max_retries must be >= 0, got {v!r}")
+        return int(v)
+
+    @field_validator("clob_rpm")
+    @classmethod
+    def _validate_clob_rpm(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"clob_rpm must be >= 0, got {v!r}")
+        return int(v)
 
     @model_validator(mode="after")
     def _fail_closed_no_secrets_in_paper_mode(self) -> "Settings":
