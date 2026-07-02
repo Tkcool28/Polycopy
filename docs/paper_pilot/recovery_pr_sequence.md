@@ -37,11 +37,12 @@ qualified wallet → specific source trade → persisted token/outcome mapping �
 
 ## 3. PR sequence overview
 
-| # | PR | Status (as of 2026-07-01) | Companion doc |
+| # | PR | Status (as of 2026-07-02) | Companion doc |
 |---|---|---|---|
 | 1 | Persist source-trade identity and outcome mapping | **MERGED + DEPLOYED** (`main` @ `fa3f2101`) | `smart_wallet_signal_path_audit.md` |
-| 2 | Persist evaluated copy candidates | **DRAFT — NOT MERGED, NOT DEPLOYED** (`feat/persist-copy-candidates`) | `copy_candidate_contract.md` |
-| 3 | Obtain fresh current-price and slippage inputs | NOT STARTED | — |
+| 1.b | Align production code with additive schema v9 (bridge) | **DRAFT — PR #15** (`fix/align-production-schema-v9` @ `5c0a80a`) — CI green | `recovery_pr_sequence.md` §15 |
+| 2 | Persist evaluated copy candidates | **MERGED + DEPLOYED** (`main` @ `3a3c03e`) | `copy_candidate_contract.md` |
+| 3 | Persist side-aware candidate price snapshots | **DRAFT — IN FLIGHT** (`feat/candidate-price-snapshots`, uncommitted in worktree) | `candidate_price_snapshot_contract.md` |
 | 4 | Build the real signal generator | NOT STARTED | — |
 | 5 | Manual paper-order preview and approval path | NOT STARTED | — |
 | 6 | Pilot-readiness verification | NOT STARTED | — |
