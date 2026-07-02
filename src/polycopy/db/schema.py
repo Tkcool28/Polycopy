@@ -43,7 +43,10 @@ natively idempotent in SQLite.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+
+# Import v10 schema changes
+from polycopy.db.schema_v10 import _V10_DDL  # noqa: E402
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -774,6 +777,7 @@ MIGRATIONS: dict[int, list[str]] = {
     7: _V7_DDL,
     8: _V8_DDL,
     9: _V9_DDL,
+    10: _V10_DDL,
 }
 
 # Current DDL is the latest migration

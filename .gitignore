@@ -51,3 +51,7 @@ build/
 frontend/dist/
 frontend/build/
 frontend/coverage/
+
+# CI virtualenvs created locally for Python 3.11/3.12 parity testing
+.ci-venv-311/
+.ci-venv-312/

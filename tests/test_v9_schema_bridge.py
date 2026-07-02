@@ -47,13 +47,13 @@ from polycopy.db.schema import (  # noqa: E402
 
 
 # ── 1. v8 → v9 migration succeeds on a v8 DB ───────────────────────────────
-def test_v8_to_v9_migration_succeeds_on_v8_db(tmp_path: Path) -> None:
-    """A v8 DB (no candidate_price_snapshots) migrates cleanly to v9."""
+def test_v9_to_v10_migration_succeeds_on_v9_db(tmp_path: Path) -> None:
+    """A v9 DB (with candidate_price_snapshots) migrates cleanly to v10."""
     db_path = tmp_path / "bridge-s1.db"
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1  # 8
+    pre_version = SCHEMA_VERSION - 1  # 9
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)
@@ -68,12 +68,13 @@ def test_v8_to_v9_migration_succeeds_on_v8_db(tmp_path: Path) -> None:
         "SELECT value FROM _meta WHERE key='schema_version'"
     ).fetchone()["value"]
     assert pre == str(pre_version)
+    # At v9 candidate_price_snapshots already exists
     assert conn.execute(
         "SELECT name FROM sqlite_master WHERE name='candidate_price_snapshots'"
-    ).fetchone() is None
+    ).fetchone() is not None
     conn.close()
 
-    # Open via Database so the migration runner applies v9.
+    # Open via Database so the migration runner applies v10.
     db = Database(db_path=db_path).connect()
     try:
         post = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
@@ -364,4 +365,4 @@ def test_no_new_market_column_added(tmp_path: Path) -> None:
 
 # ── Schema version constant is 9 ──────────────────────────────────────────
 def test_schema_version_constant_is_9() -> None:
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
