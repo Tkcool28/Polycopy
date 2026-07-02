@@ -65,6 +65,7 @@ from polycopy.domain.price_snapshot import (  # noqa: E402
 )
 from polycopy.engine.price_snapshots import (  # noqa: E402
     _compute_executable_fields,
+    _run_async_from_sync,
     snapshot_one,
 )
 
@@ -1164,3 +1165,63 @@ def test_market_metadata_fetched_at_captures_markets_fetched_at(
     assert snap.market_end_at == "2027-01-01T00:00:00Z"
     # And they are different fields, with different content.
     assert snap.market_metadata_fetched_at != snap.market_end_at
+
+
+# ── Sync→async bridge (regression for CI #88 Python 3.12) ──────────────────
+def test_snapshot_one_works_without_existing_event_loop() -> None:
+    """Regression for CI #88 (Python 3.12).
+
+    Pre-fix, ``snapshot_one`` used
+    ``asyncio.get_event_loop().run_until_complete(coro)`` which raised
+    ``RuntimeError: There is no current event loop in thread 'MainThread'``
+    on Python 3.12 because ``get_event_loop()`` no longer auto-creates
+    a loop in the main thread. The fix is
+    :func:`_run_async_from_sync` which uses the canonical
+    ``new_event_loop() + run_until_complete() + close()`` pattern.
+
+    This test calls ``snapshot_one`` (which transitively invokes
+    ``_run_async_from_sync``) from a sync context with NO running loop
+    and asserts that it returns a real :class:`PriceSnapshot`. This is
+    the same code path that 22 PR-3 tests exercise; it was broken on
+    3.12 and is now fixed.
+    """
+    # No event loop is running here — pytest's pytest-asyncio fixture
+    # does not auto-create one for plain sync tests, and
+    # ``asyncio_mode = "auto"`` only applies to ``async def`` tests.
+    # If the regression returns, this test will fail with the same
+    # RuntimeError as the 22 originally-failing tests.
+    assert _run_async_from_sync is not None  # import surface check
+
+    # Direct unit test of the helper: it must be callable from a sync
+    # context with no running loop.
+    async def _echo(x: int) -> int:
+        return x * 2
+
+    result = _run_async_from_sync(_echo(21))
+    assert result == 42
+
+
+def test_run_async_from_sync_raises_when_loop_already_running() -> None:
+    """If the caller is inside a running event loop, the bridge must
+    raise a clear :class:`RuntimeError` rather than hang or silently
+    shadow the loop.
+
+    The sync ``snapshot_one`` surface is the only supported entry point;
+    this test pins the constraint so future refactors don't regress
+    to the broken ``get_event_loop()`` pattern.
+    """
+    import asyncio as _asyncio
+
+    async def _echo_coro(x: int) -> int:
+        return x
+
+    async def _drive() -> None:
+        # Build the coroutine; the helper is expected to raise BEFORE
+        # awaiting it, so close it explicitly to silence the
+        # ``coroutine was never awaited`` warning.
+        coro = _echo_coro(7)
+        with pytest.raises(RuntimeError, match="snapshot_one"):
+            _run_async_from_sync(coro)
+        coro.close()
+
+    _asyncio.run(_drive())

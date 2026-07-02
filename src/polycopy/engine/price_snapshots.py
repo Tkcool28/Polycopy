@@ -59,15 +59,61 @@ defers that wiring).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Coroutine, Optional, TypeVar
 
 from polycopy.adapters.polymarket_clob import BookProvider, ClobBook
 from polycopy.domain.price_snapshot import PriceSnapshot, SnapshotFetchStatus
 from polycopy.engine.trade_resolution import ResolveStatus  # noqa: F401  (re-exported for tests)
 
 logger = logging.getLogger(__name__)
+
+
+# ── Sync→async bridge ────────────────────────────────────────────────────────
+# ``snapshot_one`` is a synchronous public API but it must call the async
+# ``BookProvider.fetch_book`` contract. The pre-3.12 idiom
+# ``asyncio.get_event_loop().run_until_complete(coro)`` raised ``RuntimeError:
+# There is no current event loop in thread 'MainThread'.`` on Python 3.12
+# because ``get_event_loop()`` no longer auto-creates a loop in the main
+# thread. This helper bridges sync→async safely on 3.10/3.11/3.12 without
+# forcing the entire ``snapshot_one`` surface to become async.
+_T = TypeVar("_T")
+
+
+def _run_async_from_sync(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Run ``coro`` to completion from a sync caller.
+
+    Uses the canonical ``new_event_loop() + run_until_complete() + close()``
+    pattern. This is the recommended replacement for the deprecated
+    ``asyncio.get_event_loop().run_until_complete(coro)`` call when the
+    caller does not already own an event loop (which is the case for every
+    PR-3 caller — production callers go through this sync surface, and
+    tests do not invoke ``snapshot_one`` from inside a running loop).
+
+    Raises ``RuntimeError`` with an actionable message if a loop is
+    already running on the current thread — that situation requires
+    ``await`` from an ``async`` caller, which ``snapshot_one`` is not
+    designed to support.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass  # No loop running — proceed to create one.
+    else:
+        raise RuntimeError(
+            "snapshot_one() cannot be called from within a running event "
+            "loop. Use an async caller + ``await snapshot_one_async(...)`` "
+            "(not part of the PR-3 surface; the sync surface is the only "
+            "supported entry point)."
+        )
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -562,8 +608,7 @@ def snapshot_one(
             created_at=fetched_at_iso,
         )
 
-    import asyncio
-    book: ClobBook = asyncio.get_event_loop().run_until_complete(
+    book: ClobBook = _run_async_from_sync(
         book_provider.fetch_book(cand_token_id)
     )
 
