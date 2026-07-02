@@ -876,15 +876,32 @@ def record_candidate_decision_log(
     # not flood decision_log. The key matches the candidate layer's
     # UNIQUE(wallet_id, source, source_trade_id) plus the bounded
     # decision_type so different rejection reasons for the same
-    # wallet+trade are still distinguished.
+    # wallet+trade are still distinguished, AND so two distinct
+    # source_trade_ids under the same (wallet, source) produce
+    # distinct decision rows.
+    #
+    # The LIKE clause matches BOTH a serialized ``source`` substring
+    # AND a serialized ``source_trade_id`` substring. JSON-escaping
+    # each value via ``json.dumps`` (which quotes and escapes control
+    # characters) ensures the substring can't bleed into a neighboring
+    # key — e.g. ``source_trade_id`` values are matched as their own
+    # JSON tokens, not as substrings of a longer key. ``\\`` is the
+    # LIKE escape character so we explicitly LIKE-escape backslashes
+    # inside the JSON form too (json.dumps doubles them in Python).
+    like_src = json.dumps(candidate.source)
+    like_src = like_src.replace("\\", "\\\\")
+    like_tid = json.dumps(candidate.source_trade_id)
+    like_tid = like_tid.replace("\\", "\\\\")
     existing = db.fetchone(
         "SELECT id FROM decision_log "
         "WHERE wallet_id = ? AND decision_type = ? "
-        "AND metrics LIKE ?",
+        "AND metrics LIKE ? ESCAPE '\\' "
+        "AND metrics LIKE ? ESCAPE '\\'",
         (
             candidate.wallet_id,
             decision_type,
-            f'%"source": {json.dumps(candidate.source)}%',
+            f'%{like_src}%',
+            f'%{like_tid}%',
         ),
     )
     if existing is not None:

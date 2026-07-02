@@ -1273,6 +1273,145 @@ def test_ten_reruns_do_not_flood_decision_log(tmp_path: Path) -> None:
         db.close()
 
 
+def test_distinct_source_trades_receive_distinct_decision_logs(
+    tmp_path: Path,
+) -> None:
+    """FINAL audit-idempotency regression test.
+
+    Two source trades from the same wallet + same source + DIFFERENT
+    source_trade_id values must each get their own decision_log row.
+    A duplicate rerun of either must NOT collapse them into a single
+    row, and must NOT inflate the count either.
+
+    Asserts the corrected LIKE-based idempotency key in
+    ``record_candidate_decision_log`` requires BOTH the source AND
+    source_trade_id serialized substrings to match — not source alone.
+    """
+    db = Database(db_path=tmp_path / "distinct-trades.db").connect()
+    try:
+        wallet_id = _seed_wallet(db, address="0xWALLET_A")
+        # Two markets so the resolver returns OK on each trade.
+        market_a_id, _ = _seed_market_with_outcome(
+            db, source_id="cond-a", label="Yes", token="tok-a",
+        )
+        market_b_id, _ = _seed_market_with_outcome(
+            db, source_id="cond-b", label="Yes", token="tok-b",
+        )
+
+        trade_a = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-distinct-A",
+            trader_address="0xWALLET_A",
+            token_id="tok-a",
+            market_source_id="cond-a",
+        )
+        trade_b = _seed_source_trade(
+            db,
+            source="polymarket_data_api",
+            source_trade_id="tx-distinct-B",  # different id
+            trader_address="0xWALLET_A",
+            token_id="tok-b",
+            market_source_id="cond-b",
+        )
+        score = _make_copy_candidate_score(wallet_id=wallet_id)
+        wallet = _make_wallet(address="0xWALLET_A", wallet_id=wallet_id)
+
+        def _eval(trade: SourceTrade) -> CopyCandidate:
+            cand = evaluate_source_trade_for_wallet(
+                db, wallet=wallet, trade=trade, score=score,
+            )
+            assert cand.status == CandidateStatus.PENDING_PRICE_CHECK.value
+            persist_copy_candidate(db, cand)
+            record_candidate_decision_log(
+                db,
+                candidate=cand,
+                decision_type="COPY_CANDIDATE_CREATED",
+            )
+            return cand
+
+        cand_a = _eval(trade_a)
+        cand_b = _eval(trade_b)
+
+        # Step 5: two distinct decision rows.
+        n = db.conn.execute(
+            "SELECT COUNT(*) FROM decision_log "
+            "WHERE decision_type = 'COPY_CANDIDATE_CREATED'"
+        ).fetchone()[0]
+        assert n == 2, f"expected 2 distinct decision rows, got {n}"
+
+        # Step 6: rerun BOTH (this would have collapsed them before
+        # the source_trade_id was added to the LIKE key).
+        _eval(trade_a)
+        _eval(trade_b)
+
+        # Step 7: still exactly 2 rows after the rerun.
+        n_after = db.conn.execute(
+            "SELECT COUNT(*) FROM decision_log "
+            "WHERE decision_type = 'COPY_CANDIDATE_CREATED'"
+        ).fetchone()[0]
+        assert n_after == 2, (
+            f"expected exactly 2 decision rows after rerun, got {n_after}"
+        )
+
+        # Step 8: each source_trade_id appears in exactly one decision
+        # metrics payload.
+        rows = db.conn.execute(
+            "SELECT metrics FROM decision_log "
+            "WHERE decision_type = 'COPY_CANDIDATE_CREATED'"
+        ).fetchall()
+        assert len(rows) == 2
+        counts: dict[str, int] = {}
+        for row in rows:
+            payload = json.loads(row["metrics"])
+            counts[payload["source_trade_id"]] = (
+                counts.get(payload["source_trade_id"], 0) + 1
+            )
+        assert counts.get("tx-distinct-A") == 1, (
+            f"tx-distinct-A appears in {counts.get('tx-distinct-A')} rows"
+        )
+        assert counts.get("tx-distinct-B") == 1, (
+            f"tx-distinct-B appears in {counts.get('tx-distinct-B')} rows"
+        )
+
+        # Step 9: signals/orders/positions remain zero.
+        for table in ("signals", "orders", "positions"):
+            n_t = db.conn.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            assert n_t == 0, f"{table} unexpectedly has {n_t} rows"
+
+        # Step 10: FK check clean.
+        fk_violations = db.conn.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+        assert fk_violations == []
+
+        # Sanity: each candidate row also persisted with the right
+        # source_trade_id.
+        cand_rows = db.conn.execute(
+            "SELECT source_trade_id FROM copy_candidates "
+            "ORDER BY source_trade_id"
+        ).fetchall()
+        assert [r["source_trade_id"] for r in cand_rows] == [
+            "tx-distinct-A", "tx-distinct-B",
+        ]
+        # Cross-check the candidate ids map to the decision rows.
+        for cand in (cand_a, cand_b):
+            metrics_match = db.conn.execute(
+                "SELECT COUNT(*) FROM decision_log "
+                "WHERE decision_type = 'COPY_CANDIDATE_CREATED' "
+                "AND metrics LIKE ?",
+                (f'%{cand.source_trade_id}%',),
+            ).fetchone()[0]
+            assert metrics_match == 1, (
+                f"expected exactly 1 decision row referencing "
+                f"{cand.source_trade_id!r}, got {metrics_match}"
+            )
+    finally:
+        db.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. COPY_CANDIDATE + resolved outcome → PENDING_PRICE_CHECK.
 # ─────────────────────────────────────────────────────────────────────────────
