@@ -449,6 +449,9 @@ def test_cli_never_opens_production_db(isolated_env):
     sv = conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()[0]
     conn.close()
 
+    prod_db_path = Path(PROD_DB)
+    prod_existed_before = prod_db_path.exists()
+
     r = _run_cli(isolated_env)
 
     # The CLI must not report a config error about the DB path
@@ -467,8 +470,16 @@ def test_cli_never_opens_production_db(isolated_env):
     assert str(sv) in r.stdout, \
         f"Isolated DB schema version {sv} not mentioned in CLI output"
 
-    # Verify production DB still exists (not deleted by CLI)
-    assert Path(PROD_DB).exists(), "production DB path is missing"
+    # Verify production DB state is unchanged.
+    # If it existed before, it must still exist (other services may write
+    # to it concurrently, so we do NOT assert mtime/size).
+    # If it didn't exist (CI environment), verify it wasn't created.
+    if prod_existed_before:
+        assert prod_db_path.exists(), \
+            "production DB was deleted by CLI"
+    else:
+        assert not prod_db_path.exists(), \
+            "CLI created a production DB file when none existed before"
 
 
 def test_cli_missing_override_db_exits_two(isolated_env):
