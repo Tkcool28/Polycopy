@@ -301,12 +301,15 @@ def test_v8_db_includes_copy_candidates_table(tmp_path: Path) -> None:
     db_path = tmp_path / "p02-s1.db"
     db = Database(db_path=db_path).connect()
     try:
-        # SCHEMA_VERSION constant bumped 7 → 8 by PR-2.
-        assert SCHEMA_VERSION == 8
+        # SCHEMA_VERSION constant bumped 7 → 8 by PR-2 (and may be
+        # bumped further by later recovery-sequence PRs; this test
+        # only asserts that PR-2's contract is met — that the
+        # ``copy_candidates`` table exists at the current head).
+        assert SCHEMA_VERSION >= 8
 
         version = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
         assert version is not None
-        assert int(version["value"]) == 8
+        assert int(version["value"]) >= 8
 
         tables = {
             row["name"]
@@ -363,8 +366,13 @@ def test_v7_to_v8_migration_preserves_data(tmp_path: Path) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
 
-    # Apply v1..v7 manually so the DB starts at exactly v7 with seed rows.
-    for version in range(1, SCHEMA_VERSION):  # v1..v7
+    # Apply v1..v7 manually so the DB starts at exactly v7 with seed
+    # rows. This test is the literal v7 -> v8 -> v9 path: the
+    # pre-state is the real PR-1 production endpoint, the v8 DDL is
+    # the unit under test (PR 2's contract), and the v9 DDL is
+    # exercised on the same disposable DB to prove the bridge is
+    # additive on top of a real PR 2 result.
+    for version in range(1, 8):  # v1..v7
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)
         conn.execute(
@@ -399,20 +407,21 @@ def test_v7_to_v8_migration_preserves_data(tmp_path: Path) -> None:
     )
     conn.commit()
 
-    # Sanity: pre-migration version is 7.
+    # Sanity: pre-migration version is exactly 7 (PR-1 endpoint).
     pre = conn.execute(
         "SELECT value FROM _meta WHERE key='schema_version'"
     ).fetchone()["value"]
     assert pre == "7"
 
-    # Now apply v8 via the Database class — this exercises the real
-    # migration runner path the production DB will take.
-    conn.close()  # open fresh via Database so the runner runs v8.
+    # Close the raw connection and re-open via the Database class so
+    # the migration runner applies v8 (the PR 2 unit under test) and
+    # then v9 (the additive bridge) in order.
+    conn.close()  # open fresh via Database so the runner runs.
     db = Database(db_path=db_path).connect()
     try:
         post = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
         assert post is not None
-        assert int(post["value"]) == 8
+        assert int(post["value"]) == SCHEMA_VERSION
 
         # Existing data preserved.
         assert db.fetchone("SELECT id FROM wallets WHERE id='w1'") is not None
