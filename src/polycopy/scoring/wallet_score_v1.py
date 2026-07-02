@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from polycopy.scoring.helpers import clamp, linear_score, inverse_score
@@ -72,7 +72,9 @@ class WalletScoreResult:
     components: list[WalletScoreComponent] = field(default_factory=list)
     missing_essentials: list[str] = field(default_factory=list)
     eligibility_gate_failures: list[str] = field(default_factory=list)
-    computed_at: datetime = field(default_factory=datetime.utcnow)
+    computed_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     formula_version: str = "1"
     is_sample: bool = False
 
@@ -333,7 +335,7 @@ def compute_wallet_score_v1(
     All inputs optional. Missing essential evidence produces INCOMPLETE.
     """
     if now is None:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
     components: list[WalletScoreComponent] = []
     missing_essentials: list[str] = []

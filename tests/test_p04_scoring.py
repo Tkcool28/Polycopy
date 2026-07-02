@@ -647,3 +647,46 @@ class TestComponentScoreRounding:
             alpha_signal=0.1,
         )
         assert result.score == round(result.score, 4)
+
+
+class TestNoDeprecationWarnings:
+    """Regression tests: scoring code must not emit DeprecationWarnings.
+
+    CI runs pytest with PYTHONWARNINGS=error, which promotes any
+    DeprecationWarning into an exception during collection and test
+    execution. This class exercises the scoring entry points that
+    previously called datetime.utcnow() to prove they now run cleanly
+    under a warning-as-error regime.
+    """
+
+    def test_compute_wallet_score_v1_no_deprecation(self):
+        import warnings
+        from datetime import timezone
+
+        from polycopy.scoring.wallet_score_v1 import (
+            compute_wallet_score_v1,
+            WalletScoreResult,
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            result = compute_wallet_score_v1(
+                wallet_id="regression-wallet",
+                win_rate=0.5,
+                trade_count=100,
+            )
+        assert isinstance(result, WalletScoreResult)
+        # Default now is timezone-aware UTC.
+        assert result.computed_at.tzinfo is not None
+        assert result.computed_at.utcoffset() == timezone.utc.utcoffset(
+            result.computed_at
+        )
+
+    def test_compute_wallet_score_v1_default_now_is_tz_aware_utc(self):
+        """The default `now` and `computed_at` must be tz-aware UTC."""
+        from datetime import timezone
+
+        from polycopy.scoring.wallet_score_v1 import compute_wallet_score_v1
+
+        result = compute_wallet_score_v1(wallet_id="tz-check")
+        assert result.computed_at.tzinfo is timezone.utc
