@@ -150,6 +150,46 @@ def _wallet_input(result) -> Any:
     )
 
 
+def _category_input(result) -> Any:
+    """Return the typed input that produced a CategoryWalletScoreResultV1.
+
+    Mirrors the wallet-input adapter. If the result has an explicit
+    input attached, return it directly. Otherwise reconstruct a
+    typed input from the result's stored fields. This is the ONE
+    place where getattr on result is tolerated for the category
+    input path.
+    """
+    from polycopy.scoring.category_wallet_score_v1 import (
+        CategoryWalletScoreInputV1,
+    )
+
+    if getattr(result, "input", None) is not None:
+        return result.input  # type: ignore[return-value]
+
+    return CategoryWalletScoreInputV1(
+        wallet_id=getattr(result, "wallet_id", "") or "",
+        category_label=getattr(result, "category_label", "") or "",
+        info_score=getattr(result, "info_score", None),
+        win_rate=getattr(result, "win_rate", None),
+        profit_factor=getattr(result, "profit_factor", None),
+        trade_intervals_std=getattr(result, "trade_intervals_std", None),
+        trade_count=getattr(result, "trade_count", None),
+        max_drawdown=getattr(result, "max_drawdown", None),
+        sharpe_ratio=getattr(result, "sharpe_ratio", None),
+        sample_fraction=getattr(result, "sample_fraction", None),
+        category_trade_count=getattr(result, "category_trade_count", None),
+        category_distinct_markets=getattr(result, "category_distinct_markets", None),
+        overall_trade_count=getattr(result, "overall_trade_count", None),
+        largest_winner_share=getattr(result, "largest_winner_share", None),
+        top_3_concentration=getattr(result, "top_3_concentration", None),
+        category_resolved_markets=getattr(result, "category_resolved_markets", None),
+        category_distinct_events=getattr(result, "category_distinct_events", None),
+        category_active_days=getattr(result, "category_active_days", None),
+        source_data_timestamp=getattr(result, "source_data_timestamp", None),
+        is_sample=getattr(result, "is_sample", False),
+    )
+
+
 def _trade_input(result) -> Any:
     """Return the typed input that produced a TradeScoreResult.
 
@@ -487,6 +527,103 @@ def persist_wallet_score_v1(
         """,
         existing_lookup_params=(
             wallet_id, "wallet_score", result.formula_version, idempotency_key,
+        ),
+    )
+
+
+def persist_category_score_v1(
+    db: Database,
+    wallet_id: str,
+    category_label: str,
+    result,
+    *,
+    idempotency_key: Optional[str] = None,
+    source_data_timestamp: Optional[str] = None,
+) -> int:
+    """Persist category wallet score v1 decision to database (Phase 2).
+
+    Reads every raw input column from `result.input` (the typed
+    ``CategoryWalletScoreInputV1`` that produced this result). The
+    adapter `_category_input` reconstructs a typed input from
+    result fields when no explicit input is attached.
+
+    Idempotency identity (frozen):
+        (wallet_id, category_label, formula_name, formula_version,
+         idempotency_key)
+    The idempotency_key is derived deterministically from the
+    formula name/version + the source-data timestamp by default.
+    Identical point-in-time inputs → identical key → single row.
+    A later source-data snapshot → different key → new immutable
+    row. ``category_label`` participates in the identity.
+
+    INSERT column/placeholder/value count: 28 / 28 / 28
+    (enforced by ``TestCategoryColumnPlaceholderValueCount``).
+    """
+    if idempotency_key is None:
+        idempotency_key = generate_idempotency_key(
+            formula_name="category_wallet_score",
+            formula_version=result.formula_version,
+            wallet_id=wallet_id,
+            source_data_timestamp=source_data_timestamp,
+            extra_params={"category_label": category_label},
+        )
+
+    inp = _category_input(result)
+    now = datetime.now(timezone.utc).isoformat()
+
+    return _insert_or_ignore_returning_id(
+        db,
+        sql="""
+            INSERT OR IGNORE INTO category_wallet_score_decisions (
+                wallet_id, category_label, formula_name, formula_version, idempotency_key,
+                info_score, win_rate, profit_factor, trade_intervals_std, trade_count,
+                max_drawdown, sharpe_ratio, sample_fraction,
+                category_trade_count, category_distinct_markets, overall_trade_count,
+                largest_winner_share, top_3_concentration,
+                category_resolved_markets, category_distinct_events, category_active_days,
+                component_scores_json, final_score, verdict, missing_essentials_json,
+                category_gate_failures_json, source_data_timestamp, computed_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+        """,
+        params=(
+            wallet_id,
+            category_label,
+            "category_wallet_score",
+            result.formula_version,
+            idempotency_key,
+            inp.info_score,
+            inp.win_rate,
+            inp.profit_factor,
+            inp.trade_intervals_std,
+            inp.trade_count,
+            inp.max_drawdown,
+            inp.sharpe_ratio,
+            inp.sample_fraction,
+            inp.category_trade_count,
+            inp.category_distinct_markets,
+            inp.overall_trade_count,
+            inp.largest_winner_share,
+            inp.top_3_concentration,
+            inp.category_resolved_markets,
+            inp.category_distinct_events,
+            inp.category_active_days,
+            serialize_score_components(result.components),
+            result.score,
+            result.verdict.value,
+            json.dumps(result.missing_essentials),
+            json.dumps(result.category_gate_failures),
+            source_data_timestamp,
+            now,
+            now,
+        ),
+        # Table UNIQUE: (wallet_id, category_label, formula_name, formula_version, idempotency_key)
+        existing_lookup_sql="""
+            SELECT id FROM category_wallet_score_decisions
+            WHERE wallet_id = ? AND category_label = ? AND formula_name = ? AND formula_version = ? AND idempotency_key = ?
+        """,
+        existing_lookup_params=(
+            wallet_id, category_label, "category_wallet_score", result.formula_version, idempotency_key,
         ),
     )
 

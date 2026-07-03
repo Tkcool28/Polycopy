@@ -474,3 +474,337 @@ class TestFormulaNameAndVersion:
         for n in param_names:
             assert not n.endswith("_dict"), f"suspicious dict param: {n}"
             assert not n.endswith("_inputs"), f"suspicious inputs param: {n}"
+
+
+# ---- 10. Persistence + round-trip (Task 3.3) ---------------------------
+
+
+class TestCategoryPersistenceRoundTrip:
+    """Round-trip tests for ``persist_category_score_v1``.
+
+    The tests use a fresh disposable SQLite database per test
+    (``tmp_path``). The production database is never touched.
+    """
+
+    _seeded_wallets: dict[str, str] = {}
+
+    def _make_db(self, tmp_path):
+        from polycopy.db.database import Database
+        from uuid import uuid4
+
+        db = Database(db_path=tmp_path / "cat.db").connect()
+        # Seed a single wallet for FK satisfaction. Tests that
+        # need different wallet ids create their own seeds.
+        wallet_id = "0xWALLET_" + uuid4().hex[:12]
+        db.conn.execute(
+            "INSERT INTO wallets (id, address, label, is_sample, "
+            "created_at, canonical_address) VALUES (?, ?, ?, 0, ?, ?)",
+            (wallet_id, wallet_id.lower(), "test", "2026-01-01T00:00:00Z",
+             wallet_id.lower()),
+        )
+        db.conn.commit()
+        # Stash the wallet id in a module-level cache keyed on
+        # the tmp_path so tests can find it.
+        self._seeded_wallets[str(tmp_path)] = wallet_id
+        return db
+
+    def _wallet(self, tmp_path) -> str:
+        return self._seeded_wallets[str(tmp_path)]
+
+    def _row(self, db, decision_id):
+        return db.fetchone(
+            "SELECT * FROM category_wallet_score_decisions WHERE id = ?",
+            (decision_id,),
+        )
+
+    def test_first_persist_returns_decision_id(self, tmp_path) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(wallet_id=self._wallet(tmp_path))
+            result = compute_category_wallet_score_v1(input=inp)
+            decision_id = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+                source_data_timestamp="2026-01-01T00:00:00Z",
+            )
+            assert decision_id > 0
+            row = self._row(db, decision_id)
+            assert row is not None
+            assert row["wallet_id"] == inp.wallet_id
+            assert row["category_label"] == inp.category_label
+            assert row["formula_name"] == "category_wallet_score"
+            assert row["formula_version"] == "1"
+        finally:
+            db.close()
+
+    def test_exact_raw_values_persist(self, tmp_path) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(
+                wallet_id=self._wallet(tmp_path),
+                info_score=0.42,
+                win_rate=0.58,
+                profit_factor=1.65,
+                trade_intervals_std=7200.0,
+                trade_count=99,
+                max_drawdown=0.22,
+                sharpe_ratio=1.7,
+                sample_fraction=0.15,
+                category_trade_count=70,
+                category_distinct_markets=5,
+                overall_trade_count=120,
+                largest_winner_share=0.40,
+                top_3_concentration=0.55,
+                category_resolved_markets=18,
+                category_distinct_events=9,
+                category_active_days=11,
+            )
+            result = compute_category_wallet_score_v1(input=inp)
+            decision_id = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+            )
+            row = self._row(db, decision_id)
+            # Every raw input round-trips to within float tolerance.
+            assert abs(row["info_score"] - 0.42) < 1e-9
+            assert abs(row["win_rate"] - 0.58) < 1e-9
+            assert abs(row["profit_factor"] - 1.65) < 1e-9
+            assert row["trade_count"] == 99
+            assert row["category_trade_count"] == 70
+            assert row["category_distinct_markets"] == 5
+            assert row["overall_trade_count"] == 120
+            assert row["category_resolved_markets"] == 18
+            assert row["category_distinct_events"] == 9
+            assert row["category_active_days"] == 11
+        finally:
+            db.close()
+
+    def test_exact_category_gates_persist(self, tmp_path) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            # Strong score but with a failed gate.
+            inp = _strong_category_input(
+                wallet_id=self._wallet(tmp_path),
+                info_score=0.95,
+                category_resolved_markets=10,  # below min
+                category_distinct_events=12,
+                category_active_days=14,
+            )
+            result = compute_category_wallet_score_v1(input=inp)
+            decision_id = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+            )
+            row = self._row(db, decision_id)
+            # The gate value persists.
+            assert row["category_resolved_markets"] == 10
+            # The failure JSON is non-empty.
+            import json as _json
+            failures = _json.loads(row["category_gate_failures_json"])
+            assert any("category_resolved_markets" in f for f in failures)
+        finally:
+            db.close()
+
+    def test_missing_essentials_persist(self, tmp_path) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(
+                wallet_id=self._wallet(tmp_path),
+                win_rate=None, trade_count=None,
+            )
+            result = compute_category_wallet_score_v1(input=inp)
+            assert result.verdict == WalletVerdict.INCOMPLETE
+            decision_id = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+            )
+            row = self._row(db, decision_id)
+            import json as _json
+            missing = _json.loads(row["missing_essentials_json"])
+            assert "trade_count" in missing
+            assert "win_rate" in missing
+        finally:
+            db.close()
+
+    def test_idempotent_repeat_returns_existing_id(
+        self, tmp_path
+    ) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(wallet_id=self._wallet(tmp_path))
+            result = compute_category_wallet_score_v1(input=inp)
+            id1 = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+                source_data_timestamp="2026-01-01T00:00:00Z",
+            )
+            id2 = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+                source_data_timestamp="2026-01-01T00:00:00Z",
+            )
+            assert id1 == id2
+            # Only one row exists.
+            count = db.fetchone(
+                "SELECT COUNT(*) AS n FROM category_wallet_score_decisions "
+                "WHERE wallet_id = ? AND category_label = ?",
+                (inp.wallet_id, inp.category_label),
+            )["n"]
+            assert count == 1
+        finally:
+            db.close()
+
+    def test_later_snapshot_creates_new_row(self, tmp_path) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(wallet_id=self._wallet(tmp_path))
+            result = compute_category_wallet_score_v1(input=inp)
+            id1 = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+                source_data_timestamp="2026-01-01T00:00:00Z",
+            )
+            # Later snapshot must produce a NEW immutable row.
+            id2 = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+                source_data_timestamp="2026-01-02T00:00:00Z",
+            )
+            assert id1 != id2
+            count = db.fetchone(
+                "SELECT COUNT(*) AS n FROM category_wallet_score_decisions "
+                "WHERE wallet_id = ? AND category_label = ?",
+                (inp.wallet_id, inp.category_label),
+            )["n"]
+            assert count == 2
+        finally:
+            db.close()
+
+    def test_category_label_participates_in_identity(
+        self, tmp_path
+    ) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            w = self._wallet(tmp_path)
+            inp_crypto = _strong_category_input(
+                wallet_id=w, category_label="crypto"
+            )
+            inp_politics = _strong_category_input(
+                wallet_id=w, category_label="politics"
+            )
+            r_crypto = compute_category_wallet_score_v1(input=inp_crypto)
+            r_politics = compute_category_wallet_score_v1(input=inp_politics)
+            id_c = persist_category_score_v1(
+                db, w, "crypto", r_crypto,
+            )
+            id_p = persist_category_score_v1(
+                db, w, "politics", r_politics,
+            )
+            assert id_c != id_p
+            # Two distinct rows.
+            count = db.fetchone(
+                "SELECT COUNT(*) AS n FROM category_wallet_score_decisions"
+            )["n"]
+            assert count == 2
+        finally:
+            db.close()
+
+    def test_replay_yields_same_score(self, tmp_path) -> None:
+        """The exact input that produced decision N must reproduce
+        the same numeric score (deterministic replayability)."""
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(
+                wallet_id=self._wallet(tmp_path),
+                info_score=0.42, win_rate=0.58, profit_factor=1.65,
+                trade_count=99, category_resolved_markets=18,
+                category_distinct_events=9, category_active_days=11,
+            )
+            r1 = compute_category_wallet_score_v1(input=inp)
+            persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, r1,
+                source_data_timestamp="2026-01-01T00:00:00Z",
+            )
+            r2 = compute_category_wallet_score_v1(input=inp)
+            assert r1.score == r2.score
+            assert r1.verdict == r2.verdict
+        finally:
+            db.close()
+
+    def test_explicit_idempotency_key_honored(self, tmp_path) -> None:
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(wallet_id=self._wallet(tmp_path))
+            result = compute_category_wallet_score_v1(input=inp)
+            explicit = "deadbeef" * 8  # 64 hex chars max
+            id1 = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+                idempotency_key=explicit,
+            )
+            id2 = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+                idempotency_key=explicit,
+            )
+            assert id1 == id2
+        finally:
+            db.close()
+
+    def test_no_essential_field_silently_nullified(
+        self, tmp_path
+    ) -> None:
+        """The essential fields passed in must persist exactly.
+        No 'getattr(..., None)' fallback can silently turn a real
+        value into NULL."""
+        from polycopy.scoring.score_serialization import (
+            persist_category_score_v1,
+        )
+
+        db = self._make_db(tmp_path)
+        try:
+            inp = _strong_category_input(
+                wallet_id=self._wallet(tmp_path),
+                info_score=0.77,
+                category_resolved_markets=20,
+                category_distinct_events=10,
+                category_active_days=12,
+            )
+            result = compute_category_wallet_score_v1(input=inp)
+            decision_id = persist_category_score_v1(
+                db, inp.wallet_id, inp.category_label, result,
+            )
+            row = self._row(db, decision_id)
+            assert row["info_score"] is not None
+            assert row["win_rate"] is not None
+            assert row["category_resolved_markets"] is not None
+            assert row["category_distinct_events"] is not None
+            assert row["category_active_days"] is not None
+        finally:
+            db.close()
