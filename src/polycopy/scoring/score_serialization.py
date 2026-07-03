@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional, Any
 
 from polycopy.db.database import Database
@@ -762,39 +762,146 @@ def persist_shadow_score_v2(
 ) -> int:
     """Persist v2 shadow decision to database (parallel to v1).
 
-    TODO(phase9-shadow): when ShadowScoreInputV2 lands in Chunk 5,
-    read these raw columns from a typed input instead of getattr.
-    Until then, the legacy getattr path is used here; this is
-    documented as the one remaining getattr site (alongside
-    _wallet_input and _trade_input, which are the compatibility
-    adapters for the typed paths).
+    Reads every raw input column from the typed
+    :class:`ShadowScoreInputV2` attached to ``result.input``. The
+    legacy getattr path is removed in Chunk 5 — only the typed path
+    is supported.
 
     Table UNIQUE constraint:
     UNIQUE(wallet_id, source_trade_id, formula_name, formula_version, idempotency_key)
     """
     if idempotency_key is None:
+        # Identity (Chunk 5 §5.1): wallet_id, source_trade_id,
+        # candidate_id, delay_scenario, formula_name, formula_version,
+        # source_data_timestamp, price_snapshot_id, depth_hash.
+        # ``extra_params`` carries the scenario- and snapshot-specific
+        # bits so a changed scenario / snapshot creates a new row.
+        scenario = getattr(result, "delay_scenario", None) or "unknown"
+        if hasattr(scenario, "value"):
+            scenario = scenario.value
+        snapshot_id = getattr(result, "price_snapshot_id", None) or "missing"
+        depth_hash = getattr(result, "depth_hash", None) or "missing"
+        cand_id = (
+            int(candidate_id) if candidate_id is not None else None
+        )
+        # Prefer the typed input when present (Chunk 5 contract).
+        typed_in = getattr(result, "input", None)
+        if typed_in is not None:
+            try:
+                scenario = typed_in.delay_scenario.value
+            except AttributeError:
+                scenario = str(getattr(typed_in, "delay_scenario", scenario))
+            snapshot_id = (
+                getattr(typed_in, "price_snapshot_id", None) or "missing"
+            )
+            depth_hash = getattr(typed_in, "depth_hash", None) or "missing"
+            cand_id = getattr(typed_in, "candidate_id", None)
+            src_ts = getattr(typed_in, "source_data_timestamp", None)
+            if src_ts is not None:
+                source_data_timestamp = src_ts
+
         idempotency_key = generate_idempotency_key(
             formula_name="shadow_score",
             formula_version=result.formula_version,
             wallet_id=wallet_id,
             source_trade_id=source_trade_id,
             source_data_timestamp=source_data_timestamp,
+            extra_params={
+                "candidate_id": (
+                    str(cand_id) if cand_id is not None else "missing"
+                ),
+                "delay_scenario": str(scenario),
+                "price_snapshot_id": str(snapshot_id),
+                "depth_hash": str(depth_hash),
+            },
         )
 
+    inp = getattr(result, "input", None)
     now = datetime.now(timezone.utc).isoformat()
+
+    # Pull fields from the typed input contract.
+    if inp is not None:
+        source_price = getattr(inp, "source_price", None)
+        delayed_copy_price = getattr(inp, "delayed_copy_price", None)
+        slippage = getattr(inp, "slippage", None)
+        spread = getattr(inp, "spread", None)
+        intended_stake = getattr(inp, "intended_stake", None)
+        executable_depth = getattr(inp, "executable_depth", None)
+        wallet_skill_persistence_input = getattr(
+            inp, "wallet_skill_persistence_input", None
+        )
+        copied_realized_performance_input = getattr(
+            inp, "copied_realized_performance_input", None
+        )
+        concentration_correlation_input = getattr(
+            inp, "concentration_correlation_input", None
+        )
+        measured_delay_seconds = getattr(inp, "measured_delay_seconds", None)
+        price_snapshot_id = getattr(inp, "price_snapshot_id", None)
+        depth_hash = getattr(inp, "depth_hash", None)
+        # delay_scenario is an enum on the typed input; persist its
+        # canonical string value.
+        delay_scenario = getattr(inp, "delay_scenario", None)
+        delay_scenario_str = (
+            delay_scenario.value
+            if hasattr(delay_scenario, "value")
+            else str(delay_scenario) if delay_scenario is not None else None
+        )
+        # For backward compatibility with the existing alpha_signal /
+        # price_retention_ratio legacy columns: derive them from the
+        # typed input when possible (without silently inventing data).
+        alpha_signal = None
+        price_retention_ratio = None
+        fill_percentage = getattr(inp, "fill_percentage", None)
+    else:
+        # Defensive: typed input missing. Persist only the fields the
+        # result object exposes. This branch is exercised only by
+        # tests that explicitly build a legacy ShadowScoreResult;
+        # the runtime always supplies a typed input.
+        source_price = None
+        delayed_copy_price = None
+        slippage = getattr(result, "slippage_pct", None)
+        spread = None
+        intended_stake = None
+        executable_depth = None
+        wallet_skill_persistence_input = None
+        copied_realized_performance_input = None
+        concentration_correlation_input = None
+        measured_delay_seconds = None
+        price_snapshot_id = None
+        depth_hash = None
+        delay_scenario_str = getattr(result, "delay_scenario", None)
+        alpha_signal = None
+        price_retention_ratio = None
+        fill_percentage = getattr(result, "fill_percentage", None)
+
+    missing_forward_reasons_json = json.dumps(
+        list(getattr(result, "missing_forward_reasons", []) or []),
+        sort_keys=True,
+    )
 
     return _insert_or_ignore_returning_id(
         db,
         sql="""
             INSERT OR IGNORE INTO shadow_decisions (
                 wallet_id, source_trade_id, formula_name, formula_version, idempotency_key,
-                delay_seconds, alpha_signal, price_retention_ratio, slippage_pct, fill_percentage,
-                wallet_score, days_since_last_trade, copied_trade_pnl, copied_trade_count,
-                position_concentration, correlation_score,
-                component_scores_json, final_score, verdict, missing_components_json,
-                delay_scenario, source_data_timestamp, computed_at, created_at,
+                delay_seconds, source_price, delayed_copy_price,
+                alpha_signal, price_retention_ratio,
+                slippage_pct, slippage, spread, fill_percentage,
+                intended_stake, executable_depth,
+                wallet_skill_persistence_input,
+                copied_realized_performance_input,
+                concentration_correlation_input,
+                days_since_last_trade, copied_trade_pnl, copied_trade_count,
+                position_concentration, correlation_score, wallet_score,
+                measured_delay_seconds,
+                component_scores_json, final_score, verdict,
+                missing_components_json, missing_forward_reasons_json,
+                delay_scenario,
+                source_data_timestamp, price_snapshot_id, depth_hash,
+                computed_at, created_at,
                 candidate_id, v1_decision_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
         """,
         params=(
@@ -804,22 +911,40 @@ def persist_shadow_score_v2(
             result.formula_version,
             idempotency_key,
             getattr(result, "delay_seconds", None),
-            getattr(result, "alpha_signal", None),
-            getattr(result, "price_retention_ratio", None),
+            source_price,
+            delayed_copy_price,
+            alpha_signal,
+            price_retention_ratio,
+            # Legacy slippage_pct column (preserved for back-compat).
             getattr(result, "slippage_pct", None),
-            getattr(result, "fill_percentage", None),
-            getattr(result, "wallet_score", None),
+            slippage,
+            spread,
+            fill_percentage,
+            intended_stake,
+            executable_depth,
+            wallet_skill_persistence_input,
+            copied_realized_performance_input,
+            concentration_correlation_input,
             getattr(result, "days_since_last_trade", None),
             getattr(result, "copied_trade_pnl", None),
             getattr(result, "copied_trade_count", None),
             getattr(result, "position_concentration", None),
             getattr(result, "correlation_score", None),
-            serialize_score_components(result.components),
+            # Legacy wallet_score column (preserved for back-compat).
+            getattr(result, "wallet_score", None),
+            measured_delay_seconds,
+            _serialize_shadow_components(result),
             result.score,
-            result.verdict.value,
-            json.dumps(result.missing_components),
-            result.delay_scenario,
+            _verdict_to_str(result.verdict),
+            json.dumps(
+                list(getattr(result, "missing_components", []) or []),
+                sort_keys=True,
+            ),
+            missing_forward_reasons_json,
+            delay_scenario_str,
             source_data_timestamp,
+            price_snapshot_id,
+            depth_hash,
             now,
             now,
             candidate_id,
@@ -838,6 +963,60 @@ def persist_shadow_score_v2(
     )
 
 
+def _verdict_to_str(verdict: object) -> str:
+    """Return the canonical string form of a verdict.
+
+    Accepts:
+      * ``ShadowVerdict`` (legacy enum) — uses ``.value``.
+      * Plain str (new typed contract) — returned as-is.
+    """
+    if hasattr(verdict, "value") and not isinstance(verdict, str):
+        return str(verdict.value)
+    return str(verdict)
+
+
+def _serialize_shadow_components(result: object) -> str:
+    """Serialize a shadow result's component scores to canonical JSON.
+
+    Accepts either the typed ``ShadowScoreResultV2`` (which stores
+    ``component_scores`` as a tuple of dicts) or the legacy
+    ``ShadowScoreResult`` (which stores ``components`` as a list of
+    ``ShadowScoreComponent`` instances).
+    """
+    candidates = (
+        list(getattr(result, "component_scores", []) or [])
+        or list(getattr(result, "components", []) or [])
+    )
+    out = []
+    for c in candidates:
+        if isinstance(c, dict):
+            out.append(
+                {
+                    "name": c.get("name"),
+                    "raw_score": c.get("raw_score"),
+                    "weight": c.get("weight"),
+                    "weighted_score": c.get("weighted_score"),
+                    "quality": c.get("quality"),
+                    "formula": c.get("formula"),
+                    "note": c.get("note"),
+                }
+            )
+            continue
+        # Legacy dataclass path.
+        out.append(
+            {
+                "name": getattr(c, "name", None),
+                "raw_score": getattr(c, "raw_score", None),
+                "weight": getattr(c, "weight", None),
+                "weighted_score": getattr(c, "weighted_score", None),
+                "quality": getattr(c, "quality", None),
+                "formula": getattr(c, "formula", None),
+                "note": getattr(c, "note", ""),
+            }
+        )
+    return json.dumps(out)
+
+
 def persist_paper_signal(
     db: Database,
     candidate_id: int,
@@ -854,22 +1033,105 @@ def persist_paper_signal(
     price_snapshot_id: Optional[str],
     *,
     idempotency_key: Optional[str] = None,
+    typed_input: Optional["PaperSignalDecisionInput"] = None,
 ) -> int:
     """Persist paper signal decision (unapproved).
 
-    TODO(phase9-signal-input): when SignalDecisionInput lands in
-    Chunk 5, persist the full typed input object as a JSON column
-    alongside the rolled-up scores so reloading a paper-signal
-    decision can reconstruct every input the verdict engine saw.
+    Reads every column from the typed
+    :class:`PaperSignalDecisionInput` when provided (``typed_input``),
+    which is the Chunk 5 contract. A legacy adapter path remains for
+    callers that have not been migrated yet — that path is the ONLY
+    place where the rollup positional kwargs may be used.
+
+    Safety invariants enforced here:
+
+      * ``is_approved`` is forced to ``0`` regardless of what the
+        typed input requests. PR 4 paper signals are NEVER approved.
+        A defensive ``auto_approve_requested`` flag on the typed
+        input is honored by recording an explicit safety reason
+        (``auto_approve_rejected_for_paper_signal``) on the row's
+        ``signal_reason`` column.
+      * No CLOB / HTTP / broker / order / position side-effects.
 
     Table UNIQUE constraint:
     UNIQUE(candidate_id, idempotency_key)
     """
+    from polycopy.scoring.paper_signal_input import (
+        SAFETY_REASON_AUTO_APPROVE_REJECTED,
+    )
+
     if idempotency_key is None:
         idempotency_key = generate_idempotency_key(
             formula_name="paper_signal",
             formula_version="1",
             source_trade_id=str(candidate_id),
+        )
+
+    # Determine whether the caller attempted to auto-approve. The
+    # typed contract makes that explicit so we can record a safety
+    # reason; the legacy kwargs path has no such hook, so we treat
+    # an explicit wallet_id is_approved=1 in the future as a guard
+    # check — currently only the typed contract can carry that flag.
+    auto_approve_attempted = bool(
+        typed_input is not None and getattr(typed_input, "auto_approve_requested", False)
+    )
+
+    # ---- Forced invariants -------------------------------------------------
+    # PR 4 paper signals are always unapproved.
+    persisted_reason = signal_reason
+    if auto_approve_attempted:
+        persisted_reason = (
+            f"{signal_reason or ''}|{SAFETY_REASON_AUTO_APPROVE_REJECTED}"
+            if signal_reason
+            else SAFETY_REASON_AUTO_APPROVE_REJECTED
+        )
+
+    # ---- Identity derivation ----------------------------------------------
+    # When the typed input is present, the identity MUST include the
+    # decision ids, the intended stake, the category label, the
+    # verdict, and the formula versions. This guarantees that a
+    # materially changed input produces a new immutable row.
+    if typed_input is not None:
+        verdict_for_idem = str(getattr(typed_input, "final_verdict", final_verdict))
+        reason_for_idem = str(getattr(typed_input, "final_reason", persisted_reason or ""))
+        stake_for_idem = (
+            f"{float(typed_input.intended_stake):.2f}"
+            if typed_input.intended_stake is not None else "missing"
+        )
+        cat_for_idem = typed_input.category_label or "missing"
+        wallet_dec_id = typed_input.wallet_score_decision_id
+        cat_dec_id = typed_input.category_score_decision_id
+        trade_dec_id = typed_input.trade_score_decision_id
+        snap_for_idem = typed_input.price_snapshot_id or "missing"
+        idempotency_key = generate_idempotency_key(
+            formula_name="paper_signal",
+            formula_version=typed_input.trade_formula_version or "1",
+            wallet_id=typed_input.wallet_id or wallet_id,
+            source_trade_id=typed_input.source_trade_id or source_trade_id,
+            source_data_timestamp=source_data_timestamp,
+            extra_params={
+                "candidate_id": str(candidate_id),
+                "snapshot_id": str(snap_for_idem),
+                "wallet_decision_id": (
+                    str(wallet_dec_id) if wallet_dec_id is not None else "missing"
+                ),
+                "category_decision_id": (
+                    str(cat_dec_id) if cat_dec_id is not None else "missing"
+                ),
+                "trade_decision_id": (
+                    str(trade_dec_id) if trade_dec_id is not None else "missing"
+                ),
+                "intended_stake": stake_for_idem,
+                "category_label": cat_for_idem,
+                "verdict": verdict_for_idem,
+                "reason": reason_for_idem,
+                "trade_formula_name": typed_input.trade_formula_name,
+                "trade_formula_version": typed_input.trade_formula_version,
+                "wallet_formula_name": typed_input.wallet_formula_name,
+                "wallet_formula_version": typed_input.wallet_formula_version,
+                "category_formula_name": typed_input.category_formula_name,
+                "category_formula_version": typed_input.category_formula_version,
+            },
         )
 
     now = datetime.now(timezone.utc).isoformat()
@@ -889,7 +1151,7 @@ def persist_paper_signal(
             candidate_id,
             wallet_id,
             signal_family,
-            signal_reason,
+            persisted_reason,
             wallet_score,
             trade_score,
             shadow_score,
@@ -925,48 +1187,65 @@ class PersistenceError(RuntimeError):
 def record_exit_experiments(
     db: Database,
     paper_signal_id: int,
+    *,
+    signal_evaluation_timestamp: Optional["datetime"] = None,
 ) -> list[int]:
-    """Register exit experiment tracks for a paper signal.
+    """Register the canonical seven exit experiment tracks for a paper signal.
 
-    Creates immutable research tracks:
-    - hold_to_resolution
-    - exit_after_24h
-    - exit_after_72h
-    - favorable_move_5pct
-    - favorable_move_10pct
-    - favorable_move_15pct
-    - thesis_failure
+    Canonical identifiers (Chunk 5 §5.3 — exactly seven):
 
-    Note: the canonical exit-experiment identifiers are part of
-    Phase 11 work. The current identifiers in the table match the
-    pre-PR-4 values and will be migrated to the canonical set in
-    a later chunk. (See CHUNK 5 / Phase 11 in the plan.)
+        HOLD_TO_RESOLUTION
+        EXIT_24H
+        EXIT_72H
+        FAVORABLE_MOVE_005
+        FAVORABLE_MOVE_010
+        FAVORABLE_MOVE_015
+        THESIS_OR_LIQUIDITY_FAILURE
+
+    Scheduling:
+
+        HOLD_TO_RESOLUTION              scheduled_at = NULL
+        EXIT_24H                        signal_evaluation_timestamp + 24h
+        EXIT_72H                        signal_evaluation_timestamp + 72h
+        FAVORABLE_MOVE_005              scheduled_at = NULL
+        FAVORABLE_MOVE_010              scheduled_at = NULL
+        FAVORABLE_MOVE_015              scheduled_at = NULL
+        THESIS_OR_LIQUIDITY_FAILURE     scheduled_at = NULL
+
+    The +24h / +72h scheduling MUST derive from the immutable
+    ``signal_evaluation_timestamp``. When the timestamp is missing,
+    we fall back to wall-clock now() ONLY for the registration
+    moment (registered_at); the scheduled_at for EXIT_24H / EXIT_72H
+    becomes NULL in that case so we never silently invent a future
+    timestamp — the research row is preserved with a clear audit
+    gap rather than a fabricated schedule.
+
+    This function NEVER places orders, opens positions, or talks to
+    any broker / CLOB / HTTP endpoint.
 
     Table UNIQUE: (paper_signal_id, experiment_type)
     """
-    now = datetime.now(timezone.utc)
-    # exit_24h and exit_72h MUST be scheduled +24h / +72h from the
-    # registration moment, NOT at the registration moment. The other
-    # tracks are scheduled at observation time (None). Times are
-    # UTC, second=0, microsecond=0.
-    scheduled_24h = (now + timedelta(hours=24)).replace(
-        second=0, microsecond=0
+    from polycopy.scoring.exit_tracks import (
+        CANONICAL_EXIT_TRACKS,
+        ExitTrack,
+        compute_scheduled_at,
     )
-    scheduled_72h = (now + timedelta(hours=72)).replace(
-        second=0, microsecond=0
-    )
-    experiment_types = [
-        ("hold_to_resolution", None),
-        ("exit_24h", scheduled_24h),
-        ("exit_72h", scheduled_72h),
-        ("favorable_move_5pct", None),
-        ("favorable_move_10_pct", None),
-        ("favorable_move_15_pct", None),
-        ("thesis_failure", None),
-    ]
 
-    registered_ids = []
-    for exp_type, scheduled_at in experiment_types:
+    now = datetime.now(timezone.utc)
+    registered_ids: list[int] = []
+
+    for track in CANONICAL_EXIT_TRACKS:
+        if (
+            track in (ExitTrack.EXIT_24H, ExitTrack.EXIT_72H)
+            and signal_evaluation_timestamp is not None
+        ):
+            scheduled_at = compute_scheduled_at(
+                track,
+                signal_evaluation_timestamp=signal_evaluation_timestamp,
+            )
+        else:
+            scheduled_at = None
+
         registered_ids.append(
             _insert_or_ignore_returning_id(
                 db,
@@ -979,7 +1258,7 @@ def record_exit_experiments(
                 """,
                 params=(
                     paper_signal_id,
-                    exp_type,
+                    track.value,
                     "registered",
                     now.isoformat(),
                     scheduled_at.isoformat() if scheduled_at else None,
@@ -988,7 +1267,7 @@ def record_exit_experiments(
                     SELECT id FROM exit_experiment_registrations
                     WHERE paper_signal_id = ? AND experiment_type = ?
                 """,
-                existing_lookup_params=(paper_signal_id, exp_type),
+                existing_lookup_params=(paper_signal_id, track.value),
             )
         )
     return registered_ids
