@@ -16,9 +16,12 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Optional, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from polycopy.db.database import Database
+
+if TYPE_CHECKING:
+    from polycopy.scoring.paper_signal_input import PaperSignalDecisionInput
 
 
 # ---- Idempotency key -----------------------------------------------------

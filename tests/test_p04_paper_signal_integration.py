@@ -20,17 +20,13 @@ Covers:
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-import pytest
-
 from polycopy.scoring.behavior_classification import (
     BehaviorClassification,
     BehaviorClassificationResult,
-    BehaviorEvidence,
 )
 from polycopy.scoring.category_wallet_score_v1 import (
     CategoryWalletScoreInputV1,
@@ -50,12 +46,10 @@ from polycopy.scoring.score_serialization import (
 from polycopy.scoring.trade_score_v1 import (
     TradeCopyabilityInputV1,
     TradeScoreResult,
-    TradeVerdict,
     compute_trade_score_v1,
 )
 from polycopy.scoring.verdict_generation import (
     SignalVerdict,
-    WalletVerdict,
 )
 from polycopy.scoring.wallet_score_v1 import (
     WalletScoreInputV1,
