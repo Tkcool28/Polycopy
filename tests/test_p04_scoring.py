@@ -487,79 +487,418 @@ class TestTradeScoreV1BUYPenalty:
 
 
 class TestSignalVerdictGeneration:
-    """Test every signal decision branch."""
+    """Phase 3 — exhaustive decision-table for the final signal verdict.
 
-    def test_copy_candidate_all_conditions_met(self):
-        input_data = SignalDecisionInput(
-            wallet_score=80.0,
+    Branches covered (from the frozen PR 4 spec):
+
+      1.  wallet_score or wallet_verdict missing         -> INCOMPLETE
+      2.  wallet_verdict == INCOMPLETE                    -> INCOMPLETE
+      3.  category_wallet_score or category_wallet_verdict missing -> INCOMPLETE
+      4.  category_wallet_verdict == "incomplete"         -> INCOMPLETE
+      5.  trade_score or trade_verdict missing           -> INCOMPLETE
+      6.  trade_verdict == INCOMPLETE                    -> INCOMPLETE
+      7.  behavior == MARKET_MAKER_LP                    -> SKIP
+      8.  behavior == ARBITRAGE_MULTI_LEG                -> SKIP
+      9.  behavior == HIGH_FREQUENCY_BOT                 -> SKIP
+      10. behavior == MIXED                              -> WATCHLIST cap
+      11. behavior == UNKNOWN                            -> WATCHLIST cap
+      12. has_hard_exclusion                             -> SKIP
+      13. wallet_score < 55                              -> SKIP
+      14. 55 <= wallet_score < 75                        -> WATCHLIST
+      15. wallet_score >= 75, trade_score < 70           -> SKIP
+          (skipped_reason = "skilled_wallet_trade_not_copyable")
+      16. wallet_score >= 75, category != copy_candidate -> WATCHLIST
+      17. ALL gates pass (wallet >=75, cat=copy_candidate,
+          trade >=70, directional, no exclusion)         -> COPY_CANDIDATE
+    """
+
+    def _behavior(self, classification, *, is_skip=False,
+                  is_watchlist_cap=False, is_eligible=True,
+                  reasons=None):
+        """Build a real BehaviorClassificationResult (not a mock) so
+        type checks work; the verdict_generation module only reads
+        the three booleans + the classification value."""
+        from polycopy.scoring.behavior_classification import (
+            BehaviorClassificationResult,
+        )
+        return BehaviorClassificationResult(
+            classification=classification,
+            reasons=list(reasons or []),
+            is_eligible_for_copy=is_eligible,
+            is_watchlist_cap=is_watchlist_cap,
+            is_skip=is_skip,
+        )
+
+    # ---- 1-2. wallet missing / INCOMPLETE ----
+    def test_1_wallet_score_missing_is_incomplete(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=None,
             wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
             category_wallet_verdict="copy_candidate",
             trade_score=75.0,
             trade_verdict=TradeVerdict.COPY_CANDIDATE,
             behavior_classification=None,
-            has_hard_exclusion=False,
-        )
-        result = generate_signal_verdict(input_data)
-        assert result.verdict == SignalVerdict.COPY_CANDIDATE
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+        assert result.reason == "missing_wallet_score"
 
-    def test_skip_skilled_wallet_trade_not_copyable(self):
-        input_data = SignalDecisionInput(
+    def test_1_wallet_verdict_missing_is_incomplete(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=None,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=75.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+        assert result.reason == "missing_wallet_score"
+
+    def test_2_wallet_verdict_incomplete_is_incomplete(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.INCOMPLETE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=75.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+        assert result.reason == "wallet_verdict_incomplete"
+
+    # ---- 3-4. category missing / INCOMPLETE ----
+    def test_3_category_score_missing_is_incomplete(self):
+        result = generate_signal_verdict(SignalDecisionInput(
             wallet_score=80.0,
             wallet_verdict=WalletVerdict.COPY_CANDIDATE,
-            category_wallet_verdict="copy_candidate",
-            trade_score=60.0,  # Below 70 threshold
-            trade_verdict=TradeVerdict.WATCHLIST,
-            behavior_classification=None,
-            has_hard_exclusion=False,
-        )
-        result = generate_signal_verdict(input_data)
-        assert result.verdict == SignalVerdict.SKIP
-        assert "skilled_wallet_trade_not_copyable" in (result.skipped_reason or "")
-
-    def test_watchlist_wallet_score_55_to_74(self):
-        input_data = SignalDecisionInput(
-            wallet_score=65.0,
-            wallet_verdict=WalletVerdict.WATCHLIST,
-            category_wallet_verdict="copy_candidate",
-            trade_score=80.0,
+            category_wallet_score=None,
+            category_wallet_verdict=None,
+            trade_score=75.0,
             trade_verdict=TradeVerdict.COPY_CANDIDATE,
             behavior_classification=None,
-            has_hard_exclusion=False,
-        )
-        result = generate_signal_verdict(input_data)
-        assert result.verdict == SignalVerdict.WATCHLIST
-
-    def test_incomplete_missing_wallet_score(self):
-        input_data = SignalDecisionInput(
-            wallet_score=None,
-            wallet_verdict=None,
-            category_wallet_verdict=None,
-            trade_score=None,
-            trade_verdict=None,
-            behavior_classification=None,
-            has_hard_exclusion=False,
-        )
-        result = generate_signal_verdict(input_data)
+        ))
         assert result.verdict == SignalVerdict.INCOMPLETE
+        assert result.reason == "missing_category_score"
 
-    def test_behavior_skip_caps_verdict(self):
-        input_data = SignalDecisionInput(
+    def test_4_category_verdict_incomplete_is_incomplete(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="incomplete",
+            trade_score=75.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+        assert result.reason == "category_verdict_incomplete"
+
+    # ---- 5-6. trade missing / INCOMPLETE ----
+    def test_5_trade_score_missing_is_incomplete(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=None,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+        assert result.reason == "missing_trade_score"
+
+    def test_6_trade_verdict_incomplete_is_incomplete(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=75.0,
+            trade_verdict=TradeVerdict.INCOMPLETE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+        assert result.reason == "trade_verdict_incomplete"
+
+    # ---- 7-9. behavior SKIP branches ----
+    def test_7_market_maker_behavior_is_skip(self):
+        result = generate_signal_verdict(SignalDecisionInput(
             wallet_score=90.0,
             wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
             category_wallet_verdict="copy_candidate",
             trade_score=80.0,
             trade_verdict=TradeVerdict.COPY_CANDIDATE,
-            behavior_classification=type('BehaviorClassificationResult', (), {
-                'classification': BehaviorClassification.HIGH_FREQUENCY_BOT,
-                'is_eligible_for_copy': False,
-                'is_watchlist_cap': False,
-                'is_skip': True,
-                'reasons': ['hf_detected'],
-            })(),
-            has_hard_exclusion=False,
-        )
-        result = generate_signal_verdict(input_data)
+            behavior_classification=self._behavior(
+                BehaviorClassification.MARKET_MAKER_LP, is_skip=True,
+                is_eligible=False,
+            ),
+        ))
         assert result.verdict == SignalVerdict.SKIP
+        assert result.reason == "behavior_market_maker_lp"
+
+    def test_8_arbitrage_behavior_is_skip(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=90.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=self._behavior(
+                BehaviorClassification.ARBITRAGE_MULTI_LEG, is_skip=True,
+                is_eligible=False,
+            ),
+        ))
+        assert result.verdict == SignalVerdict.SKIP
+        assert result.reason == "behavior_arbitrage_multi_leg"
+
+    def test_9_hft_behavior_is_skip(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=90.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=self._behavior(
+                BehaviorClassification.HIGH_FREQUENCY_BOT, is_skip=True,
+                is_eligible=False,
+            ),
+        ))
+        assert result.verdict == SignalVerdict.SKIP
+        assert result.reason == "behavior_high_frequency_bot"
+
+    # ---- 10-11. behavior WATCHLIST cap ----
+    def test_10_mixed_behavior_caps_at_watchlist(self):
+        # Even with wallet=90, trade=80, cat=copy_candidate, behavior
+        # MIXED must cap at WATCHLIST — never COPY_CANDIDATE.
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=90.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=self._behavior(
+                BehaviorClassification.MIXED, is_watchlist_cap=True,
+                is_eligible=False,
+            ),
+        ))
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == "behavior_mixed_watchlist_cap"
+
+    def test_11_unknown_behavior_caps_at_watchlist(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=90.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=self._behavior(
+                BehaviorClassification.UNKNOWN, is_watchlist_cap=True,
+                is_eligible=False,
+            ),
+        ))
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == "behavior_unknown_watchlist_cap"
+
+    # ---- 12. hard exclusion ----
+    def test_12_hard_exclusion_is_skip(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=90.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+            has_hard_exclusion=True,
+            hard_exclusion_reason="REGULATED_MARKET",
+        ))
+        assert result.verdict == SignalVerdict.SKIP
+        assert result.reason == "REGULATED_MARKET"
+
+    # ---- 13. wallet_score < 55 ----
+    def test_13_wallet_below_55_is_skip(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=40.0,
+            wallet_verdict=WalletVerdict.SKIP,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.SKIP
+        assert result.reason == "wallet_score_below_55"
+
+    # ---- 14. wallet_score 55-75 ----
+    def test_14_wallet_55_to_75_is_watchlist(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=65.0,
+            wallet_verdict=WalletVerdict.WATCHLIST,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == "wallet_score_watchlist_range"
+
+    def test_14_wallet_55_to_75_with_unknown_behavior_still_watchlist(self):
+        # When wallet is in watchlist range, the cap doesn't change
+        # the verdict; both reasons are acceptable but
+        # wallet_score_watchlist_range must appear.
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=65.0,
+            wallet_verdict=WalletVerdict.WATCHLIST,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=self._behavior(
+                BehaviorClassification.UNKNOWN, is_watchlist_cap=True,
+                is_eligible=False,
+            ),
+        ))
+        assert result.verdict == SignalVerdict.WATCHLIST
+
+    # ---- 15. wallet >= 75, trade < 70 ----
+    def test_15_skilled_wallet_trade_not_copyable_is_skip(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=60.0,
+            trade_verdict=TradeVerdict.WATCHLIST,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.SKIP
+        assert result.skipped_reason == "skilled_wallet_trade_not_copyable"
+        # `reason` carries the diagnostic; skipped_reason is the
+        # canonical Phase 3 #15 identifier.
+        assert "skilled_wallet_trade_not_copyable" in (
+            (result.reason or "") + " " + (result.skipped_reason or "")
+        )
+
+    # ---- 16. wallet >= 75, category not copy_candidate ----
+    def test_16_category_watchlist_blocks_copy(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=70.0,
+            category_wallet_verdict="watchlist",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == "category_verdict_not_copy_candidate"
+
+    def test_16_category_skip_blocks_copy(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=40.0,
+            category_wallet_verdict="skip",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == "category_verdict_not_copy_candidate"
+
+    # ---- 17. all gates pass -> COPY_CANDIDATE ----
+    def test_17_all_gates_pass_is_copy_candidate(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=75.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.COPY_CANDIDATE
+        assert result.reason == "all_thresholds_met"
+
+    def test_17_directional_behavior_allows_copy(self):
+        # DIRECTIONAL is the only behavior that allows COPY_CANDIDATE.
+        # We pass a real DIRECTIONAL behavior object and verify it
+        # doesn't impose a cap.
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=75.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=self._behavior(
+                BehaviorClassification.DIRECTIONAL,
+            ),
+        ))
+        assert result.verdict == SignalVerdict.COPY_CANDIDATE
+
+    # ---- numeric placeholder scores do NOT override INCOMPLETE verdicts ----
+    def test_numeric_score_does_not_override_incomplete_wallet(self):
+        # Even if trade_score and category are valid, an INCOMPLETE
+        # wallet must propagate to INCOMPLETE.
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,  # numeric placeholder present
+            wallet_verdict=WalletVerdict.INCOMPLETE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+
+    def test_numeric_score_does_not_override_incomplete_category(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="incomplete",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+
+    def test_numeric_score_does_not_override_incomplete_trade(self):
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=80.0,
+            trade_verdict=TradeVerdict.INCOMPLETE,
+            behavior_classification=None,
+        ))
+        assert result.verdict == SignalVerdict.INCOMPLETE
+
+    # ---- reason is always a SignalReason enum value (or None) ----
+    def test_reason_is_canonical_constant_or_none(self):
+        from polycopy.scoring.verdict_generation import SignalReason
+        result = generate_signal_verdict(SignalDecisionInput(
+            wallet_score=80.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=80.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=75.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=None,
+        ))
+        # All canonical reason values are valid strings
+        assert result.reason in {e.value for e in SignalReason} | {None}
 
 
 class TestIdempotency:

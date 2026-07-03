@@ -206,11 +206,17 @@ def generate_paper_signals(
             )
 
             # Generate signal verdict
+            # NOTE: category_wallet_score and category_wallet_verdict
+            # are both None here because the category score v1 module
+            # lands in Chunk 3. The verdict engine will correctly
+            # produce INCOMPLETE for these candidates; Chunk 3 will
+            # wire the real values in.
             signal_decision = generate_signal_verdict(
                 input_data=SignalDecisionInput(
                     wallet_score=wallet_score_result.score,
                     wallet_verdict=wallet_score_result.verdict,
-                    category_wallet_verdict=None,  # TODO: implement category scoring
+                    category_wallet_score=None,
+                    category_wallet_verdict=None,
                     trade_score=trade_score_result.score,
                     trade_verdict=trade_score_result.verdict,
                     behavior_classification=behavior_result if hasattr(behavior_result, 'reasons') else None,
