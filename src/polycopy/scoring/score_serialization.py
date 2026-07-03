@@ -185,6 +185,157 @@ def _trade_input(result) -> Any:
     )
 
 
+# ---- Depth-walk audit evidence serialization (Task 2.5) -------------------
+#
+# Phase 7 + Phase 9: the typed DepthWalkResult attached to the
+# trade input is the SOLE source of truth for the depth-walk audit
+# columns. We do NOT read these fields from scattered getattr
+# fallbacks on the result — every value comes from the typed input.
+#
+# JSON serialization rules:
+# - Decimal values are serialized as canonical decimal strings
+#   (no float conversion) so that round-tripping preserves the
+#   exact precision used by the score.
+# - Nullable values use JSON null (not the string "None").
+# - Booleans use JSON true/false.
+# - Sort keys for deterministic hashing.
+#
+# Equivalent Decimal values (e.g. Decimal("5.0") and Decimal("5"))
+# serialize identically because normalize() removes trailing zeros
+# before str() conversion.
+
+def _serialize_decimal(d) -> Optional[str]:
+    """Serialize a Decimal value as a canonical decimal string.
+
+    Returns None when the value is None — callers serialize None
+    as JSON null.
+
+    The canonical form is: normalize() first, then format as a
+    fixed-point string. This gives Decimal("5.00") and
+    Decimal("5") identical serializations ("5") and avoids
+    scientific notation unless the value genuinely requires it.
+    """
+    if d is None:
+        return None
+    # Use normalize() to strip trailing zeros, then format as
+    # fixed-point ("f"). This produces a deterministic, exact
+    # string representation.
+    return format(d.normalize(), "f") if d.is_finite() else format(d, "f")
+
+
+def _serialize_depth_walk(input_obj) -> Optional[str]:
+    """Serialize the depth-walk audit JSON for persistence.
+
+    Reads every field from `input_obj.depth_walk_result` (typed
+    DepthWalkResult). When no depth walk result is present but
+    `input_obj.depth_status_reason` is set, an audit envelope
+    reflecting the rejection status is persisted instead so the
+    absence is itself documented.
+
+    Returns None ONLY when no depth evidence of any kind was
+    available — i.e. neither a typed result nor a status reason.
+
+    Canonical JSON keys (sorted):
+    - side (str)
+    - intended_notional (str Decimal)
+    - filled_notional (str Decimal)
+    - fill_percentage (str Decimal)
+    - contracts_filled (str Decimal)
+    - vwap_fill_price (str Decimal or null)
+    - slippage (str Decimal or null)
+    - levels_consumed (int)
+    - remaining_notional (str Decimal)
+    - is_complete (bool)
+    - insufficient_reason (str or null)
+    - depth_hash (str or null)
+    - price_snapshot_id (str or null)
+    """
+    dw = getattr(input_obj, "depth_walk_result", None)
+    depth_hash = getattr(input_obj, "depth_hash", None)
+    price_snapshot_id = getattr(input_obj, "price_snapshot_id", None)
+
+    if dw is None:
+        # No typed result. Persist an envelope recording the
+        # rejection status (if any) so the absence is documented.
+        status = getattr(input_obj, "depth_status_reason", None)
+        if status is None:
+            return None
+        payload: dict[str, Any] = {
+            "depth_status_reason": status,
+            "is_complete": False,
+            "depth_hash": depth_hash,
+            "price_snapshot_id": price_snapshot_id,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    payload = {
+        "side": dw.side,
+        "intended_notional": _serialize_decimal(dw.intended_notional),
+        "filled_notional": _serialize_decimal(dw.filled_notional),
+        "fill_percentage": _serialize_decimal(dw.fill_percentage),
+        "contracts_filled": _serialize_decimal(dw.contracts_filled),
+        "vwap_fill_price": _serialize_decimal(dw.vwap_fill_price),
+        "slippage": _serialize_decimal(dw.slippage),
+        "levels_consumed": dw.levels_consumed,
+        "remaining_notional": _serialize_decimal(dw.remaining_notional),
+        "is_complete": bool(dw.is_complete),
+        "insufficient_reason": dw.insufficient_reason,
+        "depth_hash": depth_hash,
+        "price_snapshot_id": price_snapshot_id,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _serialize_insufficient_reason(input_obj) -> Optional[str]:
+    """Compute the insufficient_depth_reason column value.
+
+    Priority:
+      1. The typed DepthWalkResult's `insufficient_reason` (when
+         present). This is the authoritative reason — set by the
+         walk itself.
+      2. The typed input's `depth_status_reason` (DEPTH_NOT_CAPTURED /
+         DEPTH_LEVELS_MALFORMED / DEPTH_SNAPSHOT_MISMATCH) when no
+         depth walk result is available.
+      3. NULL when neither applies (e.g. full fill, no depth evidence).
+
+    Full fills must NEVER receive DEPTH_INSUFFICIENT_FOR_STAKE.
+    """
+    dw = getattr(input_obj, "depth_walk_result", None)
+    if dw is not None and dw.insufficient_reason is not None:
+        return dw.insufficient_reason
+    if dw is None:
+        status = getattr(input_obj, "depth_status_reason", None)
+        if status is not None:
+            return status
+    return None
+
+
+def _effective_fill_percentage(input_obj) -> Optional[float]:
+    """Effective fill_percentage for column storage (REAL).
+
+    Reads from the typed DepthWalkResult when present (preferred),
+    otherwise from the raw input. Decimal ratio on [0, 1] is
+    cast to float for the REAL column.
+    """
+    dw = getattr(input_obj, "depth_walk_result", None)
+    if dw is not None:
+        return float(dw.fill_percentage)
+    return getattr(input_obj, "fill_percentage", None)
+
+
+def _effective_executable_depth(input_obj) -> Optional[float]:
+    """Effective executable_depth for column storage (REAL).
+
+    The typed DepthWalkResult's `filled_notional` (in USDC) is the
+    SOLE source of truth when present. Otherwise the raw input
+    value is used.
+    """
+    dw = getattr(input_obj, "depth_walk_result", None)
+    if dw is not None:
+        return float(dw.filled_notional)
+    return getattr(input_obj, "executable_depth", None)
+
+
 # ---- INSERT ... RETURNING helper ----------------------------------------
 #
 # SQLite's behavior with INSERT ... RETURNING: the cursor returned
@@ -351,9 +502,9 @@ def persist_trade_score_v1(
     price_snapshot_id: Optional[str] = None,
     source_data_timestamp: Optional[str] = None,
 ) -> int:
-    """Persist trade copyability v1 decision to database (Phase 9).
+    """Persist trade copyability v1 decision to database (Phase 9 + Phase 7).
 
-    INSERT column/placeholder/value count: 28 / 28 / 28
+    INSERT column/placeholder/value count: 30 / 30 / 30
     (enforced by TestColumnPlaceholderValueCount).
 
     Table UNIQUE constraint:
@@ -363,9 +514,15 @@ def persist_trade_score_v1(
     wallet_id is not (multiple wallets can score the same source
     trade). wallet_id is still in the row for query convenience.
 
-    TODO(phase7): when depth-walk integration lands, the
-    depth_walk_json and insufficient_depth_reason columns will
-    be populated from a typed depth-walk result.
+    Depth-walk audit evidence (Phase 7 + Phase 9):
+    - depth_walk_json is the canonical JSON serialization of
+      result.input.depth_walk_result (or a rejection envelope if
+      depth_status_reason is set without a typed result).
+    - insufficient_depth_reason is set from the typed result's
+      insufficient_reason, falling back to depth_status_reason.
+    - fill_percentage and executable_depth are the EFFECTIVE values
+      (typed depth walk overrides raw input fields).
+    - intended_stake and price_snapshot_id come from the typed input.
     """
     if idempotency_key is None:
         idempotency_key = generate_idempotency_key(
@@ -378,6 +535,14 @@ def persist_trade_score_v1(
 
     inp = _trade_input(result)
     now = datetime.now(timezone.utc).isoformat()
+
+    # Depth-walk audit evidence (Phase 7 + Phase 9). Every value
+    # comes from the typed input — no scattered getattr fallbacks
+    # on the result.
+    depth_walk_json = _serialize_depth_walk(inp)
+    insufficient_reason = _serialize_insufficient_reason(inp)
+    eff_fill_pct = _effective_fill_percentage(inp)
+    eff_exec_depth = _effective_executable_depth(inp)
 
     return _insert_or_ignore_returning_id(
         db,
@@ -403,8 +568,8 @@ def persist_trade_score_v1(
             inp.price_deterioration_pct,
             inp.side,
             inp.intended_stake,
-            inp.executable_depth,
-            inp.fill_percentage,
+            eff_exec_depth,
+            eff_fill_pct,
             inp.spread,
             inp.best_bid_size,
             inp.best_ask_size,
@@ -413,9 +578,9 @@ def persist_trade_score_v1(
             inp.market_active,
             inp.market_closed,
             inp.market_resolved,
-            # TODO(phase7): populate from a typed depth-walk result.
-            None,  # depth_walk_json
-            None,  # insufficient_depth_reason
+            # Depth-walk audit evidence (Phase 7 + Phase 9)
+            depth_walk_json,
+            insufficient_reason,
             serialize_score_components(result.components),
             result.score,
             result.verdict.value,

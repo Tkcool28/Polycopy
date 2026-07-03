@@ -40,6 +40,7 @@ All HTTP tests mocked.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1971,6 +1972,448 @@ class TestColumnPlaceholderValueCount:
         )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 2.5 — depth-walk audit persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_dw_full():
+    """Build a fully-filled DepthWalkResult with all Decimal fields."""
+    from polycopy.scoring.depth_normalization import DepthWalkResult
+    from decimal import Decimal
+    return DepthWalkResult(
+        side="BUY",
+        intended_notional=Decimal("100"),
+        filled_notional=Decimal("100"),
+        fill_percentage=Decimal("1"),
+        contracts_filled=Decimal("1000"),
+        vwap_fill_price=Decimal("0.10"),
+        slippage=Decimal("0"),
+        levels_consumed=1,
+        remaining_notional=Decimal("0"),
+        is_complete=True,
+        insufficient_reason=None,
+    )
+
+
+def _make_dw_partial():
+    """Build a partial-fill DepthWalkResult with Decimal fields."""
+    from polycopy.scoring.depth_normalization import (
+        DepthWalkResult, DEPTH_INSUFFICIENT_FOR_STAKE,
+    )
+    from decimal import Decimal
+    return DepthWalkResult(
+        side="BUY",
+        intended_notional=Decimal("100"),
+        filled_notional=Decimal("30"),
+        fill_percentage=Decimal("0.30"),
+        contracts_filled=Decimal("300"),
+        vwap_fill_price=Decimal("0.10"),
+        slippage=Decimal("0.05"),
+        levels_consumed=1,
+        remaining_notional=Decimal("70"),
+        is_complete=False,
+        insufficient_reason=DEPTH_INSUFFICIENT_FOR_STAKE,
+    )
+
+
+class TestDepthWalkAuditPersistence:
+    """The trade-copyability INSERT persists depth-walk audit evidence
+    (depth_walk_json, insufficient_depth_reason, fill_percentage,
+    executable_depth, intended_stake, price_snapshot_id, depth_hash).
+
+    Every audit value comes from the typed input — no scattered
+    getattr fallbacks on the result.
+    """
+
+    @pytest.fixture
+    def db_with_wallet(self, tmp_path: Path):
+        """Yield a v10-schema DB with a wallet row pre-inserted."""
+        from polycopy.db.database import Database
+        db_path = tmp_path / "depth_audit_test.db"
+        db = Database(db_path=db_path)
+        db.connect()
+        db.execute(
+            """INSERT INTO wallets (id, address, label, is_sample, created_at)
+               VALUES ('wallet-depth-audit', '0xabc', 'test', 1,
+                       '2026-07-03T00:00:00Z')""",
+        )
+        return db
+
+    def _compute(self, inp):
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        return compute_trade_score_v1(input=inp)
+
+    def test_full_fill_depth_result_persists_exactly(self, db_with_wallet):
+        """A full-fill depth result persists with all Decimal values
+        serialized as canonical strings.
+        """
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+
+        dw = _make_dw_full()
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-1",
+            side="BUY",
+            intended_stake=100.0,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            depth_walk_result=dw,
+            depth_hash="hash-abc",
+            price_snapshot_id="snap-audit-1",
+        )
+        result = self._compute(inp)
+        # Insert the parent candidate + snapshot rows so the FK on
+        # price_snapshot_id is satisfied.
+        db_with_wallet.execute(
+            """INSERT INTO copy_candidates (
+                   wallet_id, source, source_trade_id,
+                   side, source_trade_price, source_trade_quantity,
+                   source_trade_timestamp, observed_at,
+                   wallet_score_version, wallet_score, wallet_verdict,
+                   status, created_at, updated_at
+               ) VALUES (
+                   'wallet-depth-audit', 'audit-src', 'trade-audit-1-src',
+                   'BUY', 0.50, 10.0,
+                   '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z',
+                   '1', 0.0, 'incomplete',
+                   'pending', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z'
+               )""",
+        )
+        db_with_wallet.execute(
+            """INSERT INTO candidate_price_snapshots (
+                   id, candidate_id, snapshot_run_id, fetch_status,
+                   fetch_endpoint, fetch_http_status, fetch_latency_ms,
+                   request_attempts,
+                   side, source_trade_price, source_trade_quantity,
+                   source_trade_timestamp,
+                   fetched_at, created_at
+               ) VALUES (
+                   ?, 1, 'run-audit-1', 'OK',
+                   'http://clob', 200, 50,
+                   1,
+                   'BUY', 0.50, 10.0,
+                   '2026-07-03T00:00:00Z',
+                   '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z'
+               )""",
+            ("snap-audit-1",),
+        )
+        db_with_wallet.conn.commit()
+        decision_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+            price_snapshot_id=inp.price_snapshot_id,
+        )
+        assert decision_id > 0
+
+        row = db_with_wallet.fetchone(
+            "SELECT depth_walk_json, insufficient_depth_reason, "
+            "fill_percentage, executable_depth, intended_stake, "
+            "price_snapshot_id FROM trade_copyability_decisions WHERE id = ?",
+            (decision_id,),
+        )
+        assert row is not None
+        payload = json.loads(row["depth_walk_json"])
+        assert payload["side"] == "BUY"
+        # Canonical Decimal strings — normalize() strips trailing zeros,
+        # so Decimal("100") → "100", Decimal("0.10") → "0.1".
+        assert payload["intended_notional"] == "100"
+        assert payload["filled_notional"] == "100"
+        assert payload["fill_percentage"] == "1"
+        assert payload["contracts_filled"] == "1000"
+        assert payload["vwap_fill_price"] == "0.1"
+        assert payload["slippage"] == "0"
+        assert payload["levels_consumed"] == 1
+        assert payload["remaining_notional"] == "0"
+        assert payload["is_complete"] is True
+        assert payload["insufficient_reason"] is None
+        assert payload["depth_hash"] == "hash-abc"
+        assert payload["price_snapshot_id"] == "snap-audit-1"
+        assert row["insufficient_depth_reason"] is None
+        assert row["fill_percentage"] == pytest.approx(1.0, abs=1e-9)
+        assert row["executable_depth"] == pytest.approx(100.0, abs=1e-9)
+        assert row["intended_stake"] == pytest.approx(100.0, abs=1e-9)
+        assert row["price_snapshot_id"] == "snap-audit-1"
+
+    def test_partial_fill_depth_result_persists_insufficient_reason(
+        self, db_with_wallet,
+    ):
+        """A partial fill persists insufficient_depth_reason and partial values."""
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+
+        dw = _make_dw_partial()
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-2",
+            side="BUY",
+            intended_stake=100.0,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            depth_walk_result=dw,
+            depth_hash="hash-partial",
+            price_snapshot_id="snap-partial",
+        )
+        result = self._compute(inp)
+        decision_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT depth_walk_json, insufficient_depth_reason, "
+            "fill_percentage, executable_depth FROM trade_copyability_decisions "
+            "WHERE id = ?",
+            (decision_id,),
+        )
+        payload = json.loads(row["depth_walk_json"])
+        assert payload["is_complete"] is False
+        assert payload["insufficient_reason"] == "DEPTH_INSUFFICIENT_FOR_STAKE"
+        assert payload["filled_notional"] == "30"
+        # Canonical Decimal strings — normalize() strips trailing zeros.
+        assert payload["fill_percentage"] == "0.3"
+        assert payload["remaining_notional"] == "70"
+        assert row["insufficient_depth_reason"] == "DEPTH_INSUFFICIENT_FOR_STAKE"
+        assert row["fill_percentage"] == pytest.approx(0.30, abs=1e-9)
+        assert row["executable_depth"] == pytest.approx(30.0, abs=1e-9)
+
+    def test_decimal_values_reload_exactly_from_canonical_strings(
+        self, db_with_wallet,
+    ):
+        """Decimal values persist as canonical strings and reload exactly."""
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+        from polycopy.scoring.depth_normalization import DepthWalkResult
+        from decimal import Decimal
+
+        dw = DepthWalkResult(
+            side="SELL",
+            intended_notional=Decimal("123.456789012345678901234567"),
+            filled_notional=Decimal("50.123456789"),
+            fill_percentage=Decimal("0.4059"),
+            contracts_filled=Decimal("501.23456789"),
+            vwap_fill_price=Decimal("0.10"),
+            slippage=Decimal("0.025"),
+            levels_consumed=2,
+            remaining_notional=Decimal("73.333333012345678901234567"),
+            is_complete=False,
+            insufficient_reason="DEPTH_INSUFFICIENT_FOR_STAKE",
+        )
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-3",
+            side="SELL",
+            intended_stake=123.456789012345,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            depth_walk_result=dw,
+        )
+        result = self._compute(inp)
+        decision_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT depth_walk_json FROM trade_copyability_decisions "
+            "WHERE id = ?",
+            (decision_id,),
+        )
+        payload = json.loads(row["depth_walk_json"])
+        # Reload each Decimal field and compare by value (not string).
+        # normalize() handles trailing zeros — equivalent Decimals
+        # compare equal.
+        assert Decimal(payload["intended_notional"]).normalize() == (
+            Decimal("123.456789012345678901234567").normalize()
+        )
+        assert Decimal(payload["filled_notional"]).normalize() == (
+            Decimal("50.123456789").normalize()
+        )
+        assert Decimal(payload["fill_percentage"]).normalize() == (
+            Decimal("0.4059").normalize()
+        )
+        assert Decimal(payload["contracts_filled"]).normalize() == (
+            Decimal("501.23456789").normalize()
+        )
+
+    def test_no_depth_evidence_produces_null_depth_walk_json(
+        self, db_with_wallet,
+    ):
+        """When no typed depth result AND no status reason, depth_walk_json is NULL."""
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-4",
+            side="BUY",
+            intended_stake=100.0,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+        )
+        result = self._compute(inp)
+        decision_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT depth_walk_json, insufficient_depth_reason "
+            "FROM trade_copyability_decisions WHERE id = ?",
+            (decision_id,),
+        )
+        assert row["depth_walk_json"] is None
+        assert row["insufficient_depth_reason"] is None
+
+    def test_depth_status_reason_persists_envelope(self, db_with_wallet):
+        """When depth_status_reason is set without a typed result, an
+        envelope is persisted documenting the rejection.
+        """
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+        from polycopy.scoring.depth_normalization import DEPTH_NOT_CAPTURED
+
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-5",
+            side="BUY",
+            intended_stake=100.0,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            depth_status_reason=DEPTH_NOT_CAPTURED,
+            depth_hash="hash-not-captured",
+            price_snapshot_id="snap-not-captured",
+        )
+        result = self._compute(inp)
+        decision_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT depth_walk_json, insufficient_depth_reason "
+            "FROM trade_copyability_decisions WHERE id = ?",
+            (decision_id,),
+        )
+        payload = json.loads(row["depth_walk_json"])
+        assert payload["depth_status_reason"] == DEPTH_NOT_CAPTURED
+        assert payload["is_complete"] is False
+        assert payload["depth_hash"] == "hash-not-captured"
+        assert payload["price_snapshot_id"] == "snap-not-captured"
+        assert row["insufficient_depth_reason"] == DEPTH_NOT_CAPTURED
+
+    def test_typed_depth_evidence_does_not_silently_become_null(
+        self, db_with_wallet,
+    ):
+        """Typed depth evidence must be persisted exactly — never NULL
+        when a typed result is supplied.
+        """
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+
+        dw = _make_dw_full()
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-6",
+            side="BUY",
+            intended_stake=100.0,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            depth_walk_result=dw,
+        )
+        result = self._compute(inp)
+        decision_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT depth_walk_json FROM trade_copyability_decisions "
+            "WHERE id = ?",
+            (decision_id,),
+        )
+        assert row["depth_walk_json"] is not None
+        payload = json.loads(row["depth_walk_json"])
+        for required_key in (
+            "side", "intended_notional", "filled_notional",
+            "fill_percentage", "contracts_filled", "vwap_fill_price",
+            "slippage", "levels_consumed", "remaining_notional",
+            "is_complete", "insufficient_reason",
+        ):
+            assert required_key in payload
+
+    def test_conflicting_raw_values_do_not_override_typed(self, db_with_wallet):
+        """Raw fields claiming full fill must not override typed partial fill."""
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+
+        dw = _make_dw_partial()
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-7",
+            side="BUY",
+            intended_stake=100.0,
+            executable_depth=99999.0,
+            fill_percentage=1.0,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            depth_walk_result=dw,
+        )
+        result = self._compute(inp)
+        decision_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT depth_walk_json, fill_percentage, executable_depth "
+            "FROM trade_copyability_decisions WHERE id = ?",
+            (decision_id,),
+        )
+        assert row["fill_percentage"] == pytest.approx(0.30, abs=1e-9)
+        assert row["executable_depth"] == pytest.approx(30.0, abs=1e-9)
+        payload = json.loads(row["depth_walk_json"])
+        # Canonical Decimal strings — normalize() strips trailing zeros.
+        assert payload["fill_percentage"] == "0.3"
+        assert payload["filled_notional"] == "30"
+
+    def test_idempotent_repeat_returns_existing_row(self, db_with_wallet):
+        """Re-persisting the same decision does not create a new row."""
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+
+        dw = _make_dw_full()
+        inp = TradeCopyabilityInputV1(
+            wallet_id="wallet-depth-audit",
+            source_trade_id="trade-audit-8",
+            side="BUY",
+            intended_stake=100.0,
+            spread=0.05,
+            trade_age_seconds=100.0,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            depth_walk_result=dw,
+        )
+        result = self._compute(inp)
+        first_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        second_id = persist_trade_score_v1(
+            db_with_wallet, inp.wallet_id, inp.source_trade_id, result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        assert first_id == second_id
+        count = db_with_wallet.fetchone(
+            "SELECT COUNT(*) AS n FROM trade_copyability_decisions "
+            "WHERE source_trade_id = ?",
+            ("trade-audit-8",),
+        )["n"]
+        assert count == 1
+
+
 class TestWalletIdContract:
     """Wallet-identity contract (Phase 9 / Chunk 1).
 
@@ -2333,8 +2776,8 @@ class TestPrecedenceWithConflictingData:
         # Optimistic raw values
         raw_fill_pct = 1.0
         raw_exec_depth = 99999.0
-        raw_slippage = 0.0
-        # Typed depth says 50% fill with nonzero slippage
+        # Typed depth says 50% fill; the typed slippage (set inside
+        # _make_partial_dw at 0.0) is also the source of truth.
         dw = _make_partial_dw(filled="50", intended="100")
         inp = _make_base_input(
             depth_walk_result=dw,

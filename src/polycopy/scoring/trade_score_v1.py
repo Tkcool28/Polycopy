@@ -580,7 +580,6 @@ def compute_trade_score_v1(
     # raw fields from silently overriding a typed depth walk.
     effective_fill_percentage: Optional[float] = None
     effective_executable_depth: Optional[float] = None
-    effective_slippage: Optional[float] = None
     if input.depth_walk_result is not None:
         dw = input.depth_walk_result
         # fill_percentage on the typed result is a Decimal ratio
@@ -590,17 +589,15 @@ def compute_trade_score_v1(
         # executable_depth = filled_notional (in USDC). This is
         # what actually got filled, not the original full depth.
         effective_executable_depth = float(dw.filled_notional)
-        # Slippage (Decimal fraction) may be None if best price was
-        # zero — propagate None through.
-        if dw.slippage is not None:
-            effective_slippage = float(dw.slippage)
+        # NOTE: typed slippage (dw.slippage) is currently consumed
+        # only for audit persistence (depth_walk_json) and is not
+        # yet a TradeScoreComponent. It is preserved on
+        # result.input.depth_walk_result for replay.
     else:
         # Fall back to raw input fields when no typed depth result
         # is supplied. This preserves the pre-Phase-7 behavior.
         effective_fill_percentage = input.fill_percentage
         effective_executable_depth = input.executable_depth
-        # raw spread is the slippage proxy when no typed depth walk
-        effective_slippage = None  # no typed slippage available
 
     # Phase 4.E: short-crypto hard exclusion (frozen formula).
     # A trade on a crypto-category market whose holding period is

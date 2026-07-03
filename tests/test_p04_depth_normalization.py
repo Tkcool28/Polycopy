@@ -23,7 +23,6 @@ from decimal import Decimal
 import pytest
 
 from polycopy.scoring.depth_normalization import (
-    DepthWalkResult,
     NormalizedLevel,
     compute_book_hash,
     normalize_book_levels,
