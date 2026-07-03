@@ -365,4 +365,7 @@ def test_no_new_market_column_added(tmp_path: Path) -> None:
 
 # ── Schema version constant is 9 ──────────────────────────────────────────
 def test_schema_version_constant_is_9() -> None:
-    assert SCHEMA_VERSION == 10
+    # Schema version advances through additive migrations (currently
+    # v11 after Chunk 5). The test still proves the version is at
+    # least v10 (so the v9 bridge is applied).
+    assert SCHEMA_VERSION >= 10

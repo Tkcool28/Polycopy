@@ -243,7 +243,9 @@ def _seed_pending_candidate(
 # ── v9 schema acceptance ───────────────────────────────────────────────────
 def test_v9_db_includes_candidate_price_snapshots_table(db: Database) -> None:
     """A fresh v9 DB has the new table + all expected columns + indexes."""
-    assert SCHEMA_VERSION == 10
+    # The schema may advance beyond v10 (currently v11 after Chunk 5);
+    # the assertions below check the v9 table is present on a fresh DB.
+    assert SCHEMA_VERSION >= 10
     row = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
     assert row is not None and int(row["value"]) == SCHEMA_VERSION
 
