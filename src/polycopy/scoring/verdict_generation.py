@@ -218,7 +218,19 @@ def generate_signal_verdict(input_data: SignalDecisionInput) -> SignalDecision:
 
     # ---- 10-11. behavior WATCHLIST cap (applied as a flag, not a hard rule) ----
     behavior_cap_reason: Optional[SignalReason] = None
-    if behavior is not None and behavior.is_watchlist_cap:
+    # Frozen contract: ONLY BehaviorClassification.DIRECTIONAL may
+    # become COPY_CANDIDATE. Any non-DIRECTIONAL classification
+    # (UNKNOWN, MIXED, MARKET_MAKER_LP, ARBITRAGE_MULTI_LEG,
+    # HIGH_FREQUENCY_BOT) caps the verdict at WATCHLIST. A missing
+    # (None) classification is treated the same as UNKNOWN — we
+    # cannot prove the wallet is directional, so we cannot allow
+    # COPY_CANDIDATE. The runtime classification layer always
+    # returns a result; this None branch is a defensive guard so
+    # that a caller-side regression cannot silently promote an
+    # unknown-behavior wallet to COPY_CANDIDATE.
+    if behavior is None:
+        behavior_cap_reason = SignalReason.BEHAVIOR_UNKNOWN_CAP
+    elif behavior.is_watchlist_cap:
         if behavior.classification == BehaviorClassification.MIXED:
             behavior_cap_reason = SignalReason.BEHAVIOR_MIXED_CAP
         elif behavior.classification == BehaviorClassification.UNKNOWN:

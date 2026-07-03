@@ -43,12 +43,14 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
 from polycopy.scoring.helpers import linear_score, inverse_score, clamp
 from polycopy.scoring.behavior_classification import (
     BehaviorClassification,
+    BehaviorClassificationResult,
     BehaviorEvidence,
     classify_wallet_behavior,
 )
@@ -66,6 +68,7 @@ from polycopy.scoring.shadow_score_v2 import (
     compute_shadow_score_v2,
 )
 from polycopy.scoring.verdict_generation import (
+    SignalReason,
     SignalVerdict,
     SignalDecisionInput,
     generate_signal_verdict,
@@ -763,6 +766,11 @@ class TestSignalVerdictGeneration:
 
     # ---- 14. wallet_score 55-75 ----
     def test_14_wallet_55_to_75_is_watchlist(self):
+        # Frozen contract: behavior_classification=None is treated as
+        # UNKNOWN (cannot prove the wallet is directional), so the
+        # WATCHLIST verdict carries the behavior-cap reason rather
+        # than the bare wallet-score reason. Use DIRECTIONAL to test
+        # the pure wallet-score WATCHLIST path.
         result = generate_signal_verdict(SignalDecisionInput(
             wallet_score=65.0,
             wallet_verdict=WalletVerdict.WATCHLIST,
@@ -770,7 +778,9 @@ class TestSignalVerdictGeneration:
             category_wallet_verdict="copy_candidate",
             trade_score=80.0,
             trade_verdict=TradeVerdict.COPY_CANDIDATE,
-            behavior_classification=None,
+            behavior_classification=self._behavior(
+                BehaviorClassification.DIRECTIONAL,
+            ),
         ))
         assert result.verdict == SignalVerdict.WATCHLIST
         assert result.reason == "wallet_score_watchlist_range"
@@ -841,6 +851,9 @@ class TestSignalVerdictGeneration:
 
     # ---- 17. all gates pass -> COPY_CANDIDATE ----
     def test_17_all_gates_pass_is_copy_candidate(self):
+        # Frozen contract: ONLY DIRECTIONAL may become COPY_CANDIDATE.
+        # A None behavior is treated as UNKNOWN and caps at WATCHLIST,
+        # so we must pass DIRECTIONAL here.
         result = generate_signal_verdict(SignalDecisionInput(
             wallet_score=80.0,
             wallet_verdict=WalletVerdict.COPY_CANDIDATE,
@@ -848,7 +861,9 @@ class TestSignalVerdictGeneration:
             category_wallet_verdict="copy_candidate",
             trade_score=75.0,
             trade_verdict=TradeVerdict.COPY_CANDIDATE,
-            behavior_classification=None,
+            behavior_classification=self._behavior(
+                BehaviorClassification.DIRECTIONAL,
+            ),
         ))
         assert result.verdict == SignalVerdict.COPY_CANDIDATE
         assert result.reason == "all_thresholds_met"
@@ -923,6 +938,147 @@ class TestSignalVerdictGeneration:
         ))
         # All canonical reason values are valid strings
         assert result.reason in {e.value for e in SignalReason} | {None}
+
+
+# ---- Behavior-gate contract (frozen PR 4 rule) ----------------------------
+# Only DIRECTIONAL may become COPY_CANDIDATE. The matrix below pins every
+# other behavior-classification outcome to a non-COPY verdict regardless
+# of how strong the other scores are.
+
+
+class TestBehaviorGateContract:
+    """Frozen contract: only DIRECTIONAL behavior may become COPY_CANDIDATE.
+
+    These tests exercise the behavior-classification gate independently
+    of the other rules (wallet/category/trade scores are all at their
+    COPY-eligible maximum). The behavior alone decides whether the
+    candidate can reach COPY_CANDIDATE.
+    """
+
+    def _all_eligible_input(
+        self,
+        behavior: Optional[BehaviorClassificationResult],
+    ) -> SignalDecisionInput:
+        return SignalDecisionInput(
+            wallet_score=95.0,
+            wallet_verdict=WalletVerdict.COPY_CANDIDATE,
+            category_wallet_score=95.0,
+            category_wallet_verdict="copy_candidate",
+            trade_score=95.0,
+            trade_verdict=TradeVerdict.COPY_CANDIDATE,
+            behavior_classification=behavior,
+        )
+
+    @staticmethod
+    def _behavior(
+        classification: BehaviorClassification,
+        *,
+        is_skip: bool = False,
+        is_watchlist_cap: bool = False,
+        is_eligible: bool = False,
+    ) -> BehaviorClassificationResult:
+        # DIRECTIONAL -> is_eligible=True (no cap).
+        # MIXED / UNKNOWN -> is_watchlist_cap=True (caps at WATCHLIST).
+        # MARKET_MAKER_LP / ARBITRAGE_MULTI_LEG / HIGH_FREQUENCY_BOT
+        # -> is_skip=True.
+        return BehaviorClassificationResult(
+            classification=classification,
+            reasons=["test"],
+            is_eligible_for_copy=is_eligible,
+            is_watchlist_cap=is_watchlist_cap,
+            is_skip=is_skip,
+        )
+
+    def test_behavior_none_caps_at_watchlist(self) -> None:
+        """behavior=None (defensive None-branch) -> WATCHLIST, not COPY."""
+        result = generate_signal_verdict(
+            self._all_eligible_input(None)
+        )
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == SignalReason.BEHAVIOR_UNKNOWN_CAP.value
+
+    def test_unknown_behavior_caps_at_watchlist(self) -> None:
+        """UNKNOWN -> WATCHLIST (cap)."""
+        result = generate_signal_verdict(
+            self._all_eligible_input(
+                self._behavior(
+                    BehaviorClassification.UNKNOWN,
+                    is_watchlist_cap=True,
+                )
+            )
+        )
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == SignalReason.BEHAVIOR_UNKNOWN_CAP.value
+
+    def test_mixed_behavior_caps_at_watchlist(self) -> None:
+        """MIXED -> WATCHLIST (cap)."""
+        result = generate_signal_verdict(
+            self._all_eligible_input(
+                self._behavior(
+                    BehaviorClassification.MIXED,
+                    is_watchlist_cap=True,
+                )
+            )
+        )
+        assert result.verdict == SignalVerdict.WATCHLIST
+        assert result.reason == SignalReason.BEHAVIOR_MIXED_CAP.value
+
+    def test_market_maker_lp_behavior_skips(self) -> None:
+        """MARKET_MAKER_LP -> SKIP."""
+        result = generate_signal_verdict(
+            self._all_eligible_input(
+                self._behavior(
+                    BehaviorClassification.MARKET_MAKER_LP,
+                    is_skip=True,
+                )
+            )
+        )
+        assert result.verdict == SignalVerdict.SKIP
+        assert (
+            result.reason
+            == SignalReason.BEHAVIOR_MARKET_MAKER.value
+        )
+
+    def test_high_frequency_bot_behavior_skips(self) -> None:
+        """HIGH_FREQUENCY_BOT -> SKIP."""
+        result = generate_signal_verdict(
+            self._all_eligible_input(
+                self._behavior(
+                    BehaviorClassification.HIGH_FREQUENCY_BOT,
+                    is_skip=True,
+                )
+            )
+        )
+        assert result.verdict == SignalVerdict.SKIP
+        assert result.reason == SignalReason.BEHAVIOR_HFT.value
+
+    def test_arbitrage_multi_leg_behavior_skips(self) -> None:
+        """ARBITRAGE_MULTI_LEG -> SKIP."""
+        result = generate_signal_verdict(
+            self._all_eligible_input(
+                self._behavior(
+                    BehaviorClassification.ARBITRAGE_MULTI_LEG,
+                    is_skip=True,
+                )
+            )
+        )
+        assert result.verdict == SignalVerdict.SKIP
+        assert (
+            result.reason == SignalReason.BEHAVIOR_ARBITRAGE.value
+        )
+
+    def test_directional_behavior_allows_copy(self) -> None:
+        """DIRECTIONAL -> COPY_CANDIDATE (only path to COPY)."""
+        result = generate_signal_verdict(
+            self._all_eligible_input(
+                self._behavior(
+                    BehaviorClassification.DIRECTIONAL,
+                    is_eligible=True,
+                )
+            )
+        )
+        assert result.verdict == SignalVerdict.COPY_CANDIDATE
+        assert result.reason == SignalReason.ALL_GATES_MET.value
 
 
 class TestIdempotency:

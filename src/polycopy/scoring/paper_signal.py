@@ -343,8 +343,13 @@ def load_persisted_paper_signal_inputs(
       * Wallet decision is selected by
         ``source_data_timestamp <= snapshot.fetched_at`` + id DESC.
       * Category decision is selected by the *exact* category label
-        from the snapshot's persisted ``book_summary_json`` (or the
-        ``market:<id>`` fallback) with the same point-in-time rule.
+        from the snapshot's persisted ``book_summary_json`` (using
+        ``book_summary.category_label`` when present, then
+        ``book_summary.category``, then the persisted
+        ``markets.category`` for the snapshot's market). The legacy
+        ``market:<id>`` fallback has been removed; a missing category
+        label propagates as ``INCOMPLETE`` rather than silently
+        substituting a guessed category.
       * Behavior classification cutoff is the snapshot's
         ``fetched_at`` (passed to the SQL loader).
     """

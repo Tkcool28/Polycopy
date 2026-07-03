@@ -17,7 +17,7 @@ Verdict rules:
 
 Duration rules:
 - Under 15 minutes: excluded
-- 15 minutes to under 6 hours: experimental only (score 75 minimum)
+- 15 minutes to under 6 hours: experimental only (score 40)
 - 6 hours to under 1 day: allowed, score 75
 - 1–14 days: preferred, score 100
 - 15–21 days: allowed, score 80
