@@ -466,7 +466,12 @@ def _parse_decimal(value: Any) -> Optional[Decimal]:
 
 
 def _canonical_decimal(d: Decimal) -> str:
-    """Return the canonical Decimal string form (no leading zeros,
-    no trailing zeros, exponent normalized).
+    """Return the value-canonical Decimal string form.
+
+    Decimal preserves trailing zeros by design (e.g. Decimal("5.0")
+    is distinct from Decimal("5") for arithmetic but represents the
+    same value). For HASH and PERSIST purposes we want the
+    value-canonical form so that
+    Decimal("5.0") == Decimal("5") hash identically.
     """
-    return format(d, "f")
+    return format(d.normalize(), "f") if d.is_finite() else format(d, "f")
