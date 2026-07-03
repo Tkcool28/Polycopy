@@ -81,9 +81,17 @@ from polycopy.scoring.depth_normalization import (
     walk_depth,
     compute_book_hash,
 )
-from polycopy.scoring.shadow_score_v2 import (
-    ShadowScoreResult,
-    compute_shadow_score_v2,
+from polycopy.scoring.shadow_score_v2_typed import (
+    DelayScenario,
+    ShadowScoreInputV2,
+    ShadowScoreResultV2,
+)
+from polycopy.scoring.shadow_score_v2_engine import (
+    compute_shadow_score_v2_from_input,
+    compute_measured_delay_seconds,
+)
+from polycopy.scoring.paper_signal_input import (
+    PaperSignalDecisionInput,
 )
 from polycopy.scoring.verdict_generation import (
     SignalDecisionInput,
@@ -134,13 +142,13 @@ PAPER_SIGNAL_FORMULA_VERSION = "1"
 # writes — these are the ones persisted in
 # ``exit_experiment_registrations.experiment_type``.
 EXIT_EXPERIMENT_TYPES: tuple[str, ...] = (
-    "hold_to_resolution",
-    "exit_24h",
-    "exit_72h",
-    "favorable_move_5pct",
-    "favorable_move_10_pct",
-    "favorable_move_15_pct",
-    "thesis_failure",
+    "HOLD_TO_RESOLUTION",
+    "EXIT_24H",
+    "EXIT_72H",
+    "FAVORABLE_MOVE_005",
+    "FAVORABLE_MOVE_010",
+    "FAVORABLE_MOVE_015",
+    "THESIS_OR_LIQUIDITY_FAILURE",
 )
 
 
@@ -881,7 +889,7 @@ def generate_paper_signal_decision(
     behavior_result: BehaviorClassificationResult,
     category_score: Optional[float],
     category_verdict: Optional[str],
-    shadow_result: Optional[ShadowScoreResult],
+    shadow_result: Optional[object] = None,
     has_hard_exclusion: bool = False,
     hard_exclusion_reason: Optional[str] = None,
 ) -> SignalVerdict:
@@ -889,7 +897,10 @@ def generate_paper_signal_decision(
 
     See :mod:`paper_signal` docstring for the policy. The shadow
     result is persisted for research but is NEVER consumed here
-    (Phase 15 / spec).
+    (Phase 15 / spec — Chunk 5 §5.8). The parameter is typed as
+    ``Optional[object]`` to accept either the legacy
+    :class:`ShadowScoreResult` or the new
+    :class:`ShadowScoreResultV2` without coupling to either.
     """
     signal_input = SignalDecisionInput(
         wallet_score=wallet_score_result.score,
@@ -1101,27 +1112,32 @@ def _evaluate_paper_signals_for_candidate_inner(
         source_data_timestamp=snap_ts,
     )
 
-    # Shadow v2 — parallel-only, never affects v1 verdict.
-    shadow_result = compute_shadow_score_v2(
-        wallet_id=inputs.wallet_id,
-        source_trade_id=inputs.source_trade_id,
+    # Shadow v2 — parallel-only, never affects v1 verdict. We persist
+    # a SEPARATE immutable research row per delay scenario (six
+    # scenarios per paper signal: THEORETICAL_IMMEDIATE,
+    # DELAY_30_SECONDS, DELAY_2_MINUTES, DELAY_5_MINUTES,
+    # DELAY_15_MINUTES, ACTUAL_MEASURED_DELAY). The shadow's first
+    # scenario row is what the paper-signal summary reports.
+    shadow_results = _compute_and_persist_shadow_v2(
+        db,
+        inputs=inputs,
         now=now,
     )
-    shadow_idem = generate_idempotency_key(
-        formula_name="shadow_score",
-        formula_version=shadow_result.formula_version,
-        wallet_id=inputs.wallet_id,
-        source_trade_id=inputs.source_trade_id,
-        source_data_timestamp=snap_ts,
+    # Primary shadow result for the paper-signal summary is the
+    # THEORETICAL_IMMEDIATE scenario (no delay penalty). When it
+    # cannot be computed (e.g. missing source/delayed prices), the
+    # first non-INCOMPLETE scenario is used; otherwise INCOMPLETE
+    # is the honest report.
+    primary_shadow = shadow_results.get(
+        DelayScenario.THEORETICAL_IMMEDIATE.value
     )
-    persist_shadow_score_v2(
-        db,
-        inputs.wallet_id,
-        inputs.source_trade_id,
-        shadow_result,
-        idempotency_key=shadow_idem,
-        source_data_timestamp=snap_ts,
-    )
+    if primary_shadow is None or primary_shadow.verdict == "SHADOW_INCOMPLETE":
+        for scenario_value, result in shadow_results.items():
+            if result.verdict != "SHADOW_INCOMPLETE":
+                primary_shadow = result
+                break
+        else:
+            primary_shadow = next(iter(shadow_results.values()), None)
 
     # Category inputs.
     cat_score: Optional[float] = None
@@ -1141,7 +1157,7 @@ def _evaluate_paper_signals_for_candidate_inner(
         behavior_result=behavior_result,
         category_score=cat_score,
         category_verdict=cat_verdict,
-        shadow_result=shadow_result,
+        shadow_result=primary_shadow,
     )
 
     # Persist paper signal (idempotent on candidate + idempotency key).
@@ -1166,6 +1182,38 @@ def _evaluate_paper_signals_for_candidate_inner(
             ) or None
         except (TypeError, ValueError):
             category_decision_id = None
+
+    # ---- Chunk 5 typed paper-signal input ---------------------------------
+    # Build the frozen typed input contract from the persisted
+    # evidence the runtime collected. This is the canonical source
+    # of truth for the paper-signal row's identity.
+    paper_signal_typed_input = PaperSignalDecisionInput(
+        candidate_id=candidate_id,
+        source_trade_id=inputs.source_trade_id or "",
+        wallet_id=inputs.wallet_id or "",
+        wallet_score_decision_id=wallet_decision_id,
+        category_score_decision_id=category_decision_id,
+        trade_score_decision_id=None,  # Set below after persist.
+        price_snapshot_id=inputs.snapshot_id,
+        intended_stake=inputs.intended_stake,
+        category_label=cat_label_for_idem
+        if cat_label_for_idem != "missing"
+        else None,
+        behavior_classification=behavior_result.classification.value
+        if behavior_result is not None
+        else "unknown",
+        wallet_formula_name="wallet_score",
+        wallet_formula_version=WALLET_FORMULA_VERSION,
+        category_formula_name="category_wallet_score",
+        category_formula_version=CATEGORY_FORMULA_VERSION,
+        trade_formula_name="trade_copyability",
+        trade_formula_version=trade_score_result.formula_version,
+        evaluation_timestamp=now,
+        final_verdict=final_verdict.value,
+        final_reason=_signal_reason(final_verdict),
+        is_approved=0,  # PR 4 paper signals are NEVER approved.
+        auto_approve_requested=False,
+    )
 
     ps_idem = generate_idempotency_key(
         formula_name="paper_signal",
@@ -1201,13 +1249,14 @@ def _evaluate_paper_signals_for_candidate_inner(
         _signal_reason(final_verdict),
         wallet_score_result.score,
         trade_score_result.score,
-        float(shadow_result.score),
-        shadow_result.verdict.value if shadow_result else None,
+        float(primary_shadow.score) if primary_shadow is not None else 0.0,
+        primary_shadow.verdict if primary_shadow is not None else None,
         final_verdict.value,
         snap_ts,
         inputs.source_trade_id,
         inputs.snapshot_id,
         idempotency_key=ps_idem,
+        typed_input=paper_signal_typed_input,
     )
 
     summary["verdict"] = final_verdict.value
@@ -1216,9 +1265,14 @@ def _evaluate_paper_signals_for_candidate_inner(
     summary["paper_signal_id"] = paper_signal_id
 
     if final_verdict == SignalVerdict.COPY_CANDIDATE:
-        # Register 7 exit experiments (research only).
+        # Register 7 exit experiments (research only). The schedule
+        # is derived from the immutable signal evaluation timestamp,
+        # NOT from wall-clock now(). Chunk 5 §5.3.
         n = record_exit_experiments_for_signal(
-            db, paper_signal_id, EXIT_EXPERIMENT_TYPES,
+            db,
+            paper_signal_id,
+            EXIT_EXPERIMENT_TYPES,
+            signal_evaluation_timestamp=now,
         )
         summary["exit_experiments_registered"] = n
 
@@ -1281,6 +1335,333 @@ def _persist_incomplete_signal(
         inputs.snapshot_id,
         idempotency_key=ps_idem,
     )
+
+
+def _compute_and_persist_shadow_v2(
+    db: Database,
+    *,
+    inputs: "PersistedPaperSignalInputs",
+    now: datetime,
+) -> dict[str, ShadowScoreResultV2]:
+    """Compute and persist V2 shadow scores for ALL SIX canonical
+    delay scenarios (Chunk 5 §5.4–§5.6).
+
+    For each scenario:
+
+      * Build a frozen :class:`ShadowScoreInputV2` from the
+        persisted evidence the runtime already collected.
+      * Look up the actual delayed snapshot that corresponds to the
+        scenario's delay (i.e. the first persisted
+        ``candidate_price_snapshots`` row for this candidate with
+        ``fetched_at >= source_trade_timestamp + delay``). When no
+        such snapshot exists, ``delayed_copy_price`` is ``None`` and
+        the result is ``SHADOW_INCOMPLETE``.
+      * Compute via :func:`compute_shadow_score_v2_from_input`.
+      * Persist via :func:`persist_shadow_score_v2`.
+
+    The function NEVER fabricates delayed prices. When a scenario
+    has no matching persisted snapshot, ``delayed_copy_price = None``
+    is explicit and the result is honestly ``SHADOW_INCOMPLETE``.
+
+    Returns ``{scenario_value: ShadowScoreResultV2}`` keyed by the
+    canonical :class:`DelayScenario` ``.value`` strings.
+
+    Safety: this function NEVER mutates V1 decisions, NEVER sets
+    ``is_approved=1``, NEVER opens positions or places orders, and
+    NEVER calls any CLOB / HTTP / broker endpoint. A failure in any
+    individual scenario is isolated to that scenario's row; the V1
+    pipeline continues.
+    """
+    snap_ts = (
+        inputs.snapshot.get("fetched_at") if inputs.snapshot else None
+    )
+    # The source price for the shadow scenario is the snapshot's
+    # best_ask (BUY) or best_bid (SELL) midpoint — when the snapshot
+    # has neither, we leave ``source_price`` None.
+    source_price: Optional[float] = None
+    if inputs.snapshot is not None:
+        bp = inputs.snapshot.get("best_bid")
+        ap = inputs.snapshot.get("best_ask")
+        try:
+            if bp is not None and ap is not None:
+                source_price = (float(bp) + float(ap)) / 2.0
+            elif ap is not None:
+                source_price = float(ap)
+            elif bp is not None:
+                source_price = float(bp)
+        except (TypeError, ValueError):
+            source_price = None
+
+    # Source trade timestamp for delay calculations.
+    source_trade_timestamp: Optional[str] = None
+    if inputs.source_trade is not None:
+        source_trade_timestamp = inputs.source_trade.get("timestamp")
+
+    # Look up the actual measured delay only when both timestamps
+    # are present. The result is the difference in seconds
+    # (max(0, ...)) between the persisted snapshot's fetched_at and
+    # the source trade timestamp. When either is missing, leave
+    # ``measured_delay_seconds`` None — the engine will report
+    # SHADOW_INCOMPLETE for the ACTUAL_MEASURED_DELAY scenario.
+    measured_delay_seconds: Optional[float] = None
+    if snap_ts is not None and source_trade_timestamp is not None:
+        try:
+            measured_delay_seconds = compute_measured_delay_seconds(
+                source_trade_timestamp=source_trade_timestamp,
+                candidate_snapshot_timestamp=snap_ts,
+            )
+        except (TypeError, ValueError):
+            measured_delay_seconds = None
+
+    # Common snapshot identity — same for every scenario.
+    price_snapshot_id = inputs.snapshot_id
+    depth_hash = inputs.depth_hash
+
+    # Other typed inputs that all six scenarios share.
+    intended_stake = inputs.intended_stake
+    executable_depth_value: Optional[float] = None
+    fill_percentage_value: Optional[float] = None
+    slippage_value: Optional[float] = None
+    spread_value: Optional[float] = None
+    if inputs.snapshot is not None:
+        try:
+            spread_value = (
+                float(inputs.snapshot.get("spread"))
+                if inputs.snapshot.get("spread") is not None else None
+            )
+        except (TypeError, ValueError):
+            spread_value = None
+    # Forward-evidence inputs (skill_persistence, copied_performance,
+    # concentration/correlation) come from the runtime context.
+    # Until the upstream analyzers populate them, we leave them None
+    # — the engine surfaces them as missing reasons and the verdict
+    # becomes SHADOW_INCOMPLETE. No silent zero substitution.
+    wallet_skill_persistence_input: Optional[float] = None
+    copied_realized_performance_input: Optional[float] = None
+    concentration_correlation_input: Optional[float] = None
+
+    # Per-scenario delayed price lookup. For each scenario we
+    # look up the FIRST persisted snapshot for this candidate whose
+    # ``fetched_at`` falls within the scenario's delay window
+    # (>= source_trade_timestamp + scenario_delay). When no such
+    # snapshot exists, the delayed price is None and the verdict
+    # becomes SHADOW_INCOMPLETE.
+    scenario_results: dict[str, ShadowScoreResultV2] = {}
+
+    for scenario in DelayScenario:
+        # Determine the delayed snapshot and delayed price.
+        delayed_copy_price: Optional[float] = None
+        delayed_snapshot_id: Optional[str] = None
+        scenario_missing: list[str] = []
+        if scenario is DelayScenario.THEORETICAL_IMMEDIATE:
+            # For the theoretical-immediate scenario, the "delayed
+            # price" is the source price at zero delay — there is
+            # no separate delayed snapshot. We use the snapshot's
+            # midpoint directly. When the source price is missing
+            # the engine will mark SHADOW_INCOMPLETE.
+            delayed_copy_price = source_price
+            delayed_snapshot_id = price_snapshot_id
+        elif scenario is DelayScenario.ACTUAL_MEASURED_DELAY:
+            # For the actual-measured scenario, the "delayed price"
+            # is the snapshot's midpoint — same snapshot we are
+            # evaluating against (its fetched_at is the actual
+            # measured moment). measured_delay_seconds is computed
+            # from real timestamps.
+            delayed_copy_price = source_price
+            delayed_snapshot_id = price_snapshot_id
+            if measured_delay_seconds is None:
+                scenario_missing.append("missing_actual_measured_delay_seconds")
+        else:
+            # Fixed-delay scenario: look up the first persisted
+            # snapshot whose fetched_at is at or after
+            # source_trade_timestamp + scenario_delay_seconds.
+            if (
+                source_trade_timestamp is not None
+                and inputs.candidate is not None
+            ):
+                cand_id = (
+                    inputs.candidate.get("id")
+                    if isinstance(inputs.candidate, dict)
+                    else None
+                )
+                if cand_id is not None:
+                    # Look up the frozen delay-seconds value from
+                    # the canonical DELAY_SCENARIO_SECONDS map.
+                    from polycopy.scoring.shadow_score_v2_typed import (
+                        DELAY_SCENARIO_SECONDS as _DELAY_SECONDS,
+                    )
+                    target_delay = _DELAY_SECONDS.get(scenario)
+                    if target_delay is not None:
+                        delayed_snapshot_id = _lookup_delayed_snapshot(
+                            db,
+                            candidate_id=int(cand_id),
+                            source_trade_timestamp=source_trade_timestamp,
+                            delay_seconds=float(target_delay),
+                        )
+                        if delayed_snapshot_id is not None:
+                            delayed_copy_price = (
+                                _midpoint_for_snapshot(
+                                    db, delayed_snapshot_id
+                                )
+                            )
+            if delayed_copy_price is None:
+                scenario_missing.append(
+                    f"missing_delayed_snapshot_for_scenario_{scenario.value}"
+                )
+
+        # Build the typed input for this scenario.
+        typed_in = ShadowScoreInputV2(
+            wallet_id=inputs.wallet_id or "",
+            source_trade_id=inputs.source_trade_id or "",
+            candidate_id=(
+                int(inputs.candidate.get("id"))
+                if inputs.candidate is not None
+                and isinstance(inputs.candidate.get("id"), int)
+                else None
+            ),
+            delay_scenario=scenario,
+            source_price=source_price,
+            delayed_copy_price=delayed_copy_price,
+            intended_stake=intended_stake,
+            executable_depth=executable_depth_value,
+            fill_percentage=fill_percentage_value,
+            slippage=slippage_value,
+            spread=spread_value,
+            wallet_skill_persistence_input=wallet_skill_persistence_input,
+            copied_realized_performance_input=copied_realized_performance_input,
+            concentration_correlation_input=concentration_correlation_input,
+            source_data_timestamp=snap_ts,
+            price_snapshot_id=(
+                delayed_snapshot_id
+                if scenario is not DelayScenario.THEORETICAL_IMMEDIATE
+                else price_snapshot_id
+            ),
+            depth_hash=depth_hash,
+            missing_forward_reasons=tuple(scenario_missing),
+            measured_delay_seconds=(
+                measured_delay_seconds
+                if scenario is DelayScenario.ACTUAL_MEASURED_DELAY
+                else None
+            ),
+        )
+
+        result = compute_shadow_score_v2_from_input(typed_in)
+
+        # Persist (idempotent on (wallet_id, source_trade_id,
+        # formula_name, formula_version, idempotency_key)). The
+        # persistence helper derives the idempotency key from the
+        # scenario + snapshot id + depth hash so a changed scenario
+        # or snapshot creates a new immutable row.
+        try:
+            persist_shadow_score_v2(
+                db,
+                wallet_id=inputs.wallet_id or "",
+                source_trade_id=inputs.source_trade_id or "",
+                result=result,
+                candidate_id=typed_in.candidate_id,
+                source_data_timestamp=snap_ts,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            # Shadow persistence failure is isolated; V1 verdict
+            # continues. The failure is recorded in the result's
+            # missing_forward_reasons so the audit trail reflects
+            # what happened.
+            logger.warning(
+                "shadow v2 persistence failed for scenario=%s: %s",
+                scenario.value,
+                exc,
+            )
+
+        scenario_results[scenario.value] = result
+
+    return scenario_results
+
+
+def _lookup_delayed_snapshot(
+    db: Database,
+    *,
+    candidate_id: int,
+    source_trade_timestamp: str,
+    delay_seconds: float,
+) -> Optional[str]:
+    """Return the FIRST persisted snapshot id for ``candidate_id``
+    whose ``fetched_at`` is at or after ``source_trade_timestamp +
+    delay_seconds``. Returns ``None`` when no such snapshot exists.
+
+    The lookup is purely on the persisted snapshot table — we never
+    fabricate or interpolate a delayed price. When the lookup fails
+    to find a match, the caller passes ``delayed_copy_price=None``
+    and the shadow verdict becomes ``SHADOW_INCOMPLETE`` honestly.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        src_dt = datetime.fromisoformat(
+            source_trade_timestamp.replace("Z", "+00:00")
+            if source_trade_timestamp.endswith("Z")
+            else source_trade_timestamp
+        )
+    except (TypeError, ValueError):
+        return None
+    if src_dt.tzinfo is None:
+        src_dt = src_dt.replace(tzinfo=timezone.utc)
+    target = (src_dt + timedelta(seconds=delay_seconds)).isoformat()
+
+    try:
+        row = db.fetchone(
+            """
+            SELECT id FROM candidate_price_snapshots
+            WHERE candidate_id = ?
+              AND fetched_at >= ?
+            ORDER BY fetched_at ASC, id ASC
+            LIMIT 1
+            """,
+            (candidate_id, target),
+        )
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        return str(row["id"])
+    except (KeyError, TypeError):
+        return None
+
+
+def _midpoint_for_snapshot(
+    db: Database, snapshot_id: str,
+) -> Optional[float]:
+    """Return the persisted midpoint for a snapshot.
+
+    Computed as the average of ``best_bid`` and ``best_ask`` when
+    both are present. Returns ``None`` when neither is present or
+    the lookup fails.
+    """
+    try:
+        row = db.fetchone(
+            "SELECT best_bid, best_ask FROM candidate_price_snapshots "
+            "WHERE id = ?",
+            (snapshot_id,),
+        )
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    try:
+        bp = row["best_bid"]
+        ap = row["best_ask"]
+    except (KeyError, TypeError):
+        return None
+    try:
+        if bp is not None and ap is not None:
+            return (float(bp) + float(ap)) / 2.0
+        if ap is not None:
+            return float(ap)
+        if bp is not None:
+            return float(bp)
+        return None
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_wallet_score(
@@ -1350,6 +1731,8 @@ def record_exit_experiments_for_signal(
     db: Database,
     paper_signal_id: int,
     experiment_types: tuple[str, ...] = EXIT_EXPERIMENT_TYPES,
+    *,
+    signal_evaluation_timestamp: Optional[datetime] = None,
 ) -> int:
     """Register exit experiments for a paper signal.
 
@@ -1357,13 +1740,17 @@ def record_exit_experiments_for_signal(
     The ``experiment_types`` argument is accepted for forward
     compatibility with the canonical Phase 11 migration but is
     currently ignored — the underlying helper has a fixed 7-row
-    canonical set.
+    canonical set (Chunk 5 §5.3).
 
     Returns the number of registrations that took effect (0
     already-registered rows are skipped by the
     ``UNIQUE(paper_signal_id, experiment_type)`` constraint).
     """
-    ids = record_exit_experiments(db, paper_signal_id)
+    ids = record_exit_experiments(
+        db,
+        paper_signal_id,
+        signal_evaluation_timestamp=signal_evaluation_timestamp,
+    )
     return len(ids)
 
 

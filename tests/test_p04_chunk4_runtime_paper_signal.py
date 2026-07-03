@@ -1616,13 +1616,13 @@ class TestExitExperimentTiming:
             types = {e["experiment_type"] for e in exps}
             assert types == set(
                 (
-                    "hold_to_resolution",
-                    "exit_24h",
-                    "exit_72h",
-                    "favorable_move_5pct",
-                    "favorable_move_10_pct",
-                    "favorable_move_15_pct",
-                    "thesis_failure",
+                    "HOLD_TO_RESOLUTION",
+                    "EXIT_24H",
+                    "EXIT_72H",
+                    "FAVORABLE_MOVE_005",
+                    "FAVORABLE_MOVE_010",
+                    "FAVORABLE_MOVE_015",
+                    "THESIS_OR_LIQUIDITY_FAILURE",
                 )
             )
 
