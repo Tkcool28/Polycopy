@@ -138,7 +138,7 @@ def test_record_creates_exactly_seven_rows(tmp_path: Path):
         "INSERT INTO paper_signal_decisions "
         "(candidate_id, wallet_id, signal_family, final_verdict, "
         " is_approved, idempotency_key, computed_at, created_at) "
-        "VALUES (1, '0xW', 'COPY_CANDIDATE', 'copy_candidate', 0, 'k1', "
+        "VALUES (1, '0xW', 'copy_candidate', 'copy_candidate', 0, 'k1', "
         " '2026-07-03T12:00:00Z', '2026-07-03T12:00:00Z')"
     )
     db.conn.commit()
@@ -191,7 +191,7 @@ def test_record_exit_experiments_rerun_no_duplicates(tmp_path: Path):
         "INSERT INTO paper_signal_decisions "
         "(candidate_id, wallet_id, signal_family, final_verdict, "
         " is_approved, idempotency_key, computed_at, created_at) "
-        "VALUES (1, '0xW', 'COPY_CANDIDATE', 'copy_candidate', 0, 'k1', "
+        "VALUES (1, '0xW', 'copy_candidate', 'copy_candidate', 0, 'k1', "
         " '2026-07-03T12:00:00Z', '2026-07-03T12:00:00Z')"
     )
     db.conn.commit()
@@ -214,7 +214,7 @@ def test_no_orders_or_positions_created_empty(tmp_path: Path):
         "INSERT INTO paper_signal_decisions "
         "(candidate_id, wallet_id, signal_family, final_verdict, "
         " is_approved, idempotency_key, computed_at, created_at) "
-        "VALUES (1, '0xW', 'COPY_CANDIDATE', 'copy_candidate', 0, 'k1', "
+        "VALUES (1, '0xW', 'copy_candidate', 'copy_candidate', 0, 'k1', "
         " '2026-07-03T12:00:00Z', '2026-07-03T12:00:00Z')"
     )
     db.conn.commit()
@@ -247,14 +247,14 @@ def test_different_signal_ids_get_own_seven(tmp_path: Path):
         "INSERT INTO paper_signal_decisions "
         "(candidate_id, wallet_id, signal_family, final_verdict, "
         " is_approved, idempotency_key, computed_at, created_at) "
-        "VALUES (1, '0xW', 'COPY_CANDIDATE', 'copy_candidate', 0, 'k1', "
+        "VALUES (1, '0xW', 'copy_candidate', 'copy_candidate', 0, 'k1', "
         " '2026-07-03T12:00:00Z', '2026-07-03T12:00:00Z')"
     )
     db.conn.execute(
         "INSERT INTO paper_signal_decisions "
         "(candidate_id, wallet_id, signal_family, final_verdict, "
         " is_approved, idempotency_key, computed_at, created_at) "
-        "VALUES (2, '0xW', 'COPY_CANDIDATE', 'copy_candidate', 0, 'k2', "
+        "VALUES (2, '0xW', 'copy_candidate', 'copy_candidate', 0, 'k2', "
         " '2026-07-03T12:00:00Z', '2026-07-03T12:00:00Z')"
     )
     db.conn.commit()
@@ -275,7 +275,7 @@ def test_missing_evaluation_timestamp_falls_back_to_null(tmp_path: Path):
         "INSERT INTO paper_signal_decisions "
         "(candidate_id, wallet_id, signal_family, final_verdict, "
         " is_approved, idempotency_key, computed_at, created_at) "
-        "VALUES (1, '0xW', 'COPY_CANDIDATE', 'copy_candidate', 0, 'k1', "
+        "VALUES (1, '0xW', 'copy_candidate', 'copy_candidate', 0, 'k1', "
         " '2026-07-03T12:00:00Z', '2026-07-03T12:00:00Z')"
     )
     db.conn.commit()
