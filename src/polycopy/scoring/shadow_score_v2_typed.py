@@ -102,6 +102,15 @@ DELAY_SCENARIO_TOLERANCE_SECONDS: dict[DelayScenario, Optional[float]] = {
 }
 
 
+# Conservative upper safety bound for ``ACTUAL_MEASURED_DELAY``.
+# The 15-minute fixed-delay scenario accepts observations up to
+# 1200s (900s target + 300s tolerance); we set the actual-measured
+# ceiling slightly higher to allow ad-hoc measured delays that may
+# exceed the longest fixed window. This is a safety guard against
+# corrupt timestamps, not a contract rule.
+ACTUAL_MEASURED_DELAY_MAX_SECONDS: float = 1500.0
+
+
 # ---- Component weights (frozen, sum=100) ---------------------------------
 
 SHADOW_WEIGHTS: dict[str, float] = {
@@ -247,3 +256,74 @@ REASON_NO_WALLET_PERSISTENCE = "missing_wallet_skill_persistence_input"
 REASON_NO_SOURCE_PRICE = "missing_source_price"
 REASON_INSUFFICIENT_DEPTH = "insufficient_executable_depth"
 REASON_NO_MEASURED_DELAY = "missing_actual_measured_delay_seconds"
+
+
+# ---- Scenario-aware delay validation (final repair pass) ----------------
+
+
+def validate_observed_delay_for_scenario(
+    scenario: "DelayScenario",
+    actual_observed_delay_seconds: Optional[float],
+) -> Optional[str]:
+    """Validate an observed delay against the scenario's contract.
+
+    Returns ``None`` when the value is in-range, or a short
+    ``actual_observed_delay_out_of_range:<scenario>:<value>`` reason
+    token when it is not. The validation rule depends on the
+    scenario:
+
+      * ``THEORETICAL_IMMEDIATE``: target=0.0, no upper bound.
+        We accept any ``actual >= 0`` (the scenario represents the
+        immediate available snapshot, not a guaranteed exact-zero
+        observation).
+      * Fixed-delay scenarios (``DELAY_30_SECONDS``, ``DELAY_2_MINUTES``,
+        ``DELAY_5_MINUTES``, ``DELAY_15_MINUTES``): valid range is
+        ``[target_delay, target_delay + tolerance]``. E.g. for
+        ``DELAY_15_MINUTES`` (target=900s, tolerance=300s), the valid
+        window is 900–1200 seconds.
+      * ``ACTUAL_MEASURED_DELAY``: target=None. We require
+        ``actual >= 0`` and ``actual <= ACTUAL_MEASURED_DELAY_MAX_SECONDS``
+        as a corrupt-timestamp safety guard (1500s — slightly above
+        the longest supported fixed scenario window).
+
+    Negative measured delays are ALWAYS rejected (clamp/typo guard).
+    """
+    if actual_observed_delay_seconds is None:
+        return None
+    try:
+        actual = float(actual_observed_delay_seconds)
+    except (TypeError, ValueError):
+        return f"actual_observed_delay_invalid:{scenario.value}"
+
+    if actual < 0.0:
+        return (
+            f"actual_observed_delay_negative:{scenario.value}:{actual}"
+        )
+
+    if scenario is DelayScenario.THEORETICAL_IMMEDIATE:
+        # No upper bound — the scenario represents the immediate
+        # available candidate snapshot, not a guaranteed exact-zero
+        # observation.
+        return None
+
+    if scenario is DelayScenario.ACTUAL_MEASURED_DELAY:
+        if actual > ACTUAL_MEASURED_DELAY_MAX_SECONDS:
+            return (
+                f"actual_observed_delay_out_of_range:{scenario.value}:"
+                f"{actual}>={ACTUAL_MEASURED_DELAY_MAX_SECONDS}"
+            )
+        return None
+
+    # Fixed-delay scenario.
+    target = DELAY_SCENARIO_SECONDS.get(scenario)
+    tolerance = DELAY_SCENARIO_TOLERANCE_SECONDS.get(scenario) or 0.0
+    if target is None:
+        return None
+    lower = float(target)
+    upper = float(target) + float(tolerance)
+    if actual < lower or actual > upper:
+        return (
+            f"actual_observed_delay_out_of_range:{scenario.value}:"
+            f"{actual} not in [{lower}, {upper}]"
+        )
+    return None

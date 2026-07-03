@@ -1499,19 +1499,17 @@ def _compute_and_persist_shadow_v2(
     # The executable VWAP is the contract-grade source-of-truth
     # price for the THEORETICAL_IMMEDIATE scenario — NEVER a
     # midpoint. When the executable walk produced no fill (insufficient
-    # depth or top-of-book-only), the source_price fallback applies.
+    # depth or top-of-book-only), ``executable_price_for_immediate``
+    # stays None and the per-scenario branch surfaces
+    # ``missing_executable_price_for_theoretical_immediate`` /
+    # ``missing_executable_price_for_actual_measured_delay`` so the
+    # engine returns SHADOW_INCOMPLETE. We NEVER substitute
+    # ``source_price`` here — that would silently fabricate a perfect
+    # "delayed" price when no real depth walk exists.
     if exec_vwap is not None:
-        # Prefer the executable VWAP over the source trade's nominal
-        # price because that is what a real order would have paid at
-        # depth. Only override the THEORETICAL_IMMEDIATE scenario's
-        # "delayed_copy_price" — fixed-delay scenarios are resolved
-        # from their own delayed snapshot below.
-        if side_for_exec == "BUY":
-            executable_price_for_immediate = exec_vwap
-        else:
-            executable_price_for_immediate = exec_vwap
+        executable_price_for_immediate = exec_vwap
     else:
-        executable_price_for_immediate = source_price
+        executable_price_for_immediate = None
 
     # Forward-evidence inputs (skill_persistence, copied_performance,
     # concentration/correlation) come from the runtime context.
@@ -1553,10 +1551,14 @@ def _compute_and_persist_shadow_v2(
             # Repair 2b — the theoretical-immediate scenario's
             # "delayed" price is the SIDE-AWARE executable price of
             # the primary snapshot, NOT a midpoint. When the
-            # executable walk produced no VWAP (insufficient depth or
-            # top-of-book-only), fall back to the source trade's
-            # nominal price. When both are missing, the engine
-            # produces SHADOW_INCOMPLETE.
+            # executable walk produced no VWAP (insufficient depth,
+            # top-of-book-only, or invalid/missing trade side), the
+            # price stays None and we surface
+            # ``missing_executable_price_for_theoretical_immediate``
+            # so the engine returns SHADOW_INCOMPLETE. We NEVER
+            # substitute ``source_price`` — that would silently
+            # fabricate a perfect "delayed" price from the trade
+            # itself, which is not what a real copy would have paid.
             delayed_copy_price = executable_price_for_immediate
             delayed_snapshot_id = price_snapshot_id
             target_delay_value = 0.0
@@ -1568,6 +1570,14 @@ def _compute_and_persist_shadow_v2(
                 delay_error_value = (
                     float(actual_observed_value)
                     - float(target_delay_value)
+                )
+            if delayed_copy_price is None:
+                if side_for_exec not in ("BUY", "SELL"):
+                    scenario_missing.append(
+                        "missing_or_invalid_trade_side"
+                    )
+                scenario_missing.append(
+                    "missing_executable_price_for_theoretical_immediate"
                 )
         elif scenario is DelayScenario.ACTUAL_MEASURED_DELAY:
             # For the actual-measured scenario, the "delayed price"
@@ -1584,6 +1594,14 @@ def _compute_and_persist_shadow_v2(
             target_delay_value = None
             actual_observed_value = measured_delay_seconds
             delay_error_value = None
+            if delayed_copy_price is None:
+                if side_for_exec not in ("BUY", "SELL"):
+                    scenario_missing.append(
+                        "missing_or_invalid_trade_side"
+                    )
+                scenario_missing.append(
+                    "missing_executable_price_for_actual_measured_delay"
+                )
         else:
             # Fixed-delay scenario. Repair 2c — pass the bounded
             # tolerance from DELAY_SCENARIO_TOLERANCE_SECONDS to
@@ -1620,31 +1638,49 @@ def _compute_and_persist_shadow_v2(
                     if delayed_snapshot_id is not None:
                         # Repair 2b — use the SIDE-AWARE executable
                         # price for the delayed snapshot (BUY walks
-                        # asks, SELL walks bids). NEVER a midpoint.
-                        (
-                            _delayed_vwap,
-                            _delayed_fill_pct,
-                            _delayed_exec_depth,
-                            _delayed_insufficient,
-                        ) = _executable_price_for_snapshot(
-                            db,
-                            snapshot_id=delayed_snapshot_id,
-                            side=(
-                                side_for_exec
-                                if side_for_exec in ("BUY", "SELL")
-                                else "BUY"
-                            ),
-                            intended_stake=intended_stake_for_exec,
-                        )
-                        if _delayed_vwap is not None:
-                            delayed_copy_price = _delayed_vwap
+                        # asks, SELL walks bids). NEVER a midpoint,
+                        # NEVER a source_price fallback. If
+                        # ``side_for_exec`` is missing or invalid, we
+                        # do NOT call ``_executable_price_for_snapshot``
+                        # at all (we refuse to invent a direction).
+                        # If the depth walk returns no VWAP, we leave
+                        # ``delayed_copy_price`` as None and surface
+                        # ``missing_executable_depth_for_scenario_<s>``
+                        # so the engine returns SHADOW_INCOMPLETE.
+                        if side_for_exec in ("BUY", "SELL"):
+                            (
+                                _delayed_vwap,
+                                _delayed_fill_pct,
+                                _delayed_exec_depth,
+                                _delayed_insufficient,
+                            ) = _executable_price_for_snapshot(
+                                db,
+                                snapshot_id=delayed_snapshot_id,
+                                side=side_for_exec,
+                                intended_stake=intended_stake_for_exec,
+                            )
+                            if _delayed_vwap is not None:
+                                delayed_copy_price = _delayed_vwap
+                            else:
+                                # No executable depth for the delayed
+                                # snapshot — surface the missing
+                                # evidence reason. We do NOT fall
+                                # back to ``source_price`` (that would
+                                # fabricate a perfect copy price) and
+                                # we do NOT fall back to midpoint, top
+                                # bid, top ask, or zero. The contract
+                                # is honest SHADOW_INCOMPLETE.
+                                scenario_missing.append(
+                                    f"missing_executable_depth_for_scenario_{scenario.value}"
+                                )
+                                if _delayed_insufficient:
+                                    scenario_missing.append(
+                                        f"insufficient_reason:{_delayed_insufficient}"
+                                    )
                         else:
-                            # No executable depth for the delayed
-                            # snapshot — fall back to source_price
-                            # so the engine has a real number to
-                            # grade, and surface the
-                            # missing-execution-evidence reason.
-                            delayed_copy_price = source_price
+                            scenario_missing.append(
+                                "missing_or_invalid_trade_side"
+                            )
                             scenario_missing.append(
                                 f"missing_executable_depth_for_scenario_{scenario.value}"
                             )
@@ -1684,22 +1720,23 @@ def _compute_and_persist_shadow_v2(
                     f"missing_delayed_snapshot_for_scenario_{scenario.value}"
                 )
 
-        # Validate the offset audit fields (Repair 2d).
-        # ``actual_observed_delay_seconds`` must be 0 <= x <= 600
-        # when present (a 10-minute ceiling matches the longest
-        # fixed-delay scenario plus tolerance). When validation
-        # fails, surface it as a missing reason rather than crash.
+        # Validate the offset audit fields (Repair 2d — scenario-aware).
+        # The validation rule depends on ``scenario``; see
+        # ``validate_observed_delay_for_scenario`` in
+        # ``shadow_score_v2_typed``. In particular the
+        # 15-minute scenario (target=900s, tolerance=300s) accepts
+        # observations up to 1200s — a global 600s ceiling would
+        # wrongly invalidate every legitimate 15-minute observation.
         if actual_observed_value is not None:
-            try:
-                if (
-                    float(actual_observed_value) < 0.0
-                    or float(actual_observed_value) > 600.0
-                ):
-                    scenario_missing.append(
-                        f"actual_observed_delay_out_of_range:{actual_observed_value}"
-                    )
-            except (TypeError, ValueError):
-                scenario_missing.append("actual_observed_delay_invalid")
+            from polycopy.scoring.shadow_score_v2_typed import (
+                validate_observed_delay_for_scenario,
+            )
+            _delay_reason = validate_observed_delay_for_scenario(
+                scenario,
+                actual_observed_value,
+            )
+            if _delay_reason is not None:
+                scenario_missing.append(_delay_reason)
 
         # Build the typed input for this scenario.
         typed_in = ShadowScoreInputV2(

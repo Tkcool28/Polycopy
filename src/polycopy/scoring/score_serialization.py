@@ -968,19 +968,55 @@ def persist_shadow_score_v2(
     # ---- Repair 2d — offset-audit bounds (0..600s on actual) ----
     # Shadow V2 audit fields. The validator above covers
     # ``measured_delay_seconds`` (legacy single field) but the v12
-    # typed contract exposes three separate offset fields. We enforce
-    # the upper bound inline so an obviously corrupt timestamp can't
-    # land in the audit trail.
+    # typed contract exposes three separate offset fields. The
+    # validation is now SCENARIO-AWARE (see
+    # ``validate_observed_delay_for_scenario``) — a global 600s
+    # ceiling would wrongly invalidate every legitimate 15-minute
+    # observation (target=900s, tolerance=300s, valid window
+    # 900-1200s). We still reject obviously corrupt values:
+    #   * any value below 0 (clock-skew/typo guard)
+    #   * any value above ACTUAL_MEASURED_DELAY_MAX_SECONDS (1500s —
+    #     slightly above the longest supported fixed scenario window)
+    #     for ACTUAL_MEASURED_DELAY scenarios.
+    #   * For fixed-delay scenarios the runtime pre-validates with
+    #     ``validate_observed_delay_for_scenario``; here we only
+    #     enforce the upper safety ceiling so a corrupt timestamp
+    #     cannot land in the audit trail.
     if actual_observed_delay_seconds is not None:
+        from polycopy.scoring.shadow_score_v2_typed import (
+            ACTUAL_MEASURED_DELAY_MAX_SECONDS,
+        )
         try:
             ao = float(actual_observed_delay_seconds)
         except (TypeError, ValueError):
-            ao = None
-        else:
-            if ao < 0.0 or ao > 600.0:
-                raise ValueError(
-                    f"actual_observed_delay_seconds={ao} outside [0, 600]"
-                )
+            raise ValueError(
+                f"actual_observed_delay_seconds={actual_observed_delay_seconds!r} "
+                f"is not numeric"
+            )
+        if ao < 0.0:
+            raise ValueError(
+                f"actual_observed_delay_seconds={ao} is negative"
+            )
+        # Only enforce the upper safety ceiling for scenarios with no
+        # fixed upper bound. Fixed-delay scenarios are pre-validated
+        # by the runtime and accept up to target + tolerance
+        # (e.g. 1200s for the 15-minute scenario).
+        # ``delay_scenario_str`` is always bound (either from typed
+        # input or from ``result.delay_scenario``); use it directly
+        # to avoid LSP "possibly unbound" complaints.
+        _scenario_str = str(delay_scenario_str or "")
+        if (
+            _scenario_str == "actual_measured_delay"
+            and ao > ACTUAL_MEASURED_DELAY_MAX_SECONDS
+        ):
+            raise ValueError(
+                f"actual_observed_delay_seconds={ao} above "
+                f"ACTUAL_MEASURED_DELAY_MAX_SECONDS="
+                f"{ACTUAL_MEASURED_DELAY_MAX_SECONDS}"
+            )
+        # THEORETICAL_IMMEDIATE has no upper bound — the scenario
+        # represents the immediate available candidate snapshot,
+        # not a guaranteed exact-zero observation.
 
     return _insert_or_ignore_returning_id(
         db,
