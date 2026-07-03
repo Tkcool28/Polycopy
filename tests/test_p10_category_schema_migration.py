@@ -13,10 +13,11 @@ necessary for the typed category score contract:
 
 This test file proves that:
 
-  1. Fresh empty DB initializes to schema v10.
-  2. Existing valid v9 DB upgrades to v10.
+  1. Fresh empty DB initializes to the current canonical schema
+     (currently v11 — Chunk 5 added shadow typed-input columns).
+  2. Existing valid v9 DB upgrades to the current canonical schema.
   3. Existing v9 data remains unchanged.
-  4. category_wallet_score_decisions exists at v10.
+  4. category_wallet_score_decisions exists at the current schema.
   5. The new category columns exist.
   6. Required category indexes exist.
   7. No category rows are invented during migration.
@@ -28,6 +29,13 @@ This test file proves that:
 
 The tests use disposable DBs (``tmp_path``); production
 ``/root/Polycopy/data/polycopy.db`` is NEVER touched.
+
+NOTE: Test 1 was originally named ``test_fresh_db_initializes_to_v10``
+and hard-coded ``SCHEMA_VERSION == 10``. Chunk 5 added v11 (additive
+shadow typed-input columns). The test is renamed to
+``test_fresh_db_initializes_to_current_schema`` and asserts against
+the imported ``SCHEMA_VERSION`` constant, which is the canonical
+source of truth.
 """
 
 from __future__ import annotations
@@ -48,10 +56,10 @@ from polycopy.db.schema import (  # noqa: E402
 )
 
 
-# ── 1. Fresh empty DB initializes to v10 ─────────────────────────────
+# ── 1. Fresh empty DB initializes to the current canonical schema ─────
 
 
-def test_fresh_db_initializes_to_v10(tmp_path: Path) -> None:
+def test_fresh_db_initializes_to_current_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "v10-s1.db"
     db = Database(db_path=db_path).connect()
     try:
@@ -59,8 +67,14 @@ def test_fresh_db_initializes_to_v10(tmp_path: Path) -> None:
             "SELECT value FROM _meta WHERE key = 'schema_version'"
         )
         assert row is not None
+        # Canonical contract: fresh DB reaches the current SCHEMA_VERSION
+        # exactly. The constant is the single source of truth; tests must
+        # not hard-code a version number that drifts on additive schema
+        # bumps (e.g. v10 → v11 added shadow typed-input columns).
         assert int(row["value"]) == SCHEMA_VERSION
-        assert SCHEMA_VERSION == 10
+        # Sanity: SCHEMA_VERSION must be a positive integer (regression
+        # guard against accidental constant corruption).
+        assert SCHEMA_VERSION >= 1
     finally:
         db.close()
 

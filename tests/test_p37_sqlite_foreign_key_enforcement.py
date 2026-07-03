@@ -24,6 +24,7 @@ import pytest
 
 from polycopy.db.database import Database
 from polycopy.db.schema import MIGRATIONS, SCHEMA_VERSION, _V5_DDL
+from polycopy.db.schema_v11 import apply_v11_idempotent
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -34,13 +35,26 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 
 def _init_db_at_version(db_path: Path, target: int) -> sqlite3.Connection:
-    """Init a DB and run migrations 1..target with raw sqlite3, FKs ON."""
+    """Init a DB and run migrations 1..target with raw sqlite3, FKs ON.
+
+    For ``target >= 11`` the v11 step is applied via the production
+    idempotency helper :func:`apply_v11_idempotent` so the migration
+    survives both fresh databases (where schema_v10 already declares
+    every v11 column) and historical v10 databases (where the columns
+    are still absent). Iterating ``MIGRATIONS[11]`` directly would
+    raise ``sqlite3.OperationalError: duplicate column name`` because
+    schema_v10's CREATE TABLE for ``shadow_decisions`` already
+    declares several columns that v11 would otherwise re-add.
+    """
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     for v in range(1, target + 1):
-        for stmt in MIGRATIONS[v]:
-            conn.execute(stmt)
+        if v == 11:
+            apply_v11_idempotent(conn)
+        else:
+            for stmt in MIGRATIONS[v]:
+                conn.execute(stmt)
         conn.execute(
             "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",
             (str(v),),
@@ -236,8 +250,12 @@ class TestFreshMigrationsWithFKs:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         for v in range(1, SCHEMA_VERSION + 1):
-            for stmt in MIGRATIONS[v]:
-                conn.execute(stmt)
+            # v11 has its own idempotency contract; see ``_init_db_at_version``.
+            if v == 11:
+                apply_v11_idempotent(conn)
+            else:
+                for stmt in MIGRATIONS[v]:
+                    conn.execute(stmt)
             conn.execute(
                 "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', ?)",
                 (str(v),),
@@ -495,3 +513,277 @@ class TestTestHelpersEnforceFKs:
                     "VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 1.0, 0.5, 'pending', ?)",
                     ("o1", "m1", "no-such-wallet", datetime.now(timezone.utc).isoformat()),
                 )
+
+
+# ─── 10. v11 column-add idempotency (forward-fix regression guard) ──────────
+
+
+class TestV11ColumnAddsIdempotent:
+    """Prove the v11 idempotency contract on the four required paths:
+
+    1. fresh DB migration succeeds (schema_v10 already declares every
+       column, so v11 must be a no-op for every column);
+    2. historical v10 DB missing the new columns receives them;
+    3. v10 DB already containing one or more v11 columns still
+       upgrades safely (the helper must skip present columns);
+    4. reopening v11 is idempotent (no error, no schema drift);
+    5. existing shadow rows remain unchanged (no destructive rebuild);
+    6. foreign_key_check is clean at every step.
+    """
+
+    def _shadow_columns(self, conn) -> set[str]:
+        rows = conn.execute(
+            "PRAGMA table_info(shadow_decisions)"
+        ).fetchall()
+        return {row["name"] for row in rows}
+
+    def _v11_required_columns(self) -> set[str]:
+        from polycopy.db.schema_v11 import _V11_COLUMN_ADDS
+
+        return {column for _table, column, _type in _V11_COLUMN_ADDS}
+
+    def test_v11_idempotent_fresh_db_succeeds(self, tmp_path: Path) -> None:
+        """Path 1: fresh DB (schema_v10 declares every v11 column)."""
+        db_path = tmp_path / "v11-fresh.db"
+        conn = _init_db_at_version(db_path, SCHEMA_VERSION)
+        try:
+            # Every required v11 column must exist.
+            present = self._shadow_columns(conn)
+            missing = self._v11_required_columns() - present
+            assert not missing, f"missing v11 columns: {missing}"
+            # foreign_key_check clean.
+            fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+            assert fk == []
+            # schema_version reached.
+            row = conn.execute(
+                "SELECT value FROM _meta WHERE key = 'schema_version'"
+            ).fetchone()
+            assert row is not None
+            assert int(row["value"]) == SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    def test_v11_idempotent_historical_v10_receives_columns(
+        self, tmp_path: Path
+    ) -> None:
+        """Path 2: a v10-only database receives every v11-only column.
+
+        Schema_v10's CREATE TABLE for ``shadow_decisions`` declares the
+        historical columns (including ``slippage``); v11's column-add list
+        includes one overlap (``slippage``, which is already present) and
+        12 v11-only columns that v10 does not declare. We build a v10 DB
+        fresh, confirm the v11-only columns are absent, then call
+        ``apply_v11_idempotent`` and confirm every v11 column is now
+        present.
+        """
+        from polycopy.db.schema_v11 import (
+            _V11_COLUMN_ADDS,
+            apply_v11_idempotent,
+        )
+
+        db_path = tmp_path / "v11-historical.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        for v in range(1, 10 + 1):
+            for stmt in MIGRATIONS[v]:
+                conn.execute(stmt)
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES "
+            "('schema_version', '10')"
+        )
+        conn.commit()
+        try:
+            v11_only = {
+                column
+                for _table, column, _type in _V11_COLUMN_ADDS
+                if column not in {"slippage"}
+            }
+            present_before = self._shadow_columns(conn)
+            missing_before = v11_only - present_before
+            assert missing_before == v11_only, (
+                f"expected v11-only columns to be absent at v10, "
+                f"but found: {v11_only - missing_before}"
+            )
+
+            # Apply v11 idempotently.
+            apply_v11_idempotent(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO _meta (key, value) VALUES "
+                "('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            conn.commit()
+
+            # Every required v11 column must now exist.
+            present_after = self._shadow_columns(conn)
+            missing = self._v11_required_columns() - present_after
+            assert not missing, f"missing v11 columns: {missing}"
+            # foreign_key_check clean.
+            fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+            assert fk == []
+        finally:
+            conn.close()
+
+    def test_v11_idempotent_partial_columns_skips_present(
+        self, tmp_path: Path
+    ) -> None:
+        """Path 3: v10 DB already containing some v11 columns still
+        upgrades safely — the helper must skip present columns and
+        add only the missing ones, in that exact order, without
+        raising."""
+        from polycopy.db.schema_v11 import apply_v11_idempotent
+
+        db_path = tmp_path / "v11-partial.db"
+        conn = _init_db_at_version(db_path, SCHEMA_VERSION)
+        try:
+            # Drop three of the v11 columns to simulate a partial state.
+            for column in (
+                "concentration_correlation_input",
+                "missing_forward_reasons_json",
+                "depth_hash",
+            ):
+                conn.execute(
+                    f"ALTER TABLE shadow_decisions DROP COLUMN {column}"
+                )
+            conn.commit()
+
+            present_before = self._shadow_columns(conn)
+            assert (
+                "concentration_correlation_input" not in present_before
+            )
+            assert "missing_forward_reasons_json" not in present_before
+            assert "depth_hash" not in present_before
+
+            # Apply v11 idempotently — must not raise on present columns.
+            apply_v11_idempotent(conn)
+
+            present_after = self._shadow_columns(conn)
+            missing = self._v11_required_columns() - present_after
+            assert not missing, f"missing v11 columns: {missing}"
+            # The other columns must still be present (helper didn't
+            # drop them).
+            for column in (
+                "source_price",
+                "slippage",
+                "spread",
+                "measured_delay_seconds",
+            ):
+                assert column in present_after
+            # foreign_key_check clean.
+            fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+            assert fk == []
+        finally:
+            conn.close()
+
+    def test_v11_idempotent_reopen_is_noop(self, tmp_path: Path) -> None:
+        """Path 4: reopening a v11 DB and re-applying v11 must be a
+        no-op — no error, no column drift, no schema_version bump
+        beyond the canonical constant."""
+        from polycopy.db.schema_v11 import apply_v11_idempotent
+
+        db_path = tmp_path / "v11-reopen.db"
+        # First pass: build fresh.
+        conn1 = _init_db_at_version(db_path, SCHEMA_VERSION)
+        before_cols = self._shadow_columns(conn1)
+        conn1.close()
+
+        # Second pass: reopen and re-apply v11.
+        conn2 = sqlite3.connect(str(db_path))
+        conn2.row_factory = sqlite3.Row
+        conn2.execute("PRAGMA foreign_keys = ON")
+        apply_v11_idempotent(conn2)
+        conn2.commit()
+        try:
+            after_cols = self._shadow_columns(conn2)
+            # No column drift.
+            assert before_cols == after_cols
+            # schema_version unchanged.
+            row = conn2.execute(
+                "SELECT value FROM _meta WHERE key = 'schema_version'"
+            ).fetchone()
+            assert row is not None
+            assert int(row["value"]) == SCHEMA_VERSION
+            # foreign_key_check clean.
+            fk = conn2.execute("PRAGMA foreign_key_check").fetchall()
+            assert fk == []
+        finally:
+            conn2.close()
+
+    def test_v11_idempotent_preserves_existing_shadow_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """Path 5: applying v11 against a DB that already has shadow
+        rows must not destroy or rewrite those rows."""
+        from polycopy.db.schema_v11 import apply_v11_idempotent
+
+        db_path = tmp_path / "v11-rows.db"
+        conn = _init_db_at_version(db_path, SCHEMA_VERSION)
+        try:
+            # Insert a wallet parent (FK target) and a synthetic
+            # shadow_decisions row so we can verify byte-for-byte
+            # preservation through the second pass.
+            conn.execute(
+                "INSERT INTO wallets (id, address, label, is_sample, "
+                "created_at, canonical_address) VALUES "
+                "('w1', '0xw', 'test', 0, '2026-01-01T00:00:00Z', '0xw')"
+            )
+            conn.execute(
+                "INSERT INTO shadow_decisions (wallet_id, source_trade_id, "
+                "formula_name, formula_version, idempotency_key, "
+                "computed_at, created_at, final_score, verdict) VALUES "
+                "('w1', 'st-1', 'v2', 'v2', 'idem-1', "
+                "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 75.0, "
+                "'SHADOW_WATCHLIST')"
+            )
+            conn.commit()
+            before = conn.execute(
+                "SELECT * FROM shadow_decisions WHERE idempotency_key='idem-1'"
+            ).fetchall()
+            assert len(before) == 1
+            before_row = dict(before[0])
+
+            # Re-apply v11 idempotently.
+            apply_v11_idempotent(conn)
+            conn.commit()
+
+            after = conn.execute(
+                "SELECT * FROM shadow_decisions WHERE idempotency_key='idem-1'"
+            ).fetchall()
+            assert len(after) == 1
+            after_row = dict(after[0])
+            # All pre-existing columns must be byte-for-byte identical.
+            for key, value in before_row.items():
+                assert after_row[key] == value, (
+                    f"shadow_decisions.{key} drifted: "
+                    f"{value!r} -> {after_row[key]!r}"
+                )
+            # foreign_key_check clean.
+            fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+            assert fk == []
+        finally:
+            conn.close()
+
+    def test_v11_idempotent_foreign_key_check_clean(self, tmp_path: Path) -> None:
+        """Path 6: foreign_key_check is clean after every v11 path.
+
+        This is a focused assertion that the v11 column-additions
+        do not introduce referential-integrity violations. The v11
+        migration adds a single FK (price_snapshot_id -> candidate_price_snapshots).
+        On a fresh DB the FK target table is empty, so no row-level
+        violations can occur; we assert the FK is structurally valid
+        and that ``PRAGMA foreign_key_check`` returns zero rows.
+        """
+        db_path = tmp_path / "v11-fkcheck.db"
+        conn = _init_db_at_version(db_path, SCHEMA_VERSION)
+        try:
+            fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+            assert fk == [], f"unexpected FK violations: {fk}"
+            # The shadow_decisions.price_snapshot_id FK must be visible.
+            fk_rows = conn.execute(
+                "SELECT * FROM pragma_foreign_key_list('shadow_decisions')"
+            ).fetchall()
+            fk_targets = {row["table"] for row in fk_rows}
+            assert "candidate_price_snapshots" in fk_targets
+        finally:
+            conn.close()
