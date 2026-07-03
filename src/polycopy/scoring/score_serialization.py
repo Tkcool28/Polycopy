@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 
 from polycopy.db.database import Database
@@ -409,9 +409,13 @@ def _insert_or_ignore_returning_id(
 
     On insert: drains the RETURNING cursor, commits, returns the new id.
     On skip: drains the RETURNING cursor, then runs `existing_lookup_sql`
-    to find the existing row, drains that cursor, commits, returns the
-    existing id. If the existing row is not found, returns 0 (this
-    should be impossible given a working UNIQUE constraint).
+    to find the existing row, drains that cursor too, commits, returns
+    the existing id.
+
+    Raises :class:`PersistenceError` when neither path produces a
+    row id. Callers MUST NOT use ``int(cur.lastrowid or 0)`` to
+    mask this failure — a row whose id is unknown is a
+    persistence bug, not a silent skip.
     """
     cursor = db.execute(sql, params)
     inserted = cursor.fetchone()
@@ -428,8 +432,13 @@ def _insert_or_ignore_returning_id(
     db.conn.commit()
     if existing is None:
         # Defensive: this should not happen if the UNIQUE constraint
-        # is enforced. Return 0 to signal "row id unknown".
-        return 0
+        # is enforced. Raise so the caller can surface the failure
+        # clearly instead of silently writing rows whose id is 0.
+        raise PersistenceError(
+            "INSERT OR IGNORE skipped AND the existing-row lookup "
+            "returned no row — UNIQUE constraint may not be enforced "
+            "or the lookup SQL is incorrect."
+        )
     return int(existing["id"] if "id" in existing.keys() else existing[0])
 
 
@@ -785,7 +794,7 @@ def persist_shadow_score_v2(
                 component_scores_json, final_score, verdict, missing_components_json,
                 delay_scenario, source_data_timestamp, computed_at, created_at,
                 candidate_id, v1_decision_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
         """,
         params=(
@@ -904,6 +913,15 @@ def persist_paper_signal(
 
 # ---- Exit experiments (not in scope for this fix but uses RETURNING) ---
 
+
+class PersistenceError(RuntimeError):
+    """Raised when a persistence helper cannot return a row id.
+
+    Used in place of ``int(x or 0)`` for lastrowid handling so the
+    caller can surface a clear error rather than silently writing
+    a row whose id is unknown.
+    """
+
 def record_exit_experiments(
     db: Database,
     paper_signal_id: int,
@@ -927,10 +945,20 @@ def record_exit_experiments(
     Table UNIQUE: (paper_signal_id, experiment_type)
     """
     now = datetime.now(timezone.utc)
+    # exit_24h and exit_72h MUST be scheduled +24h / +72h from the
+    # registration moment, NOT at the registration moment. The other
+    # tracks are scheduled at observation time (None). Times are
+    # UTC, second=0, microsecond=0.
+    scheduled_24h = (now + timedelta(hours=24)).replace(
+        second=0, microsecond=0
+    )
+    scheduled_72h = (now + timedelta(hours=72)).replace(
+        second=0, microsecond=0
+    )
     experiment_types = [
         ("hold_to_resolution", None),
-        ("exit_24h", now.replace(second=0, microsecond=0)),
-        ("exit_72h", now.replace(second=0, microsecond=0)),
+        ("exit_24h", scheduled_24h),
+        ("exit_72h", scheduled_72h),
         ("favorable_move_5pct", None),
         ("favorable_move_10_pct", None),
         ("favorable_move_15_pct", None),
