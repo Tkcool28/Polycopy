@@ -28,7 +28,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -139,6 +139,21 @@ class ScanResult:
         self.signals: int = 0
         self.related_wallets: int = 0
         self.anonymous_trades_skipped: int = 0  # legacy alias, kept for back-compat
+        # PR 5 of 6 — pipeline-wiring counters.
+        # ``wallet_score_decisions_persisted`` and the surrounding fields
+        # are populated by ``scripts.scan_pipeline_wiring``. They live on
+        # ``ScanResult`` so the result summary surfaces how much the run
+        # wrote without requiring callers to inspect the wiring module.
+        self.wallet_score_decisions_persisted: int = 0
+        self.wallet_score_decisions_reused: int = 0
+        self.category_score_decisions_persisted: int = 0
+        self.category_score_decisions_reused: int = 0
+        self.copy_candidates_created: int = 0
+        self.copy_candidates_rejected_wallet: int = 0
+        self.copy_candidates_rejected_other: int = 0
+        self.decision_verdicts_persisted: int = 0
+        self.score_component_inputs_persisted: int = 0
+        self.trades_scanned_for_candidates: int = 0
         # Round-10 fetch-status counters (per-market, not per-row).
         self.market_fetches_complete: int = 0
         self.market_fetches_partial: int = 0
@@ -173,6 +188,17 @@ class ScanResult:
             f"    sentinel/anonymous skipped (legacy): {self.anonymous_trades_skipped}\n"
             f"  related wallets: {self.related_wallets}\n"
             f"  signals generated: {self.signals}\n"
+            f"  PR-5 pipeline writes:\n"
+            f"    wallet_score_decisions: persisted={self.wallet_score_decisions_persisted}, "
+            f"reused={self.wallet_score_decisions_reused}\n"
+            f"    category_score_decisions: persisted={self.category_score_decisions_persisted}, "
+            f"reused={self.category_score_decisions_reused}\n"
+            f"    copy_candidates: created={self.copy_candidates_created}, "
+            f"rejected_wallet={self.copy_candidates_rejected_wallet}, "
+            f"rejected_other={self.copy_candidates_rejected_other}, "
+            f"trades_scanned={self.trades_scanned_for_candidates}\n"
+            f"    decision_verdicts: {self.decision_verdicts_persisted}\n"
+            f"    score_component_inputs: {self.score_component_inputs_persisted}\n"
             f"  missing data entries: {len(self.missing_data)}\n"
             f"  errors: {len(self.errors)}"
         )
@@ -183,6 +209,10 @@ async def run_scan(
     settings=None,
     market_limit: int = 20,
     use_sample: bool = False,
+    *,
+    max_paper_candidates: int = 25,
+    max_trades_per_wallet: int = 3,
+    enable_pr5_pipeline: bool = True,
 ) -> ScanResult:
     """Execute the full scan pipeline.
 
@@ -191,10 +221,25 @@ async def run_scan(
     2. Fetch active markets from Polymarket
     3. For each market, fetch trades → discover new wallets
     4. Run trade detection (dedup + staleness)
-    5. Score all wallets
+    5. Score all wallets (legacy path — counters only)
+    5b. (PR 5) Persist v1 wallet score decisions
+    5c. (PR 5) Persist v1 category wallet score decisions
+    5d. (PR 5) Persist copy candidates (PR-2 contract)
+    5e. (PR 5) Persist decision_verdicts + score_component_inputs audit trail
     6. Run related-wallet detection
-    7. Generate signals for COPY_CANDIDATE wallets
+    7. Generate paper-signal decisions for eligible candidates
     8. Record experiment run
+
+    ``max_paper_candidates`` and ``max_trades_per_wallet`` bound the PR-5
+    pipeline work so the scan runtime remains bounded. The existing PR 4
+    paper-signal Step 7 continues to operate on whatever
+    ``copy_candidates`` exist after Step 5d.
+
+    ``enable_pr5_pipeline=False`` is the explicit escape hatch that
+    short-circuits every PR-5 write (Steps 5b–5e). It is provided for
+    test-suite scenarios that want the legacy Step 5 / Step 7 behavior
+    without the new persistence writes. Production scans never set this
+    to False.
     """
     if settings is None:
         settings = get_settings()
@@ -446,8 +491,19 @@ async def run_scan(
     )
 
     # ── Step 5: Score all wallets ─────────────────────────────────────────
+    # PR 5: the legacy ``evaluate_wallet`` call still tallies
+    # ``result.copy_candidates`` / ``result.watchlist`` / etc. — the
+    # back-compat summary counters — but the metric payload it relies on
+    # is now also passed forward to the new pipeline-wiring helpers in
+    # Steps 5b–5d. We collect ``metrics_by_address`` here so PR-5 writes
+    # are not duplicated by re-querying the DB.
     logger.info("Step 5: Scoring %d wallets...", result.wallets_discovered)
     wallet_addresses = [w["address"] for w in discovery.list_wallets()]
+    metrics_by_address: dict[str, dict] = {}
+    # PR-5: trade history by canonical address, used by Step 5d to
+    # generate copy candidates. Keyed on the canonical address (not the
+    # raw entry["address"]) so identity agrees with discovery + SQL.
+    trades_by_address: dict[str, list[SourceTrade]] = {}
     for address in wallet_addresses:
         try:
             # Gather metrics for scoring
@@ -455,6 +511,7 @@ async def run_scan(
             if metrics is None:
                 result.missing_data.append(f"Cannot compute metrics for {address[:12]}")
                 continue
+            metrics_by_address[address] = metrics
 
             score_id, summary = evaluate_wallet(
                 wallet_address=address,
@@ -484,10 +541,129 @@ async def run_scan(
             result.errors.append(f"Score error {address[:12]}: {e}")
             logger.warning("Failed to score wallet %s: %s", address[:12], e)
 
+    # PR-5: build a ``trades_by_address`` map from the in-memory
+    # ``attributed_trades`` already collected by Step 4. This lets the
+    # pipeline-wiring Step 5d reuse the same trade history without
+    # a second DB scan.
+    for trade in attributed_trades:
+        trader = trade.trader_address
+        if not trader or is_sentinel_trader_address(trader):
+            continue
+        trades_by_address.setdefault(trader, []).append(trade)
+
     logger.info(
         "  Scored: %d copy_candidate, %d watchlist, %d skip, %d incomplete",
         result.copy_candidates, result.watchlist, result.skipped, result.incomplete,
     )
+
+    # ── Steps 5b–5e: PR-5 — Persist PR-17/2 paper-decision evidence ───────
+    # Wrapped in a single guard so the ``pr5c`` ``ScanPipelineCounters``
+    # instance is always initialized before any helper runs. When
+    # ``enable_pr5_pipeline`` is False (test-only escape hatch), the
+    # counters remain at zero on the result and nothing is written.
+    if enable_pr5_pipeline:
+        from scripts.scan_pipeline_wiring import (  # local import
+            ScanPipelineCounters,
+            persist_category_v1_decisions,
+            persist_copy_candidates_for_trades,
+            persist_decision_verdicts_and_components,
+            persist_score_component_inputs_for_wallet_decisions,
+            persist_wallet_v1_decisions,
+        )
+        pr5c = ScanPipelineCounters()
+
+        # Step 5b — wallet score v1
+        logger.info(
+            "Step 5b: Persisting v1 wallet-score decisions (max %d wallets)...",
+            len(metrics_by_address),
+        )
+        persist_wallet_v1_decisions(
+            db,
+            addresses=list(metrics_by_address.keys()),
+            metrics_by_address=metrics_by_address,
+            now=now,
+            counters=pr5c,
+        )
+        result.wallet_score_decisions_persisted = pr5c.wallet_score_decisions_persisted
+        result.wallet_score_decisions_reused = pr5c.wallet_score_decisions_reused
+        logger.info(
+            "  wallet_score_decisions: %d persisted, %d reused",
+            result.wallet_score_decisions_persisted,
+            result.wallet_score_decisions_reused,
+        )
+
+        # Step 5c — category wallet score v1.
+        # The legacy run-scan path does NOT yet produce per-market
+        # category metadata; the helper is wired with an empty
+        # ``categories_per_wallet`` map so Step 5c persists nothing
+        # rather than fabricating category labels. The helper is
+        # unit-tested independently so the contract surface is complete.
+        logger.info(
+            "Step 5c: Persisting v1 category-wallet-score decisions..."
+        )
+        categories_per_wallet: dict[str, Sequence[str]] = {}
+        applied_cats = persist_category_v1_decisions(
+            db,
+            addresses=list(metrics_by_address.keys()),
+            categories_per_wallet=categories_per_wallet,
+            now=now,
+            counters=pr5c,
+        )
+        result.category_score_decisions_persisted = pr5c.category_score_decisions_persisted
+        result.category_score_decisions_reused = pr5c.category_score_decisions_reused
+        logger.info(
+            "  category_score_decisions: %d persisted, %d reused (helpers=%d)",
+            result.category_score_decisions_persisted,
+            result.category_score_decisions_reused,
+            applied_cats,
+        )
+
+        # Step 5d — copy candidates (PR-2 contract)
+        logger.info(
+            "Step 5d: Persisting copy candidates (max %d, max_trades/wallet=%d)...",
+            max_paper_candidates, max_trades_per_wallet,
+        )
+        persist_copy_candidates_for_trades(
+            db,
+            addresses=list(metrics_by_address.keys()),
+            metrics_by_address=metrics_by_address,
+            trades_by_address=trades_by_address,
+            now=now,
+            counters=pr5c,
+            max_paper_candidates=max_paper_candidates,
+            max_trades_per_wallet=max_trades_per_wallet,
+        )
+        result.copy_candidates_created = pr5c.copy_candidates_created
+        result.copy_candidates_rejected_wallet = pr5c.copy_candidates_rejected_wallet
+        result.copy_candidates_rejected_other = pr5c.copy_candidates_rejected_other
+        result.trades_scanned_for_candidates = pr5c.trades_scanned_for_candidates
+        logger.info(
+            "  copy_candidates: created=%d, rejected_wallet=%d, rejected_other=%d, "
+            "trades_scanned=%d",
+            result.copy_candidates_created,
+            result.copy_candidates_rejected_wallet,
+            result.copy_candidates_rejected_other,
+            result.trades_scanned_for_candidates,
+        )
+
+        # Step 5e — decision_verdicts + score_component_inputs audit trail.
+        logger.info(
+            "Step 5e: Persisting decision_verdicts + score_component_inputs..."
+        )
+        persist_decision_verdicts_and_components(
+            db, now=now, counters=pr5c,
+        )
+        persist_score_component_inputs_for_wallet_decisions(
+            db, counters=pr5c,
+        )
+        result.decision_verdicts_persisted = pr5c.decision_verdicts_persisted
+        result.score_component_inputs_persisted = pr5c.score_component_inputs_persisted
+        logger.info(
+            "  decision_verdicts: %d, score_component_inputs: %d",
+            result.decision_verdicts_persisted,
+            result.score_component_inputs_persisted,
+        )
+
 
     # ── Step 6: Related-wallet detection ───────────────────────────────────
     logger.info("Step 6: Running related-wallet detection...")
@@ -1214,6 +1390,27 @@ def _record_experiment(db: Database, result: ScanResult, settings) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run full smart-money scan")
     parser.add_argument("--market-limit", type=int, default=20, help="Max markets to scan")
+    parser.add_argument(
+        "--max-paper-candidates",
+        type=int,
+        default=25,
+        help="PR 5: cap on persisted copy-candidate rows per scan run. "
+        "Used to keep scan runtime bounded; passed to "
+        "scripts.scan_pipeline_wiring.persist_copy_candidates_for_trades.",
+    )
+    parser.add_argument(
+        "--max-trades-per-wallet",
+        type=int,
+        default=3,
+        help="PR 5: cap on trades considered per wallet when generating "
+        "copy candidates. Forward-going evidence only.",
+    )
+    parser.add_argument(
+        "--no-pr5-pipeline",
+        action="store_true",
+        help="Disable PR-5 pipeline writes (Steps 5b–5e). Test-only; "
+        "production scans never set this.",
+    )
     parser.add_argument("--db", type=str, default=None, help="SQLite database path")
     parser.add_argument("--use-sample", action="store_true", help="Use sample data instead of live API")
     parser.add_argument("--lock-timeout", type=float, default=10.0, help="Lock timeout seconds")
@@ -1234,6 +1431,9 @@ def main() -> int:
                     db=db, settings=settings,
                     market_limit=args.market_limit,
                     use_sample=args.use_sample,
+                    max_paper_candidates=args.max_paper_candidates,
+                    max_trades_per_wallet=args.max_trades_per_wallet,
+                    enable_pr5_pipeline=not args.no_pr5_pipeline,
                 ))
             finally:
                 db.close()
