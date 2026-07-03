@@ -2064,3 +2064,322 @@ class TestWalletIdContract:
             compute_trade_score_v1(
                 wallet_id="w-a", source_trade_id="t-b", input=inp,
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 2.4 — typed depth-walk evidence integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_full_dw(side="BUY", fill_pct="1", slippage="0"):
+    """Build a fully-filled DepthWalkResult for testing."""
+    from polycopy.scoring.depth_normalization import DepthWalkResult
+    from decimal import Decimal
+    return DepthWalkResult(
+        side=side,
+        intended_notional=Decimal("100"),
+        filled_notional=Decimal("100"),
+        fill_percentage=Decimal(fill_pct),
+        contracts_filled=Decimal("1000"),
+        vwap_fill_price=Decimal("0.10"),
+        slippage=Decimal(slippage),
+        levels_consumed=1,
+        remaining_notional=Decimal("0"),
+        is_complete=True,
+        insufficient_reason=None,
+    )
+
+
+def _make_partial_dw(side="BUY", intended="100", filled="50"):
+    """Build a partial-fill DepthWalkResult."""
+    from polycopy.scoring.depth_normalization import (
+        DepthWalkResult, DEPTH_INSUFFICIENT_FOR_STAKE,
+    )
+    from decimal import Decimal
+    filled_d = Decimal(filled)
+    intended_d = Decimal(intended)
+    fp = filled_d / intended_d
+    return DepthWalkResult(
+        side=side,
+        intended_notional=intended_d,
+        filled_notional=filled_d,
+        fill_percentage=fp,
+        contracts_filled=filled_d / Decimal("0.10"),
+        vwap_fill_price=Decimal("0.10"),
+        slippage=Decimal("0.0"),
+        levels_consumed=1,
+        remaining_notional=intended_d - filled_d,
+        is_complete=False,
+        insufficient_reason=DEPTH_INSUFFICIENT_FOR_STAKE,
+    )
+
+
+def _make_base_input(**overrides):
+    """Build a minimal valid TradeCopyabilityInputV1."""
+    from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+    base: dict = dict(
+        wallet_id="wallet-depth-1",
+        source_trade_id="trade-depth-1",
+        side="BUY",
+        intended_stake=100.0,
+        executable_depth=200.0,
+        fill_percentage=1.0,
+        spread=0.05,
+        best_bid_size=10.0,
+        best_ask_size=10.0,
+        trade_age_seconds=100.0,
+        seconds_to_market_end=24 * 3600,
+        market_active=True,
+        has_valid_strategy=True,
+        has_complete_data=True,
+    )
+    base.update(overrides)
+    return TradeCopyabilityInputV1(**base)
+
+
+class TestTypedDepthWalkAccepted:
+    """The typed depth_walk_result is accepted by compute_trade_score_v1."""
+
+    def test_typed_depth_result_accepted_full_fill(self):
+        """A typed full-fill depth result yields a regular verdict."""
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_full_dw()
+        inp = _make_base_input(depth_walk_result=dw)
+        result = compute_trade_score_v1(input=inp)
+        assert result.input is inp
+        assert result.input.depth_walk_result is dw
+
+    def test_typed_depth_result_does_not_become_none(self):
+        """The typed depth_walk_result attached to result.input survives
+        the compute call (no silent None substitution).
+        """
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_full_dw()
+        inp = _make_base_input(depth_walk_result=dw)
+        result = compute_trade_score_v1(input=inp)
+        assert result.input.depth_walk_result is dw
+        assert result.input.price_snapshot_id == inp.price_snapshot_id
+        assert result.input.depth_hash == inp.depth_hash
+
+    def test_price_snapshot_id_attached_to_typed_input(self):
+        """price_snapshot_id is preserved on the typed input/output."""
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_full_dw()
+        inp = _make_base_input(
+            depth_walk_result=dw,
+            price_snapshot_id="snap-abc",
+        )
+        result = compute_trade_score_v1(input=inp)
+        assert result.input.price_snapshot_id == "snap-abc"
+
+    def test_depth_hash_attached_to_typed_input(self):
+        """depth_hash is preserved on the typed input/output."""
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_full_dw()
+        inp = _make_base_input(
+            depth_walk_result=dw,
+            depth_hash="abc123def456",
+        )
+        result = compute_trade_score_v1(input=inp)
+        assert result.input.depth_hash == "abc123def456"
+
+
+class TestTypedDepthOverridesRawFields:
+    """The typed depth result overrides conflicting raw fields."""
+
+    def test_fill_percentage_typed_overrides_raw(self):
+        """Typed fill_percentage = 0.5 overrides raw fill_percentage = 1.0."""
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_partial_dw(filled="50", intended="100")
+        # raw fill_percentage = 1.0 (lie), typed says 0.5
+        inp = _make_base_input(
+            depth_walk_result=dw,
+            fill_percentage=1.0,
+            executable_depth=200.0,
+        )
+        result = compute_trade_score_v1(input=inp)
+        # Fill_feasibility should reflect 50/100 = 50, not 1.0*100=100.
+        ff_component = next(
+            c for c in result.components if c.name == "fill_feasibility"
+        )
+        assert ff_component.raw_score == pytest.approx(50.0, abs=0.001)
+
+    def test_executable_depth_typed_overrides_raw(self):
+        """Typed filled_notional = 50 overrides raw executable_depth = 9999."""
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_partial_dw(filled="50", intended="100")
+        inp = _make_base_input(
+            depth_walk_result=dw,
+            executable_depth=9999.0,
+            fill_percentage=0.99,
+        )
+        result = compute_trade_score_v1(input=inp)
+        ff_component = next(
+            c for c in result.components if c.name == "fill_feasibility"
+        )
+        # filled (50) / intended (100) = 0.5 → 50.0 score
+        assert ff_component.raw_score == pytest.approx(50.0, abs=0.001)
+
+    def test_raw_lying_full_fill_does_not_promote_to_copy_candidate(self):
+        """Raw fields claiming full fill must NOT override a typed
+        partial fill. The score is partial-truth, not optimistic.
+        """
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        # Typed depth says only 10% fill
+        dw = _make_partial_dw(filled="10", intended="100")
+        # Raw fields claim 100% fill with huge executable depth
+        inp = _make_base_input(
+            depth_walk_result=dw,
+            fill_percentage=1.0,
+            executable_depth=99999.0,
+        )
+        result = compute_trade_score_v1(input=inp)
+        ff_component = next(
+            c for c in result.components if c.name == "fill_feasibility"
+        )
+        # The fill_feasibility component must reflect the TYPED 10% fill,
+        # not the raw 100% claim.
+        assert ff_component.raw_score < 20.0
+        # The rejection_reasons must include DEPTH_INSUFFICIENT_FOR_STAKE
+        assert "DEPTH_INSUFFICIENT_FOR_STAKE" in result.rejection_reasons
+
+
+class TestDepthStatusReasons:
+    """INCOMPLETE propagation when depth evidence is unavailable or bad."""
+
+    def test_depth_not_captured_returns_incomplete(self):
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        from polycopy.scoring.depth_normalization import DEPTH_NOT_CAPTURED
+        inp = _make_base_input(depth_status_reason=DEPTH_NOT_CAPTURED)
+        result = compute_trade_score_v1(input=inp)
+        assert result.verdict == TradeVerdict.INCOMPLETE
+        assert "depth_not_captured" in result.missing_essentials
+        assert DEPTH_NOT_CAPTURED in result.rejection_reasons
+        assert result.score == 0.0
+
+    def test_depth_levels_malformed_returns_incomplete(self):
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        from polycopy.scoring.depth_normalization import DEPTH_LEVELS_MALFORMED
+        inp = _make_base_input(depth_status_reason=DEPTH_LEVELS_MALFORMED)
+        result = compute_trade_score_v1(input=inp)
+        assert result.verdict == TradeVerdict.INCOMPLETE
+        assert "depth_levels_malformed" in result.missing_essentials
+        assert DEPTH_LEVELS_MALFORMED in result.rejection_reasons
+        assert result.score == 0.0
+
+    def test_depth_snapshot_mismatch_returns_incomplete(self):
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        from polycopy.scoring.depth_normalization import DEPTH_SNAPSHOT_MISMATCH
+        inp = _make_base_input(depth_status_reason=DEPTH_SNAPSHOT_MISMATCH)
+        result = compute_trade_score_v1(input=inp)
+        assert result.verdict == TradeVerdict.INCOMPLETE
+        assert "depth_snapshot_mismatch" in result.missing_essentials
+        assert DEPTH_SNAPSHOT_MISMATCH in result.rejection_reasons
+        assert result.score == 0.0
+
+
+class TestPartialFillPreserved:
+    """A partial fill must be preserved truthfully, not silently
+    promoted to a full fill.
+    """
+
+    def test_partial_fill_records_insufficient_reason(self):
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_partial_dw(filled="30", intended="100")
+        inp = _make_base_input(depth_walk_result=dw)
+        result = compute_trade_score_v1(input=inp)
+        assert "DEPTH_INSUFFICIENT_FOR_STAKE" in result.rejection_reasons
+
+    def test_partial_fill_does_not_become_full_fill(self):
+        """The fill_feasibility score must reflect the actual partial
+        fill ratio, not be silently promoted to 100.
+        """
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_partial_dw(filled="30", intended="100")
+        inp = _make_base_input(depth_walk_result=dw)
+        result = compute_trade_score_v1(input=inp)
+        ff = next(
+            c for c in result.components if c.name == "fill_feasibility"
+        )
+        # 30 / 100 = 0.30 → 30.0
+        assert ff.raw_score == pytest.approx(30.0, abs=0.001)
+
+    def test_full_fill_does_not_record_insufficient_reason(self):
+        """Full fills must NOT have DEPTH_INSUFFICIENT_FOR_STAKE recorded."""
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        dw = _make_full_dw()
+        inp = _make_base_input(depth_walk_result=dw)
+        result = compute_trade_score_v1(input=inp)
+        assert "DEPTH_INSUFFICIENT_FOR_STAKE" not in result.rejection_reasons
+
+
+class TestPrecedenceWithConflictingData:
+    """Typed depth evidence must take precedence over conflicting raw
+    fields. The score and persisted audit fields reflect the typed
+    depth result, never the optimistic raw values.
+    """
+
+    def test_conflicting_data_uses_typed_result(self):
+        """Raw fields claim full fill; typed depth says 50% fill.
+        The score uses the typed 50%, not the optimistic 100%.
+        """
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        # Optimistic raw values
+        raw_fill_pct = 1.0
+        raw_exec_depth = 99999.0
+        raw_slippage = 0.0
+        # Typed depth says 50% fill with nonzero slippage
+        dw = _make_partial_dw(filled="50", intended="100")
+        inp = _make_base_input(
+            depth_walk_result=dw,
+            fill_percentage=raw_fill_pct,
+            executable_depth=raw_exec_depth,
+        )
+        result = compute_trade_score_v1(input=inp)
+        ff = next(
+            c for c in result.components if c.name == "fill_feasibility"
+        )
+        # Typed wins: 50/100 = 0.5 → 50.0 component score
+        assert ff.raw_score == pytest.approx(50.0, abs=0.001)
+        # DEPTH_INSUFFICIENT_FOR_STAKE was added because typed
+        # fill was partial
+        assert "DEPTH_INSUFFICIENT_FOR_STAKE" in result.rejection_reasons
+
+
+class TestDepthWalkResultFields:
+    """The DepthWalkResult carries all fields needed for audit
+    persistence: side, intended_notional, filled_notional,
+    fill_percentage, contracts_filled, vwap_fill_price, slippage,
+    levels_consumed, remaining_notional, is_complete,
+    insufficient_reason.
+    """
+    from decimal import Decimal
+
+    def test_full_dw_has_all_required_fields(self):
+        dw = _make_full_dw()
+        Decimal = self.Decimal
+        assert dw.side == "BUY"
+        assert dw.intended_notional == Decimal("100")
+        assert dw.filled_notional == Decimal("100")
+        assert dw.fill_percentage == Decimal("1")
+        assert dw.contracts_filled == Decimal("1000")
+        assert dw.vwap_fill_price == Decimal("0.10")
+        assert dw.slippage == Decimal("0")
+        assert dw.levels_consumed == 1
+        assert dw.remaining_notional == Decimal("0")
+        assert dw.is_complete is True
+        assert dw.insufficient_reason is None
+
+    def test_partial_dw_has_all_required_fields(self):
+        dw = _make_partial_dw(filled="30", intended="100")
+        Decimal = self.Decimal
+        assert dw.fill_percentage == Decimal("0.30")
+        assert dw.is_complete is False
+        assert dw.insufficient_reason == "DEPTH_INSUFFICIENT_FOR_STAKE"
+        assert dw.remaining_notional == Decimal("70")

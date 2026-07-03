@@ -34,6 +34,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from polycopy.scoring.helpers import clamp, inverse_score
+from polycopy.scoring.depth_normalization import (
+    DepthWalkResult,
+    DEPTH_INSUFFICIENT_FOR_STAKE,
+    DEPTH_LEVELS_MALFORMED,
+    DEPTH_NOT_CAPTURED,
+    DEPTH_SNAPSHOT_MISMATCH,
+)
 
 
 class TradeVerdict(str, enum.Enum):
@@ -85,7 +92,7 @@ class TradeScoreResult:
 
 @dataclass(frozen=True)
 class TradeCopyabilityInputV1:
-    """Typed input for Trade Copyability Score v1 (Phase 9).
+    """Typed input for Trade Copyability Score v1 (Phase 9 + Phase 7).
 
     Every raw input used by the score is a named, typed field with a
     deterministic default. Frozen so callers cannot mutate the input
@@ -93,6 +100,21 @@ class TradeCopyabilityInputV1:
 
     `side` is explicitly Optional (not "BUY") — unknown or missing
     sides must produce INCOMPLETE (Phase 4.D).
+
+    `depth_walk_result`, when supplied, is the SOLE source of truth
+    for `fill_percentage`, `executable_depth`, and slippage. The
+    raw `fill_percentage` / `executable_depth` / `best_bid_size` /
+    `best_ask_size` fields are ignored when `depth_walk_result` is
+    set. The depth-walk result also carries `insufficient_reason`
+    and the deterministic `depth_hash` for idempotency.
+
+    `depth_status_reason` is the rejection status when depth was
+    not captured, malformed, or mismatched. One of
+    DEPTH_NOT_CAPTURED, DEPTH_LEVELS_MALFORMED, DEPTH_SNAPSHOT_MISMATCH.
+    When set, the verdict must be INCOMPLETE.
+
+    `price_snapshot_id` is the FK reference to the persisted
+    snapshot that produced this depth evidence (replayability).
     """
 
     wallet_id: str
@@ -113,6 +135,11 @@ class TradeCopyabilityInputV1:
     has_valid_strategy: Optional[bool] = None
     has_complete_data: Optional[bool] = None
     market_category: Optional[str] = None
+    # Phase 7: typed depth-walk evidence
+    depth_walk_result: Optional["DepthWalkResult"] = None
+    depth_status_reason: Optional[str] = None
+    price_snapshot_id: Optional[str] = None
+    depth_hash: Optional[str] = None
 
 
 # Frozen weights (must sum to 100)
@@ -497,6 +524,84 @@ def compute_trade_score_v1(
             is_sample=is_sample,
         )
 
+    # Phase 7: typed depth-walk integration.
+    # The depth_walk_result (when supplied) is the SOLE source of truth
+    # for fill_percentage, executable_depth, and slippage. Raw
+    # best_bid_size / best_ask_size / fill_percentage / executable_depth
+    # fields are IGNORED when depth_walk_result is present.
+    #
+    # depth_status_reason is the rejection status when depth evidence
+    # was not available or malformed. INCOMPLETE propagation:
+    #   - DEPTH_NOT_CAPTURED       → no depth captured at all
+    #   - DEPTH_LEVELS_MALFORMED   → stored depth cannot be parsed
+    #   - DEPTH_SNAPSHOT_MISMATCH  → stored depth disagrees with the
+    #                                normalized bounded book for this
+    #                                snapshot
+    if input.depth_status_reason == DEPTH_NOT_CAPTURED:
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.INCOMPLETE,
+            missing_essentials=["depth_not_captured"],
+            rejection_reasons=[DEPTH_NOT_CAPTURED],
+            computed_at=now,
+            is_sample=is_sample,
+        )
+    if input.depth_status_reason == DEPTH_LEVELS_MALFORMED:
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.INCOMPLETE,
+            missing_essentials=["depth_levels_malformed"],
+            rejection_reasons=[DEPTH_LEVELS_MALFORMED],
+            computed_at=now,
+            is_sample=is_sample,
+        )
+    if input.depth_status_reason == DEPTH_SNAPSHOT_MISMATCH:
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.INCOMPLETE,
+            missing_essentials=["depth_snapshot_mismatch"],
+            rejection_reasons=[DEPTH_SNAPSHOT_MISMATCH],
+            computed_at=now,
+            is_sample=is_sample,
+        )
+
+    # If depth_walk_result is set, override the raw fill/exec-depth
+    # fields. The raw `fill_percentage` and `executable_depth` fields
+    # are NOT used — the typed result is authoritative. This prevents
+    # raw fields from silently overriding a typed depth walk.
+    effective_fill_percentage: Optional[float] = None
+    effective_executable_depth: Optional[float] = None
+    effective_slippage: Optional[float] = None
+    if input.depth_walk_result is not None:
+        dw = input.depth_walk_result
+        # fill_percentage on the typed result is a Decimal ratio
+        # in [0, 1]. The fill_feasibility formula multiplies by 100
+        # to bring it onto the 0-100 component scale.
+        effective_fill_percentage = float(dw.fill_percentage)
+        # executable_depth = filled_notional (in USDC). This is
+        # what actually got filled, not the original full depth.
+        effective_executable_depth = float(dw.filled_notional)
+        # Slippage (Decimal fraction) may be None if best price was
+        # zero — propagate None through.
+        if dw.slippage is not None:
+            effective_slippage = float(dw.slippage)
+    else:
+        # Fall back to raw input fields when no typed depth result
+        # is supplied. This preserves the pre-Phase-7 behavior.
+        effective_fill_percentage = input.fill_percentage
+        effective_executable_depth = input.executable_depth
+        # raw spread is the slippage proxy when no typed depth walk
+        effective_slippage = None  # no typed slippage available
+
     # Phase 4.E: short-crypto hard exclusion (frozen formula).
     # A trade on a crypto-category market whose holding period is
     # under 6 hours is excluded outright (SKIP, score 0).
@@ -519,13 +624,18 @@ def compute_trade_score_v1(
     missing_essentials: list[str] = []
     rejection_reasons: list[str] = []
 
-    # Check essential evidence (Phase 4.C). Holding period and
+    # Check essential evidence (Phase 4.C + Phase 7). Holding period and
     # market_active are essential — without them the score silently
     # degrades with "unknown" quality on key components, which hides
     # data gaps from the operator.
+    #
+    # Phase 7: executable_depth and fill_percentage are checked against
+    # the EFFECTIVE values (depth_walk_result overrides raw fields).
+    # If intended_stake is missing or the depth walk says the stake
+    # could not be filled at all, the verdict is INCOMPLETE.
     if input.intended_stake is None:
         missing_essentials.append("intended_stake")
-    if input.executable_depth is None:
+    if effective_executable_depth is None:
         missing_essentials.append("executable_depth")
     if input.spread is None:
         missing_essentials.append("spread")
@@ -537,6 +647,19 @@ def compute_trade_score_v1(
         missing_essentials.append("seconds_to_market_end")
     if input.market_active is None:
         missing_essentials.append("market_active")
+
+    # Phase 7: a partial fill is preserved as partial. If the depth
+    # walk says the stake is not fully covered, we still proceed
+    # with the partial fill (so the fill_feasibility component can
+    # score the partial truthfully) but we record
+    # DEPTH_INSUFFICIENT_FOR_STAKE so downstream code can see it.
+    # Partial fill does NOT force INCOMPLETE on its own — only
+    # missing essential evidence does.
+    if (
+        input.depth_walk_result is not None
+        and not input.depth_walk_result.is_complete
+    ):
+        rejection_reasons.append(DEPTH_INSUFFICIENT_FOR_STAKE)
 
     if missing_essentials:
         return TradeScoreResult(
@@ -565,7 +688,7 @@ def compute_trade_score_v1(
     ))
 
     raw, quality, note = _fill_feasibility_component(
-        input.intended_stake, input.executable_depth, input.fill_percentage
+        input.intended_stake, effective_executable_depth, effective_fill_percentage
     )
     components.append(TradeScoreComponent(
         name="fill_feasibility",
