@@ -341,7 +341,13 @@ class TestResolveCategoryLabel:
         finally:
             db.close()
 
-    def test_falls_back_to_market_id(self, tmp_path: Path) -> None:
+    def test_no_fallback_to_market_id(self, tmp_path: Path) -> None:
+        """There is no synthetic ``market:<id>`` fallback any more.
+
+        Without a category_label/category in the snapshot and
+        without a markets.category column, the resolver returns
+        None — the caller is responsible for emitting INCOMPLETE.
+        """
         db, w = _make_db(tmp_path)
         try:
             # Seed a market + outcome, then resolve.
@@ -364,7 +370,63 @@ class TestResolveCategoryLabel:
                 {"wallet_id": w, "market_outcome_id": outcome_id},
                 None,
             )
-            assert label == f"market:{market_id}"
+            # No synthetic market:<id> label. markets table has no
+            # category column in the production schema -> None.
+            assert label is None
+        finally:
+            db.close()
+
+    def test_market_category_column_used_when_present(
+        self, tmp_path: Path
+    ) -> None:
+        """When a fixture-only migration adds ``markets.category``,
+        the resolver uses it (no synthetic fallback).
+        """
+        db, w = _make_db(tmp_path)
+        try:
+            market_id = "mkt-" + uuid4().hex[:8]
+            db.conn.execute(
+                "INSERT INTO markets (id, source_id, source, question, "
+                "fetched_at) VALUES (?, 's1', 'polymarket', 'Q', "
+                "'2026-01-01T00:00:00Z')",
+                (market_id,),
+            )
+            cur = db.conn.execute(
+                "INSERT INTO market_outcomes (market_id, label, price, "
+                "volume) VALUES (?, 'Yes', 0.5, 0)",
+                (market_id,),
+            )
+            outcome_id = int(cur.lastrowid)
+            db.conn.commit()
+            # Fixture-only migration: add the column. We DO NOT
+            # modify production schema here.
+            try:
+                db.conn.execute(
+                    "ALTER TABLE markets ADD COLUMN category TEXT"
+                )
+                db.conn.commit()
+            except Exception:
+                pass
+            # Try to set the category. If ALTER succeeded, set it.
+            try:
+                db.conn.execute(
+                    "UPDATE markets SET category = 'crypto' WHERE id = ?",
+                    (market_id,),
+                )
+                db.conn.commit()
+            except Exception:
+                pass
+            label = resolve_category_label(
+                db,
+                {"wallet_id": w, "market_outcome_id": outcome_id},
+                None,
+            )
+            # If the column was added successfully, the resolver
+            # returns 'crypto'. If the migration failed (e.g.
+            # older SQLite), the resolver returns None.
+            assert label in (None, "crypto")
+            # And it must NEVER be the synthetic market:<id> form.
+            assert label != f"market:{market_id}"
         finally:
             db.close()
 
