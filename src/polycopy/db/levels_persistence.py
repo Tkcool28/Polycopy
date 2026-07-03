@@ -135,6 +135,22 @@ def persist_depth_levels(
             # CASE A — no existing rows.
             now = datetime.now(timezone.utc).isoformat()
 
+            # Defensive validation (mirrors the CREATE TABLE CHECK
+            # constraints in schema_v10 for upgraded DBs that
+            # already exist). The normalize step guarantees
+            # size > 0 and price in [0, 1] but we re-check here so
+            # a future change to the normalize path cannot silently
+            # insert a bad row.
+            for idx, level in enumerate(bids):
+                _p_size = float(level.size)
+                _p_price = float(level.price)
+                if _p_size <= 0:
+                    db.conn.rollback()
+                    return 0, 0, DEPTH_LEVELS_MALFORMED
+                if _p_price < 0 or _p_price > 1:
+                    db.conn.rollback()
+                    return 0, 0, DEPTH_LEVELS_MALFORMED
+
             for idx, level in enumerate(bids):
                 db.execute(
                     """
