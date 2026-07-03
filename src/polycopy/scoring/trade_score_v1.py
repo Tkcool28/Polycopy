@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from polycopy.scoring.helpers import clamp, linear_score, inverse_score
+from polycopy.scoring.helpers import clamp, inverse_score
 
 
 class TradeVerdict(str, enum.Enum):
@@ -165,24 +165,41 @@ def _fill_feasibility_component(
     executable_depth: Optional[float],
     fill_percentage: Optional[float],
 ) -> tuple[float, str, str]:
-    """Score: can we fill the intended stake?
+    """Score: can we fill the intended stake? (Phase 4.A)
 
-    Score factors:
-    - Fill percentage: 100% → 100, 0% → 0
-    - Depth ratio: stake fits → 100, insufficient → 0-100
+    Spec rule:
+        fill_ratio = executable_depth / intended_stake
+
+    A ratio of 1.0 (or more) means depth fully covers the stake and the
+    component scores 100. A ratio of 0.25 means only 25% of the stake
+    is fillable, so the component scores 25. The score is clamped to
+    [0, 100] and never extrapolates beyond stored levels.
+
+    An explicit `fill_percentage` from a depth-walk result (introduced
+    in Phase 7) takes precedence over the simple ratio.
     """
     if intended_stake is None or executable_depth is None:
         return 0.0, "unknown", "intended_stake or executable_depth missing"
 
-    # Fill percentage component
-    fill_pct_score = 0.0
     if fill_percentage is not None:
-        fill_pct_score = clamp(fill_percentage * 100.0)
-    else:
-        # Derive from depth ratio
-        fill_pct_score = clamp(linear_score(min(intended_stake / executable_depth, 1.0), 0.0, 1.0))
+        # Caller-supplied explicit fill pct (e.g. from a depth-walk
+        # result) takes precedence.
+        return clamp(fill_percentage * 100.0), "observed", \
+            f"explicit_fill_pct={fill_percentage:.4f}"
 
-    return fill_pct_score, "observed", f"stake={intended_stake} depth={executable_depth} fill_pct={fill_pct_score:.1f}"
+    if intended_stake <= 0:
+        # Degenerate "no position" state. Cannot divide by zero; treat
+        # as 0 fill rather than raising.
+        return 0.0, "observed", f"intended_stake<=0 intended={intended_stake}"
+
+    if executable_depth <= 0:
+        return 0.0, "observed", f"executable_depth<=0 depth={executable_depth}"
+
+    # Spec: fill_ratio = executable_depth / intended_stake
+    # Clamp to [0, 1] (do not extrapolate beyond 100%) and scale to 0-100.
+    fill_ratio = min(1.0, executable_depth / intended_stake)
+    return clamp(fill_ratio * 100.0), "observed", \
+        f"depth={executable_depth} stake={intended_stake} fill_pct={fill_ratio:.4f}"
 
 
 def _liquidity_spread_component(

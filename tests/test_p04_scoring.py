@@ -854,3 +854,69 @@ class TestTypedInputDataclasses:
         inp = TradeCopyabilityInputV1(wallet_id="w-1", source_trade_id="t-1")
         with pytest.raises(Exception):
             inp.intended_stake = 50.0  # type: ignore[misc]
+
+
+class TestFillFeasibilityMath:
+    """Phase 4.A: fill_ratio = executable_depth / intended_stake.
+
+    A score of 100 means the depth fully covers the intended stake.
+    A score of 25 means only 25% of the intended stake is fillable.
+    """
+
+    def _kwargs(self, **overrides):
+        base = dict(
+            wallet_id="w",
+            source_trade_id="t",
+            side="BUY",
+            intended_stake=100.0,
+            executable_depth=200.0,
+            spread=0.05,
+            trade_age_seconds=100,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+        )
+        base.update(overrides)
+        return base
+
+    def _fill_score(self, **overrides):
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        result = compute_trade_score_v1(**self._kwargs(**overrides))
+        comp = next(
+            (c for c in result.components if c.name == "fill_feasibility"),
+            None,
+        )
+        assert comp is not None, "fill_feasibility component missing"
+        return comp.raw_score
+
+    def test_full_fill_when_depth_covers_stake(self):
+        # depth = 2x stake → 100% fillable → 100
+        assert self._fill_score(intended_stake=100.0, executable_depth=200.0) == 100.0
+
+    def test_full_fill_when_depth_equals_stake(self):
+        # depth = stake → 100% fillable → 100
+        assert self._fill_score(intended_stake=100.0, executable_depth=100.0) == 100.0
+
+    def test_partial_fill_score_proportional(self):
+        # depth = 25% of stake → fillable 25% → 25
+        assert self._fill_score(intended_stake=100.0, executable_depth=25.0) == 25.0
+
+    def test_zero_depth_yields_zero_fill_score(self):
+        assert self._fill_score(intended_stake=100.0, executable_depth=0.0) == 0.0
+
+    def test_zero_intended_stake_does_not_divide_by_zero(self):
+        # Degenerate "no position" state: must not raise.
+        # Spec rule: cannot copy 0 stake as 100 → 0 fill.
+        assert self._fill_score(intended_stake=0.0, executable_depth=100.0) == 0.0
+
+    def test_explicit_fill_percentage_overrides_depth_ratio(self):
+        # When the caller provides a depth-walk result as fill_percentage,
+        # that explicit number wins (this is how Phase 7 will integrate).
+        assert self._fill_score(
+            intended_stake=100.0,
+            executable_depth=25.0,  # would imply 25%
+            fill_percentage=0.8,    # but caller says 80%
+        ) == 80.0
+
+    def test_fill_never_exceeds_100(self):
+        # depth = 10x stake → 100% fillable, NOT 1000
+        assert self._fill_score(intended_stake=10.0, executable_depth=100.0) == 100.0
