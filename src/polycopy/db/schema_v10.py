@@ -75,7 +75,7 @@ _V10_DDL = [
         formula_name    TEXT    NOT NULL,
         formula_version TEXT    NOT NULL,
         idempotency_key TEXT    NOT NULL,
-        
+
         -- Raw inputs
         info_score              REAL,
         win_rate                REAL,
@@ -90,19 +90,26 @@ _V10_DDL = [
         overall_trade_count       INTEGER,
         largest_winner_share      REAL,
         top_3_concentration     REAL,
-        
+
+        -- Category gate values (Phase 2 / Chunk 3)
+        category_resolved_markets INTEGER,
+        category_distinct_events  INTEGER,
+        category_active_days      INTEGER,
+
         -- Component scores
         component_scores_json   TEXT,
-        
+
         -- Final score and verdict
         final_score             REAL NOT NULL,
         verdict                 TEXT NOT NULL,
-        
+        missing_essentials_json TEXT,
+        category_gate_failures_json TEXT,
+
         -- Timestamps
         source_data_timestamp  TEXT,
         computed_at            TEXT NOT NULL,
         created_at             TEXT NOT NULL,
-        
+
         UNIQUE(wallet_id, category_label, formula_name, formula_version, idempotency_key)
     );""",
     
