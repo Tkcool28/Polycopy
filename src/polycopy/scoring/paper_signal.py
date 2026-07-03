@@ -10,23 +10,35 @@ This module replaces the placeholder _generate_signals in run_scan.py.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from polycopy.db.database import Database
 from polycopy.db.copy_candidate_persistence import CandidateStatus
-from polycopy.db.price_snapshot_persistence import get_latest_snapshot_for_candidate
+from polycopy.db.price_snapshot_persistence import (
+    get_latest_price_snapshot as get_latest_snapshot_for_candidate,
+)
 from polycopy.scoring.behavior_classification import (
+    BehaviorClassification,
     BehaviorEvidence,
+    BehaviorClassificationResult,
     classify_wallet_behavior,
+    load_behavior_evidence as _load_behavior_evidence_for_wallet,
 )
 from polycopy.scoring.wallet_score_v1 import (
+    WalletVerdict,
+    WalletScoreResult,
     compute_wallet_score_v1,
 )
 from polycopy.scoring.trade_score_v1 import (
+    TradeVerdict,
+    TradeScoreResult,
     compute_trade_score_v1,
 )
 from polycopy.scoring.shadow_score_v2 import (
+    ShadowVerdict,
+    ShadowScoreResult,
     compute_shadow_score_v2,
 )
 from polycopy.scoring.verdict_generation import (
@@ -40,31 +52,148 @@ from polycopy.scoring.score_serialization import (
     persist_shadow_score_v2,
     persist_paper_signal,
     record_exit_experiments,
+    persist_category_score_v1,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _load_behavior_evidence_for_wallet(
-    db: Database, wallet_id: str
-) -> BehaviorEvidence:
-    """Load trade data to construct behavior evidence."""
-    # TODO: Implement using actual wallet trade history
-    # For now, return default unknown evidence
-    return BehaviorEvidence()
+# ---- Category decision loader (Task 3.7) -------------------------------
 
 
-def _load_category_wallet_verdict(
-    db: Database, wallet_id: str, category: str
-) -> Optional[str]:
-    """Load category-specific wallet verdict if available."""
+CATEGORY_FORMULA_VERSION = "1"
+
+
+@dataclass(frozen=True)
+class PersistedCategoryDecision:
+    """Narrow typed result of loading a persisted
+    ``category_wallet_score_decisions`` row.
+
+    Carries the canonical fields the paper-signal decision
+    engine needs:
+
+      - score (0-100)
+      - verdict: copy_candidate | watchlist | skip | incomplete
+      - category_label: never None
+      - source_data_timestamp: point-in-time identity (may be None
+        for legacy rows)
+      - decision_id: row id, for audit
+
+    Constructed only by :func:`load_persisted_category_decision`.
+    """
+
+    decision_id: int
+    wallet_id: str
+    category_label: str
+    score: float
+    verdict: str
+    source_data_timestamp: Optional[str]
+
+
+def load_persisted_category_decision(
+    db: Database,
+    wallet_id: str,
+    category_label: Optional[str],
+) -> Optional[PersistedCategoryDecision]:
+    """Load the latest ``category_wallet_score_decisions`` row
+    for ``(wallet_id, category_label, formula_version="1")``.
+
+    Filtering by ``category_label`` is mandatory — the function
+    MUST NOT return a "latest" decision for some other category.
+    A missing or empty ``category_label`` returns ``None`` (the
+    caller treats this as INCOMPLETE).
+
+    The "latest" row is the row with the largest
+    ``source_data_timestamp``; ties are broken by ``id DESC`` so
+    a more recently inserted row wins.
+    """
+    if not category_label or not category_label.strip():
+        return None
+
     row = db.fetchone(
-        """SELECT verdict FROM category_wallet_score_decisions 
-           WHERE wallet_id = ? AND category_label = ?
-           ORDER BY created_at DESC LIMIT 1""",
-        (wallet_id, category),
+        """
+        SELECT id, wallet_id, category_label, final_score, verdict,
+               source_data_timestamp
+        FROM category_wallet_score_decisions
+        WHERE wallet_id = ? AND category_label = ? AND formula_name = ?
+          AND formula_version = ?
+        ORDER BY COALESCE(source_data_timestamp, '') DESC, id DESC
+        LIMIT 1
+        """,
+        (wallet_id, category_label, "category_wallet_score",
+         CATEGORY_FORMULA_VERSION),
     )
-    return row["verdict"] if row else None
+    if row is None:
+        return None
+    return PersistedCategoryDecision(
+        decision_id=int(row["id"]),
+        wallet_id=str(row["wallet_id"]),
+        category_label=str(row["category_label"]),
+        score=float(row["final_score"]) if row["final_score"] is not None else 0.0,
+        verdict=str(row["verdict"]),
+        source_data_timestamp=(
+            str(row["source_data_timestamp"])
+            if row["source_data_timestamp"] is not None
+            else None
+        ),
+    )
+
+
+# ---- Category label resolution (Task 3.7) ------------------------------
+
+
+def resolve_category_label(
+    db: Database,
+    candidate_row: dict,
+    snapshot_row: Optional[dict],
+) -> Optional[str]:
+    """Resolve the category_label for a candidate.
+
+    The runtime path may need a category label before any
+    category score has been computed. The label is taken from
+    the snapshot's ``book_summary_json`` field if present
+    (canonical key ``category_label``), otherwise from the
+    candidate's ``market_outcome_id`` lookup, otherwise None.
+
+    The function never invents a label. It returns None if no
+    label is available; the caller treats None as INCOMPLETE.
+    """
+    if snapshot_row is not None:
+        summary = snapshot_row.get("book_summary_json")
+        if isinstance(summary, str) and summary:
+            import json as _json
+            try:
+                parsed = _json.loads(summary)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                label = parsed.get("category_label")
+                if isinstance(label, str) and label.strip():
+                    return label.strip()
+
+    outcome_id = candidate_row.get("market_outcome_id") if hasattr(candidate_row, "get") else None
+    if outcome_id is None and "market_outcome_id" in candidate_row.keys():
+        outcome_id = candidate_row["market_outcome_id"]
+    if outcome_id is not None:
+        try:
+            row = db.fetchone(
+                "SELECT m.id, m.question FROM market_outcomes mo "
+                "JOIN markets m ON m.id = mo.market_id "
+                "WHERE mo.id = ?",
+                (outcome_id,),
+            )
+        except Exception:
+            row = None
+        if row is not None:
+            # Use the market id as a stable category label
+            # surrogate; the persisted category decision will
+            # be queried with this exact label.
+            market_id_value = row["id"] if "id" in row.keys() else None
+            if market_id_value:
+                label = f"market:{market_id_value}"
+                return label
+
+    return None
 
 
 def _load_snapshot_metrics(snapshot: Optional[dict]) -> dict:
@@ -84,6 +213,93 @@ def _load_snapshot_metrics(snapshot: Optional[dict]) -> dict:
         "market_closed": bool(snapshot.get("market_closed_at_fetch")),
         "market_resolved": bool(snapshot.get("market_resolved_at_fetch")),
     }
+
+
+# ---- Verdict integration (Task 3.7) ------------------------------------
+
+
+def _build_category_inputs(
+    db: Database,
+    candidate_row: dict,
+    snapshot_row: Optional[dict],
+) -> tuple[Optional[float], Optional[str]]:
+    """Return (category_score, category_verdict) for use in
+    :class:`SignalDecisionInput`.
+
+    Either both are non-None (a persisted decision exists) or
+    both are None (no label / no decision). The signal engine
+    maps None → INCOMPLETE.
+    """
+    label = resolve_category_label(db, candidate_row, snapshot_row)
+    if label is None:
+        return None, None
+    persisted = load_persisted_category_decision(db, candidate_row["wallet_id"], label)
+    if persisted is None:
+        return None, None
+    return persisted.score, persisted.verdict
+
+
+# ---- Pure decision function (Task 3.7) ---------------------------------
+
+
+def generate_paper_signal_decision(
+    *,
+    wallet_score_result: WalletScoreResult,
+    trade_score_result: TradeScoreResult,
+    behavior_result: BehaviorClassificationResult,
+    category_score: Optional[float],
+    category_verdict: Optional[str],
+    shadow_result: Optional[ShadowScoreResult],
+    has_hard_exclusion: bool = False,
+    hard_exclusion_reason: Optional[str] = None,
+) -> SignalVerdict:
+    """Pure function that builds a SignalDecisionInput from typed
+    scoring outputs and returns the canonical verdict.
+
+    This is the single decision boundary for Chunk 3. It is
+    PURE (no I/O, no side effects). The orchestration loop in
+    :func:`generate_paper_signals` is responsible for I/O and
+    persistence.
+
+    Behavior caps (Phase 12):
+      - MARKET_MAKER_LP / ARBITRAGE_MULTI_LEG / HIGH_FREQUENCY_BOT
+        → SKIP (handled by verdict_generation)
+      - MIXED / UNKNOWN → WATCHLIST cap
+
+    Category constraints (Phase 2 / Phase 3):
+      - category_verdict == INCOMPLETE → INCOMPLETE
+      - category_verdict != COPY_CANDIDATE → blocks COPY_CANDIDATE
+        (decision engine returns WATCHLIST via the CATEGORY_NOT_COPY
+        branch)
+
+    Shadow isolation (Phase 15, deferred to Chunk 5):
+      - The shadow result is NOT consumed by this function. It is
+        persisted for research but does not affect the verdict.
+    """
+    # Build the typed input. Shadow result is intentionally NOT
+    # passed — shadow never controls v1 (Phase 15 / spec).
+    signal_input = SignalDecisionInput(
+        wallet_score=wallet_score_result.score,
+        wallet_verdict=wallet_score_result.verdict,
+        category_wallet_score=category_score,
+        category_wallet_verdict=category_verdict,
+        trade_score=trade_score_result.score,
+        trade_verdict=trade_score_result.verdict,
+        behavior_classification=behavior_result,
+        has_hard_exclusion=has_hard_exclusion,
+        hard_exclusion_reason=hard_exclusion_reason,
+    )
+    decision = generate_signal_verdict(signal_input)
+    return decision.verdict
+
+
+# ---- Backwards-compat behavior loader alias ---------------------------
+
+
+#: Backwards-compat name preserved for the original placeholder
+#: signature. The new behavior loader is the real one — no
+#: empty-evidence scaffolding remains in the active path.
+_load_behavior_evidence_for_wallet_legacy = _load_behavior_evidence_for_wallet
 
 
 def generate_paper_signals(
@@ -132,13 +348,22 @@ def generate_paper_signals(
         source_trade_id = cand["source_trade_id"]
 
         try:
-            # Get latest price snapshot
-            snapshot = get_latest_snapshot_for_candidate(db, candidate_id, now)
-
-            if snapshot is None:
+            # Get latest price snapshot. The real persistence
+            # helper returns a PriceSnapshot domain object; we
+            # convert it to a dict-shaped mapping for the rest
+            # of the loop (kept as a dict to avoid touching
+            # every downstream reader in this chunk).
+            snapshot_obj = get_latest_snapshot_for_candidate(
+                db, candidate_id
+            )
+            if snapshot_obj is None:
                 # No fresh snapshot → INCOMPLETE, do not hit CLOB
                 results["incomplete"] += 1
                 continue
+            try:
+                snapshot = dict(snapshot_obj)
+            except TypeError:
+                snapshot = vars(snapshot_obj)
 
             # Load behavior evidence and classify
             evidence = _load_behavior_evidence_for_wallet(db, wallet_id)
@@ -205,21 +430,29 @@ def generate_paper_signals(
                 source_data_timestamp=snapshot.get("fetched_at"),
             )
 
-            # Generate signal verdict
-            # NOTE: category_wallet_score and category_wallet_verdict
-            # are both None here because the category score v1 module
-            # lands in Chunk 3. The verdict engine will correctly
-            # produce INCOMPLETE for these candidates; Chunk 3 will
-            # wire the real values in.
+            # Generate signal verdict (Task 3.7).
+            #
+            # Category inputs are loaded from the persisted
+            # category_wallet_score_decisions table. The label
+            # is resolved from the snapshot's book_summary_json
+            # or the candidate's market_outcome_id. A missing
+            # label or missing decision produces (None, None)
+            # which the verdict engine maps to INCOMPLETE.
+            #
+            # Shadow output is persisted for research but is NOT
+            # consumed by the verdict engine (Phase 15).
+            category_score, category_verdict = _build_category_inputs(
+                db, dict(cand), snapshot
+            )
             signal_decision = generate_signal_verdict(
                 input_data=SignalDecisionInput(
                     wallet_score=wallet_score_result.score,
                     wallet_verdict=wallet_score_result.verdict,
-                    category_wallet_score=None,
-                    category_wallet_verdict=None,
+                    category_wallet_score=category_score,
+                    category_wallet_verdict=category_verdict,
                     trade_score=trade_score_result.score,
                     trade_verdict=trade_score_result.verdict,
-                    behavior_classification=behavior_result if hasattr(behavior_result, 'reasons') else None,
+                    behavior_classification=behavior_result,
                     has_hard_exclusion=False,
                 ),
             )
