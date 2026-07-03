@@ -243,9 +243,11 @@ def _seed_pending_candidate(
 # ── v9 schema acceptance ───────────────────────────────────────────────────
 def test_v9_db_includes_candidate_price_snapshots_table(db: Database) -> None:
     """A fresh v9 DB has the new table + all expected columns + indexes."""
-    assert SCHEMA_VERSION == 9
+    # The schema may advance beyond v10 (currently v11 after Chunk 5);
+    # the assertions below check the v9 table is present on a fresh DB.
+    assert SCHEMA_VERSION >= 10
     row = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
-    assert row is not None and int(row["value"]) == 9
+    assert row is not None and int(row["value"]) == SCHEMA_VERSION
 
     cols = {
         r["name"]
@@ -295,7 +297,9 @@ def test_v8_to_v9_migration_preserves_data(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1  # 8
+    # SCHEMA_VERSION bumped past v11; we only need the migrations
+    # up to and including v8 (the pre-state for the v8→v9 test).
+    pre_version = 8
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)

@@ -176,8 +176,30 @@ class Database:
             statements = MIGRATIONS.get(target_version)
             if statements is None:
                 raise RuntimeError(f"No migration defined for version {target_version}.")
-            for stmt in statements:
-                self._execute_migration_statement(stmt)
+            # v11 carries its own idempotency contract via
+            # ``polycopy.db.schema_v11.apply_v11_idempotent``: schema_v10's
+            # CREATE TABLE already declares every column v11 would otherwise
+            # add, so re-running v11 against a fresh DB (or a DB that has
+            # already reached v11) must be a no-op. We use the explicit
+            # applier for v11 so the guard lives in one place, and fall
+            # back to the generic statement-by-statement path for all
+            # other versions.
+            if target_version == 11:
+                from polycopy.db.schema_v11 import apply_v11_idempotent
+
+                apply_v11_idempotent(self.conn)
+            elif target_version == 12:
+                # v12 introduces decision_input_json on
+                # paper_signal_decisions. Schema_v10 does NOT declare this
+                # column, so the v11-style "fresh DB already has it"
+                # pattern does not apply — every fresh DB needs the ALTER.
+                # The applier remains idempotent for upgraded v12 DBs.
+                from polycopy.db.schema_v12 import apply_v12_idempotent
+
+                apply_v12_idempotent(self.conn)
+            else:
+                for stmt in statements:
+                    self._execute_migration_statement(stmt)
             self._set_version(target_version)
             logger.info("Applied migration to version %d.", target_version)
 

@@ -499,11 +499,25 @@ async def run_scan(
         result.related_wallets = len(related)
         logger.info("  Found %d possibly related wallets", result.related_wallets)
 
-    # ── Step 7: Generate signals for COPY_CANDIDATE wallets ───────────────
-    logger.info("Step 7: Generating signals for copy candidates...")
-    signals = _generate_signals(db, market_list, now)
-    result.signals = len(signals)
-    logger.info("  Generated %d signals", result.signals)
+    # ── Step 7: Generate paper-signal decisions for eligible candidates ──
+    # PR 4 (Chunk 4): replace the legacy edge-based signal generator with
+    # the persisted-evidence paper-signal pipeline. This step consumes:
+    #   - copy_candidates (status=READY_FOR_PAPER_SIGNAL or
+    #     PENDING_PRICE_CHECK)
+    #   - source_trades
+    #   - candidate_price_snapshots + candidate_price_snapshot_levels
+    #   - wallet_score_decisions
+    #   - category_wallet_score_decisions
+    #   - behavior evidence derived from source_trades
+    # It must NEVER write to: orders, positions, fills, broker requests,
+    # CLOB fetches, or HTTP. All paper_signal_decisions are persisted with
+    # is_approved = 0 and remain unapproved at all times.
+    logger.info(
+        "Step 7: Evaluating paper-signal decisions for copy candidates..."
+    )
+    paper_signals = _evaluate_paper_signals_step(db, now=now)
+    result.signals = paper_signals
+    logger.info("  Paper-signal decisions recorded: %d", result.signals)
 
     # ── Step 8: Record experiment run ─────────────────────────────────────
     result.ended_at = datetime.now(timezone.utc)
@@ -602,57 +616,90 @@ def _compute_wallet_metrics(
 
 
 def _generate_signals(db: Database, markets: list[Market], now: datetime) -> list[dict]:
-    """Generate trading signals for high-scoring markets."""
-    signals = []
-    for market in markets:
-        if not market.active or market.closed:
-            continue
-        for outcome in market.outcomes:
-            # Simple edge signal: high-priced outcome with volume
-            if outcome.price >= 0.6 and outcome.volume >= 10000:
-                edge = outcome.price - 0.5
-                signal = {
-                    "id": str(uuid.uuid4()),
-                    "market_id": str(market.id),
-                    "source": "scan_signal_v1",
-                    "strength": "buy" if edge >= 0.15 else "neutral",
-                    "confidence": min(outcome.price, 0.95),
-                    "edge_estimate": round(edge, 4),
-                    "predicted_prob": outcome.price,
-                    "market_prob": outcome.price,
-                    "reasoning": f"High-probability outcome ({outcome.label}) at {outcome.price:.2f} with volume {outcome.volume:.0f}",
-                    "produced_at": now.isoformat(),
-                    "is_sample": market.is_sample,
-                }
-                signals.append(signal)
-                # Persist signal
-                try:
-                    db.execute(
-                        """INSERT INTO signals
-                           (id, market_id, source, strength, confidence, edge_estimate,
-                            predicted_prob, market_prob, reasoning, produced_at, is_sample)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            signal["id"],
-                            signal["market_id"],
-                            signal["source"],
-                            signal["strength"],
-                            signal["confidence"],
-                            signal["edge_estimate"],
-                            signal["predicted_prob"],
-                            signal["market_prob"],
-                            signal["reasoning"],
-                            signal["produced_at"],
-                            int(signal["is_sample"]),
-                        ),
-                    )
-                except Exception as e:
-                    logger.warning("Failed to persist signal: %s", e)
+    """LEGACY signal generator — DEPRECATED, DO NOT CALL.
 
-    if signals:
-        db.conn.commit()
+    Replaced by Step 7's ``_evaluate_paper_signals_step`` (PR 4 Chunk 4).
+    This stub remains only as a monkeypatch surface for the historical
+    test suite (``tests/test_p22`` … ``tests/test_p36``). The function
+    is NOT invoked from the live ``run_scan`` pipeline; it returns an
+    empty list and performs no side effects. New code MUST use
+    :func:`_evaluate_paper_signals_step` instead.
+    """
+    logger.debug(
+        "_generate_signals (legacy) called — returning []. Use "
+        "_evaluate_paper_signals_step instead."
+    )
+    return []
 
-    return signals
+
+def _evaluate_paper_signals_step(
+    db: Database,
+    *,
+    now: Optional[datetime] = None,
+) -> int:
+    """Step 7 entrypoint for the PR 4 paper-signal pipeline.
+
+    Iterates every persisted ``copy_candidates`` row in an eligible
+    status (PENDING_PRICE_CHECK or READY_FOR_PAPER_SIGNAL) and runs the
+    full pipeline:
+
+        1. Load persisted candidate + source_trade + snapshot + depth.
+        2. Load wallet score v1 decision (point-in-time).
+        3. Load exact category score v1 decision (point-in-time).
+        4. Classify wallet behavior from persisted source_trades.
+        5. Walk persisted depth levels for the snapshot.
+        6. Build a typed TradeCopyabilityInputV1 from persisted truth.
+        7. Compute trade copyability v1.
+        8. Generate final paper-signal verdict.
+        9. Persist immutable paper_signal_decisions row (is_approved=0).
+       10. Register seven exit experiments (if COPY_CANDIDATE).
+
+    All inputs are persisted. No network calls, no CLOB fetches, no
+    broker/order/position writes. On missing evidence the signal is
+    persisted as INCOMPLETE with the specific reason.
+
+    Returns the number of immutable paper_signal_decisions rows
+    recorded by this run.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # Import inside the function so scripts that import run_scan do not
+    # pay the paper-signal module import cost on cold start.
+    from polycopy.scoring.paper_signal import evaluate_paper_signal_for_candidate
+
+    total = 0
+
+    # Iterate every persisted candidate in an eligible status. The
+    # status check uses the bounded CandidateStatus enum values
+    # ("PENDING_PRICE_CHECK", "READY_FOR_PAPER_SIGNAL") plus the
+    # legacy "pending" string (kept for back-compat). Any candidate
+    # not in an eligible status is silently skipped — it will be
+    # re-evaluated when its status advances.
+    candidate_rows = db.fetchall(
+        """SELECT id FROM copy_candidates
+           WHERE status IN ('PENDING_PRICE_CHECK', 'READY_FOR_PAPER_SIGNAL', 'pending')
+           ORDER BY id ASC"""
+    )
+
+    for cand_row in candidate_rows:
+        candidate_id = int(cand_row["id"])
+        try:
+            outcome_kind = evaluate_paper_signal_for_candidate(
+                db,
+                candidate_id=candidate_id,
+                now=now,
+            )
+            if outcome_kind == "persisted":
+                total += 1
+        except Exception as exc:  # defensive: never abort the run
+            logger.warning(
+                "Paper-signal evaluation failed for candidate %d: %s",
+                candidate_id, exc,
+            )
+
+    db.conn.commit()
+    return total
 
 
 def _persist_wallet(db: Database, wallet) -> str | None:
