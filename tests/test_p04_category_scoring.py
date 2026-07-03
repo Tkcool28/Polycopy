@@ -30,7 +30,6 @@ from polycopy.scoring.category_wallet_score_v1 import (
     VERDICT_COPY_CANDIDATE_MIN,
     VERDICT_WATCHLIST_MIN,
     CategoryWalletScoreInputV1,
-    CategoryWalletScoreResultV1,
     compute_category_wallet_score_v1,
 )
 from polycopy.scoring.wallet_score_v1 import WalletVerdict

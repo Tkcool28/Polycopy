@@ -20,24 +20,19 @@ from polycopy.db.price_snapshot_persistence import (
     get_latest_price_snapshot as get_latest_snapshot_for_candidate,
 )
 from polycopy.scoring.behavior_classification import (
-    BehaviorClassification,
-    BehaviorEvidence,
     BehaviorClassificationResult,
     classify_wallet_behavior,
     load_behavior_evidence as _load_behavior_evidence_for_wallet,
 )
 from polycopy.scoring.wallet_score_v1 import (
-    WalletVerdict,
     WalletScoreResult,
     compute_wallet_score_v1,
 )
 from polycopy.scoring.trade_score_v1 import (
-    TradeVerdict,
     TradeScoreResult,
     compute_trade_score_v1,
 )
 from polycopy.scoring.shadow_score_v2 import (
-    ShadowVerdict,
     ShadowScoreResult,
     compute_shadow_score_v2,
 )
@@ -52,7 +47,6 @@ from polycopy.scoring.score_serialization import (
     persist_shadow_score_v2,
     persist_paper_signal,
     record_exit_experiments,
-    persist_category_score_v1,
 )
 
 logger = logging.getLogger(__name__)

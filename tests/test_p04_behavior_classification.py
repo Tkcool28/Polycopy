@@ -31,10 +31,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Optional
 from uuid import uuid4
-
-import pytest
 
 from polycopy.scoring.behavior_classification import (
     ARB_MIN_DISTINCT_MARKETS,
@@ -52,7 +49,6 @@ from polycopy.scoring.behavior_classification import (
     TWO_SIDED_MARKET_MIN,
     TWO_SIDED_MARKET_SHARE,
     BehaviorClassification,
-    BehaviorClassificationResult,
     BehaviorEvidence,
     classify_wallet_behavior,
     load_behavior_evidence_from_rows,
