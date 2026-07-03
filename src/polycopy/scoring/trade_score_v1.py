@@ -63,18 +63,56 @@ class TradeScoreComponent:
 
 @dataclass
 class TradeScoreResult:
-    """Result of trade v1 copyability scoring."""
+    """Result of trade v1 copyability scoring.
+
+    The `input` field is the typed `TradeCopyabilityInputV1` instance
+    that produced this result. Persisters must read raw columns from
+    `result.input.<field>`, not from `getattr(result, ..., None)`.
+    """
 
     wallet_id: str
     source_trade_id: str
     score: float
     verdict: TradeVerdict
+    input: Optional["TradeCopyabilityInputV1"] = None
     components: list[TradeScoreComponent] = field(default_factory=list)
     missing_essentials: list[str] = field(default_factory=list)
     rejection_reasons: list[str] = field(default_factory=list)
     computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     formula_version: str = "1"
     is_sample: bool = False
+
+
+@dataclass(frozen=True)
+class TradeCopyabilityInputV1:
+    """Typed input for Trade Copyability Score v1 (Phase 9).
+
+    Every raw input used by the score is a named, typed field with a
+    deterministic default. Frozen so callers cannot mutate the input
+    after the score has been computed, which guarantees replayability.
+
+    `side` is explicitly Optional (not "BUY") — unknown or missing
+    sides must produce INCOMPLETE (Phase 4.D).
+    """
+
+    wallet_id: str
+    source_trade_id: str
+    side: Optional[str] = None
+    price_deterioration_pct: Optional[float] = None
+    intended_stake: Optional[float] = None
+    executable_depth: Optional[float] = None
+    fill_percentage: Optional[float] = None
+    spread: Optional[float] = None
+    best_bid_size: Optional[float] = None
+    best_ask_size: Optional[float] = None
+    trade_age_seconds: Optional[float] = None
+    seconds_to_market_end: Optional[float] = None
+    market_active: Optional[bool] = None
+    market_closed: Optional[bool] = None
+    market_resolved: Optional[bool] = None
+    has_valid_strategy: Optional[bool] = None
+    has_complete_data: Optional[bool] = None
+    market_category: Optional[str] = None
 
 
 # Frozen weights (must sum to 100)
@@ -280,12 +318,13 @@ def _strategy_data_component(
 
 
 def compute_trade_score_v1(
-    wallet_id: str,
-    source_trade_id: str,
+    wallet_id: Optional[str] = None,
+    source_trade_id: Optional[str] = None,
     *,
+    input: Optional[TradeCopyabilityInputV1] = None,
     # Copy price quality
     price_deterioration_pct: Optional[float] = None,
-    side: str = "BUY",
+    side: Optional[str] = None,
 
     # Fill feasibility
     intended_stake: Optional[float] = None,
@@ -312,32 +351,119 @@ def compute_trade_score_v1(
     has_valid_strategy: Optional[bool] = None,
     has_complete_data: Optional[bool] = None,
 
+    # Market category (for short-crypto hard exclusion — Phase 4.E)
+    market_category: Optional[str] = None,
+
     # Metadata
     now: Optional[datetime] = None,
     is_sample: bool = False,
 ) -> TradeScoreResult:
-    """Compute Trade Copyability Score v1."""
+    """Compute Trade Copyability Score v1.
+
+    All inputs optional. Missing essential evidence produces INCOMPLETE.
+
+    Callers may either:
+      1. Pass a typed `TradeCopyabilityInputV1` as `input=...` (preferred
+         — enables replayable persistence), or
+      2. Pass raw kwargs directly (legacy / convenience path) — the
+         function builds a default input from those.
+
+    If both are passed, the explicit `input` wins; loose kwargs are
+    ignored.
+
+    `side` must be "BUY" or "SELL" — anything else (including the
+    pre-Phase-4.D default of "BUY") now produces INCOMPLETE so the
+    caller is forced to be explicit. There is no silent fallback.
+    """
     if now is None:
         now = datetime.now(timezone.utc)
+
+    if input is None:
+        input = TradeCopyabilityInputV1(
+            wallet_id=wallet_id or "",
+            source_trade_id=source_trade_id or "",
+            side=side,
+            price_deterioration_pct=price_deterioration_pct,
+            intended_stake=intended_stake,
+            executable_depth=executable_depth,
+            fill_percentage=fill_percentage,
+            spread=spread,
+            best_bid_size=best_bid_size,
+            best_ask_size=best_ask_size,
+            trade_age_seconds=trade_age_seconds,
+            seconds_to_market_end=seconds_to_market_end,
+            market_active=market_active,
+            market_closed=market_closed,
+            market_resolved=market_resolved,
+            has_valid_strategy=has_valid_strategy,
+            has_complete_data=has_complete_data,
+            market_category=market_category,
+        )
+    else:
+        # When the caller passes an explicit `input` object, the
+        # wallet_id/source_trade_id on the result must match it. This
+        # lets callers write `compute_trade_score_v1(input=inp)` without
+        # repeating the IDs at the call site.
+        wallet_id = input.wallet_id
+        source_trade_id = input.source_trade_id
+
+    # Phase 4.D: side must be explicit. No silent BUY fallback.
+    if input.side is None or input.side not in ("BUY", "SELL"):
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.INCOMPLETE,
+            missing_essentials=["side"],
+            computed_at=now,
+            is_sample=is_sample,
+        )
+
+    # Phase 4.E: short-crypto hard exclusion (frozen formula).
+    # A trade on a crypto-category market whose holding period is
+    # under 6 hours is excluded outright (SKIP, score 0).
+    if (input.market_category is not None
+            and str(input.market_category).strip().lower() == "crypto"
+            and input.seconds_to_market_end is not None
+            and input.seconds_to_market_end < 6 * 3600):
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.SKIP,
+            rejection_reasons=["short_crypto_exclusion"],
+            computed_at=now,
+            is_sample=is_sample,
+        )
 
     components: list[TradeScoreComponent] = []
     missing_essentials: list[str] = []
     rejection_reasons: list[str] = []
 
-    # Check essential evidence
-    if intended_stake is None:
+    # Check essential evidence (Phase 4.C). Holding period and
+    # market_active are essential — without them the score silently
+    # degrades with "unknown" quality on key components, which hides
+    # data gaps from the operator.
+    if input.intended_stake is None:
         missing_essentials.append("intended_stake")
-    if executable_depth is None:
+    if input.executable_depth is None:
         missing_essentials.append("executable_depth")
-    if spread is None:
+    if input.spread is None:
         missing_essentials.append("spread")
-    if trade_age_seconds is None:
+    if input.trade_age_seconds is None:
         missing_essentials.append("trade_age_seconds")
+    if input.seconds_to_market_end is None:
+        missing_essentials.append("seconds_to_market_end")
+    if input.market_active is None:
+        missing_essentials.append("market_active")
 
     if missing_essentials:
         return TradeScoreResult(
             wallet_id=wallet_id,
             source_trade_id=source_trade_id,
+            input=input,
             score=0.0,
             verdict=TradeVerdict.INCOMPLETE,
             components=components,
@@ -346,8 +472,10 @@ def compute_trade_score_v1(
             is_sample=is_sample,
         )
 
-    # Compute components
-    raw, quality, note = _copy_price_quality_component(price_deterioration_pct, side)
+    # Compute components (read from input so persisters see consistent values)
+    raw, quality, note = _copy_price_quality_component(
+        input.price_deterioration_pct, input.side
+    )
     components.append(TradeScoreComponent(
         name="copy_price_quality",
         raw_score=raw,
@@ -358,19 +486,19 @@ def compute_trade_score_v1(
     ))
 
     raw, quality, note = _fill_feasibility_component(
-        intended_stake, executable_depth, fill_percentage
+        input.intended_stake, input.executable_depth, input.fill_percentage
     )
     components.append(TradeScoreComponent(
         name="fill_feasibility",
         raw_score=raw,
         weight=WEIGHTS["fill_feasibility"],
         quality=quality,
-        formula="fill_percentage * 100 or depth_ratio",
+        formula="fill_ratio = executable_depth / intended_stake (clamped 0-1)",
         note=note,
     ))
 
     raw, quality, note = _liquidity_spread_component(
-        spread, best_bid_size, best_ask_size, intended_stake
+        input.spread, input.best_bid_size, input.best_ask_size, input.intended_stake
     )
     components.append(TradeScoreComponent(
         name="liquidity_and_spread_quality",
@@ -381,7 +509,7 @@ def compute_trade_score_v1(
         note=note,
     ))
 
-    raw, quality, note = _trade_freshness_component(trade_age_seconds)
+    raw, quality, note = _trade_freshness_component(input.trade_age_seconds)
     components.append(TradeScoreComponent(
         name="trade_freshness",
         raw_score=raw,
@@ -391,7 +519,7 @@ def compute_trade_score_v1(
         note=note,
     ))
 
-    raw, quality, note = _holding_period_component(seconds_to_market_end)
+    raw, quality, note = _holding_period_component(input.seconds_to_market_end)
     components.append(TradeScoreComponent(
         name="holding_period_quality",
         raw_score=raw,
@@ -402,7 +530,7 @@ def compute_trade_score_v1(
     ))
 
     raw, quality, note = _market_resolution_component(
-        market_active, market_closed, market_resolved
+        input.market_active, input.market_closed, input.market_resolved
     )
     components.append(TradeScoreComponent(
         name="market_and_resolution_quality",
@@ -413,7 +541,9 @@ def compute_trade_score_v1(
         note=note,
     ))
 
-    raw, quality, note = _strategy_data_component(has_valid_strategy, has_complete_data)
+    raw, quality, note = _strategy_data_component(
+        input.has_valid_strategy, input.has_complete_data
+    )
     components.append(TradeScoreComponent(
         name="strategy_and_data_quality",
         raw_score=raw,
@@ -440,6 +570,7 @@ def compute_trade_score_v1(
         source_trade_id=source_trade_id,
         score=final_score,
         verdict=verdict,
+        input=input,
         components=components,
         missing_essentials=missing_essentials,
         rejection_reasons=rejection_reasons,

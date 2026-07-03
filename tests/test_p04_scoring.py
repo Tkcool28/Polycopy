@@ -376,11 +376,13 @@ class TestTradeScoreV1HoldingPeriods:
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=14 * 60,  # 14 minutes
+            market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
         assert hp_comp.raw_score == 0.0
@@ -389,11 +391,13 @@ class TestTradeScoreV1HoldingPeriods:
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=5 * 3600,  # 5 hours
+            market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
         assert hp_comp.raw_score == 75.0
@@ -402,11 +406,13 @@ class TestTradeScoreV1HoldingPeriods:
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=12 * 3600,  # 12 hours
+            market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
         assert hp_comp.raw_score == 100.0
@@ -415,11 +421,13 @@ class TestTradeScoreV1HoldingPeriods:
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=18 * 24 * 3600,  # 18 days
+            market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
         assert hp_comp.raw_score == 80.0
@@ -428,11 +436,13 @@ class TestTradeScoreV1HoldingPeriods:
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=30 * 24 * 3600,  # 30 days
+            market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
         assert hp_comp.raw_score == 40.0
@@ -441,11 +451,13 @@ class TestTradeScoreV1HoldingPeriods:
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=60 * 24 * 3600,  # 60 days
+            market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
         assert hp_comp.raw_score == 0.0
@@ -465,6 +477,7 @@ class TestTradeScoreV1BUYPenalty:
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=24 * 3600,
+            market_active=True,
         )
         cp_comp = next(c for c in result.components if c.name == "copy_price_quality")
         # Inverse score: 0% = 100, 50% = 0
@@ -597,11 +610,13 @@ class TestV2ShadowIsolation:
         v1_result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=24 * 3600,
+            market_active=True,
         )
 
         v2_result = compute_shadow_score_v2(
@@ -631,11 +646,13 @@ class TestComponentScoreRounding:
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
+            side="BUY",
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
             trade_age_seconds=100,
             seconds_to_market_end=24 * 3600,
+            market_active=True,
         )
         assert result.score == round(result.score, 4)
 
@@ -787,3 +804,53 @@ class TestTypedInputDataclasses:
             wallet_id="w-1", input=inp, win_rate=0.1
         )
         assert result.input.win_rate == 0.6
+
+    def test_trade_copyability_input_v1_default_construction(self):
+        from polycopy.scoring.trade_score_v1 import (
+            TradeCopyabilityInputV1,
+        )
+
+        inp = TradeCopyabilityInputV1(wallet_id="w-1", source_trade_id="t-1")
+        assert inp.wallet_id == "w-1"
+        assert inp.source_trade_id == "t-1"
+        # All raw input fields must be Optional with None default
+        assert inp.intended_stake is None
+        assert inp.executable_depth is None
+        assert inp.spread is None
+        assert inp.side is None  # 4.D: no silent "BUY" fallback
+        assert inp.market_category is None
+        assert inp.seconds_to_market_end is None
+
+    def test_trade_score_result_carries_raw_inputs(self):
+        from polycopy.scoring.trade_score_v1 import (
+            TradeCopyabilityInputV1,
+            compute_trade_score_v1,
+        )
+
+        inp = TradeCopyabilityInputV1(
+            wallet_id="w-1",
+            source_trade_id="t-1",
+            side="BUY",
+            intended_stake=100.0,
+            executable_depth=200.0,
+            spread=0.05,
+            trade_age_seconds=120,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+            market_closed=False,
+            market_resolved=False,
+            market_category="politics",
+        )
+        result = compute_trade_score_v1(input=inp)
+        assert result.input is inp
+        assert result.input.intended_stake == 100.0
+        assert result.input.executable_depth == 200.0
+        assert result.input.market_category == "politics"
+        assert result.input.side == "BUY"
+
+    def test_trade_copyability_input_v1_is_frozen(self):
+        from polycopy.scoring.trade_score_v1 import TradeCopyabilityInputV1
+
+        inp = TradeCopyabilityInputV1(wallet_id="w-1", source_trade_id="t-1")
+        with pytest.raises(Exception):
+            inp.intended_stake = 50.0  # type: ignore[misc]
