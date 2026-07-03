@@ -40,6 +40,9 @@ All HTTP tests mocked.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from pathlib import Path
+
 import pytest
 
 from polycopy.scoring.helpers import linear_score, inverse_score, clamp
@@ -67,6 +70,7 @@ from polycopy.scoring.verdict_generation import (
     generate_signal_verdict,
 )
 from polycopy.scoring.score_serialization import generate_idempotency_key
+from polycopy.db.database import Database
 
 
 class TestHelpersNormalizationBoundaries:
@@ -1419,3 +1423,644 @@ class TestTradeScoreV1HoldingPeriodBoundaries:
             market_active=True,
         )
         assert result.verdict == TradeVerdict.INCOMPLETE
+
+
+class TestRawInputPersistence:
+    """Phase 9: persisters must read raw inputs from result.input
+    so no essential field silently becomes NULL.
+
+    Round-trip tests prove:
+      1. supplied wallet inputs are persisted exactly
+      2. supplied trade inputs are persisted exactly
+      3. reloaded raw inputs can reproduce the same score
+      4. no essential field silently becomes NULL
+      5. the legacy back-compat path (result without explicit input)
+         also persists, but using whatever fields the result carries
+    """
+
+    @pytest.fixture
+    def db_with_wallet(self, tmp_path: Path):
+        """Yield a v10-schema DB with one wallet row pre-inserted so
+        FK constraints on the scoring decision tables are satisfied."""
+        db_path = tmp_path / "persist_test.db"
+        db = Database(db_path=db_path)
+        db.connect()
+        # Insert a minimal wallet row to satisfy the FK.
+        db.execute(
+            """INSERT INTO wallets (id, address, label, is_sample, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                "w-test",
+                "0xtest",
+                "test-wallet",
+                1,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        db.conn.commit()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    def test_wallet_input_round_trip(self, db_with_wallet: Database):
+        """Every field supplied in the typed input must be persisted
+        with the exact value."""
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1, WalletVerdict,
+        )
+        from polycopy.scoring.score_serialization import (
+            persist_wallet_score_v1,
+        )
+
+        inp = WalletScoreInputV1(
+            wallet_id="w-test",
+            info_score=0.55,
+            win_rate=0.6,
+            profit_factor=1.8,
+            trade_intervals_std=1200.0,
+            trade_count=200,
+            max_drawdown=0.15,
+            sharpe_ratio=1.4,
+            sample_fraction=0.1,
+            category_trade_count=80,
+            category_distinct_markets=6,
+            overall_trade_count=200,
+            largest_winner_share=0.4,
+            top_3_concentration=0.6,
+            resolved_markets=45,
+            active_trading_days=30,
+            distinct_events=20,
+            category_resolved_markets=20,
+            category_distinct_events=12,
+            category_active_days=15,
+        )
+        result = compute_wallet_score_v1(input=inp)
+        assert result.verdict == WalletVerdict.COPY_CANDIDATE
+        row_id = persist_wallet_score_v1(
+            db_with_wallet, "w-test", result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        assert row_id > 0
+
+        # Reload and assert every field survived the round-trip.
+        row = db_with_wallet.fetchone(
+            "SELECT * FROM wallet_score_decisions WHERE id = ?", (row_id,)
+        )
+        assert row is not None
+        assert row["info_score"] == pytest.approx(0.55)
+        assert row["win_rate"] == pytest.approx(0.6)
+        assert row["profit_factor"] == pytest.approx(1.8)
+        assert row["trade_intervals_std"] == pytest.approx(1200.0)
+        assert row["trade_count"] == 200
+        assert row["max_drawdown"] == pytest.approx(0.15)
+        assert row["sharpe_ratio"] == pytest.approx(1.4)
+        assert row["sample_fraction"] == pytest.approx(0.1)
+        assert row["category_trade_count"] == 80
+        assert row["category_distinct_markets"] == 6
+        assert row["overall_trade_count"] == 200
+        assert row["largest_winner_share"] == pytest.approx(0.4)
+        assert row["top_3_concentration"] == pytest.approx(0.6)
+        assert row["resolved_markets"] == 45
+        assert row["active_trading_days"] == 30
+        assert row["distinct_events"] == 20
+        assert row["category_resolved_markets"] == 20
+        assert row["category_distinct_events"] == 12
+        assert row["category_active_days"] == 15
+        assert row["final_score"] == pytest.approx(result.score)
+        assert row["verdict"] == "copy_candidate"
+        assert row["source_data_timestamp"] == "2026-07-03T00:00:00Z"
+
+    def test_trade_input_round_trip(self, db_with_wallet: Database):
+        """Every field supplied in the typed input must be persisted
+        with the exact value.
+
+        Note: candidate_id and price_snapshot_id are FK-constrained to
+        copy_candidates and candidate_price_snapshots. Those tables
+        aren't populated in this fixture; their persistence is
+        covered by the Chunk 2/7 tests. The test here exercises the
+        raw-input columns only.
+        """
+        from polycopy.scoring.trade_score_v1 import (
+            TradeCopyabilityInputV1, TradeVerdict,
+        )
+        from polycopy.scoring.score_serialization import (
+            persist_trade_score_v1,
+        )
+
+        inp = TradeCopyabilityInputV1(
+            wallet_id="w-test",
+            source_trade_id="trade-1",
+            side="BUY",
+            price_deterioration_pct=0.05,
+            intended_stake=150.0,
+            executable_depth=300.0,
+            fill_percentage=None,  # let the score compute it
+            spread=0.03,
+            best_bid_size=500.0,
+            best_ask_size=400.0,
+            trade_age_seconds=120,
+            seconds_to_market_end=3 * 24 * 3600,
+            market_active=True,
+            market_closed=False,
+            market_resolved=False,
+            has_valid_strategy=True,
+            has_complete_data=True,
+            market_category="politics",
+        )
+        result = compute_trade_score_v1(input=inp)
+        assert result.verdict in (
+            TradeVerdict.COPY_CANDIDATE,
+            TradeVerdict.WATCHLIST,
+            TradeVerdict.SKIP,
+        )
+
+        row_id = persist_trade_score_v1(
+            db_with_wallet, "w-test", "trade-1", result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        assert row_id > 0
+
+        row = db_with_wallet.fetchone(
+            "SELECT * FROM trade_copyability_decisions WHERE id = ?",
+            (row_id,),
+        )
+        assert row is not None
+        assert row["wallet_id"] == "w-test"
+        assert row["source_trade_id"] == "trade-1"
+        assert row["side"] == "BUY"
+        assert row["price_deterioration_pct"] == pytest.approx(0.05)
+        assert row["intended_stake"] == pytest.approx(150.0)
+        assert row["executable_depth"] == pytest.approx(300.0)
+        assert row["spread"] == pytest.approx(0.03)
+        assert row["best_bid_size"] == pytest.approx(500.0)
+        assert row["best_ask_size"] == pytest.approx(400.0)
+        assert row["trade_age_seconds"] == pytest.approx(120)
+        assert row["seconds_to_market_end"] == pytest.approx(3 * 24 * 3600)
+        assert row["market_active"] == 1
+        assert row["market_closed"] == 0
+        assert row["market_resolved"] == 0
+        assert row["source_data_timestamp"] == "2026-07-03T00:00:00Z"
+        assert row["formula_version"] == "1"
+        # candidate_id and price_snapshot_id are NULL because we did
+        # not pass them (their FK target rows don't exist in the
+        # minimal fixture; coverage for them lands in Chunk 2/7).
+        assert row["candidate_id"] is None
+        assert row["price_snapshot_id"] is None
+
+    def test_reload_input_reproduces_score(self, db_with_wallet: Database):
+        """Reloading the raw input from the DB and recomputing the
+        score must produce the same final_score (replayability)."""
+        from polycopy.scoring.wallet_score_v1 import WalletScoreInputV1
+        from polycopy.scoring.score_serialization import (
+            persist_wallet_score_v1,
+        )
+
+        inp = WalletScoreInputV1(
+            wallet_id="w-test",
+            info_score=0.4,
+            win_rate=0.55,
+            profit_factor=1.5,
+            trade_count=180,
+            max_drawdown=0.2,
+            sharpe_ratio=1.1,
+            sample_fraction=0.05,
+            resolved_markets=50,
+            active_trading_days=25,
+            distinct_events=18,
+        )
+        result = compute_wallet_score_v1(input=inp)
+        original_score = result.score
+
+        row_id = persist_wallet_score_v1(
+            db_with_wallet, "w-test", result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT * FROM wallet_score_decisions WHERE id = ?", (row_id,)
+        )
+
+        # Reload every field from the DB and rebuild the input.
+        reloaded_inp = WalletScoreInputV1(
+            wallet_id=row["wallet_id"],
+            info_score=row["info_score"],
+            win_rate=row["win_rate"],
+            profit_factor=row["profit_factor"],
+            trade_count=row["trade_count"],
+            max_drawdown=row["max_drawdown"],
+            sharpe_ratio=row["sharpe_ratio"],
+            sample_fraction=row["sample_fraction"],
+            resolved_markets=row["resolved_markets"],
+            active_trading_days=row["active_trading_days"],
+            distinct_events=row["distinct_events"],
+        )
+        reloaded_result = compute_wallet_score_v1(input=reloaded_inp)
+        assert reloaded_result.score == pytest.approx(original_score)
+        assert reloaded_result.verdict == result.verdict
+
+    def test_no_essential_field_silently_null(self, db_with_wallet: Database):
+        """When a typed input carries a non-None value, the persisted
+        column must not be NULL. This is the regression test for the
+        silent-NULL bug."""
+        from polycopy.scoring.trade_score_v1 import (
+            TradeCopyabilityInputV1,
+        )
+        from polycopy.scoring.score_serialization import (
+            persist_trade_score_v1,
+        )
+
+        inp = TradeCopyabilityInputV1(
+            wallet_id="w-test",
+            source_trade_id="t-2",
+            side="SELL",
+            price_deterioration_pct=0.02,
+            intended_stake=200.0,
+            executable_depth=200.0,
+            spread=0.01,
+            best_bid_size=100.0,
+            best_ask_size=120.0,
+            trade_age_seconds=60,
+            seconds_to_market_end=2 * 24 * 3600,
+            market_active=True,
+            market_category="crypto",  # would be excluded if short, but 2d is fine
+        )
+        result = compute_trade_score_v1(input=inp)
+        row_id = persist_trade_score_v1(
+            db_with_wallet, "w-test", "t-2", result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        row = db_with_wallet.fetchone(
+            "SELECT * FROM trade_copyability_decisions WHERE id = ?",
+            (row_id,),
+        )
+        # Every column we set in the input must NOT be NULL in the row.
+        non_null_columns = [
+            "side", "price_deterioration_pct", "intended_stake",
+            "executable_depth", "spread", "best_bid_size", "best_ask_size",
+            "trade_age_seconds", "seconds_to_market_end",
+        ]
+        for col in non_null_columns:
+            assert row[col] is not None, (
+                f"column {col!r} is NULL despite input carrying a value"
+            )
+
+    def test_legacy_result_without_explicit_input_still_persists(
+        self, db_with_wallet: Database,
+    ):
+        """Back-compat: a result built without an explicit input
+        object must still persist (using getattr fallbacks). The
+        values come from whatever fields the result carries."""
+        from polycopy.scoring.score_serialization import (
+            persist_wallet_score_v1,
+        )
+
+        # Build a result with no input attribute. We do this by
+        # constructing the dataclass directly with input=None.
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreComponent, WalletScoreResult, WalletVerdict,
+        )
+        result = WalletScoreResult(
+            wallet_id="w-test",
+            score=72.0,
+            verdict=WalletVerdict.WATCHLIST,
+            input=None,  # legacy: no typed input attached
+            components=[
+                WalletScoreComponent(
+                    name="information_and_price_improvement",
+                    raw_score=70.0,
+                    weight=30.0,
+                    quality="calculated",
+                    formula="info_score * 100",
+                    note="test",
+                ),
+            ],
+            missing_essentials=[],
+            eligibility_gate_failures=[],
+        )
+        row_id = persist_wallet_score_v1(
+            db_with_wallet, "w-test", result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        assert row_id > 0
+        row = db_with_wallet.fetchone(
+            "SELECT * FROM wallet_score_decisions WHERE id = ?", (row_id,)
+        )
+        assert row["wallet_id"] == "w-test"
+        assert row["final_score"] == pytest.approx(72.0)
+        assert row["verdict"] == "watchlist"
+
+    def test_idempotent_persist_does_not_duplicate(self, db_with_wallet: Database):
+        """INSERT OR IGNORE on the idempotency key must not create a
+        second row for the same point-in-time inputs."""
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1,
+        )
+        from polycopy.scoring.score_serialization import (
+            persist_wallet_score_v1,
+        )
+
+        inp = WalletScoreInputV1(
+            wallet_id="w-test",
+            win_rate=0.5,
+            trade_count=100,
+        )
+        result = compute_wallet_score_v1(input=inp)
+        first_id = persist_wallet_score_v1(
+            db_with_wallet, "w-test", result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        second_id = persist_wallet_score_v1(
+            db_with_wallet, "w-test", result,
+            source_data_timestamp="2026-07-03T00:00:00Z",
+        )
+        assert first_id == second_id
+        # Verify only one row exists for this idempotency key.
+        count = db_with_wallet.fetchone(
+            "SELECT COUNT(*) AS n FROM wallet_score_decisions "
+            "WHERE wallet_id = ?",
+            ("w-test",),
+        )
+        assert count["n"] == 1
+
+
+class TestColumnPlaceholderValueCount:
+    """Regression tests for INSERT/VALUES column counts.
+
+    During Chunk 1 work, the wallet serializer was found to have
+    32 INSERT columns but only 31 VALUES placeholders, and the
+    eligibility_failures_json column was misnamed. These tests
+    pin the correct counts at runtime by parsing the actual SQL
+    so a future regression (extra/missing column or placeholder)
+    fails loudly instead of silently corrupting persistence.
+    """
+
+    @staticmethod
+    def _extract_values_list(insert_sql: str) -> str:
+        """Return the raw VALUES (?, ?, ...) substring from an INSERT
+        statement. Handles trailing `RETURNING id` and arbitrary
+        whitespace."""
+        idx = insert_sql.index("VALUES")
+        rest = insert_sql[idx + len("VALUES"):]
+        # Find the matching close paren for the VALUES list.
+        depth = 0
+        for i, ch in enumerate(rest):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return rest[: i + 1]
+        raise AssertionError(f"could not find VALUES (...) in: {insert_sql!r}")
+
+    def test_wallet_score_decisions_column_count_matches_schema(self, tmp_path: Path):
+        """The INSERT in persist_wallet_score_v1 must list every
+        column the v10 schema defines, no more, no less."""
+        from polycopy.scoring.score_serialization import persist_wallet_score_v1
+        from polycopy.db.database import Database
+
+        # Build a minimal result to drive the function.
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1,
+        )
+        inp = WalletScoreInputV1(
+            wallet_id="w-test",
+            win_rate=0.5,
+            trade_count=100,
+        )
+        result = compute_wallet_score_v1(input=inp)
+
+        # Read the actual schema columns. `id` is the auto-increment
+        # primary key, never part of an INSERT, so exclude it.
+        with Database(db_path=tmp_path / "schema_check.db") as db:
+            schema_cols = {
+                row["name"]
+                for row in db.fetchall(
+                    "PRAGMA table_info(wallet_score_decisions)"
+                )
+            } - {"id"}
+
+        # Capture the SQL by monkey-patching Database.execute.
+        import polycopy.scoring.score_serialization as ser
+        captured: list[str] = []
+        real_execute = ser.Database.execute
+        def fake_execute(self_db, sql, params=()):
+            captured.append(sql)
+            return real_execute(self_db, sql, params)
+        try:
+            ser.Database.execute = fake_execute  # type: ignore[assignment]
+            with Database(db_path=tmp_path / "schema_check2.db") as db:
+                db.execute(
+                    "INSERT INTO wallets (id, address, label, is_sample, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("w-test", "0x", "l", 1, "2026-01-01T00:00:00Z"),
+                )
+                db.conn.commit()
+                try:
+                    persist_wallet_score_v1(
+                        db, "w-test", result,
+                        source_data_timestamp="2026-01-01T00:00:00Z",
+                    )
+                except Exception:
+                    pass
+        finally:
+            ser.Database.execute = real_execute  # type: ignore[assignment]
+
+        insert_sql = next(
+            (s for s in captured if "INSERT" in s and "wallet_score_decisions" in s),
+            None,
+        )
+        assert insert_sql is not None, "wallet_score_decisions INSERT not captured"
+
+        # The INSERT's column list is between `INSERT INTO table (` and
+        # `) VALUES (`.
+        col_start = insert_sql.index("(") + 1
+        col_end = insert_sql.index(")", col_start)
+        col_items = [
+            c.strip() for c in insert_sql[col_start:col_end].split(",")
+        ]
+        values_list = self._extract_values_list(insert_sql)
+        ph_items = [
+            p.strip() for p in values_list.strip()[1:-1].split(",")
+        ]
+        assert len(col_items) == len(ph_items), (
+            f"INSERT column count {len(col_items)} != "
+            f"VALUES placeholder count {len(ph_items)}"
+        )
+        declared = set(col_items)
+        assert declared == schema_cols, (
+            f"INSERT columns {declared - schema_cols} not in schema; "
+            f"schema columns {schema_cols - declared} not in INSERT"
+        )
+
+    def test_trade_score_decisions_column_count_matches_schema(self, tmp_path: Path):
+        """The INSERT in persist_trade_score_v1 must list every
+        column the v10 schema defines."""
+        from polycopy.scoring.score_serialization import persist_trade_score_v1
+        from polycopy.db.database import Database
+        from polycopy.scoring.trade_score_v1 import (
+            TradeCopyabilityInputV1,
+        )
+        import polycopy.scoring.score_serialization as ser
+
+        inp = TradeCopyabilityInputV1(
+            wallet_id="w-test",
+            source_trade_id="t-1",
+            side="BUY",
+            intended_stake=100.0,
+            executable_depth=200.0,
+            spread=0.05,
+            trade_age_seconds=100,
+            seconds_to_market_end=24 * 3600,
+            market_active=True,
+        )
+        result = compute_trade_score_v1(input=inp)
+
+        with Database(db_path=tmp_path / "schema_check3.db") as db:
+            schema_cols = {
+                row["name"]
+                for row in db.fetchall(
+                    "PRAGMA table_info(trade_copyability_decisions)"
+                )
+            } - {"id"}
+            db.execute(
+                "INSERT INTO wallets (id, address, label, is_sample, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("w-test", "0x", "l", 1, "2026-01-01T00:00:00Z"),
+            )
+            db.conn.commit()
+
+            captured: list[str] = []
+            real_execute = ser.Database.execute
+            def fake_execute(self_db, sql, params=()):
+                captured.append(sql)
+                return real_execute(self_db, sql, params)
+            try:
+                ser.Database.execute = fake_execute  # type: ignore[assignment]
+                try:
+                    persist_trade_score_v1(
+                        db, "w-test", "t-1", result,
+                        source_data_timestamp="2026-01-01T00:00:00Z",
+                    )
+                except Exception:
+                    pass
+            finally:
+                ser.Database.execute = real_execute  # type: ignore[assignment]
+
+        insert_sql = next(
+            (s for s in captured if "INSERT" in s and "trade_copyability_decisions" in s),
+            None,
+        )
+        assert insert_sql is not None, "trade_copyability_decisions INSERT not captured"
+        col_start = insert_sql.index("(") + 1
+        col_end = insert_sql.index(")", col_start)
+        col_items = [
+            c.strip() for c in insert_sql[col_start:col_end].split(",")
+        ]
+        values_list = self._extract_values_list(insert_sql)
+        ph_items = [
+            p.strip() for p in values_list.strip()[1:-1].split(",")
+        ]
+        assert len(col_items) == len(ph_items), (
+            f"INSERT column count {len(col_items)} != "
+            f"VALUES placeholder count {len(ph_items)}"
+        )
+        declared = set(col_items)
+        assert declared == schema_cols, (
+            f"INSERT columns {declared - schema_cols} not in schema; "
+            f"schema columns {schema_cols - declared} not in INSERT"
+        )
+
+
+class TestWalletIdContract:
+    """Wallet-identity contract (Phase 9 / Chunk 1).
+
+    The compute functions must:
+      * accept input-only wallet_id (preferred)
+      * accept positional-only wallet_id
+      * accept matching duplicates without error
+      * raise ValueError on conflicting duplicates
+      * raise ValueError on missing wallet_id
+    """
+
+    def test_wallet_input_only(self):
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1, compute_wallet_score_v1,
+        )
+        inp = WalletScoreInputV1(wallet_id="w-only", win_rate=0.5, trade_count=100)
+        result = compute_wallet_score_v1(input=inp)
+        assert result.wallet_id == "w-only"
+
+    def test_wallet_positional_only(self):
+        from polycopy.scoring.wallet_score_v1 import compute_wallet_score_v1
+        result = compute_wallet_score_v1(
+            wallet_id="w-pos", win_rate=0.5, trade_count=100,
+        )
+        assert result.wallet_id == "w-pos"
+
+    def test_wallet_matching_duplicates(self):
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1, compute_wallet_score_v1,
+        )
+        inp = WalletScoreInputV1(wallet_id="w-dup", win_rate=0.5, trade_count=100)
+        # Passing matching positional wallet_id alongside input is allowed.
+        result = compute_wallet_score_v1(
+            wallet_id="w-dup", input=inp,
+        )
+        assert result.wallet_id == "w-dup"
+
+    def test_wallet_conflicting_ids_raise(self):
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1, compute_wallet_score_v1,
+        )
+        inp = WalletScoreInputV1(wallet_id="w-a", win_rate=0.5, trade_count=100)
+        with pytest.raises(ValueError, match="wallet_id conflict"):
+            compute_wallet_score_v1(wallet_id="w-b", input=inp)
+
+    def test_wallet_missing_id_raises(self):
+        from polycopy.scoring.wallet_score_v1 import compute_wallet_score_v1
+        with pytest.raises(ValueError, match="non-empty wallet_id"):
+            compute_wallet_score_v1()
+        with pytest.raises(ValueError, match="non-empty wallet_id"):
+            compute_wallet_score_v1(wallet_id="")
+
+    def test_wallet_input_with_empty_id_raises(self):
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1, compute_wallet_score_v1,
+        )
+        inp = WalletScoreInputV1(wallet_id="")
+        with pytest.raises(ValueError, match="input.wallet_id"):
+            compute_wallet_score_v1(input=inp)
+
+    def test_trade_input_only(self):
+        from polycopy.scoring.trade_score_v1 import (
+            TradeCopyabilityInputV1, compute_trade_score_v1,
+        )
+        inp = TradeCopyabilityInputV1(
+            wallet_id="w-only", source_trade_id="t-1",
+            side="BUY", intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=24 * 3600, market_active=True,
+        )
+        result = compute_trade_score_v1(input=inp)
+        assert result.wallet_id == "w-only"
+        assert result.source_trade_id == "t-1"
+
+    def test_trade_missing_source_trade_id_raises(self):
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        with pytest.raises(ValueError, match="source_trade_id"):
+            compute_trade_score_v1(wallet_id="w")
+
+    def test_trade_conflicting_ids_raise(self):
+        from polycopy.scoring.trade_score_v1 import (
+            TradeCopyabilityInputV1, compute_trade_score_v1,
+        )
+        inp = TradeCopyabilityInputV1(
+            wallet_id="w-a", source_trade_id="t-a",
+            side="BUY", intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=24 * 3600, market_active=True,
+        )
+        with pytest.raises(ValueError, match="source_trade_id conflict"):
+            compute_trade_score_v1(
+                wallet_id="w-a", source_trade_id="t-b", input=inp,
+            )

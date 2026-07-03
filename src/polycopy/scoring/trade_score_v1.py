@@ -400,16 +400,22 @@ def compute_trade_score_v1(
 ) -> TradeScoreResult:
     """Compute Trade Copyability Score v1.
 
-    All inputs optional. Missing essential evidence produces INCOMPLETE.
+    Trade-identity contract (Phase 9 / Chunk 1):
 
-    Callers may either:
-      1. Pass a typed `TradeCopyabilityInputV1` as `input=...` (preferred
-         — enables replayable persistence), or
-      2. Pass raw kwargs directly (legacy / convenience path) — the
-         function builds a default input from those.
+      * If a typed `TradeCopyabilityInputV1` is passed as `input=...`,
+        `input.wallet_id` and `input.source_trade_id` are the
+        source of truth.
+      * If positional `wallet_id` / `source_trade_id` are passed
+        and no `input=...` is given, the positional values are used.
+      * If both are passed, they must match — a conflict raises
+        `ValueError`.
+      * If neither is provided, OR if `input.wallet_id` /
+        `input.source_trade_id` is the empty string, `ValueError`
+        is raised. A result with empty IDs is never silently
+        produced.
 
-    If both are passed, the explicit `input` wins; loose kwargs are
-    ignored.
+    All raw inputs remain optional. Missing essential evidence
+    produces INCOMPLETE.
 
     `side` must be "BUY" or "SELL" — anything else (including the
     pre-Phase-4.D default of "BUY") now produces INCOMPLETE so the
@@ -419,9 +425,19 @@ def compute_trade_score_v1(
         now = datetime.now(timezone.utc)
 
     if input is None:
+        if wallet_id is None or wallet_id == "":
+            raise ValueError(
+                "compute_trade_score_v1 requires a non-empty wallet_id "
+                "either positionally or via input.wallet_id"
+            )
+        if source_trade_id is None or source_trade_id == "":
+            raise ValueError(
+                "compute_trade_score_v1 requires a non-empty source_trade_id "
+                "either positionally or via input.source_trade_id"
+            )
         input = TradeCopyabilityInputV1(
-            wallet_id=wallet_id or "",
-            source_trade_id=source_trade_id or "",
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
             side=side,
             price_deterioration_pct=price_deterioration_pct,
             intended_stake=intended_stake,
@@ -440,10 +456,31 @@ def compute_trade_score_v1(
             market_category=market_category,
         )
     else:
-        # When the caller passes an explicit `input` object, the
-        # wallet_id/source_trade_id on the result must match it. This
-        # lets callers write `compute_trade_score_v1(input=inp)` without
-        # repeating the IDs at the call site.
+        # Explicit `input` is the source of truth. The wallet_id
+        # and source_trade_id on it must be non-empty, and any
+        # positional duplicates must match.
+        if input.wallet_id is None or input.wallet_id == "":
+            raise ValueError(
+                "compute_trade_score_v1 requires input.wallet_id to be "
+                "non-empty; got empty input.wallet_id"
+            )
+        if input.source_trade_id is None or input.source_trade_id == "":
+            raise ValueError(
+                "compute_trade_score_v1 requires input.source_trade_id to be "
+                "non-empty; got empty input.source_trade_id"
+            )
+        if wallet_id is not None and wallet_id != input.wallet_id:
+            raise ValueError(
+                f"compute_trade_score_v1 wallet_id conflict: "
+                f"positional wallet_id={wallet_id!r} but "
+                f"input.wallet_id={input.wallet_id!r}"
+            )
+        if source_trade_id is not None and source_trade_id != input.source_trade_id:
+            raise ValueError(
+                f"compute_trade_score_v1 source_trade_id conflict: "
+                f"positional source_trade_id={source_trade_id!r} but "
+                f"input.source_trade_id={input.source_trade_id!r}"
+            )
         wallet_id = input.wallet_id
         source_trade_id = input.source_trade_id
 

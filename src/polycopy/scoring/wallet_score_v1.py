@@ -324,7 +324,7 @@ def _concentration_quality_component(
 
 
 def compute_wallet_score_v1(
-    wallet_id: str,
+    wallet_id: Optional[str] = None,
     *,
     input: Optional[WalletScoreInputV1] = None,
     # Information and price improvement
@@ -370,21 +370,33 @@ def compute_wallet_score_v1(
 ) -> WalletScoreResult:
     """Compute Persistent Specialist Wallet Score v1.
 
-    All inputs optional. Missing essential evidence produces INCOMPLETE.
+    Wallet-identity contract (Phase 9 / Chunk 1):
 
-    Callers may either:
-      1. Pass a typed `WalletScoreInputV1` as `input=...` (preferred —
-         enables replayable persistence), or
-      2. Pass raw kwargs directly (legacy / convenience path) — the
-         function builds a default `WalletScoreInputV1` from those.
+      * If a typed `WalletScoreInputV1` is passed as `input=...`,
+        `input.wallet_id` is the source of truth.
+      * If a positional `wallet_id` is passed and no `input=...`
+        is given, the positional value is used.
+      * If both are passed, they must match — a conflict raises
+        `ValueError`. This prevents silent wallet-id drift in
+        callers that mix the two paths.
+      * If neither is provided, OR if `input.wallet_id` is the
+        empty string, `ValueError` is raised. A result with
+        `wallet_id=""` is never silently produced; the persistence
+        path treats empty wallet_id as "unknown" and that
+        classification must be explicit, not accidental.
 
-    If both are passed, the explicit `input` wins; loose kwargs are
-    ignored.
+    All raw inputs remain optional. Missing essential evidence
+    produces INCOMPLETE.
     """
     if now is None:
         now = datetime.now(timezone.utc)
 
     if input is None:
+        if wallet_id is None or wallet_id == "":
+            raise ValueError(
+                "compute_wallet_score_v1 requires a non-empty wallet_id "
+                "either positionally or via input.wallet_id"
+            )
         input = WalletScoreInputV1(
             wallet_id=wallet_id,
             info_score=info_score,
@@ -407,36 +419,81 @@ def compute_wallet_score_v1(
             category_distinct_events=category_distinct_events,
             category_active_days=category_active_days,
         )
+    else:
+        # Explicit `input` is the source of truth. If the caller
+        # also passed a positional wallet_id, it must match
+        # input.wallet_id — otherwise we raise.
+        if input.wallet_id is None or input.wallet_id == "":
+            raise ValueError(
+                "compute_wallet_score_v1 requires input.wallet_id to be "
+                "non-empty; got empty input.wallet_id"
+            )
+        if wallet_id is not None and wallet_id != input.wallet_id:
+            raise ValueError(
+                f"compute_wallet_score_v1 wallet_id conflict: "
+                f"positional wallet_id={wallet_id!r} but "
+                f"input.wallet_id={input.wallet_id!r}"
+            )
+        wallet_id = input.wallet_id
+
+    # Phase 9: after the input object is finalized (whether built
+    # from loose kwargs or supplied by the caller), copy every
+    # relevant field back into the local kwargs so the component
+    # functions below read consistent values. This avoids the
+    # silent-NULL bug where callers pass `input=inp` and the
+    # function's local kwargs default to None.
+    info_score = input.info_score
+    win_rate = input.win_rate
+    profit_factor = input.profit_factor
+    trade_intervals_std = input.trade_intervals_std
+    trade_count = input.trade_count
+    max_drawdown = input.max_drawdown
+    sharpe_ratio = input.sharpe_ratio
+    sample_fraction = input.sample_fraction
+    category_trade_count = input.category_trade_count
+    category_distinct_markets = input.category_distinct_markets
+    overall_trade_count = input.overall_trade_count
+    largest_winner_share = input.largest_winner_share
+    top_3_concentration = input.top_3_concentration
+    resolved_markets = input.resolved_markets
+    active_trading_days = input.active_trading_days
+    distinct_events = input.distinct_events
+    category_resolved_markets = input.category_resolved_markets
+    category_distinct_events = input.category_distinct_events
+    category_active_days = input.category_active_days
 
     components: list[WalletScoreComponent] = []
     missing_essentials: list[str] = []
     gate_failures: list[str] = []
 
-    # Check essential evidence
-    if trade_count is None:
+    # Check essential evidence (Phase 9: read from typed input so
+    # callers that pass `input=...` alone — without loose kwargs —
+    # are correctly evaluated).
+    if input.trade_count is None:
         missing_essentials.append("trade_count")
-    if win_rate is None:
+    if input.win_rate is None:
         missing_essentials.append("win_rate")
 
     # Check global eligibility gates (do not disqualify, but affect score)
-    if resolved_markets is not None and resolved_markets < GLOBAL_MIN_RESOLVED_MARKETS:
-        gate_failures.append(f"resolved_markets={resolved_markets} < {GLOBAL_MIN_RESOLVED_MARKETS}")
+    if input.resolved_markets is not None and input.resolved_markets < GLOBAL_MIN_RESOLVED_MARKETS:
+        gate_failures.append(f"resolved_markets={input.resolved_markets} < {GLOBAL_MIN_RESOLVED_MARKETS}")
 
-    if active_trading_days is not None and active_trading_days < GLOBAL_MIN_ACTIVE_TRADING_DAYS:
-        gate_failures.append(f"active_trading_days={active_trading_days} < {GLOBAL_MIN_ACTIVE_TRADING_DAYS}")
+    if input.active_trading_days is not None and input.active_trading_days < GLOBAL_MIN_ACTIVE_TRADING_DAYS:
+        gate_failures.append(f"active_trading_days={input.active_trading_days} < {GLOBAL_MIN_ACTIVE_TRADING_DAYS}")
 
-    if distinct_events is not None and distinct_events < GLOBAL_MIN_DISTINCT_EVENTS:
-        gate_failures.append(f"distinct_events={distinct_events} < {GLOBAL_MIN_DISTINCT_EVENTS}")
+    if input.distinct_events is not None and input.distinct_events < GLOBAL_MIN_DISTINCT_EVENTS:
+        gate_failures.append(f"distinct_events={input.distinct_events} < {GLOBAL_MIN_DISTINCT_EVENTS}")
 
     # Check category eligibility gates
-    if category_resolved_markets is not None and category_resolved_markets < CATEGORY_MIN_RESOLVED_MARKETS:
-        gate_failures.append(f"category_resolved_markets={category_resolved_markets} < {CATEGORY_MIN_RESOLVED_MARKETS}")
+    if input.category_resolved_markets is not None and input.category_resolved_markets < CATEGORY_MIN_RESOLVED_MARKETS:
+        gate_failures.append(f"category_resolved_markets={input.category_resolved_markets} < {CATEGORY_MIN_RESOLVED_MARKETS}")
 
-    if category_distinct_events is not None and category_distinct_events < CATEGORY_MIN_DISTINCT_EVENTS:
-        gate_failures.append(f"category_distinct_events={category_distinct_events} < {CATEGORY_MIN_DISTINCT_EVENTS}")
+    if input.category_distinct_events is not None and input.category_distinct_events < CATEGORY_MIN_DISTINCT_EVENTS:
+        gate_failures.append(f"category_distinct_events={input.category_distinct_events} < {CATEGORY_MIN_DISTINCT_EVENTS}")
 
-    if category_active_days is not None and category_active_days < CATEGORY_MIN_ACTIVE_DAYS:
-        gate_failures.append(f"category_active_days={category_active_days} < {CATEGORY_MIN_ACTIVE_DAYS}")
+
+    if input.category_active_days is not None and input.category_active_days < CATEGORY_MIN_ACTIVE_DAYS:
+        gate_failures.append(f"category_active_days={input.category_active_days} < {CATEGORY_MIN_ACTIVE_DAYS}")
 
     # If essential evidence is missing, return INCOMPLETE
     if missing_essentials:
