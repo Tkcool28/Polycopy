@@ -336,15 +336,34 @@ class TestBehaviorClassification:
     """Test wallet behavior classification caps."""
 
     def test_directional_classification(self):
+        # DIRECTIONAL requires positive evidence (at least one
+        # dominant-side market). The pre-PR-4 default-to-DIRECTIONAL
+        # behavior is REMOVED (Phase 12 / Chunk 3).
         evidence = BehaviorEvidence(
             trade_count=50,
             avg_time_between_trades_seconds=1000,  # Not HF
             distinct_markets_traded=10,
+            dominant_side_market_count=3,  # positive directional evidence
         )
         result = classify_wallet_behavior(evidence)
         assert result.classification == BehaviorClassification.DIRECTIONAL
         assert result.is_eligible_for_copy is True
         assert result.is_skip is False
+
+    def test_no_positive_directional_evidence_is_unknown(self):
+        # A wallet with trades but no dominant-side market is
+        # UNKNOWN, not silently DIRECTIONAL. This is the spec
+        # change in Phase 12.
+        evidence = BehaviorEvidence(
+            trade_count=50,
+            avg_time_between_trades_seconds=1000,
+            distinct_markets_traded=10,
+            dominant_side_market_count=0,
+        )
+        result = classify_wallet_behavior(evidence)
+        assert result.classification == BehaviorClassification.UNKNOWN
+        assert result.is_eligible_for_copy is False
+        assert result.is_watchlist_cap is True
 
     def test_high_frequency_bot(self):
         evidence = BehaviorEvidence(
