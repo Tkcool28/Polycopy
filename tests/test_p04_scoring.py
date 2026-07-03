@@ -690,3 +690,100 @@ class TestNoDeprecationWarnings:
 
         result = compute_wallet_score_v1(wallet_id="tz-check")
         assert result.computed_at.tzinfo is timezone.utc
+
+
+class TestTypedInputDataclasses:
+    """Phase 9 (partial): typed input objects must carry raw fields onto
+    the result for replayable persistence.
+
+    Score serializers must not rely on `getattr(result, ..., None)` —
+    every raw column must be reachable via a typed `result.input` object.
+    """
+
+    def test_wallet_score_input_v1_default_construction(self):
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1,
+            WalletScoreResult,
+            compute_wallet_score_v1,
+        )
+
+        inp = WalletScoreInputV1(wallet_id="w-1")
+        assert inp.wallet_id == "w-1"
+        # All raw input fields must be Optional with None default
+        assert inp.info_score is None
+        assert inp.win_rate is None
+        assert inp.trade_count is None
+        assert inp.profit_factor is None
+        assert inp.category_resolved_markets is None
+
+        # Back-compat: passing raw kwargs (no explicit input) must still
+        # produce a result with a typed input object attached.
+        result = compute_wallet_score_v1(
+            wallet_id="w-1",
+            win_rate=0.5,
+            trade_count=100,
+        )
+        assert isinstance(result, WalletScoreResult)
+        assert result.input is not None
+        assert result.input.wallet_id == "w-1"
+        assert result.input.win_rate == 0.5
+        assert result.input.trade_count == 100
+
+    def test_wallet_score_result_carries_raw_inputs_for_persistence(self):
+        """Every field the serializer cares about must be reachable
+        through `result.input.<field>` — no getattr(..., None) tolerated."""
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1,
+            compute_wallet_score_v1,
+        )
+
+        inp = WalletScoreInputV1(
+            wallet_id="w-1",
+            win_rate=0.6,
+            profit_factor=1.4,
+            trade_count=120,
+            info_score=0.5,
+            resolved_markets=40,
+            active_trading_days=22,
+            distinct_events=18,
+            category_resolved_markets=20,
+            category_distinct_events=10,
+            category_active_days=12,
+        )
+        result = compute_wallet_score_v1(wallet_id="w-1", input=inp)
+        assert result.input is inp
+        # Mirror every column the serializer persists
+        assert result.input.info_score == 0.5
+        assert result.input.win_rate == 0.6
+        assert result.input.profit_factor == 1.4
+        assert result.input.trade_count == 120
+        assert result.input.resolved_markets == 40
+        assert result.input.active_trading_days == 22
+        assert result.input.distinct_events == 18
+        assert result.input.category_resolved_markets == 20
+        assert result.input.category_distinct_events == 10
+        assert result.input.category_active_days == 12
+
+    def test_wallet_score_input_v1_is_frozen(self):
+        """Typed input must be immutable to enforce replayability."""
+        from polycopy.scoring.wallet_score_v1 import WalletScoreInputV1
+
+        inp = WalletScoreInputV1(wallet_id="w-1", win_rate=0.5)
+        with pytest.raises(Exception):
+            # Frozen dataclass: attribute assignment is forbidden.
+            inp.win_rate = 0.7  # type: ignore[misc]
+
+    def test_wallet_score_input_v1_explicit_overrides_kwargs(self):
+        """When both an `input` object and loose kwargs are passed,
+        the explicit input wins (no silent mixing)."""
+        from polycopy.scoring.wallet_score_v1 import (
+            WalletScoreInputV1,
+            compute_wallet_score_v1,
+        )
+
+        inp = WalletScoreInputV1(wallet_id="w-1", win_rate=0.6)
+        # Even if the caller also passes win_rate=0.1, the input wins.
+        result = compute_wallet_score_v1(
+            wallet_id="w-1", input=inp, win_rate=0.1
+        )
+        assert result.input.win_rate == 0.6

@@ -64,11 +64,17 @@ class WalletScoreComponent:
 
 @dataclass
 class WalletScoreResult:
-    """Result of wallet v1 scoring with full component breakdown."""
+    """Result of wallet v1 scoring with full component breakdown.
+
+    The `input` field is the typed `WalletScoreInputV1` instance that
+    produced this result. Persisters must read raw columns from
+    `result.input.<field>`, not from `getattr(result, ..., None)`.
+    """
 
     wallet_id: str
     score: float  # Final 0-100 score
     verdict: WalletVerdict
+    input: Optional[WalletScoreInputV1] = None
     components: list[WalletScoreComponent] = field(default_factory=list)
     missing_essentials: list[str] = field(default_factory=list)
     eligibility_gate_failures: list[str] = field(default_factory=list)
@@ -89,6 +95,37 @@ WEIGHTS = {
     "category_specialization": 15.0,
     "concentration_quality": 5.0,
 }
+
+
+@dataclass(frozen=True)
+class WalletScoreInputV1:
+    """Typed input for Wallet Score v1 (Phase 9).
+
+    Every raw input used by the score is a named, typed field with a
+    deterministic default. Frozen so callers cannot mutate the input
+    after the score has been computed, which guarantees replayability.
+    """
+
+    wallet_id: str
+    info_score: Optional[float] = None
+    win_rate: Optional[float] = None
+    profit_factor: Optional[float] = None
+    trade_intervals_std: Optional[float] = None
+    trade_count: Optional[int] = None
+    max_drawdown: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    sample_fraction: Optional[float] = None
+    category_trade_count: Optional[int] = None
+    category_distinct_markets: Optional[int] = None
+    overall_trade_count: Optional[int] = None
+    largest_winner_share: Optional[float] = None
+    top_3_concentration: Optional[float] = None
+    resolved_markets: Optional[int] = None
+    active_trading_days: Optional[int] = None
+    distinct_events: Optional[int] = None
+    category_resolved_markets: Optional[int] = None
+    category_distinct_events: Optional[int] = None
+    category_active_days: Optional[int] = None
 
 # Verdict thresholds
 VERDICT_COPY_CANDIDATE_MIN = 75.0
@@ -289,6 +326,7 @@ def _concentration_quality_component(
 def compute_wallet_score_v1(
     wallet_id: str,
     *,
+    input: Optional[WalletScoreInputV1] = None,
     # Information and price improvement
     info_score: Optional[float] = None,
 
@@ -333,9 +371,42 @@ def compute_wallet_score_v1(
     """Compute Persistent Specialist Wallet Score v1.
 
     All inputs optional. Missing essential evidence produces INCOMPLETE.
+
+    Callers may either:
+      1. Pass a typed `WalletScoreInputV1` as `input=...` (preferred —
+         enables replayable persistence), or
+      2. Pass raw kwargs directly (legacy / convenience path) — the
+         function builds a default `WalletScoreInputV1` from those.
+
+    If both are passed, the explicit `input` wins; loose kwargs are
+    ignored.
     """
     if now is None:
         now = datetime.now(timezone.utc)
+
+    if input is None:
+        input = WalletScoreInputV1(
+            wallet_id=wallet_id,
+            info_score=info_score,
+            win_rate=win_rate,
+            profit_factor=profit_factor,
+            trade_intervals_std=trade_intervals_std,
+            trade_count=trade_count,
+            max_drawdown=max_drawdown,
+            sharpe_ratio=sharpe_ratio,
+            sample_fraction=sample_fraction,
+            category_trade_count=category_trade_count,
+            category_distinct_markets=category_distinct_markets,
+            overall_trade_count=overall_trade_count,
+            largest_winner_share=largest_winner_share,
+            top_3_concentration=top_3_concentration,
+            resolved_markets=resolved_markets,
+            active_trading_days=active_trading_days,
+            distinct_events=distinct_events,
+            category_resolved_markets=category_resolved_markets,
+            category_distinct_events=category_distinct_events,
+            category_active_days=category_active_days,
+        )
 
     components: list[WalletScoreComponent] = []
     missing_essentials: list[str] = []
@@ -374,6 +445,7 @@ def compute_wallet_score_v1(
             wallet_id=wallet_id,
             score=0.0,
             verdict=WalletVerdict.INCOMPLETE,
+            input=input,
             components=components,
             missing_essentials=missing_essentials,
             eligibility_gate_failures=gate_failures,
@@ -475,6 +547,7 @@ def compute_wallet_score_v1(
         wallet_id=wallet_id,
         score=final_score,
         verdict=verdict,
+        input=input,
         components=components,
         missing_essentials=missing_essentials,
         eligibility_gate_failures=gate_failures,
