@@ -188,6 +188,15 @@ class Database:
                 from polycopy.db.schema_v11 import apply_v11_idempotent
 
                 apply_v11_idempotent(self.conn)
+            elif target_version == 12:
+                # v12 introduces decision_input_json on
+                # paper_signal_decisions. Schema_v10 does NOT declare this
+                # column, so the v11-style "fresh DB already has it"
+                # pattern does not apply — every fresh DB needs the ALTER.
+                # The applier remains idempotent for upgraded v12 DBs.
+                from polycopy.db.schema_v12 import apply_v12_idempotent
+
+                apply_v12_idempotent(self.conn)
             else:
                 for stmt in statements:
                     self._execute_migration_statement(stmt)

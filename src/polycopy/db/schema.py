@@ -43,13 +43,16 @@ natively idempotent in SQLite.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Import v10 schema changes
 from polycopy.db.schema_v10 import _V10_DDL  # noqa: E402
 
 # Import v11 schema changes (additive ALTER TABLE for V2 shadow typed input)
 from polycopy.db.schema_v11 import _V11_DDL  # noqa: E402
+
+# Import v12 schema changes (additive audit storage for paper-signal input)
+from polycopy.db.schema_v12 import _V12_DDL  # noqa: E402
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -782,6 +785,7 @@ MIGRATIONS: dict[int, list[str]] = {
     9: _V9_DDL,
     10: _V10_DDL,
     11: _V11_DDL,
+    12: _V12_DDL,
 }
 
 # Current DDL is the latest migration

@@ -297,7 +297,9 @@ def test_v8_to_v9_migration_preserves_data(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1  # 8
+    # SCHEMA_VERSION bumped past v11; we only need the migrations
+    # up to and including v8 (the pre-state for the v8→v9 test).
+    pre_version = 8
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)

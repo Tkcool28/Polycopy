@@ -95,8 +95,10 @@ def test_v10_to_v11_upgrade(tmp_path: Path):
     """Manually pin the DB at v10 and verify the runner upgrades to
     v11 by applying the additive ALTER TABLE statements."""
     db = _fresh_db(tmp_path)
-    # Verify we're already at v11; this is the "post-upgrade" state.
-    assert _read_schema_version(db) == 11
+    # Verify we're at SCHEMA_VERSION (post all upgrades including v12);
+    # this is the "post-upgrade" state.
+    assert _read_schema_version(db) == SCHEMA_VERSION
+    assert SCHEMA_VERSION >= 11
     # The post-upgrade state is what we verify here.
     db.close()
 
@@ -113,10 +115,11 @@ def test_v10_to_v11_upgrade(tmp_path: Path):
     db2.conn.commit()
     db2.close()
 
-    # Re-open: migration runner should bring v10 -> v11.
+    # Re-open: migration runner should bring v10 -> SCHEMA_VERSION
+    # (applying v11 idempotently, then v12 idempotently).
     db3 = Database(db_path=db2_path)
     db3.connect()
-    assert _read_schema_version(db3) == 11
+    assert _read_schema_version(db3) == SCHEMA_VERSION
     cols_after = _shadow_columns(db3)
     assert "source_price" in cols_after
     assert "delayed_copy_price" in cols_after
@@ -160,7 +163,7 @@ def test_existing_rows_unchanged_after_v11_migration(tmp_path: Path):
     # Re-open; the migration runner will skip already-applied work.
     db2 = Database(db_path=tmp_path / "fresh.db")
     db2.connect()
-    assert _read_schema_version(db2) == 11
+    assert _read_schema_version(db2) == SCHEMA_VERSION
     n_wallets = db2.fetchone("SELECT COUNT(*) AS n FROM wallets")
     n_signals = db2.fetchone(
         "SELECT COUNT(*) AS n FROM paper_signal_decisions"

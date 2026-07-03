@@ -812,9 +812,10 @@ def persist_shadow_score_v2(
     """Persist v2 shadow decision to database (parallel to v1).
 
     Reads every raw input column from the typed
-    :class:`ShadowScoreInputV2` attached to ``result.input``. The
-    legacy getattr path is removed in Chunk 5 — only the typed path
-    is supported.
+    :class:`ShadowScoreInputV2` attached to ``result.input``. A
+    defensive legacy fallback (in the ``else`` branch below) remains
+    for tests that explicitly build a non-typed ``ShadowScoreResult``;
+    the runtime always supplies a typed input.
 
     Table UNIQUE constraint:
     UNIQUE(wallet_id, source_trade_id, formula_name, formula_version, idempotency_key)
@@ -888,6 +889,18 @@ def persist_shadow_score_v2(
         measured_delay_seconds = getattr(inp, "measured_delay_seconds", None)
         price_snapshot_id = getattr(inp, "price_snapshot_id", None)
         depth_hash = getattr(inp, "depth_hash", None)
+        # Repair 2d — offset audit fields, sourced from the typed
+        # input. The runtime enforces 0 <= actual_observed <= 600;
+        # the validator below rejects anything outside that range.
+        target_delay_seconds = getattr(
+            inp, "target_delay_seconds", None
+        )
+        actual_observed_delay_seconds = getattr(
+            inp, "actual_observed_delay_seconds", None
+        )
+        delay_error_seconds = getattr(
+            inp, "delay_error_seconds", None
+        )
         # delay_scenario is an enum on the typed input; persist its
         # canonical string value.
         delay_scenario = getattr(inp, "delay_scenario", None)
@@ -919,6 +932,10 @@ def persist_shadow_score_v2(
         measured_delay_seconds = None
         price_snapshot_id = None
         depth_hash = None
+        # Repair 2d — defensive defaults when no typed input.
+        target_delay_seconds = None
+        actual_observed_delay_seconds = None
+        delay_error_seconds = None
         delay_scenario_str = getattr(result, "delay_scenario", None)
         alpha_signal = None
         price_retention_ratio = None
@@ -948,6 +965,22 @@ def persist_shadow_score_v2(
         copied_trade_count=getattr(result, "copied_trade_count", None),
         days_since_last_trade=getattr(result, "days_since_last_trade", None),
     )
+    # ---- Repair 2d — offset-audit bounds (0..600s on actual) ----
+    # Shadow V2 audit fields. The validator above covers
+    # ``measured_delay_seconds`` (legacy single field) but the v12
+    # typed contract exposes three separate offset fields. We enforce
+    # the upper bound inline so an obviously corrupt timestamp can't
+    # land in the audit trail.
+    if actual_observed_delay_seconds is not None:
+        try:
+            ao = float(actual_observed_delay_seconds)
+        except (TypeError, ValueError):
+            ao = None
+        else:
+            if ao < 0.0 or ao > 600.0:
+                raise ValueError(
+                    f"actual_observed_delay_seconds={ao} outside [0, 600]"
+                )
 
     return _insert_or_ignore_returning_id(
         db,
@@ -969,8 +1002,9 @@ def persist_shadow_score_v2(
                 delay_scenario,
                 source_data_timestamp, price_snapshot_id, depth_hash,
                 computed_at, created_at,
-                candidate_id, v1_decision_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                candidate_id, v1_decision_id,
+                target_delay_seconds, actual_observed_delay_seconds, delay_error_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
         """,
         params=(
@@ -1018,6 +1052,11 @@ def persist_shadow_score_v2(
             now,
             candidate_id,
             v1_decision_id,
+            # Repair 2d — v12 offset-audit columns, sourced from the
+            # typed input (or None when the defensive legacy branch ran).
+            target_delay_seconds,
+            actual_observed_delay_seconds,
+            delay_error_seconds,
         ),
         # Table UNIQUE: (wallet_id, source_trade_id, formula_name, formula_version, idempotency_key)
         existing_lookup_sql="""
@@ -1108,9 +1147,14 @@ def persist_paper_signal(
 
     Reads every column from the typed
     :class:`PaperSignalDecisionInput` when provided (``typed_input``),
-    which is the Chunk 5 contract. A legacy adapter path remains for
-    callers that have not been migrated yet — that path is the ONLY
-    place where the rollup positional kwargs may be used.
+    which is the Chunk 5 contract. The typed input is the source of
+    truth for the audit columns
+    (``decision_input_json``, ``wallet_score_decision_id``,
+    ``category_score_decision_id``, ``trade_score_decision_id``) — the
+    positional kwargs may be omitted or stale, but the audit fields
+    come from the typed contract. A legacy adapter path remains for
+    callers that have not been migrated yet — that path writes
+    ``NULL`` for the audit columns and never fabricates data.
 
     Safety invariants enforced here:
 
@@ -1127,6 +1171,7 @@ def persist_paper_signal(
     """
     from polycopy.scoring.paper_signal_input import (
         SAFETY_REASON_AUTO_APPROVE_REJECTED,
+        serialize_paper_signal_input,
     )
 
     if idempotency_key is None:
@@ -1173,6 +1218,10 @@ def persist_paper_signal(
     # decision ids, the intended stake, the category label, the
     # verdict, and the formula versions. This guarantees that a
     # materially changed input produces a new immutable row.
+    # Repair 1 strengthens the identity to also include the trade
+    # decision id, so a changed trade-decision id (e.g. a re-run
+    # that re-persisted trade scoring) yields a new paper-signal
+    # row rather than silently re-using the previous audit row.
     if typed_input is not None:
         verdict_for_idem = str(getattr(typed_input, "final_verdict", final_verdict))
         reason_for_idem = str(getattr(typed_input, "final_reason", persisted_reason or ""))
@@ -1218,6 +1267,20 @@ def persist_paper_signal(
 
     now = datetime.now(timezone.utc).isoformat()
 
+    # ---- Audit columns (Repair 1 — v12) -----------------------------------
+    # The typed input is the source of truth for the four audit
+    # columns. Legacy callers that omit ``typed_input`` get NULLs —
+    # we never invent audit data on their behalf.
+    audit_decision_input_json: Optional[str] = None
+    audit_wallet_decision_id: Optional[int] = None
+    audit_category_decision_id: Optional[int] = None
+    audit_trade_decision_id: Optional[int] = None
+    if typed_input is not None:
+        audit_decision_input_json = serialize_paper_signal_input(typed_input)
+        audit_wallet_decision_id = typed_input.wallet_score_decision_id
+        audit_category_decision_id = typed_input.category_score_decision_id
+        audit_trade_decision_id = typed_input.trade_score_decision_id
+
     return _insert_or_ignore_returning_id(
         db,
         sql="""
@@ -1225,8 +1288,13 @@ def persist_paper_signal(
                 candidate_id, wallet_id, signal_family, signal_reason,
                 wallet_score, trade_score, shadow_score, shadow_verdict, final_verdict,
                 source_data_timestamp, source_trade_id, price_snapshot_id,
-                idempotency_key, computed_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                idempotency_key, computed_at, created_at,
+                decision_input_json,
+                wallet_score_decision_id,
+                category_score_decision_id,
+                trade_score_decision_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?)
             RETURNING id
         """,
         params=(
@@ -1245,6 +1313,13 @@ def persist_paper_signal(
             idempotency_key,
             now,
             now,
+            # Audit columns (Repair 1). Null for legacy callers that
+            # omitted typed_input; non-null when the typed contract
+            # is the source of truth.
+            audit_decision_input_json,
+            audit_wallet_decision_id,
+            audit_category_decision_id,
+            audit_trade_decision_id,
         ),
         # Table UNIQUE: (candidate_id, idempotency_key)
         existing_lookup_sql="""

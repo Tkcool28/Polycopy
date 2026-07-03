@@ -87,7 +87,11 @@ def test_v9_db_upgrades_to_v10(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1  # 9
+    # SCHEMA_VERSION bumped past v11; pre-state for the v9→v10
+    # test is v9, so we stop at v9 (v10's CREATE TABLE for
+    # shadow_decisions already declares the slippage column that
+    # v11 would then try to ADD again).
+    pre_version = 9
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)
@@ -118,7 +122,8 @@ def test_existing_v9_data_preserved_through_v10(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1
+    # SCHEMA_VERSION bumped past v11; stop at v9 (pre-state for v10).
+    pre_version = 9
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)
@@ -375,7 +380,8 @@ def test_v9_production_style_rows_preserved_exactly(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1
+    # SCHEMA_VERSION bumped past v11; stop at v9 (pre-state for v10).
+    pre_version = 9
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)

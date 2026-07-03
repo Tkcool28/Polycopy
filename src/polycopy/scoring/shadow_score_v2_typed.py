@@ -82,6 +82,26 @@ DELAY_SCENARIO_SECONDS: dict[DelayScenario, Optional[float]] = {
 }
 
 
+# Bounded tolerance window (Repair 2c). For a fixed-delay scenario
+# to consider a persisted snapshot valid, that snapshot's
+# ``fetched_at`` must fall in
+# ``[source_trade_timestamp + delay_seconds,
+#    source_trade_timestamp + delay_seconds + tolerance]``.
+# A snapshot that is much later than expected is rejected — it does
+# not represent "the price 30s after the trade"; it represents a
+# stale observation. THEORETICAL_IMMEDIATE and ACTUAL_MEASURED_DELAY
+# have no fixed target so they don't use this map (their windows
+# are defined by the scenario itself).
+DELAY_SCENARIO_TOLERANCE_SECONDS: dict[DelayScenario, Optional[float]] = {
+    DelayScenario.THEORETICAL_IMMEDIATE: None,
+    DelayScenario.DELAY_30_SECONDS: 30.0,
+    DelayScenario.DELAY_2_MINUTES: 60.0,
+    DelayScenario.DELAY_5_MINUTES: 120.0,
+    DelayScenario.DELAY_15_MINUTES: 300.0,
+    DelayScenario.ACTUAL_MEASURED_DELAY: None,
+}
+
+
 # ---- Component weights (frozen, sum=100) ---------------------------------
 
 SHADOW_WEIGHTS: dict[str, float] = {
@@ -145,6 +165,26 @@ class ShadowScoreInputV2:
     # When delay_scenario == ACTUAL_MEASURED_DELAY and this is None
     # at compute time, the result is SHADOW_INCOMPLETE.
     measured_delay_seconds: Optional[float] = None
+
+    # Offset audit fields (Repair 2d). For every scenario:
+    #   * ``target_delay_seconds`` is the scenario's requested delay
+    #     (the constant from DELAY_SCENARIO_SECONDS); NULL for
+    #     ACTUAL_MEASURED_DELAY (whose target is its own measured
+    #     delay) and for scenarios where the typed contract elects
+    #     not to surface a target.
+    #   * ``actual_observed_delay_seconds`` is the measured offset
+    #     between the source trade timestamp and the persisted
+    #     snapshot's ``fetched_at``. NULL when no qualifying snapshot
+    #     exists. The runtime enforces ``0 <= x <= 600`` (a 10-min
+    #     ceiling matches the longest fixed-delay scenario plus its
+    #     tolerance) and surfaces out-of-range values as a missing
+    #     reason rather than crashing.
+    #   * ``delay_error_seconds`` = ``actual_observed_delay_seconds -
+    #     target_delay_seconds`` when both are available; NULL
+    #     otherwise.
+    target_delay_seconds: Optional[float] = None
+    actual_observed_delay_seconds: Optional[float] = None
+    delay_error_seconds: Optional[float] = None
 
     @property
     def delay_scenario_seconds(self) -> Optional[float]:

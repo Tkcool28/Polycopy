@@ -1106,7 +1106,12 @@ def _evaluate_paper_signals_for_candidate_inner(
             "category_label": cat_label_for_idem,
         },
     )
-    persist_trade_score_v1(
+    # Capture the persisted trade-decision id (Chunk 5 contract +
+    # Repair 1 audit). The runtime MUST surface this id into the
+    # downstream ``PaperSignalDecisionInput`` so the audit row can
+    # record the trade-decision provenance rather than silently
+    # leaving it None.
+    trade_score_decision_id = persist_trade_score_v1(
         db,
         inputs.wallet_id,
         inputs.source_trade_id,
@@ -1116,6 +1121,14 @@ def _evaluate_paper_signals_for_candidate_inner(
         price_snapshot_id=inputs.snapshot_id,
         source_data_timestamp=snap_ts,
     )
+    # ``persist_trade_score_v1`` always returns an int (the inserted
+    # or pre-existing row's id). We coerce defensively in case a
+    # future migration ever returns a falsy non-int; the typed
+    # contract still gets a usable int.
+    try:
+        trade_score_decision_id = int(trade_score_decision_id)
+    except (TypeError, ValueError):
+        trade_score_decision_id = None
 
     # Shadow v2 — parallel-only, never affects v1 verdict. We persist
     # a SEPARATE immutable research row per delay scenario (six
@@ -1198,7 +1211,7 @@ def _evaluate_paper_signals_for_candidate_inner(
         wallet_id=inputs.wallet_id or "",
         wallet_score_decision_id=wallet_decision_id,
         category_score_decision_id=category_decision_id,
-        trade_score_decision_id=None,  # Set below after persist.
+        trade_score_decision_id=trade_score_decision_id,
         price_snapshot_id=inputs.snapshot_id,
         intended_stake=inputs.intended_stake,
         category_label=cat_label_for_idem
@@ -1380,20 +1393,27 @@ def _compute_and_persist_shadow_v2(
     snap_ts = (
         inputs.snapshot.get("fetched_at") if inputs.snapshot else None
     )
-    # The source price for the shadow scenario is the snapshot's
-    # best_ask (BUY) or best_bid (SELL) midpoint — when the snapshot
-    # has neither, we leave ``source_price`` None.
+    # Repair 2a — the source price for the shadow scenario comes from
+    # the source trade (the actual traded price) — NOT from a
+    # midpoint of the snapshot book. The fallback is the snapshot's
+    # ``source_trade_price`` field (set by the snapshot engine for
+    # forward-compatibility); when both are missing, source_price is
+    # left as None and the engine will produce SHADOW_INCOMPLETE for
+    # the delayed_entry_alpha component (no silent midpoint
+    # substitution).
     source_price: Optional[float] = None
-    if inputs.snapshot is not None:
-        bp = inputs.snapshot.get("best_bid")
-        ap = inputs.snapshot.get("best_ask")
+    if inputs.source_trade is not None:
         try:
-            if bp is not None and ap is not None:
-                source_price = (float(bp) + float(ap)) / 2.0
-            elif ap is not None:
-                source_price = float(ap)
-            elif bp is not None:
-                source_price = float(bp)
+            st_price = inputs.source_trade.get("price")
+            if st_price is not None:
+                source_price = float(st_price)
+        except (TypeError, ValueError):
+            source_price = None
+    if source_price is None and inputs.snapshot is not None:
+        try:
+            stp = inputs.snapshot.get("source_trade_price")
+            if stp is not None:
+                source_price = float(stp)
         except (TypeError, ValueError):
             source_price = None
 
@@ -1422,6 +1442,15 @@ def _compute_and_persist_shadow_v2(
     price_snapshot_id = inputs.snapshot_id
     depth_hash = inputs.depth_hash
 
+    # Side and intended stake for executable-price resolution
+    # (Repair 2b). The executable price is side-aware: BUY walks
+    # asks ascending, SELL walks bids descending. When ``side``
+    # is missing or not BUY/SELL, the executable-depth inputs stay
+    # None and the engine surfaces SHADOW_INCOMPLETE for the
+    # execution_feasibility component.
+    side_for_exec: Optional[str] = inputs.side
+    intended_stake_for_exec: Optional[float] = inputs.intended_stake
+
     # Other typed inputs that all six scenarios share.
     intended_stake = inputs.intended_stake
     executable_depth_value: Optional[float] = None
@@ -1436,6 +1465,54 @@ def _compute_and_persist_shadow_v2(
             )
         except (TypeError, ValueError):
             spread_value = None
+
+    # Repair 2b — compute the side-aware executable price for the
+    # PRIMARY snapshot (``price_snapshot_id``). The result feeds the
+    # ``executable_depth`` and ``fill_percentage`` typed inputs and
+    # is reused for fixed-delay scenarios that find a delayed
+    # snapshot at the same depth shape.
+    exec_vwap: Optional[float] = None
+    exec_fill_pct: Optional[float] = None
+    exec_depth: Optional[float] = None
+    exec_insufficient: Optional[str] = None
+    if (
+        price_snapshot_id is not None
+        and side_for_exec in ("BUY", "SELL")
+        and intended_stake_for_exec is not None
+        and float(intended_stake_for_exec) > 0
+    ):
+        (
+            exec_vwap,
+            exec_fill_pct,
+            exec_depth,
+            exec_insufficient,
+        ) = _executable_price_for_snapshot(
+            db,
+            snapshot_id=price_snapshot_id,
+            side=side_for_exec,
+            intended_stake=intended_stake_for_exec,
+        )
+    if exec_depth is not None:
+        executable_depth_value = exec_depth
+    if exec_fill_pct is not None:
+        fill_percentage_value = exec_fill_pct
+    # The executable VWAP is the contract-grade source-of-truth
+    # price for the THEORETICAL_IMMEDIATE scenario — NEVER a
+    # midpoint. When the executable walk produced no fill (insufficient
+    # depth or top-of-book-only), the source_price fallback applies.
+    if exec_vwap is not None:
+        # Prefer the executable VWAP over the source trade's nominal
+        # price because that is what a real order would have paid at
+        # depth. Only override the THEORETICAL_IMMEDIATE scenario's
+        # "delayed_copy_price" — fixed-delay scenarios are resolved
+        # from their own delayed snapshot below.
+        if side_for_exec == "BUY":
+            executable_price_for_immediate = exec_vwap
+        else:
+            executable_price_for_immediate = exec_vwap
+    else:
+        executable_price_for_immediate = source_price
+
     # Forward-evidence inputs (skill_persistence, copied_performance,
     # concentration/correlation) come from the runtime context.
     # Until the upstream analyzers populate them, we leave them None
@@ -1447,10 +1524,11 @@ def _compute_and_persist_shadow_v2(
 
     # Per-scenario delayed price lookup. For each scenario we
     # look up the FIRST persisted snapshot for this candidate whose
-    # ``fetched_at`` falls within the scenario's delay window
-    # (>= source_trade_timestamp + scenario_delay). When no such
-    # snapshot exists, the delayed price is None and the verdict
-    # becomes SHADOW_INCOMPLETE.
+    # ``fetched_at`` falls within the bounded scenario window
+    # ``[source_trade_timestamp + scenario_delay,
+    #    source_trade_timestamp + scenario_delay + tolerance]``.
+    # When no such snapshot exists, the delayed price is None and
+    # the verdict becomes SHADOW_INCOMPLETE.
     scenario_results: dict[str, ShadowScoreResultV2] = {}
 
     for scenario in DelayScenario:
@@ -1458,31 +1536,73 @@ def _compute_and_persist_shadow_v2(
         delayed_copy_price: Optional[float] = None
         delayed_snapshot_id: Optional[str] = None
         scenario_missing: list[str] = []
+        # Offset audit fields (Repair 2d). Per scenario:
+        #   * THEORETICAL_IMMEDIATE: target=0.0, actual=measured (or
+        #     None), error=actual-target (or None).
+        #   * ACTUAL_MEASURED_DELAY: target=None, actual=measured,
+        #     error=None (the target IS the actual).
+        #   * Fixed-delay scenarios: target=scenario_delay_seconds,
+        #     actual=offset from the picked snapshot to the
+        #     source-trade timestamp, error=actual-target (None if
+        #     either is None).
+        target_delay_value: Optional[float] = None
+        actual_observed_value: Optional[float] = None
+        delay_error_value: Optional[float] = None
+
         if scenario is DelayScenario.THEORETICAL_IMMEDIATE:
-            # For the theoretical-immediate scenario, the "delayed
-            # price" is the source price at zero delay — there is
-            # no separate delayed snapshot. We use the snapshot's
-            # midpoint directly. When the source price is missing
-            # the engine will mark SHADOW_INCOMPLETE.
-            delayed_copy_price = source_price
+            # Repair 2b — the theoretical-immediate scenario's
+            # "delayed" price is the SIDE-AWARE executable price of
+            # the primary snapshot, NOT a midpoint. When the
+            # executable walk produced no VWAP (insufficient depth or
+            # top-of-book-only), fall back to the source trade's
+            # nominal price. When both are missing, the engine
+            # produces SHADOW_INCOMPLETE.
+            delayed_copy_price = executable_price_for_immediate
             delayed_snapshot_id = price_snapshot_id
+            target_delay_value = 0.0
+            actual_observed_value = measured_delay_seconds
+            if (
+                actual_observed_value is not None
+                and target_delay_value is not None
+            ):
+                delay_error_value = (
+                    float(actual_observed_value)
+                    - float(target_delay_value)
+                )
         elif scenario is DelayScenario.ACTUAL_MEASURED_DELAY:
             # For the actual-measured scenario, the "delayed price"
-            # is the snapshot's midpoint — same snapshot we are
-            # evaluating against (its fetched_at is the actual
-            # measured moment). measured_delay_seconds is computed
-            # from real timestamps.
-            delayed_copy_price = source_price
+            # is the side-aware executable price of the primary
+            # snapshot (same as THEORETICAL_IMMEDIATE — the
+            # difference is in how the engine weighs the delay
+            # penalty via ``measured_delay_seconds``). The snapshot
+            # used IS the primary snapshot (its fetched_at IS the
+            # actual measured moment).
+            delayed_copy_price = executable_price_for_immediate
             delayed_snapshot_id = price_snapshot_id
             if measured_delay_seconds is None:
                 scenario_missing.append("missing_actual_measured_delay_seconds")
+            target_delay_value = None
+            actual_observed_value = measured_delay_seconds
+            delay_error_value = None
         else:
-            # Fixed-delay scenario: look up the first persisted
-            # snapshot whose fetched_at is at or after
-            # source_trade_timestamp + scenario_delay_seconds.
+            # Fixed-delay scenario. Repair 2c — pass the bounded
+            # tolerance from DELAY_SCENARIO_TOLERANCE_SECONDS to
+            # _lookup_delayed_snapshot so the SQL selects ONLY
+            # snapshots inside the delay window (rejects stale
+            # observations).
+            from polycopy.scoring.shadow_score_v2_typed import (
+                DELAY_SCENARIO_SECONDS as _DELAY_SECONDS,
+                DELAY_SCENARIO_TOLERANCE_SECONDS as _DELAY_TOLERANCES,
+            )
+            target_delay = _DELAY_SECONDS.get(scenario)
+            tolerance_seconds = _DELAY_TOLERANCES.get(scenario) or 0.0
+            target_delay_value = (
+                float(target_delay) if target_delay is not None else None
+            )
             if (
                 source_trade_timestamp is not None
                 and inputs.candidate is not None
+                and target_delay is not None
             ):
                 cand_id = (
                     inputs.candidate.get("id")
@@ -1490,29 +1610,96 @@ def _compute_and_persist_shadow_v2(
                     else None
                 )
                 if cand_id is not None:
-                    # Look up the frozen delay-seconds value from
-                    # the canonical DELAY_SCENARIO_SECONDS map.
-                    from polycopy.scoring.shadow_score_v2_typed import (
-                        DELAY_SCENARIO_SECONDS as _DELAY_SECONDS,
+                    delayed_snapshot_id = _lookup_delayed_snapshot(
+                        db,
+                        candidate_id=int(cand_id),
+                        source_trade_timestamp=source_trade_timestamp,
+                        delay_seconds=float(target_delay),
+                        tolerance_seconds=float(tolerance_seconds),
                     )
-                    target_delay = _DELAY_SECONDS.get(scenario)
-                    if target_delay is not None:
-                        delayed_snapshot_id = _lookup_delayed_snapshot(
+                    if delayed_snapshot_id is not None:
+                        # Repair 2b — use the SIDE-AWARE executable
+                        # price for the delayed snapshot (BUY walks
+                        # asks, SELL walks bids). NEVER a midpoint.
+                        (
+                            _delayed_vwap,
+                            _delayed_fill_pct,
+                            _delayed_exec_depth,
+                            _delayed_insufficient,
+                        ) = _executable_price_for_snapshot(
                             db,
-                            candidate_id=int(cand_id),
-                            source_trade_timestamp=source_trade_timestamp,
-                            delay_seconds=float(target_delay),
+                            snapshot_id=delayed_snapshot_id,
+                            side=(
+                                side_for_exec
+                                if side_for_exec in ("BUY", "SELL")
+                                else "BUY"
+                            ),
+                            intended_stake=intended_stake_for_exec,
                         )
-                        if delayed_snapshot_id is not None:
-                            delayed_copy_price = (
-                                _midpoint_for_snapshot(
-                                    db, delayed_snapshot_id
-                                )
+                        if _delayed_vwap is not None:
+                            delayed_copy_price = _delayed_vwap
+                        else:
+                            # No executable depth for the delayed
+                            # snapshot — fall back to source_price
+                            # so the engine has a real number to
+                            # grade, and surface the
+                            # missing-execution-evidence reason.
+                            delayed_copy_price = source_price
+                            scenario_missing.append(
+                                f"missing_executable_depth_for_scenario_{scenario.value}"
                             )
+
+                        # Repair 2d — the actual observed delay is
+                        # the offset of the picked snapshot's
+                        # fetched_at from the source trade
+                        # timestamp. We re-read the picked row to
+                        # compute it exactly.
+                        try:
+                            _picked_row = db.fetchone(
+                                "SELECT fetched_at FROM candidate_price_snapshots "
+                                "WHERE id = ?",
+                                (delayed_snapshot_id,),
+                            )
+                        except sqlite3.Error:
+                            _picked_row = None
+                        if _picked_row is not None:
+                            try:
+                                _picked_ts = _picked_row["fetched_at"]
+                                _observed = compute_measured_delay_seconds(
+                                    source_trade_timestamp=source_trade_timestamp,
+                                    candidate_snapshot_timestamp=_picked_ts,
+                                )
+                                actual_observed_value = float(_observed)
+                                if target_delay_value is not None:
+                                    delay_error_value = (
+                                        float(actual_observed_value)
+                                        - float(target_delay_value)
+                                    )
+                            except (TypeError, ValueError, KeyError):
+                                actual_observed_value = None
+                                delay_error_value = None
+
             if delayed_copy_price is None:
                 scenario_missing.append(
                     f"missing_delayed_snapshot_for_scenario_{scenario.value}"
                 )
+
+        # Validate the offset audit fields (Repair 2d).
+        # ``actual_observed_delay_seconds`` must be 0 <= x <= 600
+        # when present (a 10-minute ceiling matches the longest
+        # fixed-delay scenario plus tolerance). When validation
+        # fails, surface it as a missing reason rather than crash.
+        if actual_observed_value is not None:
+            try:
+                if (
+                    float(actual_observed_value) < 0.0
+                    or float(actual_observed_value) > 600.0
+                ):
+                    scenario_missing.append(
+                        f"actual_observed_delay_out_of_range:{actual_observed_value}"
+                    )
+            except (TypeError, ValueError):
+                scenario_missing.append("actual_observed_delay_invalid")
 
         # Build the typed input for this scenario.
         typed_in = ShadowScoreInputV2(
@@ -1548,6 +1735,9 @@ def _compute_and_persist_shadow_v2(
                 if scenario is DelayScenario.ACTUAL_MEASURED_DELAY
                 else None
             ),
+            target_delay_seconds=target_delay_value,
+            actual_observed_delay_seconds=actual_observed_value,
+            delay_error_seconds=delay_error_value,
         )
 
         result = compute_shadow_score_v2_from_input(typed_in)
@@ -1588,15 +1778,27 @@ def _lookup_delayed_snapshot(
     candidate_id: int,
     source_trade_timestamp: str,
     delay_seconds: float,
+    tolerance_seconds: float = 0.0,
 ) -> Optional[str]:
     """Return the FIRST persisted snapshot id for ``candidate_id``
-    whose ``fetched_at`` is at or after ``source_trade_timestamp +
-    delay_seconds``. Returns ``None`` when no such snapshot exists.
+    whose ``fetched_at`` falls within the bounded window
+    ``[source_trade_timestamp + delay_seconds,
+       source_trade_timestamp + delay_seconds + tolerance_seconds]``.
 
-    The lookup is purely on the persisted snapshot table — we never
-    fabricate or interpolate a delayed price. When the lookup fails
-    to find a match, the caller passes ``delayed_copy_price=None``
-    and the shadow verdict becomes ``SHADOW_INCOMPLETE`` honestly.
+    The window is closed on both ends. When ``tolerance_seconds`` is
+    zero (the default — used for THEORETICAL_IMMEDIATE and
+    ACTUAL_MEASURED_DELAY), the upper bound equals the lower bound
+    and the SQL reduces to ``fetched_at >= target``. When the
+    snapshot is older than the lower bound OR newer than the upper
+    bound, it is rejected — a stale observation does NOT represent
+    "the price 30s after the trade" and would silently fabricate
+    alpha evidence if accepted.
+
+    Returns ``None`` when no such snapshot exists. The lookup is
+    purely on the persisted snapshot table — we never fabricate or
+    interpolate a delayed price. When the lookup fails to find a
+    match, the caller passes ``delayed_copy_price=None`` and the
+    shadow verdict becomes ``SHADOW_INCOMPLETE`` honestly.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -1610,7 +1812,14 @@ def _lookup_delayed_snapshot(
         return None
     if src_dt.tzinfo is None:
         src_dt = src_dt.replace(tzinfo=timezone.utc)
-    target = (src_dt + timedelta(seconds=delay_seconds)).isoformat()
+    target_low = (
+        src_dt + timedelta(seconds=float(delay_seconds))
+    ).isoformat()
+    target_high = (
+        src_dt + timedelta(
+            seconds=float(delay_seconds) + float(tolerance_seconds)
+        )
+    ).isoformat()
 
     try:
         row = db.fetchone(
@@ -1618,10 +1827,11 @@ def _lookup_delayed_snapshot(
             SELECT id FROM candidate_price_snapshots
             WHERE candidate_id = ?
               AND fetched_at >= ?
+              AND fetched_at <= ?
             ORDER BY fetched_at ASC, id ASC
             LIMIT 1
             """,
-            (candidate_id, target),
+            (candidate_id, target_low, target_high),
         )
     except sqlite3.Error:
         return None
@@ -1633,40 +1843,111 @@ def _lookup_delayed_snapshot(
         return None
 
 
-def _midpoint_for_snapshot(
-    db: Database, snapshot_id: str,
-) -> Optional[float]:
-    """Return the persisted midpoint for a snapshot.
+def _executable_price_for_snapshot(
+    db: Database,
+    snapshot_id: str,
+    side: str,
+    intended_stake: Optional[float],
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[str]]:
+    """Resolve the executable VWAP for ``snapshot_id`` on the given ``side``.
 
-    Computed as the average of ``best_bid`` and ``best_ask`` when
-    both are present. Returns ``None`` when neither is present or
-    the lookup fails.
+    Side-aware semantics (Repair 2b):
+
+      * BUY  walks persisted ASK levels ASCENDING via
+        :func:`walk_depth` — the executable price is the
+        cumulative VWAP across the consumed asks.
+      * SELL walks persisted BID levels DESCENDING via
+        :func:`walk_depth` — the executable price is the
+        cumulative VWAP across the consumed bids.
+
+    Returns a 4-tuple:
+
+      ``(executable_vwap, fill_percentage, executable_depth, insufficient_reason)``
+
+    Top-of-book fallback (best_ask for BUY, best_bid for SELL)
+    ONLY when ``intended_stake`` is None or 0; in that case the
+    function returns ``(None, None, None, "top_of_book_only")`` —
+    the caller's depth-aware pipeline will surface that sentinel as
+    a missing-execution-evidence reason.
+
+    NEVER returns a midpoint as the executable price. A midpoint
+    does not represent the cost of filling a real order at depth.
+
+    The function reads the persisted depth levels from
+    ``candidate_price_snapshot_levels`` for the chosen snapshot.
+    When no levels exist for the chosen side, the function falls
+    back to the persisted top-of-book column on the snapshot row
+    (with the top-of-book sentinel above).
     """
+    if side not in ("BUY", "SELL"):
+        return (None, None, None, "invalid_side")
+    if intended_stake is None or float(intended_stake) <= 0:
+        # Top-of-book fallback. We deliberately do NOT return the
+        # top-of-book price as the "executable price" — the caller
+        # treats ``insufficient_reason == "top_of_book_only"`` as a
+        # missing-execution-evidence signal.
+        return (None, None, None, "top_of_book_only")
+
+    # Read the persisted depth levels for this snapshot.
     try:
-        row = db.fetchone(
-            "SELECT best_bid, best_ask FROM candidate_price_snapshots "
-            "WHERE id = ?",
-            (snapshot_id,),
-        )
+        if side == "BUY":
+            level_rows = db.fetchall(
+                """
+                SELECT level_index, side, price, size,
+                       cumulative_size, cumulative_notional
+                FROM candidate_price_snapshot_levels
+                WHERE snapshot_id = ? AND UPPER(side) = 'ASK'
+                ORDER BY level_index ASC
+                """,
+                (snapshot_id,),
+            )
+        else:
+            level_rows = db.fetchall(
+                """
+                SELECT level_index, side, price, size,
+                       cumulative_size, cumulative_notional
+                FROM candidate_price_snapshot_levels
+                WHERE snapshot_id = ? AND UPPER(side) = 'BID'
+                ORDER BY level_index ASC
+                """,
+                (snapshot_id,),
+            )
     except sqlite3.Error:
-        return None
-    if row is None:
-        return None
+        level_rows = []
+
+    levels = _coerce_levels(level_rows)
+    if not levels:
+        # No persisted levels for this side — fall back to top-of-book.
+        return (None, None, None, "top_of_book_only")
+
     try:
-        bp = row["best_bid"]
-        ap = row["best_ask"]
-    except (KeyError, TypeError):
-        return None
+        walk = walk_depth(
+            levels=list(levels),
+            side=side,
+            intended_notional=Decimal(str(intended_stake)),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("walk_depth failed in _executable_price_for_snapshot: %s", exc)
+        return (None, None, None, "walk_failed")
+
+    vwap: Optional[float] = None
+    if walk.vwap_fill_price is not None:
+        try:
+            vwap = float(walk.vwap_fill_price)
+        except (TypeError, ValueError):
+            vwap = None
+    fill_pct: Optional[float] = None
     try:
-        if bp is not None and ap is not None:
-            return (float(bp) + float(ap)) / 2.0
-        if ap is not None:
-            return float(ap)
-        if bp is not None:
-            return float(bp)
-        return None
+        fill_pct = float(walk.fill_percentage)
     except (TypeError, ValueError):
-        return None
+        fill_pct = None
+    exec_depth: Optional[float] = None
+    try:
+        exec_depth = float(walk.filled_notional)
+    except (TypeError, ValueError):
+        exec_depth = None
+
+    return (vwap, fill_pct, exec_depth, walk.insufficient_reason)
 
 
 def _resolve_wallet_score(

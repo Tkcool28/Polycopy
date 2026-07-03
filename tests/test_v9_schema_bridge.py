@@ -53,7 +53,9 @@ def test_v9_to_v10_migration_succeeds_on_v9_db(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1  # 9
+    # SCHEMA_VERSION bumped past v11; pre-state for the v9→v10
+    # test is v9, so we stop at v9.
+    pre_version = 9
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)
@@ -91,7 +93,9 @@ def test_existing_rows_preserved_through_bridge(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    pre_version = SCHEMA_VERSION - 1
+    # SCHEMA_VERSION bumped past v11; pre-state is v8 (per the
+    # test description).
+    pre_version = 8
     for version in range(1, pre_version + 1):
         for stmt in MIGRATIONS[version]:
             conn.execute(stmt)
