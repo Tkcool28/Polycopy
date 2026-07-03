@@ -1645,7 +1645,7 @@ class TestExitExperimentTiming:
         row = db.conn.execute(
             "SELECT registered_at, scheduled_at FROM "
             "exit_experiment_registrations WHERE paper_signal_id=? "
-            "AND experiment_type='exit_24h'",
+            "AND experiment_type='EXIT_24H'",
             (ps_id,),
         ).fetchone()
         if row is None:
@@ -1686,7 +1686,7 @@ class TestExitExperimentTiming:
         row = db.conn.execute(
             "SELECT registered_at, scheduled_at FROM "
             "exit_experiment_registrations WHERE paper_signal_id=? "
-            "AND experiment_type='exit_72h'",
+            "AND experiment_type='EXIT_72H'",
             (ps_id,),
         ).fetchone()
         if row is None:
