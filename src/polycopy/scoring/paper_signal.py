@@ -1323,13 +1323,13 @@ def _persist_incomplete_signal(
         db,
         candidate_id,
         inputs.wallet_id or "",
-        "INCOMPLETE",
+        "incomplete",  # canonical lowercase V1 verdict (SignalVerdict.INCOMPLETE.value)
         reason,
         float(wallet_score.score) if wallet_score is not None else 0.0,
         0.0,
         0.0,
         None,
-        "INCOMPLETE",
+        "incomplete",  # canonical lowercase V1 verdict
         snap_ts,
         inputs.source_trade_id,
         inputs.snapshot_id,

@@ -470,6 +470,24 @@ def persist_wallet_score_v1(
     UNIQUE(wallet_id, formula_name, formula_version, idempotency_key)
     The fallback lookup uses all four columns to find the existing row.
     """
+    # ---- Application-level validation (mirrors schema CHECKs) -------
+    inp = _wallet_input(result)
+    from polycopy.scoring.persistence_validation import validate_wallet_row
+    validate_wallet_row(
+        final_score=result.score,
+        verdict=result.verdict,
+        trade_count=inp.trade_count,
+        category_trade_count=inp.category_trade_count,
+        category_distinct_markets=inp.category_distinct_markets,
+        overall_trade_count=inp.overall_trade_count,
+        resolved_markets=inp.resolved_markets,
+        active_trading_days=inp.active_trading_days,
+        distinct_events=inp.distinct_events,
+        category_resolved_markets=inp.category_resolved_markets,
+        category_distinct_events=inp.category_distinct_events,
+        category_active_days=inp.category_active_days,
+    )
+
     if idempotency_key is None:
         idempotency_key = generate_idempotency_key(
             formula_name="wallet_score",
@@ -478,7 +496,6 @@ def persist_wallet_score_v1(
             source_data_timestamp=source_data_timestamp,
         )
 
-    inp = _wallet_input(result)
     now = datetime.now(timezone.utc).isoformat()
 
     return _insert_or_ignore_returning_id(
@@ -581,6 +598,20 @@ def persist_category_score_v1(
         )
 
     inp = _category_input(result)
+    # ---- Application-level validation (mirrors schema CHECKs) -------
+    from polycopy.scoring.persistence_validation import validate_category_row
+    validate_category_row(
+        final_score=result.score,
+        verdict=result.verdict,
+        trade_count=inp.trade_count,
+        category_trade_count=inp.category_trade_count,
+        category_distinct_markets=inp.category_distinct_markets,
+        overall_trade_count=inp.overall_trade_count,
+        category_resolved_markets=inp.category_resolved_markets,
+        category_distinct_events=inp.category_distinct_events,
+        category_active_days=inp.category_active_days,
+    )
+
     now = datetime.now(timezone.utc).isoformat()
 
     return _insert_or_ignore_returning_id(
@@ -683,6 +714,21 @@ def persist_trade_score_v1(
         )
 
     inp = _trade_input(result)
+    # ---- Application-level validation (mirrors schema CHECKs) -------
+    from polycopy.scoring.persistence_validation import validate_trade_row
+    validate_trade_row(
+        final_score=result.score,
+        verdict=result.verdict,
+        intended_stake=inp.intended_stake,
+        executable_depth=inp.executable_depth,
+        fill_percentage=inp.fill_percentage,
+        trade_age_seconds=inp.trade_age_seconds,
+        seconds_to_market_end=inp.seconds_to_market_end,
+        market_active=inp.market_active,
+        market_closed=inp.market_closed,
+        market_resolved=inp.market_resolved,
+    )
+
     now = datetime.now(timezone.utc).isoformat()
 
     # Depth-walk audit evidence (Phase 7 + Phase 9). Every value
@@ -881,6 +927,26 @@ def persist_shadow_score_v2(
     missing_forward_reasons_json = json.dumps(
         list(getattr(result, "missing_forward_reasons", []) or []),
         sort_keys=True,
+    )
+
+    # ---- Application-level validation (mirrors schema CHECKs) -------
+    from polycopy.scoring.persistence_validation import validate_shadow_row
+    # Resolve delay_seconds from the typed input when present.
+    typed_in = getattr(result, "input", None)
+    if typed_in is not None:
+        ds_attr = getattr(typed_in, "delay_scenario_seconds", None)
+        delay_seconds_val = ds_attr() if callable(ds_attr) else ds_attr
+    else:
+        delay_seconds_val = getattr(result, "delay_seconds", None)
+    validate_shadow_row(
+        final_score=result.score,
+        verdict=result.verdict,
+        delay_scenario=delay_scenario_str,
+        delay_seconds=delay_seconds_val,
+        fill_percentage=fill_percentage,
+        measured_delay_seconds=measured_delay_seconds,
+        copied_trade_count=getattr(result, "copied_trade_count", None),
+        days_since_last_trade=getattr(result, "days_since_last_trade", None),
     )
 
     return _insert_or_ignore_returning_id(
@@ -1089,6 +1155,19 @@ def persist_paper_signal(
             else SAFETY_REASON_AUTO_APPROVE_REJECTED
         )
 
+    # ---- Application-level validation (mirrors schema CHECKs) -------
+    from polycopy.scoring.persistence_validation import validate_paper_signal_row
+    validate_paper_signal_row(
+        signal_family=signal_family,
+        wallet_score=wallet_score,
+        trade_score=trade_score,
+        shadow_score=shadow_score,
+        shadow_verdict=shadow_verdict,
+        final_verdict=final_verdict,
+        is_approved=0,  # PR 4 always-0 invariant; explicit for clarity.
+        auto_approve_requested=auto_approve_attempted,
+    )
+
     # ---- Identity derivation ----------------------------------------------
     # When the typed input is present, the identity MUST include the
     # decision ids, the intended stake, the category label, the
@@ -1233,6 +1312,10 @@ def record_exit_experiments(
         ExitTrack,
         compute_scheduled_at,
     )
+
+    # ---- Application-level validation (mirrors schema CHECKs) -------
+    from polycopy.scoring.persistence_validation import validate_exit_track_batch
+    validate_exit_track_batch(CANONICAL_EXIT_TRACKS)
 
     now = datetime.now(timezone.utc)
     registered_ids: list[int] = []
