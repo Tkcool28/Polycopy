@@ -214,14 +214,72 @@ class TestRunScan:
         assert len(rows) > 0
 
     @pytest.mark.asyncio
-    async def test_scan_persists_signals(self, db: Database, settings: Settings) -> None:
-        """Scan generates signals for high-volume markets."""
+    async def test_scan_does_not_generate_legacy_price_volume_signals(
+        self, db: Database, settings: Settings
+    ) -> None:
+        """Scan must NOT create legacy price/volume signals.
+
+        The historical ``_generate_signals`` stub was replaced by the
+        PR 4 Chunk 4 paper-signal pipeline (Step 7's
+        ``_evaluate_paper_signals_step``). The stub returns ``[]`` and
+        performs no side effects; the live pipeline requires the full
+        persisted-evidence chain (copy_candidate, source_trade, wallet
+        score decision, category decision, price snapshot, persisted
+        depth, behavior evidence) before it can write a
+        ``paper_signal_decisions`` row.
+
+        This test proves the new contract end-to-end on a sample DB
+        that intentionally provides NONE of the required evidence:
+
+          * the legacy ``signals`` table remains empty;
+          * no ``paper_signal_decisions`` row is written (would be
+            ``incomplete`` if it were, because the candidate chain is
+            absent);
+          * no ``orders`` are created;
+          * no ``positions`` are created;
+          * the scan completes cleanly and records an experiment run.
+
+        The full positive PR 4 contract — including a happy-path
+        ``copy_candidate`` paper signal — is exercised by
+        ``tests/test_p04_full_contract.py`` and the Chunk 6 contract
+        suite; this test only pins the negative path here.
+        """
         from scripts.run_scan import run_scan
+
+        orders_before = db.fetchall("SELECT id FROM orders")
+        positions_before = db.fetchall("SELECT id FROM positions")
+        assert len(orders_before) == 0
+        assert len(positions_before) == 0
 
         await run_scan(db=db, settings=settings, use_sample=True)
 
-        rows = db.fetchall("SELECT * FROM signals")
-        assert len(rows) > 0
+        # Legacy signals must NOT be created from price/volume alone.
+        legacy_signals = db.fetchall("SELECT * FROM signals")
+        assert legacy_signals == [], (
+            "scan created legacy signals from price/volume alone; "
+            "_generate_signals must remain inactive"
+        )
+
+        # With no copy_candidates / source_trades / depth, the new
+        # pipeline has nothing to evaluate. The PR 4 contract guarantees
+        # no paper-signal row is written when the candidate chain is
+        # absent (Step 7 short-circuits on empty copy_candidates).
+        paper_signals = db.fetchall("SELECT * FROM paper_signal_decisions")
+        assert paper_signals == [], (
+            "scan wrote a paper_signal_decisions row without the "
+            "required persisted-evidence chain"
+        )
+
+        # No execution side-effects.
+        orders_after = db.fetchall("SELECT id FROM orders")
+        positions_after = db.fetchall("SELECT id FROM positions")
+        assert len(orders_after) == 0
+        assert len(positions_after) == 0
+
+        # The scan completed cleanly and recorded an experiment run.
+        row = db.fetchone("SELECT * FROM experiment_runs LIMIT 1")
+        assert row is not None
+        assert row["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_live_market_fetch_failure_does_not_use_sample(
