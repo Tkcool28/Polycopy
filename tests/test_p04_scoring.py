@@ -400,7 +400,8 @@ class TestTradeScoreV1HoldingPeriods:
             market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
-        assert hp_comp.raw_score == 75.0
+        # Frozen spec: 15m to <6h → experimental → score 40.
+        assert hp_comp.raw_score == 40.0
 
     def test_preferred_6h_to_14d(self):
         result = compute_trade_score_v1(
@@ -415,7 +416,8 @@ class TestTradeScoreV1HoldingPeriods:
             market_active=True,
         )
         hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
-        assert hp_comp.raw_score == 100.0
+        # Frozen spec: 6h to <1d → allowed → score 75.
+        assert hp_comp.raw_score == 75.0
 
     def test_long_allowed_15d_to_21d(self):
         result = compute_trade_score_v1(
@@ -920,3 +922,161 @@ class TestFillFeasibilityMath:
     def test_fill_never_exceeds_100(self):
         # depth = 10x stake → 100% fillable, NOT 1000
         assert self._fill_score(intended_stake=10.0, executable_depth=100.0) == 100.0
+
+
+class TestTradeScoreV1HoldingPeriodBoundaries:
+    """Phase 4.B: exhaustive boundary tests for the holding-period buckets.
+
+    Encodes the frozen PR 4 spec at every spec-required boundary using
+    exact seconds (NOT rounded day labels, so the 14d/15d and 21d/22d
+    transitions are unambiguous).
+
+    Frozen buckets (authoritative):
+
+        < 15 min              → excluded   (0)
+        15m - <6h             → experimental (40)
+        6h  - <1d             → allowed    (75)
+        1d  - 14d             → preferred  (100)
+        >14d - 21d            → allowed    (80)
+        >21d - 45d            → penalized  (40)
+        > 45d                 → excluded   (0)
+        unknown               → INCOMPLETE (0, missing_essentials)
+    """
+
+    def _hp(self, seconds):
+        from polycopy.scoring.trade_score_v1 import compute_trade_score_v1
+        result = compute_trade_score_v1(
+            wallet_id="w", source_trade_id="t",
+            side="BUY",
+            intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=seconds,
+            market_active=True,
+        )
+        comp = next(
+            (c for c in result.components if c.name == "holding_period_quality"),
+            None,
+        )
+        assert comp is not None, "holding_period_quality component missing"
+        return comp
+
+    # --- < 15 minutes: excluded ---
+    def test_14m59s_excluded_zero(self):
+        c = self._hp(14 * 60 + 59)
+        assert c.raw_score == 0.0
+        assert "duration_excluded_short" in c.note
+
+    def test_0s_excluded_zero(self):
+        c = self._hp(0)
+        assert c.raw_score == 0.0
+
+    def test_15m00s_experimental_40(self):
+        c = self._hp(15 * 60)
+        assert c.raw_score == 40.0
+        assert "duration_experimental" in c.note
+
+    # --- 15m to <6h: experimental (40) ---
+    def test_5h59m59s_experimental_40(self):
+        c = self._hp(5 * 3600 + 3599)
+        assert c.raw_score == 40.0
+        assert "duration_experimental" in c.note
+
+    def test_6h00m00s_allowed_75(self):
+        c = self._hp(6 * 3600)
+        assert c.raw_score == 75.0
+        assert "duration_short_preferred" in c.note
+
+    # --- 6h to <1d: allowed (75) ---
+    def test_23h59m59s_allowed_75(self):
+        c = self._hp(23 * 3600 + 3599)
+        assert c.raw_score == 75.0
+        assert "duration_short_preferred" in c.note
+
+    def test_1d00h00m00s_preferred_100(self):
+        # 1d boundary now falls into the 1d-14d bucket (preferred),
+        # not the 6h-1d bucket, because the 6h-1d bucket is strictly
+        # < 1d.
+        c = self._hp(24 * 3600)
+        assert c.raw_score == 100.0
+        assert "duration_preferred" in c.note
+
+    # --- 1d to 14d: preferred (100) ---
+    def test_14d00h00m00s_preferred_100(self):
+        c = self._hp(14 * 24 * 3600)
+        assert c.raw_score == 100.0
+        assert "duration_preferred" in c.note
+
+    # --- >14d to 21d: allowed (80). Test both sides of 14d/15d. ---
+    def test_14d00h00m01s_long_allowed_80(self):
+        # One second past 14d → 80 (not 100)
+        c = self._hp(14 * 24 * 3600 + 1)
+        assert c.raw_score == 80.0
+        assert "duration_long_allowed" in c.note
+
+    def test_15d_long_allowed_80(self):
+        c = self._hp(15 * 24 * 3600)
+        assert c.raw_score == 80.0
+        assert "duration_long_allowed" in c.note
+
+    def test_21d00h00m00s_long_allowed_80(self):
+        c = self._hp(21 * 24 * 3600)
+        assert c.raw_score == 80.0
+        assert "duration_long_allowed" in c.note
+
+    # --- >21d to 45d: penalized (40). Test both sides of 21d/22d. ---
+    def test_21d00h00m01s_penalized_40(self):
+        # One second past 21d → 40 (not 80)
+        c = self._hp(21 * 24 * 3600 + 1)
+        assert c.raw_score == 40.0
+        assert "duration_penalized" in c.note
+
+    def test_22d_penalized_40(self):
+        c = self._hp(22 * 24 * 3600)
+        assert c.raw_score == 40.0
+        assert "duration_penalized" in c.note
+
+    def test_45d00h00m00s_penalized_40(self):
+        c = self._hp(45 * 24 * 3600)
+        assert c.raw_score == 40.0
+        assert "duration_penalized" in c.note
+
+    def test_45d00h00m01s_excluded_long_zero(self):
+        # One second past 45d → excluded (0)
+        c = self._hp(45 * 24 * 3600 + 1)
+        assert c.raw_score == 0.0
+        assert "duration_excluded_long" in c.note
+
+    def test_60d_excluded_long_zero(self):
+        c = self._hp(60 * 24 * 3600)
+        assert c.raw_score == 0.0
+        assert "duration_excluded_long" in c.note
+
+    # --- unknown → INCOMPLETE upstream ---
+    def test_unknown_seconds_yields_incomplete(self):
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        result = compute_trade_score_v1(
+            wallet_id="w", source_trade_id="t",
+            side="BUY",
+            intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            # no seconds_to_market_end
+            market_active=True,
+        )
+        assert result.verdict == TradeVerdict.INCOMPLETE
+        assert "seconds_to_market_end" in result.missing_essentials
+
+    def test_negative_seconds_yields_incomplete(self):
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        result = compute_trade_score_v1(
+            wallet_id="w", source_trade_id="t",
+            side="BUY",
+            intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=-1,
+            market_active=True,
+        )
+        assert result.verdict == TradeVerdict.INCOMPLETE

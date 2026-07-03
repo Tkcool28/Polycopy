@@ -247,16 +247,31 @@ def _trade_freshness_component(
 def _holding_period_component(
     seconds_to_market_end: Optional[float],
 ) -> tuple[float, str, str]:
-    """Score based on market duration remaining.
+    """Frozen holding-period bucket scoring (Phase 4.B).
 
-    Duration rules:
-    - Under 15 min: excluded (0 score)
-    - 15 min - 6h: experimental (score 75)
-    - 6h - 1d: allowed (score 100)
-    - 1d - 14d: preferred (score 100)
-    - 15d - 21d: allowed (score 80)
-    - 22d - 45d: penalized (score 40)
-    - Over 45d: excluded (0 score)
+    Authoritative values (from the PR 4 spec, NOT pre-existing code/tests):
+
+        < 15 minutes                              → excluded (0)
+        15 minutes <= t < 6 hours                → experimental (40)
+        6 hours   <= t < 1 day                   → allowed (75)
+        1 day     <= t <= 14 days                → preferred (100)
+        14 days   <  t <= 21 days                → allowed (80)
+        21 days   <  t <= 45 days                → penalized (40)
+        t > 45 days                              → excluded (0)
+        t is None or negative                    → unknown (0, INCOMPLETE upstream)
+
+    Boundary semantics (exact seconds):
+
+        14m59s          → excluded (0)
+        15m00s          → 40
+        5h59m59s        → 40
+        6h00m00s        → 75
+        23h59m59s       → 75
+        1d00h00m00s     → 100
+        14d00h00m00s    → 100
+        (14d, 21d]      → 80
+        (21d, 45d]      → 40
+        > 45d           → excluded (0)
     """
     if seconds_to_market_end is None or seconds_to_market_end < 0:
         return 0.0, "unknown", "invalid or missing seconds_to_market_end"
@@ -264,30 +279,38 @@ def _holding_period_component(
     age_days = seconds_to_market_end / (24 * 3600)
 
     if seconds_to_market_end < DURATION_EXCLUDED_SHORT:
-        # Under 15 minutes: excluded
-        return 0.0, "observed", f"duration_excluded_short={age_days:.4f}d (< 15min)"
+        # < 15 minutes: excluded
+        return 0.0, "observed", \
+            f"duration_excluded_short={age_days:.4f}d (< 15min)"
 
     if seconds_to_market_end < DURATION_PREFERRED_MIN:
-        # 15 min to under 6 hours: experimental only
-        return 75.0, "observed", f"duration_experimental={age_days:.4f}d (15min-6h)"
+        # 15 minutes to under 6 hours: experimental (frozen score 40)
+        return 40.0, "observed", \
+            f"duration_experimental={age_days:.4f}d (15min-6h)"
 
-    if seconds_to_market_end <= DURATION_MAX:
-        return 100.0, "observed", f"duration_short_preferred={age_days:.4f}d (6h-1d)"
+    if seconds_to_market_end < DURATION_MAX:
+        # 6 hours to under 1 day: allowed (frozen score 75)
+        return 75.0, "observed", \
+            f"duration_short_preferred={age_days:.4f}d (6h-1d)"
 
     if seconds_to_market_end <= 14 * 24 * 3600:
-        # 1d to 14 days: preferred
-        return 100.0, "observed", f"duration_preferred={age_days:.4f}d (1d-14d)"
+        # 1 day to 14 days: preferred (frozen score 100)
+        return 100.0, "observed", \
+            f"duration_preferred={age_days:.4f}d (1d-14d)"
 
     if seconds_to_market_end <= 21 * 24 * 3600:
-        # 15-21 days: allowed with penalty
-        return 80.0, "observed", f"duration_long_allowed={age_days:.4f}d (15d-21d)"
+        # > 14 days and up to 21 days: allowed (frozen score 80)
+        return 80.0, "observed", \
+            f"duration_long_allowed={age_days:.4f}d (>14d-21d)"
 
     if seconds_to_market_end <= DURATION_PENALIZED_MAX:
-        # 22-45 days: penalized
-        return 40.0, "observed", f"duration_penalized={age_days:.4f}d (22d-45d)"
+        # > 21 days and up to 45 days: penalized (frozen score 40)
+        return 40.0, "observed", \
+            f"duration_penalized={age_days:.4f}d (>21d-45d)"
 
-    # Over 45 days: excluded
-    return 0.0, "observed", f"duration_excluded_long={age_days:.4f}d (>45d)"
+    # > 45 days: excluded
+    return 0.0, "observed", \
+        f"duration_excluded_long={age_days:.4f}d (>45d)"
 
 
 def _market_resolution_component(
@@ -471,7 +494,9 @@ def compute_trade_score_v1(
         missing_essentials.append("spread")
     if input.trade_age_seconds is None:
         missing_essentials.append("trade_age_seconds")
-    if input.seconds_to_market_end is None:
+    # Phase 4.B/C: seconds_to_market_end is essential; None OR negative
+    # is "unknown" per the spec and must produce INCOMPLETE.
+    if input.seconds_to_market_end is None or input.seconds_to_market_end < 0:
         missing_essentials.append("seconds_to_market_end")
     if input.market_active is None:
         missing_essentials.append("market_active")
