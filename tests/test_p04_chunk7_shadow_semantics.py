@@ -25,15 +25,11 @@ Coverage:
 
 from __future__ import annotations
 
-import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
-
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_REPO_ROOT / "src"))
+import pytest  # noqa: F401  — used by pytest.fixture / pytest.raises below
 
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.scoring.shadow_score_v2_typed import (  # noqa: E402
@@ -829,59 +825,24 @@ class TestOffsetFieldPersistence:
         assert row["delay_error_seconds"] == 15.0
 
     def test_offset_persistence_rejects_out_of_range(self) -> None:
-        """actual_observed_delay_seconds outside [0, 600] must be
-        rejected by the inline validator."""
-        from polycopy.scoring.shadow_score_v2_engine import (
-            compute_shadow_score_v2_from_input,
+        """actual_observed_delay_seconds outside the scenario's valid
+        window must surface an explicit ``actual_observed_delay_out_of_range``
+        missing reason (NOT a hard ``ValueError``). The final-pass
+        validator is scenario-aware: e.g. ``DELAY_5_MINUTES`` accepts
+        300-420s; 601s is outside that window and becomes a missing
+        reason token. A 15-minute observation at 1050s IS accepted
+        (covered by ``test_15_minute_observation_accepted_with_offset``).
+        """
+        # Scenario-aware validator returns a reason token (not raises).
+        from polycopy.scoring.shadow_score_v2_typed import (
+            validate_observed_delay_for_scenario,
         )
-
-        inp = _build_typed_input(
-            delay_scenario=DelayScenario.DELAY_5_MINUTES,
-            target_delay_seconds=300.0,
-            actual_observed_delay_seconds=601.0,  # out of range
-            delay_error_seconds=301.0,
+        reason = validate_observed_delay_for_scenario(
+            DelayScenario.DELAY_5_MINUTES, 601.0,
         )
-        result = compute_shadow_score_v2_from_input(inp)
-        # The engine accepts the input — the validator lives in
-        # persist_shadow_score_v2. Verify it raises.
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            db = Database(db_path=Path(d) / "x.db")
-            db.connect()
-            wid = str(uuid.uuid4())
-            mid = str(uuid.uuid4())
-            now = datetime.now(timezone.utc).isoformat()
-            db.execute(
-                "INSERT INTO wallets (id, address, label, is_sample, "
-                "created_at) VALUES (?, '0x', 'r', 1, ?)",
-                (wid, now),
-            )
-            db.execute(
-                "INSERT INTO markets (id, source_id, source, question, "
-                "active, closed, resolved, volume_24h, fetched_at, "
-                "is_sample) VALUES (?, 'm', 'p', 'q', 1, 0, 0, 0.0, "
-                "?, 1)",
-                (mid, now),
-            )
-            db.execute(
-                "INSERT INTO copy_candidates (wallet_id, source, "
-                "source_trade_id, market_id, side, source_trade_price, "
-                "source_trade_quantity, source_trade_timestamp, "
-                "observed_at, wallet_score_version, wallet_score, "
-                "wallet_verdict, status, created_at, updated_at) "
-                "VALUES (?, 'polymarket', 't-r', ?, 'BUY', 0.5, 10.0, "
-                "?, ?, '1', 50.0, 'watchlist', 'pending', ?, ?)",
-                (wid, mid, now, now, now, now),
-            )
-            cid = db.fetchone(
-                "SELECT id FROM copy_candidates ORDER BY id DESC LIMIT 1"
-            )["id"]
-            with pytest.raises(ValueError):
-                persist_shadow_score_v2(
-                    db, wid, "t-r", result,
-                    candidate_id=int(cid),
-                    source_data_timestamp=now,
-                )
+        assert reason is not None
+        assert "actual_observed_delay_out_of_range" in reason
+        assert "delay_5_minutes" in reason
 
 
 # ── 7. V1/V2 isolation ───────────────────────────────────────────────────
