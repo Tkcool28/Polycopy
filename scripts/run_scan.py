@@ -310,6 +310,24 @@ async def run_scan(
 
     now = datetime.now(timezone.utc)
 
+    # PR 19 — sys.path bootstrap. The bounded-Step-5 helper is
+    # imported as ``from scripts.scan_pipeline_wiring import ...``,
+    # which requires the ``scripts`` PACKAGE'S PARENT directory
+    # (the repo root) to be on sys.path, not ``scripts/`` itself.
+    # The module-level setup at lines 33/62 only adds ``src`` and
+    # ``scripts/`` to sys.path; under ``systemd`` the cwd is set
+    # by ``WorkingDirectory`` which adds the cwd to sys.path[0] as
+    # the empty string. That normally makes the package import
+    # work, but if anything that runs BEFORE this function
+    # exhaustively rebuilds sys.path (eg. a vendored ``site``
+    # shim from another ``scripts/`` sibling) the cwd can be
+    # stripped — making ``from scripts.X import Y`` fail at
+    # runtime. Guarding with an explicit insert is cheap and
+    # makes the deploy path independent of side-channel state.
+    _repo_root = Path(__file__).resolve().parent.parent
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+
     # ── Step 1: Load existing wallets from DB ──────────────────────────────
     logger.info("Step 1: Loading existing wallets from database...")
     # Defensive: filter sentinel / empty / whitespace-only addresses in
