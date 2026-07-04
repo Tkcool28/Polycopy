@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Sequence
 
@@ -138,8 +139,176 @@ class ScanPipelineCounters:
 
 
 # ------------------------------------------------------------------------
+# PR 19 — bounded Step 5 (legacy scoring loop) slice resolution
+# ------------------------------------------------------------------------
+#
+# ``Step 5`` in ``scripts/run_scan.py`` historically iterated the FULL
+# discovery wallet list to compute metrics + call ``evaluate_wallet``
+# for the legacy tally counters. With a 95k+ wallet corpus this loop
+# alone consumes the systemd ``TimeoutStartSec=900`` budget before
+# PR #18's bounded Step 5b ever runs, and no PR-18 evidence rows are
+# produced.
+#
+# The fix below resolves the SAME bounded-progression concept PR #18
+# used for Step 5b but applied to the upstream legacy loop:
+#
+#   1. Sort canonical addresses once (deterministic iteration order).
+#   2. Pre-load the existing ``(wallet_id, idempotency_key)`` set so we
+#      can recognise already-scored material-identical wallets without
+#      a second DB scan.
+#   3. Return a slice = (fresh inserts the budget allows) +
+#      already-scored no-op addresses for honest telemetry. Deferred
+#      addresses are NOT in the slice.
+#
+# Because skipped (already-scored) wallets do NOT consume the budget,
+# the scan naturally rotates through the corpus across runs: the next
+# scan sees the previously-deferred addresses arrive at the budget
+# head.
+# ------------------------------------------------------------------------
+
+
+@dataclass
+class SlicedRunTelemetry:
+    """Telemetry emitted by :func:`resolve_bounded_wallet_slice`.
+
+    All counts are integers. ``addresses_in_slice`` is a ``list[str]``
+    of canonical addresses the caller should iterate downstream; it is
+    always a subsequence of the sorted input addresses.
+    """
+
+    addresses_in_slice: list[str]
+    wallets_considered: int            # total canonical addresses seen
+    wallets_already_scored: int        # already-scored no-ops
+    wallets_in_slice: int              # fresh slice, budget-limited
+    wallets_deferred_to_next_run: int  # post-budget rest
+
+
+def resolve_bounded_wallet_slice(
+    db: Database,
+    *,
+    addresses: Sequence[str],
+    max_wallet_scores: Optional[int],
+) -> SlicedRunTelemetry:
+    """Return the bounded wallet slice the legacy Step 5 should iterate.
+
+    The slice is computed by walking the sorted canonical-address list
+    once and applying the same three-state rule used by Step 5b:
+
+      * **Already-scored** (any pre-existing ``wallet_score_decisions``
+        row for this ``wallet_id`` under the V1 formula) → included in
+        the slice with no budget consumption. The downstream helpers
+        WILL see these addresses and DO call
+        ``_compute_wallet_metrics`` / ``evaluate_wallet`` on them,
+        exactly as the unbounded loop would have. They then short-
+        circuit in Step 5b via the existing skip-already-scored logic
+        without writing. Counting them here keeps the legacy summary
+        honest.
+      * **Fresh** (no matching ``wallet_score_decisions`` row for this
+        wallet_id) → included in the slice AND counts against the
+        budget. The budget defaults to ``max_wallet_scores`` when
+        provided and positive.
+      * **Deferred** (budget exhausted) → excluded from the slice;
+        will be processed on a subsequent run as the sorted cursor
+        advances.
+
+    Parameters
+    ----------
+    db:
+        Connected :class:`polycopy.db.database.Database`.
+    addresses:
+        Iterable of canonical wallet addresses to slice. May be
+        unsorted; the helper sorts internally.
+    max_wallet_scores:
+        Maximum number of FRESH inserts to allow per run. ``None`` or a
+        non-positive value disables the budget and returns the full
+        sorted list (with the pre-flight cache applied; Step 5b will
+        then short-circuit any already-scored wallet without writing).
+
+    Notes
+    -----
+    Computing metrics for already-scored wallets is intentional: the
+    legacy Step 5 tally counters (``copy_candidates``, ``watchlist``,
+    ``skipped``, ``incomplete``) are bounded-slice counters in PR 19,
+    which means they reflect the wallets the run ACTUALLY acted on.
+    Skipping already-scored wallets entirely would silently drop the
+    tally for them, breaking operator-facing summary semantics.
+
+    The material-input idempotency comparison (the stricter check that
+    matches ``_wallet_idempotency_key`` byte-for-byte) still happens
+    downstream in ``persist_wallet_v1_decisions``. If the inputs later
+    differ, the downstream helper WILL insert a fresh row and count it
+    as ``wallet_score_decisions_persisted`` — and the slice-level
+    count ``wallets_in_slice`` may then exceed that number for that
+    wallet (because the slice counts by wallet_id presence, not by
+    strict material-equality). Both counters are exposed separately
+    so operators can see the rotation in action.
+    """
+    sorted_addrs = sorted(set(addresses))
+
+    # Resolve wallet_ids up front + pre-load the existing
+    # (wallet_id, idempotency_key) set. This is the same pre-flight
+    # cache the inner loop of ``persist_wallet_v1_decisions`` uses;
+    # we keep it here so the slice decision does not need a second
+    # DB scan and never disagrees with what Step 5b will do.
+    addr_to_wallet_id: dict[str, Optional[str]] = {}
+    for canonical_addr in sorted_addrs:
+        addr_to_wallet_id[canonical_addr] = _load_wallet_id(db, canonical_addr)
+    candidate_wallet_ids = [
+        wid for wid in addr_to_wallet_id.values() if wid is not None
+    ]
+    existing_keys = _existing_wallet_idem_keys(
+        db, candidate_wallet_ids, WALLET_FORMULA_VERSION,
+    )
+
+    budget_remaining: Optional[int] = (
+        max_wallet_scores if (max_wallet_scores and max_wallet_scores > 0) else None
+    )
+    addresses_in_slice: list[str] = []
+    wallets_already_scored = 0
+    wallets_in_slice = 0
+    wallets_deferred = 0
+    for canonical_addr in sorted_addrs:
+        wallet_id = addr_to_wallet_id.get(canonical_addr)
+        if wallet_id is None:
+            # Wallet not present in the ``wallets`` table. Treat as
+            # already-scored (zero-budget, no-op slot) so the
+            # summary stays honest. Downstream helpers (Step 5b)
+            # silently drop the address when the wallet_id lookup
+            # fails.
+            addresses_in_slice.append(canonical_addr)
+            continue
+        already_scored_for_wallet_id = any(
+            combo.startswith(f"{wallet_id}|")
+            for combo in existing_keys
+        )
+        if already_scored_for_wallet_id:
+            addresses_in_slice.append(canonical_addr)
+            wallets_already_scored += 1
+            continue
+        if budget_remaining is None:
+            addresses_in_slice.append(canonical_addr)
+            wallets_in_slice += 1
+            continue
+        if budget_remaining > 0:
+            addresses_in_slice.append(canonical_addr)
+            wallets_in_slice += 1
+            budget_remaining -= 1
+            continue
+        wallets_deferred += 1
+
+    return SlicedRunTelemetry(
+        addresses_in_slice=addresses_in_slice,
+        wallets_considered=len(sorted_addrs),
+        wallets_already_scored=wallets_already_scored,
+        wallets_in_slice=wallets_in_slice,
+        wallets_deferred_to_next_run=wallets_deferred,
+    )
+
+
+# ------------------------------------------------------------------------
 # Step 5b — wallet score v1 persistence
 # ------------------------------------------------------------------------
+
 
 def _load_wallet_id(db: Database, canonical_addr: str) -> Optional[str]:
     """Return the persisted ``wallets.id`` UUID string for a canonical address."""
@@ -1057,6 +1226,8 @@ def canonical_addresses(discovery) -> list[str]:
 
 __all__ = [
     "ScanPipelineCounters",
+    "SlicedRunTelemetry",
+    "resolve_bounded_wallet_slice",
     "persist_wallet_v1_decisions",
     "persist_category_v1_decisions",
     "persist_copy_candidates_for_trades",

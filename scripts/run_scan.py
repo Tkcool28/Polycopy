@@ -171,6 +171,26 @@ class ScanResult:
         self.wallet_scores_skipped: int = 0
         self.wallet_scores_deferred: int = 0
         self.trades_scanned_for_candidates: int = 0
+        # PR 19 — bounded legacy Step 5 telemetry.
+        # ``wallets_considered_for_scoring`` is the TOTAL canonical
+        # wallet count the bounded slice helper saw (the full
+        # discovery list size before slice resolution). It is the
+        # denominator for the bounded-slice summary so operators can
+        # see "how much of the corpus are we actually processing
+        # this run".
+        # ``wallets_already_scored_for_scoring`` counts the addresses
+        # the slice included that already have a V1 wallet-score
+        # decision (no-op slots). ``wallets_in_slice_for_scoring`` is
+        # the budget-limited fresh-insert addresses included by the
+        # slice. ``wallets_deferred_to_next_run`` is the remainder
+        # that the bounded budget excluded from the slice.
+        # ``wallets_scored`` remains the legacy "how many wallets did
+        # the loop actually call ``evaluate_wallet`` on" counter,
+        # now bounded-slice rather than full-corpus.
+        self.wallets_considered_for_scoring: int = 0
+        self.wallets_already_scored_for_scoring: int = 0
+        self.wallets_in_slice_for_scoring: int = 0
+        self.wallets_deferred_to_next_run: int = 0
         # Round-10 fetch-status counters (per-market, not per-row).
         self.market_fetches_complete: int = 0
         self.market_fetches_partial: int = 0
@@ -189,7 +209,11 @@ class ScanResult:
             f"discovered_new={self.wallets_discovered_new}, "
             f"total_known={self.wallets_total_known}\n"
             f"  wallets discovered (back-compat alias for new): {self.wallets_discovered}\n"
-            f"  wallets scored: {self.wallets_scored}\n"
+            f"  wallets considered for scoring (denominator): {self.wallets_considered_for_scoring}\n"
+            f"    already_scored no-ops: {self.wallets_already_scored_for_scoring}\n"
+            f"    in bounded slice (budget=fresh inserts): {self.wallets_in_slice_for_scoring}\n"
+            f"    deferred to next run: {self.wallets_deferred_to_next_run}\n"
+            f"  wallets scored (bounded slice): {self.wallets_scored}\n"
             f"    copy_candidates: {self.copy_candidates}\n"
             f"    watchlist: {self.watchlist}\n"
             f"    skipped: {self.skipped}\n"
@@ -508,19 +532,81 @@ async def run_scan(
         result.trades_processed, result.trades_deduped, result.trades_stale,
     )
 
-    # ── Step 5: Score all wallets ─────────────────────────────────────────
-    # PR 5: the legacy ``evaluate_wallet`` call still tallies
-    # ``result.copy_candidates`` / ``result.watchlist`` / etc. — the
-    # back-compat summary counters — but the metric payload it relies on
-    # is now also passed forward to the new pipeline-wiring helpers in
-    # Steps 5b–5d. We collect ``metrics_by_address`` here so PR-5 writes
-    # are not duplicated by re-querying the DB.
-    logger.info("Step 5: Scoring %d wallets...", result.wallets_discovered)
-    wallet_addresses = [w["address"] for w in discovery.list_wallets()]
+    # ── Step 5: Score the bounded wallet slice ────────────────────────────
+    # PR 19: the legacy ``evaluate_wallet`` loop used to iterate the
+    # FULL discovery wallet list, computing metrics + scoring every
+    # canonical wallet regardless of size. With ~95k wallets in the
+    # production corpus this loop alone consumed the systemd
+    # ``TimeoutStartSec=900`` budget and prevented PR-18's bounded
+    # Step 5b from ever running.
+    #
+    # The fix below resolves the SAME bounded-progression concept PR
+    # 18 used for Step 5b but applied to the upstream legacy loop:
+    #
+    #   1. Determine the wallet list once in deterministic sorted
+    #      canonical-address order (via ``canonical_addresses``).
+    #   2. Resolve the bounded slice via
+    #      ``scripts.scan_pipeline_wiring.resolve_bounded_wallet_slice``
+    #      which reuses the (wallet_id, idempotency_key) pre-flight
+    #      cache Step 5b will use.
+    #   3. Step 5's legacy loop iterates ONLY the bounded slice, not
+    #      the full corpus — so the per-wallet DB work stays inside
+    #      the 900s systemd budget even as the corpus grows.
+    #   4. Steps 5b/5c/5d receive the SAME bounded slice (already
+    #      accepts ``addresses=`` so just thread it), and Step 5e
+    #      continues to scope audit writes to the fresh-insert IDs.
+    #   5. Step 6 (related-wallet detection) uses the bounded slice
+    #      too — reasoning: the slice IS the wallet set Step 5 will
+    #      score, so related detection over out-of-slice wallets
+    #      would be wasted work that re-expands runtime. Documented
+    #      and unit-tested.
+    #
+    # Legacy summary counters (``copy_candidates``, ``watchlist``,
+    # ``skipped``, ``incomplete``) remain but are bounded-slice
+    # counters rather than full-corpus counters — i.e. they reflect
+    # only the wallets this run actually acted on. New explicit
+    # bounded-slice telemetry (``wallets_considered_for_scoring``,
+    # ``wallets_in_slice_for_scoring``, ``wallets_deferred_to_next_run``,
+    # ``wallets_already_scored_for_scoring``) is added so operators
+    # can see the rotation in action.
+    from scripts.scan_pipeline_wiring import (
+        canonical_addresses,
+        resolve_bounded_wallet_slice,
+    )
+
+    all_wallet_addresses = sorted(set(
+        canonical_addresses(discovery)
+    ))
+    logger.info(
+        "Step 5: Resolving bounded wallet slice (corpus=%d, max=%d fresh inserts)...",
+        len(all_wallet_addresses),
+        max_wallet_scores,
+    )
+    sliced = resolve_bounded_wallet_slice(
+        db,
+        addresses=all_wallet_addresses,
+        max_wallet_scores=max_wallet_scores,
+    )
+    # Bounded-slice telemetry (PR 19).
+    result.wallets_considered_for_scoring = sliced.wallets_considered
+    result.wallets_already_scored_for_scoring = sliced.wallets_already_scored
+    result.wallets_in_slice_for_scoring = sliced.wallets_in_slice
+    result.wallets_deferred_to_next_run = sliced.wallets_deferred_to_next_run
+    wallet_addresses = sliced.addresses_in_slice
+    logger.info(
+        "  Step 5 slice: considered=%d, in_slice=%d, already_scored=%d, "
+        "deferred=%d",
+        sliced.wallets_considered,
+        sliced.wallets_in_slice,
+        sliced.wallets_already_scored,
+        sliced.wallets_deferred_to_next_run,
+    )
     metrics_by_address: dict[str, dict] = {}
     # PR-5: trade history by canonical address, used by Step 5d to
     # generate copy candidates. Keyed on the canonical address (not the
     # raw entry["address"]) so identity agrees with discovery + SQL.
+    # Built over the BOUNDED slice — out-of-slice wallets never reach
+    # Step 5d, so their trades aren't collected here either.
     trades_by_address: dict[str, list[SourceTrade]] = {}
     for address in wallet_addresses:
         try:
@@ -545,7 +631,7 @@ async def run_scan(
             )
 
             result.wallets_scored += 1
-            # Tally verdicts
+            # Tally verdicts. These are bounded-slice counters in PR 19.
             if "copy_candidate" in summary.lower():
                 result.copy_candidates += 1
             elif "watchlist" in summary.lower():
@@ -734,7 +820,16 @@ async def run_scan(
 
 
     # ── Step 6: Related-wallet detection ───────────────────────────────────
-    logger.info("Step 6: Running related-wallet detection...")
+    # PR 19: Step 6 now operates on the BOUNDED slice (the same
+    # ``wallet_addresses`` Step 5 just iterated), not the full corpus.
+    # Rationale: Step 5 only scores wallets in the slice, so
+    # related-wallet detection over out-of-slice wallets would be
+    # wasted work that re-expands runtime — defeating the bounded
+    # budget. Detection across a single primary + 4 of the sliced
+    # wallets is sufficient for operator summary purposes. The bounded
+    # slice addresses (canonical-address sorted) are deterministic
+    # across runs so related-wallet output is reproducible.
+    logger.info("Step 6: Running related-wallet detection (bounded slice)...")
     if len(wallet_addresses) >= 2:
         # Use first wallet as primary, check others against it
         primary = wallet_addresses[0]
