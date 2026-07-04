@@ -153,6 +153,11 @@ class ScanResult:
         self.copy_candidates_rejected_other: int = 0
         self.decision_verdicts_persisted: int = 0
         self.score_component_inputs_persisted: int = 0
+        # PR 20 — specialist-metric aggregation counters. New evidence
+        # table only; nothing in this PR feeds a scoring formula from
+        # these counters.
+        self.specialist_aggregations_written: int = 0
+        self.specialist_aggregations_skipped: int = 0
         # PR 5 — bounded-slice telemetry.
         # ``wallet_scores_processed`` is the count of wallets whose score
         # was computed + attempted this run (Steps 5b/5c/5d). The legacy
@@ -268,6 +273,12 @@ async def run_scan(
     max_trades_per_wallet: int = 3,
     max_wallet_scores: int = 50,
     enable_pr5_pipeline: bool = True,
+    # PR 20 — specialist-metric aggregation. Defaults to ``False``
+    # so existing tests that call ``run_scan`` without the new args
+    # continue to behave exactly as before. Production scans in PR
+    # 20+ enable this explicitly via the CLI flag.
+    enable_pr20_specialist_aggregations: bool = False,
+    max_specialist_aggregations: int = 50,
 ) -> ScanResult:
     """Execute the full scan pipeline.
 
@@ -869,6 +880,52 @@ async def run_scan(
             result.decision_verdicts_persisted,
             result.score_component_inputs_persisted,
         )
+
+        # PR 20 — Step 5f (optional): specialist-metric aggregation
+        # evidence. Operates on the EXACT same fresh-insert wallet
+        # set as Step 5b/5e so the PR 19 hard-cap invariant
+        # (``len(fresh_insert_wallet_ids) <= max_wallet_scores``)
+        # is preserved. Writes ONLY to the new
+        # ``wallet_specialist_aggregations`` evidence table — no
+        # scoring formula consumes it in this PR. Safe to re-run
+        # (idempotent via UNIQUE constraint).
+        if enable_pr20_specialist_aggregations:
+            try:
+                from scripts.specialist_aggregation_step import (
+                    compute_and_persist_wallet_specialist_aggregations,
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "Step 5f (specialist aggregations): import failed: %s", exc
+                )
+                compute_and_persist_wallet_specialist_aggregations = None  # type: ignore[assignment]
+
+            if compute_and_persist_wallet_specialist_aggregations is not None:
+                logger.info(
+                    "Step 5f: Persisting specialist-metric aggregations "
+                    "(scoped to %d fresh-insert wallets, budget=%d)...",
+                    len(fresh_insert_wallet_ids),
+                    max_specialist_aggregations,
+                )
+                sa_counters = compute_and_persist_wallet_specialist_aggregations(
+                    db,
+                    fresh_insert_wallet_ids=fresh_insert_wallet_ids,
+                    max_aggregations=max_specialist_aggregations,
+                    now=now,
+                )
+                result.specialist_aggregations_written = sa_counters[
+                    "rows_written"
+                ]
+                result.specialist_aggregations_skipped = sa_counters[
+                    "rows_skipped_idempotent"
+                ]
+                logger.info(
+                    "  specialist_aggregations: rows_written=%d "
+                    "rows_skipped_idempotent=%d errors=%d",
+                    result.specialist_aggregations_written,
+                    result.specialist_aggregations_skipped,
+                    sa_counters["errors"],
+                )
 
 
     # ── Step 6: Related-wallet detection ───────────────────────────────────
@@ -1665,6 +1722,23 @@ def main() -> int:
         help="Disable PR-5 pipeline writes (Steps 5b–5e). Test-only; "
         "production scans never set this.",
     )
+    parser.add_argument(
+        "--enable-pr20-specialist-aggregations",
+        action="store_true",
+        help="PR 20: enable Step 5f, the bounded specialist-metric "
+        "aggregation evidence table. Writes ONLY to "
+        "wallet_specialist_aggregations — no scoring formula "
+        "consumes it. Safe, idempotent, paper-only.",
+    )
+    parser.add_argument(
+        "--max-specialist-aggregations",
+        type=int,
+        default=50,
+        help="PR 20: cap on specialist-metric aggregation rows written "
+        "per scan run (Step 5f). Mirrors --max-wallet-scores. "
+        "Default 50; ignored when --enable-pr20-specialist-aggregations "
+        "is not set.",
+    )
     parser.add_argument("--db", type=str, default=None, help="SQLite database path")
     parser.add_argument("--use-sample", action="store_true", help="Use sample data instead of live API")
     parser.add_argument("--lock-timeout", type=float, default=10.0, help="Lock timeout seconds")
@@ -1689,6 +1763,12 @@ def main() -> int:
                     max_trades_per_wallet=args.max_trades_per_wallet,
                     max_wallet_scores=args.max_wallet_scores,
                     enable_pr5_pipeline=not args.no_pr5_pipeline,
+                    enable_pr20_specialist_aggregations=(
+                        args.enable_pr20_specialist_aggregations
+                    ),
+                    max_specialist_aggregations=(
+                        args.max_specialist_aggregations
+                    ),
                 ))
             finally:
                 db.close()
