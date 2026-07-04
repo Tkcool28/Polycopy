@@ -143,15 +143,49 @@ class DashboardRepository:
         # rows returned by the DB (in case the schema ever drifts).
         where = f" WHERE {_SENTINEL_FRAGMENT}"
         total = self._count("wallets", where, _SENTINEL_PARAMS)
+        # LEFT JOIN exactly ONE latest wallet_score_decisions per wallet. The
+        # correlated subquery picks the most recent decision by computed_at,
+        # with a deterministic tie-breaker chain (computed_at DESC,
+        # created_at DESC, id DESC) so that two rows with identical
+        # computed_at cannot duplicate the wallet or flip-flop between calls.
+        # read-only — we do not write or recompute scores here. Wallets
+        # without any decision row surface as final_score=NULL/verdict=NULL
+        # and the frontend renders them as "—" / INCOMPLETE. source_count
+        # continues to join performance_summaries.trade_count (or 0); we
+        # deliberately do NOT relabel it because performance_summaries has a
+        # different meaning (aggregated trade count) than
+        # wallet_score_decisions (per-wallet copy candidate evaluation).
         rows = self.db.fetchall(
             f"""
             SELECT w.id, w.address, w.label, w.is_sample,
                    COALESCE(ps.trade_count, 0) AS source_count,
-                   ps.total_pnl, ps.win_rate
+                   ps.total_pnl, ps.win_rate,
+                   latest.final_score AS score,
+                   latest.verdict AS score_verdict,
+                   latest.computed_at AS scored_at
               FROM wallets w
               LEFT JOIN performance_summaries ps ON ps.wallet_id = w.id
+              LEFT JOIN wallet_score_decisions latest
+                ON latest.id = (
+                    SELECT wsd2.id
+                      FROM wallet_score_decisions wsd2
+                     WHERE wsd2.wallet_id = w.id
+                     ORDER BY wsd2.computed_at DESC,
+                              wsd2.created_at DESC,
+                              wsd2.id DESC
+                     LIMIT 1
+                )
             {where}
-             ORDER BY w.created_at DESC, w.id
+             ORDER BY
+               -- Scored wallets come first (NULL final_score sorts to the end).
+               CASE WHEN latest.final_score IS NULL THEN 1 ELSE 0 END,
+               -- Within scored wallets, highest score first.
+               latest.final_score DESC,
+               -- Newest computed_at breaks ties on equal scores.
+               latest.computed_at DESC,
+               -- Wallet created_at DESC is the original stable fallback.
+               w.created_at DESC,
+               w.id
              LIMIT ? OFFSET ?
             """,
             _SENTINEL_PARAMS + (page.limit, page.offset),
@@ -159,18 +193,29 @@ class DashboardRepository:
         rows = [r for r in rows if not is_sentinel_trader_address(r["address"])]
         if total == 0 and self.demo_enabled:
             return ScanResponse(scans=self._sample_scans()[page.offset : page.offset + page.limit], total_count=1, is_sample_data=True)
-        scans = [
-            ScanResult(
-                address=row["address"],
-                label=self._label(row["label"], _is_sample(row)),
-                sources=["persisted"],
-                source_count=int(row["source_count"] or 0),
-                score=None,
-                verdict="INCOMPLETE" if row["total_pnl"] is None and row["win_rate"] is None else "persisted",
-                is_sample=_is_sample(row),
+        scans = []
+        for row in rows:
+            # Verdict precedence: if a wallet has a real wallet_score_decisions
+            # verdict, surface it verbatim. Otherwise fall back to the legacy
+            # derived verdict based on performance_summaries presence, and
+            # finally to INCOMPLETE if neither signal exists.
+            if row["score_verdict"] is not None:
+                verdict = str(row["score_verdict"])
+            elif row["total_pnl"] is None and row["win_rate"] is None:
+                verdict = "INCOMPLETE"
+            else:
+                verdict = "persisted"
+            scans.append(
+                ScanResult(
+                    address=row["address"],
+                    label=self._label(row["label"], _is_sample(row)),
+                    sources=["persisted"],
+                    source_count=int(row["source_count"] or 0),
+                    score=(float(row["score"]) if row["score"] is not None else None),
+                    verdict=verdict,
+                    is_sample=_is_sample(row),
+                )
             )
-            for row in rows
-        ]
         return ScanResponse(scans=scans, total_count=total, is_sample_data=any(s.is_sample for s in scans))
 
     def wallets(self, page: Page) -> WalletsResponse:
