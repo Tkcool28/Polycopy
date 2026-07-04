@@ -889,7 +889,47 @@ async def run_scan(
         # ``wallet_specialist_aggregations`` evidence table — no
         # scoring formula consumes it in this PR. Safe to re-run
         # (idempotent via UNIQUE constraint).
-        if enable_pr20_specialist_aggregations:
+        #
+        # Activation contract:
+        #   - Default is OFF so existing production scans behave
+        #     exactly as before (no new writes, no schema v13 reads).
+        #   - The single explicit switch is the
+        #     ``specialist_aggregations_enabled`` setting on
+        #     ``polycopy.config.settings.Settings`` (env prefix
+        #     ``POLYCOPY_``). Flipping this switch from False to
+        #     True — either via env var
+        #     ``POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true`` or by
+        #     editing the field default — is the **only** change
+        #     required to activate Step 5f.
+        #   - The ``enable_pr20_specialist_aggregations`` kwarg on
+        #     ``run_scan`` and the ``--enable-pr20-specialist-aggregations``
+        #     CLI flag remain as explicit overrides; they take
+        #     precedence over the Settings default when supplied.
+        #   - Activation does NOT enable live trading, does NOT add
+        #     a formula consumer, and does NOT touch
+        #     ``TimeoutStartSec``. Safety tests in
+        #     ``tests/test_pr20_specialist_metrics_persistence.py``
+        #     assert the paper-only invariant regardless of
+        #     activation state.
+        settings = get_settings()
+        config_enabled = bool(
+            getattr(settings, "specialist_aggregations_enabled", False)
+        )
+        # CLI / kwarg override beats config; default-False wins
+        # when neither is set.
+        effective_enabled = bool(
+            enable_pr20_specialist_aggregations or config_enabled
+        )
+        effective_cap = max_specialist_aggregations
+        if config_enabled and not enable_pr20_specialist_aggregations:
+            # When the config switch is the activation source, honor
+            # the config-defined cap unless the caller explicitly
+            # overrides it. The kwarg default of 50 mirrors the
+            # config default so the two paths agree.
+            effective_cap = int(
+                getattr(settings, "specialist_aggregations_max_rows_per_run", 50)
+            )
+        if effective_enabled:
             try:
                 from scripts.specialist_aggregation_step import (
                     compute_and_persist_wallet_specialist_aggregations,
@@ -901,16 +941,23 @@ async def run_scan(
                 compute_and_persist_wallet_specialist_aggregations = None  # type: ignore[assignment]
 
             if compute_and_persist_wallet_specialist_aggregations is not None:
+                activation_source = (
+                    "config" if config_enabled
+                    and not enable_pr20_specialist_aggregations
+                    else "cli_or_kwarg"
+                )
                 logger.info(
                     "Step 5f: Persisting specialist-metric aggregations "
-                    "(scoped to %d fresh-insert wallets, budget=%d)...",
+                    "(scoped to %d fresh-insert wallets, budget=%d, "
+                    "activation=%s)...",
                     len(fresh_insert_wallet_ids),
-                    max_specialist_aggregations,
+                    effective_cap,
+                    activation_source,
                 )
                 sa_counters = compute_and_persist_wallet_specialist_aggregations(
                     db,
                     fresh_insert_wallet_ids=fresh_insert_wallet_ids,
-                    max_aggregations=max_specialist_aggregations,
+                    max_aggregations=effective_cap,
                     now=now,
                 )
                 result.specialist_aggregations_written = sa_counters[

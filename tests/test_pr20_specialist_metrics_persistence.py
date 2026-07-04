@@ -431,6 +431,78 @@ class RunScanDefaultFlagTests(unittest.TestCase):
         self.assertEqual(sig.parameters["max_specialist_aggregations"].default, 50)
 
 
+class SingleLineActivationTests(unittest.TestCase):
+    """Verify the single explicit activation switch (the
+    ``specialist_aggregations_enabled`` setting on
+    ``polycopy.config.settings.Settings``) is the documented
+    one-line / one-word path to activate Step 5f.
+
+    Three properties:
+
+      1. Default OFF — no env var → flag is False.
+      2. Env var ``POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true``
+         flips it to True (the single activation line).
+      3. Explicit ``=false`` overrides the field default back to
+         False (so an operator can disable without code change).
+    """
+
+    def test_default_is_off(self):
+        # No env override — should pick up the field default of False.
+        import os
+        for k in (
+            "POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED",
+            "POLYCOPY_SPECIALIST_AGGREGATIONS_MAX_ROWS_PER_RUN",
+        ):
+            os.environ.pop(k, None)
+        from polycopy.config.settings import Settings
+        s = Settings()
+        self.assertFalse(s.specialist_aggregations_enabled)
+        self.assertEqual(s.specialist_aggregations_max_rows_per_run, 50)
+
+    def test_env_var_true_flips_to_on(self):
+        import os
+        os.environ["POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED"] = "true"
+        try:
+            from polycopy.config.settings import Settings
+            s = Settings()
+            self.assertTrue(
+                s.specialist_aggregations_enabled,
+                "POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true must enable Step 5f",
+            )
+        finally:
+            os.environ.pop("POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED", None)
+
+    def test_env_var_false_overrides_default(self):
+        # Defensive: explicit false must still mean false even if the
+        # default ever flips. This prevents an "always-on" footgun.
+        import os
+        # First prove the field default is False.
+        os.environ.pop("POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED", None)
+        from polycopy.config.settings import Settings
+        s_default = Settings()
+        self.assertFalse(s_default.specialist_aggregations_enabled)
+        # Then explicit false.
+        os.environ["POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED"] = "false"
+        try:
+            s_false = Settings()
+            self.assertFalse(s_false.specialist_aggregations_enabled)
+        finally:
+            os.environ.pop("POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED", None)
+
+    def test_env_var_cap_override(self):
+        import os
+        os.environ["POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED"] = "true"
+        os.environ["POLYCOPY_SPECIALIST_AGGREGATIONS_MAX_ROWS_PER_RUN"] = "25"
+        try:
+            from polycopy.config.settings import Settings
+            s = Settings()
+            self.assertTrue(s.specialist_aggregations_enabled)
+            self.assertEqual(s.specialist_aggregations_max_rows_per_run, 25)
+        finally:
+            os.environ.pop("POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED", None)
+            os.environ.pop("POLYCOPY_SPECIALIST_AGGREGATIONS_MAX_ROWS_PER_RUN", None)
+
+
 # ---------------------------------------------------------------------------
 # Safety tests — paper-only invariant
 # ---------------------------------------------------------------------------

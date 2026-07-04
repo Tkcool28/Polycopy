@@ -80,6 +80,56 @@ class Settings(BaseSettings):
             "factory call that the caller controls."
         ),
     )
+
+    # ── Specialist-metric aggregation (PR #20, dormant by default) ─────────
+    # ``specialist_aggregations_enabled`` is the **single explicit
+    # activation switch** for the PR #20 evidence layer. When False
+    # (default), :func:`scripts.run_scan.run_scan` skips Step 5f
+    # entirely — no writes to ``wallet_specialist_aggregations``,
+    # no schema v13 reads, no observable behavior change.
+    #
+    # To activate Step 5f in production after the PR #19 24-hour
+    # observation is clean, the **only** required change is to set
+    # the env variable:
+    #
+    #     POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true
+    #
+    # (or flip the default in this Settings class from False to
+    # True). No code change, no separate feature PR, no new
+    # consumer, no formula change. The activation is a one-line /
+    # one-word edit; it does not enable live trading, does not
+    # create approvals / orders / positions / fills, and does not
+    # touch ``TimeoutStartSec``.
+    #
+    # This default of False is the load-bearing safety invariant
+    # for PR #20: deploying PR #20 must not start writing
+    # specialist aggregation rows until the operator flips the
+    # switch.
+    specialist_aggregations_enabled: bool = Field(
+        default=False,
+        description=(
+            "PR #20: enable Step 5f (specialist-metric aggregation evidence "
+            "table). MUST remain False until the PR #19 24-hour observation "
+            "is accepted. Activating this flag does NOT enable live trading, "
+            "does NOT consume the new rows in any formula, and does NOT "
+            "create orders/positions/approvals. One-line activation: set "
+            "POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true."
+        ),
+    )
+
+    # PR #20 specialist-metric aggregation cap (mirrors PR #19's
+    # ``max_wallet_scores`` invariant). Default 50 — bounded, low,
+    # and operator-overridable. This cap is only consulted when
+    # ``specialist_aggregations_enabled`` is True.
+    specialist_aggregations_max_rows_per_run: int = Field(
+        default=50,
+        description=(
+            "PR #20: cap on ``wallet_specialist_aggregations`` rows written "
+            "per run_scan invocation. Default 50; only consulted when "
+            "specialist_aggregations_enabled is True."
+        ),
+    )
+
     clob_base_url: str = Field(
         default="https://clob.polymarket.com",
         description=(

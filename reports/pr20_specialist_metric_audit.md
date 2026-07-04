@@ -382,42 +382,89 @@ data arrives.
 
 ---
 
-## 12. Production activation — Option A (dormant audit / optional evidence layer)
+## 12. Production activation — single explicit switch (Option A revised)
 
-**This PR does NOT activate specialist aggregation rows in the
-production scan.** PR #20 ships:
+**This PR does NOT activate specialist aggregation rows in production by
+default.** PR #20 ships the schema, the aggregator, the idempotent
+persistence helper, the bounded Step 5f, and a single explicit
+activation switch.
 
-1. the schema (`wallet_specialist_aggregations`),
-2. the pure-function aggregator and idempotent persistence helper,
-3. a new bounded Step 5f in `run_scan` that *can* write evidence rows,
-4. CLI flags `--enable-pr20-specialist-aggregations` and
-   `--max-specialist-aggregations`,
+The activation switch is
+`Settings.specialist_aggregations_enabled` in
+`src/polycopy/config/settings.py`. It honors the existing
+`POLYCOPY_*` env-var prefix and the `Settings` field is the load-bearing
+default.
 
-but the new flags default to OFF (`enable_pr20_specialist_aggregations
-= False`) and Step 5f is gated behind that flag. Concretely:
+**Activation is a one-line / one-word change.** No code changes are
+required to flip Step 5f on — pick one:
 
-* Existing production scans that do not change their systemd unit or
-  CLI invocation behave **exactly as before** — no new writes, no new
-  rows, no observable change.
-* The systemd unit file is **not modified** by this PR.
-* The `enable_pr20_specialist_aggregations` parameter on
-  `run_scan(...)` defaults to `False` — an explicit test
-  (`tests/test_pr20_specialist_metrics_persistence.py::
-  RunScanDefaultFlagTests::test_run_scan_default_aggregation_is_off`)
-  asserts this contract.
+```bash
+# Option 1 — env var (preferred for production deploys)
+export POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true
+export POLYCOPY_SPECIALIST_AGGREGATIONS_MAX_ROWS_PER_RUN=50  # default
+```
 
-**Activation is a follow-on decision**, owned by a later PR
-(candidate: PR #21 or a deployment-config PR) that will, at minimum:
-  1. observe the 24-hour PR #19 production scan is clean,
-  2. update the systemd unit (or `Makefile` target) to pass
-     `--enable-pr20-specialist-aggregations`,
-  3. add a deployment-validation step that asserts rows appear in
-     `wallet_specialist_aggregations` after a representative run,
-  4. confirm Step 5f only runs when the schema is at v13 or higher.
+```python
+# Option 2 — flip the field default in settings.py (one word)
+# src/polycopy/config/settings.py
+-    default=False,
++    default=True,
+```
 
-Until that follow-on, `wallet_specialist_aggregations` is an unused
-table in production — present in the schema, writable via the helper,
-but never written by the live scan.
+A four-test suite (`SingleLineActivationTests`) pins the contract:
+
+1. `test_default_is_off` — no env var → flag is False.
+2. `test_env_var_true_flips_to_on` — `POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true` activates Step 5f.
+3. `test_env_var_false_overrides_default` — explicit `false` always disables (no "always-on" footgun).
+4. `test_env_var_cap_override` — the row-cap env var overrides the default.
+
+Activation is **deferred until PR #19 24-hour observation is accepted**.
+PR #20 may be finalized either with activation OFF as infrastructure-only
+or with the single activation switch flipped ON before merge, depending
+on review. This PR contains the entire activation surface — no separate
+feature PR is required to turn Step 5f on.
+
+**Activation does NOT enable live trading.** It does NOT add a formula
+consumer. It does NOT create orders / positions / approvals / fills. It
+does NOT touch `TimeoutStartSec`. The safety tests
+(`SafetyTests::test_no_orders_positions_signals_balances_writes` and
+`SafetyTests::test_no_approved_paper_signals`) assert the paper-only
+invariant regardless of activation state.
+
+### Deployment note (only relevant if PR #20 is merged with activation ON)
+
+If PR #20 is finalized with activation ON:
+
+1. **Verify** `POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED=true` is set
+   in the systemd unit's `Environment=` line (or in the
+   `Makefile` target's shell).
+2. **After first run**, confirm rows appear in
+   `wallet_specialist_aggregations`:
+   ```sql
+   SELECT COUNT(*), MAX(created_at) FROM wallet_specialist_aggregations;
+   ```
+   A non-zero `COUNT(*)` and a recent `MAX(created_at)` confirm Step 5f
+   ran.
+3. **Confirm formulas still do NOT consume the new table** by inspecting
+   `src/polycopy/scoring/wallet_score_v1.py` and
+   `src/polycopy/scoring/category_wallet_score_v1.py` — neither
+   references `wallet_specialist_aggregations`. (Verified in PR #20
+   review.)
+4. **Confirm orders/positions/signals remain zero** with the existing
+   systemd post-scan health check.
+5. **Revert plan**: unset the env var (or flip the field default back
+   to `False`) and restart the scan service. The new table will simply
+   stop receiving inserts; existing rows are harmless audit evidence.
+
+### Why this design (vs. "requires a separate feature PR")
+
+The original Option-A wording framed activation as something a
+follow-on PR would own. Per the second-review clarification, that
+framing was unnecessarily heavy: the activation surface in PR #20 is
+already complete. No new consumer, no new formula, no new code path is
+required to write rows — only the switch needs to flip. Forcing a
+separate feature PR to do that one-line change would add review
+overhead without any code-quality or safety benefit.
 
 ---
 
