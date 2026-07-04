@@ -1136,3 +1136,376 @@ def test_pr5_item22_e2e_scan_creates_no_orders_positions(tmp_path: Path):
     assert after_positions == before_positions
     assert after_approvals == before_approvals
     assert approved_count == 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Blocker-2: idempotency is material-input based, not wall-clock based
+# (PR 5 second review)
+# ─────────────────────────────────────────────────────────────────────
+
+def test_pr5_review_b23_wallclock_change_does_not_duplicate_decision(
+    tmp_path: Path,
+) -> None:
+    """B23 — wall-clock scan time alone MUST NOT create a new immutable row.
+
+    Same wallet + same canonical metrics + DIFFERENT ``now`` → exactly one
+    ``wallet_score_decisions`` row. ``now.isoformat()`` must no longer be
+    part of the idempotency key.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from scripts import scan_pipeline_wiring
+
+    db = _make_db(tmp_path)
+    wid = _insert_wallet(db)
+    addr = db.fetchone(
+        "SELECT canonical_address FROM wallets WHERE id = ?", (wid,)
+    )["canonical_address"]
+    metrics = {"win_rate": 0.6, "trade_count": 100, "sharpe_ratio": 0.5}
+    counters = scan_pipeline_wiring.ScanPipelineCounters()
+    scan_pipeline_wiring.persist_wallet_v1_decisions(
+        db, addresses=[addr], metrics_by_address={addr: metrics},
+        now=datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc),
+        counters=counters,
+    )
+    scan_pipeline_wiring.persist_wallet_v1_decisions(
+        db, addresses=[addr], metrics_by_address={addr: metrics},
+        now=datetime(2026, 7, 2, 13, 30, 45, tzinfo=timezone.utc),
+        counters=counters,
+    )
+    db.conn.commit()
+    rows = db.fetchall(
+        "SELECT COUNT(*) AS c FROM wallet_score_decisions WHERE wallet_id = ?",
+        (wid,),
+    )
+    assert rows[0]["c"] == 1, (
+        f"wall-clock change must not duplicate semantic decision; got {rows[0]['c']} rows"
+    )
+
+
+def test_pr5_review_b24_changed_material_metrics_creates_new_row(
+    tmp_path: Path,
+) -> None:
+    """B24 — same wallet + CHANGED material metric → new immutable row.
+
+    Verifies that the idempotency key IS sensitive to material inputs
+    (so a real change in evidence produces a new audit row) while remaining
+    insensitive to wall-clock (see B23).
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from scripts import scan_pipeline_wiring
+
+    db = _make_db(tmp_path)
+    wid = _insert_wallet(db)
+    addr = db.fetchone(
+        "SELECT canonical_address FROM wallets WHERE id = ?", (wid,)
+    )["canonical_address"]
+    now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    counters = scan_pipeline_wiring.ScanPipelineCounters()
+
+    metrics_v1 = {"win_rate": 0.6, "trade_count": 100, "sharpe_ratio": 0.5}
+    metrics_v2 = {"win_rate": 0.7, "trade_count": 120, "sharpe_ratio": 0.8}
+
+    scan_pipeline_wiring.persist_wallet_v1_decisions(
+        db, addresses=[addr], metrics_by_address={addr: metrics_v1},
+        now=now, counters=counters,
+    )
+    scan_pipeline_wiring.persist_wallet_v1_decisions(
+        db, addresses=[addr], metrics_by_address={addr: metrics_v2},
+        now=now, counters=counters,
+    )
+    db.conn.commit()
+    rows = db.fetchall(
+        "SELECT final_score, verdict FROM wallet_score_decisions WHERE wallet_id = ? ORDER BY id",
+        (wid,),
+    )
+    assert len(rows) == 2, (
+        f"changed material metrics must produce new row; got {len(rows)}"
+    )
+    # Both rows are readable; the historical row reflects the original metric.
+    pre_score = float(rows[0]["final_score"])
+    cur_score = float(rows[1]["final_score"])
+    assert pre_score != cur_score, (
+        f"two different metric snapshots must yield two different scores; "
+        f"got {pre_score} == {cur_score}"
+    )
+
+
+def test_pr5_review_b25_historical_row_remains_readable(tmp_path: Path) -> None:
+    """B25 — historical row remains readable after a material-change iteration."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from scripts import scan_pipeline_wiring
+
+    db = _make_db(tmp_path)
+    wid = _insert_wallet(db)
+    addr = db.fetchone(
+        "SELECT canonical_address FROM wallets WHERE id = ?", (wid,)
+    )["canonical_address"]
+    now = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    counters = scan_pipeline_wiring.ScanPipelineCounters()
+    scan_pipeline_wiring.persist_wallet_v1_decisions(
+        db, addresses=[addr], metrics_by_address={
+            addr: {"win_rate": 0.5, "trade_count": 50, "sharpe_ratio": 0.3},
+        },
+        now=now, counters=counters,
+    )
+    scan_pipeline_wiring.persist_wallet_v1_decisions(
+        db, addresses=[addr], metrics_by_address={
+            addr: {"win_rate": 0.8, "trade_count": 200, "sharpe_ratio": 1.0},
+        },
+        now=now, counters=counters,
+    )
+    db.conn.commit()
+    rows = db.fetchall(
+        "SELECT id, final_score, verdict, idempotency_key "
+        "FROM wallet_score_decisions WHERE wallet_id = ? ORDER BY id",
+        (wid,),
+    )
+    assert len(rows) == 2
+    # Both rows are SELECT-able and distinct.
+    assert rows[0]["idempotency_key"] != rows[1]["idempotency_key"]
+    # The first (historical) row is still individually retrievable.
+    first_row = db.fetchone(
+        "SELECT final_score FROM wallet_score_decisions WHERE id = ?",
+        (rows[0]["id"],),
+    )
+    assert first_row is not None
+
+
+def test_pr5_review_b26_idempotency_key_is_byte_stable(tmp_path: Path) -> None:
+    """B26 — identical material inputs → byte-identical idempotency key.
+
+    Different ``now`` MUST NOT change the key. Dict-insertion order MUST
+    NOT change the key. Missing-vs-None MUST NOT change the key.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from scripts.scan_pipeline_wiring import (
+        _canonical_metrics_blob,
+        _wallet_idempotency_key,
+    )
+
+    addr = "0xwallet_abc123"
+
+    # Identical metrics via different dict-insertion orders.
+    metrics_a = {"win_rate": 0.6, "trade_count": 100, "sharpe_ratio": 0.5}
+    metrics_b = {"sharpe_ratio": 0.5, "trade_count": 100, "win_rate": 0.6}
+    # Same logical content but with a None instead of missing key.
+    metrics_c = {
+        "win_rate": 0.6, "trade_count": 100, "sharpe_ratio": 0.5,
+        "markets_traded": None, "is_sample": False,
+    }
+
+    key_a = _wallet_idempotency_key(addr, metrics_a)
+    key_b = _wallet_idempotency_key(addr, metrics_b)
+    key_c = _wallet_idempotency_key(addr, metrics_c)
+
+    assert key_a == key_b, (
+        f"dict-order must not change idempotency key; got {key_a} vs {key_b}"
+    )
+    assert key_a == key_c, (
+        f"missing-vs-None must not change idempotency key; got {key_a} vs {key_c}"
+    )
+    # And the canonical blob itself is byte-stable across runs.
+    blob_1 = _canonical_metrics_blob(metrics_a)
+    blob_2 = _canonical_metrics_blob(metrics_a)
+    assert blob_1 == blob_2
+
+    # Different material input MUST change the key.
+    metrics_d = {"win_rate": 0.7, "trade_count": 100, "sharpe_ratio": 0.5}
+    key_d = _wallet_idempotency_key(addr, metrics_d)
+    assert key_a != key_d
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Blocker-1 + Blocker-3: production-shaped runtime bound on Step 5b/5e
+# ─────────────────────────────────────────────────────────────────────
+
+def test_pr5_review_b27_max_wallet_scores_bounds_step5b_and_step5e(
+    tmp_path: Path,
+) -> None:
+    """B27 — production-shaped bound.
+
+    Seed 100 wallets. Run the Step 5b helper with ``max_wallet_scores=10``
+    using the same sort-and-slice algorithm ``run_scan`` uses, then call
+    the Step 5e helpers with ``scoped_wallet_ids`` for only the 10
+    processed wallets. The contract:
+
+      * only 10 ``wallet_score_decisions`` rows land;
+      * only 10 ``decision_verdicts`` rows land (for those wallets);
+      * only the components of those 10 land in ``score_component_inputs``;
+      * the remaining 90 wallets are NOT touched by Step 5e;
+      * no orders, positions, or approvals are created.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from scripts import scan_pipeline_wiring
+
+    db = _make_db(tmp_path)
+
+    # Seed 100 wallets with stable canonical addresses (lowercase) and a
+    # pre-populated ``wallets`` row so the persisters can resolve
+    # canonical_address → wallet_id.
+    canonical_addrs: list[str] = []
+    for i in range(100):
+        addr = f"0xwal{i:08x}{i:08x}"
+        wid = str(uuid4())
+        db.conn.execute(
+            "INSERT INTO wallets (id, address, label, is_sample, "
+            "created_at, canonical_address) VALUES (?, ?, 'w', 0, ?, ?)",
+            (wid, addr.lower(), "2026-01-01T00:00:00Z", addr.lower()),
+        )
+        canonical_addrs.append(addr.lower())
+    db.conn.commit()
+
+    # Build the ``metrics_by_address`` dict the same way run_scan does,
+    # and apply the deterministic sort-and-slice Step 5b uses.
+    metrics_by_address = {
+        addr: {
+            "win_rate": 0.5 + (i % 50) / 100.0,
+            "trade_count": 50 + i,
+            "sharpe_ratio": 0.4,
+            "markets_traded": 5,
+            "is_sample": False,
+        }
+        for i, addr in enumerate(canonical_addrs)
+    }
+    max_wallet_scores = 10
+    bounded = sorted(canonical_addrs)[:max_wallet_scores]
+    skipped = len(canonical_addrs) - len(bounded)
+    assert skipped == 90
+
+    counters = scan_pipeline_wiring.ScanPipelineCounters()
+    persisted = scan_pipeline_wiring.persist_wallet_v1_decisions(
+        db, addresses=bounded, metrics_by_address=metrics_by_address,
+        now=datetime(2026, 7, 1, tzinfo=timezone.utc), counters=counters,
+    )
+    assert persisted == max_wallet_scores
+
+    n_wsd = db.fetchone("SELECT COUNT(*) AS c FROM wallet_score_decisions")["c"]
+    assert n_wsd == max_wallet_scores, (
+        f"only {max_wallet_scores} wallets must be persisted; got {n_wsd}"
+    )
+
+    # Step 5e must be SCOPED to the bounded slice. The ``run_scan``
+    # contract resolves canonical_addresses → wallet_ids and passes them
+    # via ``scoped_wallet_ids`` so the helpers cannot accidentally audit
+    # the 90 deferred wallets via the latest-rows fallback.
+    scoped_ids = [
+        r["id"] for r in db.fetchall(
+            f"SELECT id FROM wallets WHERE canonical_address IN "
+            f"({','.join('?' for _ in bounded)})",
+            tuple(bounded),
+        )
+    ]
+    assert len(scoped_ids) == max_wallet_scores
+
+    scan_pipeline_wiring.persist_decision_verdicts_and_components(
+        db, now=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        counters=counters, scoped_wallet_ids=scoped_ids,
+    )
+    scan_pipeline_wiring.persist_score_component_inputs_for_wallet_decisions(
+        db, counters=counters, scoped_wallet_ids=scoped_ids,
+    )
+
+    n_dv = db.fetchone("SELECT COUNT(*) AS c FROM decision_verdicts")["c"]
+    n_sci = db.fetchone(
+        "SELECT COUNT(*) AS c FROM score_component_inputs"
+    )["c"]
+    # Each bounded wallet has at least one decision_verdict row. The
+    # component count is bounded by the number of distinct
+    # (decision_id, component_name) pairs for those 10 wallets.
+    assert n_dv >= max_wallet_scores, (
+        f"decision_verdicts must cover the bounded slice; got {n_dv}"
+    )
+    assert n_sci >= max_wallet_scores, (
+        f"score_component_inputs must cover the bounded slice; got {n_sci}"
+    )
+
+    # And crucially: the 90 deferred wallets must NOT have decision
+    # verdicts or component-inputs audit rows. (One way to assert this:
+    # query for any row whose wallet_id is NOT in the scoped set and
+    # confirm none exist.)
+    deferred_ids = [
+        r["id"] for r in db.fetchall(
+            f"SELECT id FROM wallets WHERE canonical_address NOT IN "
+            f"({','.join('?' for _ in bounded)})",
+            tuple(bounded),
+        )
+    ]
+    assert len(deferred_ids) == 90
+    placeholders = ",".join("?" for _ in deferred_ids)
+    n_dv_deferred = db.fetchone(
+        f"SELECT COUNT(*) AS c FROM decision_verdicts "
+        f"WHERE wallet_id IN ({placeholders})",
+        tuple(deferred_ids),
+    )["c"]
+    n_sci_deferred = db.fetchone(
+        f"SELECT COUNT(*) AS c FROM score_component_inputs "
+        f"WHERE decision_ref_type = 'wallet_score' "
+        f"AND decision_ref_id IN ("
+        f"SELECT id FROM wallet_score_decisions WHERE wallet_id IN ({placeholders}))",
+        tuple(deferred_ids),
+    )["c"]
+    assert n_dv_deferred == 0, (
+        f"deferred wallets must have 0 decision_verdicts; got {n_dv_deferred}"
+    )
+    assert n_sci_deferred == 0, (
+        f"deferred wallets must have 0 score_component_inputs; got {n_sci_deferred}"
+    )
+
+    # Safety: no orders / positions / approvals are ever created.
+    assert db.fetchone("SELECT COUNT(*) AS c FROM orders")["c"] == 0
+    assert db.fetchone("SELECT COUNT(*) AS c FROM positions")["c"] == 0
+    has_approvals = db.fetchone(
+        "SELECT name FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'paper_signal_approvals'"
+    )
+    if has_approvals:
+        assert db.fetchone(
+            "SELECT COUNT(*) AS c FROM paper_signal_approvals"
+        )["c"] == 0
+        assert db.fetchone(
+            "SELECT COUNT(*) AS c FROM paper_signal_decisions WHERE is_approved = 1"
+        )["c"] == 0
+
+
+def test_pr5_review_b28_run_scan_exposes_max_wallet_scores_flag() -> None:
+    """B28 — the ``--max-wallet-scores`` flag is wired into the run_scan CLI."""
+    import subprocess
+
+    proc = subprocess.run(
+        ["python3", "scripts/run_scan.py", "--help"],
+        capture_output=True, text=True, timeout=20,
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    assert proc.returncode == 0
+    assert "--max-wallet-scores" in proc.stdout, (
+        f"--max-wallet-scores missing from --help; got:\n{proc.stdout}"
+    )
+    # The help text must mention that this cap bounds Step 5b so an
+    # operator reading the help knows what it does.
+    help_text = proc.stdout.lower()
+    assert "wallet" in help_text and "score" in help_text, (
+        "help text for --max-wallet-scores should mention wallet-score bound"
+    )
+
+
+def test_pr5_review_b29_scan_result_carries_processed_and_skipped_counts(
+    tmp_path: Path,
+) -> None:
+    """B29 — ScanResult exposes ``wallet_scores_processed`` and
+    ``wallet_scores_skipped`` so operators can see bounded-slice progress.
+
+    Direct unit test on the ScanResult dataclass — no need to drive the
+    full run_scan async loop for this telemetry field check.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from scripts.run_scan import ScanResult
+
+    r = ScanResult()
+    assert hasattr(r, "wallet_scores_processed")
+    assert hasattr(r, "wallet_scores_skipped")
+    assert r.wallet_scores_processed == 0
+    assert r.wallet_scores_skipped == 0
+    r.wallet_scores_processed = 10
+    r.wallet_scores_skipped = 90
+    assert r.wallet_scores_processed == 10
+    assert r.wallet_scores_skipped == 90

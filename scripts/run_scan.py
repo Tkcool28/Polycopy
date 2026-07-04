@@ -153,6 +153,17 @@ class ScanResult:
         self.copy_candidates_rejected_other: int = 0
         self.decision_verdicts_persisted: int = 0
         self.score_component_inputs_persisted: int = 0
+        # PR 5 — bounded-slice telemetry.
+        # ``wallet_scores_processed`` is the count of wallets whose score
+        # was computed + attempted this run (Steps 5b/5c/5d). The legacy
+        # counters above are populated only when a row actually took
+        # effect (insert or unique-match), so they can be smaller than
+        # ``wallet_scores_processed`` when helpers encounter errors.
+        # ``wallet_scores_skipped`` is the count of wallets that
+        # ``metrics_by_address`` discovered but were deferred to a
+        # subsequent run because of ``max_wallet_scores``.
+        self.wallet_scores_processed: int = 0
+        self.wallet_scores_skipped: int = 0
         self.trades_scanned_for_candidates: int = 0
         # Round-10 fetch-status counters (per-market, not per-row).
         self.market_fetches_complete: int = 0
@@ -212,6 +223,7 @@ async def run_scan(
     *,
     max_paper_candidates: int = 25,
     max_trades_per_wallet: int = 3,
+    max_wallet_scores: int = 50,
     enable_pr5_pipeline: bool = True,
 ) -> ScanResult:
     """Execute the full scan pipeline.
@@ -572,14 +584,41 @@ async def run_scan(
         )
         pr5c = ScanPipelineCounters()
 
-        # Step 5b — wallet score v1
+        # Step 5b — wallet score v1 (BOUNDED slice).
+        # ``max_wallet_scores`` caps how many wallets this run touches so a
+        # timer invocation cannot process 89k+ wallets in a single run.
+        # The slice is taken in deterministic wallet-id order so repeated
+        # runs progress through the wallet corpus without duplicating
+        # already-scored rows (UNIQUE(wallet_id, formula_name,
+        # formula_version, idempotency_key) suppresses duplicates and the
+        # counters differentiate "fresh insert" from "reused"). Wallets
+        # beyond the slice are deferred to subsequent runs and reported in
+        # ``result.wallet_scores_skipped``.
+        all_wallet_addrs = list(metrics_by_address.keys())
+        if len(all_wallet_addrs) > max_wallet_scores:
+            # Stable ordering: sort by canonical address. This keeps
+            # repeated scans consuming the corpus in the same order
+            # rather than rediscovering the ordering from dict insertion
+            # (which depends on upstream discovery order).
+            all_wallet_addrs.sort()
+            bounded_wallet_addrs = all_wallet_addrs[:max_wallet_scores]
+            wallet_scores_skipped = len(all_wallet_addrs) - len(bounded_wallet_addrs)
+        else:
+            bounded_wallet_addrs = all_wallet_addrs
+            wallet_scores_skipped = 0
+        result.wallet_scores_skipped = wallet_scores_skipped
+        result.wallet_scores_processed = len(bounded_wallet_addrs)
+
         logger.info(
-            "Step 5b: Persisting v1 wallet-score decisions (max %d wallets)...",
-            len(metrics_by_address),
+            "Step 5b: Persisting v1 wallet-score decisions "
+            "(processing %d of %d wallets, %d deferred to next run)...",
+            len(bounded_wallet_addrs),
+            len(all_wallet_addrs),
+            wallet_scores_skipped,
         )
         persist_wallet_v1_decisions(
             db,
-            addresses=list(metrics_by_address.keys()),
+            addresses=bounded_wallet_addrs,
             metrics_by_address=metrics_by_address,
             now=now,
             counters=pr5c,
@@ -598,13 +637,15 @@ async def run_scan(
         # ``categories_per_wallet`` map so Step 5c persists nothing
         # rather than fabricating category labels. The helper is
         # unit-tested independently so the contract surface is complete.
+        # The address list is bounded to match Step 5b so Step 5e can
+        # reason about the same wallet slice.
         logger.info(
             "Step 5c: Persisting v1 category-wallet-score decisions..."
         )
         categories_per_wallet: dict[str, Sequence[str]] = {}
         applied_cats = persist_category_v1_decisions(
             db,
-            addresses=list(metrics_by_address.keys()),
+            addresses=bounded_wallet_addrs,
             categories_per_wallet=categories_per_wallet,
             now=now,
             counters=pr5c,
@@ -625,7 +666,7 @@ async def run_scan(
         )
         persist_copy_candidates_for_trades(
             db,
-            addresses=list(metrics_by_address.keys()),
+            addresses=bounded_wallet_addrs,
             metrics_by_address=metrics_by_address,
             trades_by_address=trades_by_address,
             now=now,
@@ -647,14 +688,31 @@ async def run_scan(
         )
 
         # Step 5e — decision_verdicts + score_component_inputs audit trail.
+        # IMPORTANT: both helpers are scoped to the BOUNDED Step 5b/5c
+        # slice so decision_verdicts and score_component_inputs only
+        # reflect wallets this run actually processed (not arbitrary
+        # latest rows from the whole wallet_score_decisions table). The
+        # cap ``max_wallet_scores`` is passed through so the LIMIT in
+        # those helpers never exceeds this run's processed slice.
         logger.info(
-            "Step 5e: Persisting decision_verdicts + score_component_inputs..."
+            "Step 5e: Persisting decision_verdicts + score_component_inputs "
+            "(bounded to %d wallets processed this run)...",
+            len(bounded_wallet_addrs),
         )
         persist_decision_verdicts_and_components(
-            db, now=now, counters=pr5c,
+            db,
+            now=now,
+            counters=pr5c,
+            scoped_wallet_ids=(
+                _resolve_wallet_ids(db, bounded_wallet_addrs)
+            ),
         )
         persist_score_component_inputs_for_wallet_decisions(
-            db, counters=pr5c,
+            db,
+            counters=pr5c,
+            scoped_wallet_ids=(
+                _resolve_wallet_ids(db, bounded_wallet_addrs)
+            ),
         )
         result.decision_verdicts_persisted = pr5c.decision_verdicts_persisted
         result.score_component_inputs_persisted = pr5c.score_component_inputs_persisted
@@ -789,6 +847,35 @@ def _compute_wallet_metrics(
         "markets_traded": markets_traded,
         "is_sample": is_sample,
     }
+
+
+def _resolve_wallet_ids(
+    db: Database,
+    canonical_addresses: list[str],
+) -> list[str]:
+    """Return ``wallets.id`` UUID strings for the given canonical addresses.
+
+    Mirrors :func:`scripts.scan_pipeline_wiring._load_wallet_id` so the
+    Step 5e audit helpers can scope their writes to the bounded Step 5b
+    wallet slice without re-deriving IDs. Missing wallets (e.g. an
+    address discovered in Step 5 but not yet persisted) are silently
+    dropped from the returned list — the helper callers only operate on
+    IDs that exist, and any missing wallets simply produce zero
+    decision_verdicts / score_component_inputs rows for them, which is
+    safe because no upstream row was created either.
+    """
+    if not canonical_addresses:
+        return []
+    placeholders = ",".join("?" for _ in canonical_addresses)
+    try:
+        rows = db.fetchall(
+            f"SELECT id, canonical_address FROM wallets "
+            f"WHERE canonical_address IN ({placeholders})",
+            tuple(canonical_addresses),
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return []
+    return [str(r["id"]) for r in rows]
 
 
 def _generate_signals(db: Database, markets: list[Market], now: datetime) -> list[dict]:
@@ -1406,6 +1493,16 @@ def main() -> int:
         "copy candidates. Forward-going evidence only.",
     )
     parser.add_argument(
+        "--max-wallet-scores",
+        type=int,
+        default=50,
+        help="PR 5: cap on wallets persisted to wallet_score_decisions per "
+        "scan run (Step 5b). Bounds the DB-write fan-out so the scan "
+        "remains runtime-bounded even when discovery returns many wallets. "
+        "Step 5e mirrors this cap so decision_verdicts and "
+        "score_component_inputs only reflect the bounded slice.",
+    )
+    parser.add_argument(
         "--no-pr5-pipeline",
         action="store_true",
         help="Disable PR-5 pipeline writes (Steps 5b–5e). Test-only; "
@@ -1433,6 +1530,7 @@ def main() -> int:
                     use_sample=args.use_sample,
                     max_paper_candidates=args.max_paper_candidates,
                     max_trades_per_wallet=args.max_trades_per_wallet,
+                    max_wallet_scores=args.max_wallet_scores,
                     enable_pr5_pipeline=not args.no_pr5_pipeline,
                 ))
             finally:

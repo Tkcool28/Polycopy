@@ -211,7 +211,9 @@ def persist_wallet_v1_decisions(
                 db,
                 wallet_id,
                 result,
-                idempotency_key=_wallet_idempotency_key(canonical_addr, now),
+                idempotency_key=_wallet_idempotency_key(
+                    canonical_addr, metrics,
+                ),
                 source_data_timestamp=now.isoformat(),
             )
         except Exception as exc:  # noqa: BLE001 — defensive: never abort scan
@@ -230,19 +232,85 @@ def persist_wallet_v1_decisions(
     return applied
 
 
+def _canonical_metrics_blob(metrics: dict) -> str:
+    """Return a stable JSON blob for the canonical subset of wallet metrics.
+
+    Only the fields the V1 formula actually consumes are included. JSON
+    keys are sorted so the blob is byte-stable across runs and across
+    dict-insertion order, which is the property required for stable
+    idempotency-key derivation.
+
+    Missing values, ``None``, and ``False`` are normalized to a single
+    canonical ``None`` form so two metric dicts that differ only by
+    a missing-vs-None-vs-False field produce the same blob. This
+    matches the review-blocker spec: "canonicalized metric payload
+    actually used by the formula" — the formula treats any of those
+    three as "no evidence for this field".
+
+    Timestamps are normalized to ISO strings, floats are rounded to
+    9 decimal places, and bools are normalized to ``None`` when falsy
+    to keep the canonical form compact.
+    """
+    canonical_keys = (
+        "sharpe_ratio",
+        "win_rate",
+        "trade_count",
+        "markets_traded",
+        "is_sample",
+        "latest_trade_ts",
+        "first_trade_ts",
+    )
+    out: dict[str, object] = {}
+    for k in canonical_keys:
+        v = metrics.get(k, None)
+        # Check ``bool`` BEFORE ``int``/``float`` because in Python
+        # ``isinstance(True, int) is True`` and the float branch below
+        # would try to round a bool.
+        if isinstance(v, bool):
+            # Falsy bools collapse to None: a missing bool and an
+            # explicit ``False`` are the same "no evidence" signal.
+            out[k] = None if not v else True
+        elif v is None:
+            out[k] = None
+        elif hasattr(v, "isoformat"):
+            # datetime / date — normalize to ISO string so the blob is
+            # comparable across runtimes without relying on Python repr.
+            out[k] = v.isoformat()
+        elif isinstance(v, float):
+            # Round to a stable precision so float repr noise does not
+            # produce new idempotency keys for the same logical value.
+            out[k] = float(round(v, 9))
+        else:
+            out[k] = v
+    return json.dumps(out, sort_keys=True, separators=(",", ":"))
+
+
 def _wallet_idempotency_key(
-    canonical_addr: str, now: datetime,
+    canonical_addr: str,
+    metrics: dict,
+    formula_version: str = WALLET_FORMULA_VERSION,
 ) -> str:
     """Deterministic per-wallet idempotency key for the V1 wallet score row.
 
-    The key is keyed on the canonical address and the run-time ``now``
-    timestamp; identical runs produce identical keys, so re-running the scan
-    over the same inputs never duplicates semantic decisions.
+    The key is keyed on the canonical address and a canonical hash of the
+    material inputs (the metrics the formula actually consumes).
+    Identical material inputs produce identical keys, so re-running the
+    scan over the same inputs never duplicates semantic decisions.
+    Wall-clock scan time is intentionally NOT included because the
+    runtime is allowed to vary across timer invocations while the
+    underlying decision identity must remain stable.
+
+    The formula version is included so a future formula bump creates a
+    new immutable decision row rather than colliding with a frozen V1 row.
     """
-    ts = now.isoformat()
     blob = json.dumps(
-        {"wallet": canonical_addr, "ts": ts, "v": WALLET_FORMULA_VERSION},
+        {
+            "wallet": canonical_addr,
+            "v": formula_version,
+            "metrics": json.loads(_canonical_metrics_blob(metrics)),
+        },
         sort_keys=True,
+        separators=(",", ":"),
     )
     return _sha256_hex(blob)[:32]
 
@@ -252,16 +320,27 @@ def _wallet_idempotency_key(
 # ------------------------------------------------------------------------
 
 def _category_idempotency_key(
-    canonical_addr: str, category_label: str, now: datetime,
+    canonical_addr: str,
+    category_label: str,
+    metrics: dict,
+    formula_version: str = "category_wallet_score/1",
 ) -> str:
+    """Stable idempotency key for a (wallet, category) score decision.
+
+    Keyed on canonical address, category label, the canonical material
+    metrics the formula consumes, and the formula version. Wall-clock scan
+    time is intentionally NOT included so re-running the scan with
+    identical inputs is a no-op (see PR 5 charter §3).
+    """
     blob = json.dumps(
         {
             "wallet": canonical_addr,
             "category": category_label,
-            "ts": now.isoformat(),
-            "v": "category_wallet_score/1",
+            "v": formula_version,
+            "metrics": json.loads(_canonical_metrics_blob(metrics)),
         },
         sort_keys=True,
+        separators=(",", ":"),
     )
     return _sha256_hex(blob)[:32]
 
@@ -319,7 +398,18 @@ def persist_category_v1_decisions(
                 source_data_timestamp=now.isoformat(),
             )
             result = compute_category_wallet_score_v1(input=input_obj, now=now)
-            idem = _category_idempotency_key(canonical_addr, category_label, now)
+            # The category-score form in PR 5 is fed only fixed-None
+            # specialist inputs from the legacy ``_compute_wallet_metrics``
+            # path (PR 5 deliberately does not fabricate category
+            # evidence). The idempotency key therefore reduces to
+            # ``(canonical_addr, category_label, formula_version)`` and
+            # is byte-stable across scan wall-clock changes. An empty
+            # ``metrics`` dict flows through ``_canonical_metrics_blob``
+            # as a stable empty-JSON blob, so two scans with the same
+            # inputs produce identical keys.
+            idem = _category_idempotency_key(
+                canonical_addr, category_label, {},
+            )
             before = _count_rows(db, "category_wallet_score_decisions")
             try:
                 persist_category_score_v1(
@@ -547,6 +637,7 @@ def persist_decision_verdicts_and_components(
     now: Optional[datetime] = None,
     counters: ScanPipelineCounters,
     max_verdicts: int = 50,
+    scoped_wallet_ids: Optional[Sequence[str]] = None,
 ) -> None:
     """Backfill a single ``decision_verdicts`` row per wallet/category decision.
 
@@ -558,23 +649,46 @@ def persist_decision_verdicts_and_components(
     ``decision_verdicts`` row per wallet-category combination created in
     this run and one row per category decision whose wallet was scored.
 
-    ``max_verdicts`` hard-caps the helper's work — older wallet decisions
-    are unaffected when the cap is hit.
+    ``scoped_wallet_ids`` narrows the audit to the wallets THIS run
+    actually processed (Step 5b's bounded slice). When ``None``, the
+    helper falls back to ``max_verdicts`` cap with an arbitrary latest
+    rows scan — this fallback exists only for the unit-test path that
+    seeds rows directly into the DB without going through run_scan.
+
+    ``max_verdicts`` further caps the helper's work — older wallet
+    decisions are unaffected when the cap is hit.
     """
     if now is None:
         now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     applied = 0
-    rows = db.fetchall(
-        """
-        SELECT id, wallet_id, final_score, verdict, source_data_timestamp
-        FROM wallet_score_decisions
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (max_verdicts,),
-    )
-    for r in rows:
+    if scoped_wallet_ids is not None:
+        # Deterministic, scoped path: the bounded slice from Step 5b.
+        if not scoped_wallet_ids:
+            wallet_rows = []
+        else:
+            placeholders = ",".join("?" for _ in scoped_wallet_ids)
+            wallet_rows = db.fetchall(
+                f"""
+                SELECT id, wallet_id, final_score, verdict, source_data_timestamp
+                FROM wallet_score_decisions
+                WHERE wallet_id IN ({placeholders})
+                ORDER BY id DESC
+                """,
+                tuple(scoped_wallet_ids),
+            )
+    else:
+        # Fallback: latest N rows by id (test-only path).
+        wallet_rows = db.fetchall(
+            """
+            SELECT id, wallet_id, final_score, verdict, source_data_timestamp
+            FROM wallet_score_decisions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max_verdicts,),
+        )
+    for r in wallet_rows:
         try:
             score = float(r["final_score"])
         except (TypeError, ValueError):
@@ -606,15 +720,30 @@ def persist_decision_verdicts_and_components(
             applied += 1
         except Exception as exc:  # noqa: BLE001 — defensive
             logger.warning("decision_verdicts insert failed: %s", exc)
-    cat_rows = db.fetchall(
-        """
-        SELECT id, wallet_id, category_label, final_score, verdict
-        FROM category_wallet_score_decisions
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (max_verdicts,),
-    )
+    if scoped_wallet_ids is not None:
+        if not scoped_wallet_ids:
+            cat_rows = []
+        else:
+            placeholders = ",".join("?" for _ in scoped_wallet_ids)
+            cat_rows = db.fetchall(
+                f"""
+                SELECT id, wallet_id, category_label, final_score, verdict
+                FROM category_wallet_score_decisions
+                WHERE wallet_id IN ({placeholders})
+                ORDER BY id DESC
+                """,
+                tuple(scoped_wallet_ids),
+            )
+    else:
+        cat_rows = db.fetchall(
+            """
+            SELECT id, wallet_id, category_label, final_score, verdict
+            FROM category_wallet_score_decisions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max_verdicts,),
+        )
     for r in cat_rows:
         try:
             score = float(r["final_score"])
@@ -656,6 +785,7 @@ def persist_score_component_inputs_for_wallet_decisions(
     *,
     counters: ScanPipelineCounters,
     max_decisions: int = 50,
+    scoped_wallet_ids: Optional[Sequence[str]] = None,
 ) -> None:
     """Emit ``score_component_inputs`` rows for wallet-score decisions in this run.
 
@@ -671,18 +801,36 @@ def persist_score_component_inputs_for_wallet_decisions(
     the ``score_component_inputs`` table growing on rerun — see PR 5 charter
     §3 ("identically canonical inputs must reproduce a stable identity").
 
-    Mirrors the same defensive limits as
-    :func:`persist_decision_verdicts_and_components`.
+    ``scoped_wallet_ids`` mirrors the ``persist_decision_verdicts_and_components``
+    contract: when provided, the helper processes only the wallet-score
+    decisions for those wallet IDs (Step 5b's bounded slice). When ``None``,
+    the helper falls back to ``max_decisions`` cap with an arbitrary
+    latest rows scan — this fallback exists only for the unit-test path.
     """
-    rows = db.fetchall(
-        """
-        SELECT id, component_scores_json
-        FROM wallet_score_decisions
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (max_decisions,),
-    )
+    if scoped_wallet_ids is not None:
+        if not scoped_wallet_ids:
+            rows = []
+        else:
+            placeholders = ",".join("?" for _ in scoped_wallet_ids)
+            rows = db.fetchall(
+                f"""
+                SELECT id, component_scores_json
+                FROM wallet_score_decisions
+                WHERE wallet_id IN ({placeholders})
+                ORDER BY id DESC
+                """,
+                tuple(scoped_wallet_ids),
+            )
+    else:
+        rows = db.fetchall(
+            """
+            SELECT id, component_scores_json
+            FROM wallet_score_decisions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max_decisions,),
+        )
     if not rows:
         counters.score_component_inputs_persisted = 0
         return
