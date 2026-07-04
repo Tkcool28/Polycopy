@@ -143,15 +143,18 @@ class DashboardRepository:
         # rows returned by the DB (in case the schema ever drifts).
         where = f" WHERE {_SENTINEL_FRAGMENT}"
         total = self._count("wallets", where, _SENTINEL_PARAMS)
-        # LEFT JOIN the LATEST wallet_score_decisions per wallet (by computed_at).
-        # The correlated subquery selects the most recent decision for each wallet;
-        # this is read-only — we do not write or recompute scores here. Wallets
-        # without any decision row surface as final_score=NULL/verdict=NULL and
-        # the frontend renders them as "—" / INCOMPLETE. source_count continues
-        # to join performance_summaries.trade_count (or 0); we deliberately do
-        # NOT relabel it because performance_summaries has a different meaning
-        # (aggregated trade count) than wallet_score_decisions (per-wallet copy
-        # candidate evaluation).
+        # LEFT JOIN exactly ONE latest wallet_score_decisions per wallet. The
+        # correlated subquery picks the most recent decision by computed_at,
+        # with a deterministic tie-breaker chain (computed_at DESC,
+        # created_at DESC, id DESC) so that two rows with identical
+        # computed_at cannot duplicate the wallet or flip-flop between calls.
+        # read-only — we do not write or recompute scores here. Wallets
+        # without any decision row surface as final_score=NULL/verdict=NULL
+        # and the frontend renders them as "—" / INCOMPLETE. source_count
+        # continues to join performance_summaries.trade_count (or 0); we
+        # deliberately do NOT relabel it because performance_summaries has a
+        # different meaning (aggregated trade count) than
+        # wallet_score_decisions (per-wallet copy candidate evaluation).
         rows = self.db.fetchall(
             f"""
             SELECT w.id, w.address, w.label, w.is_sample,
@@ -162,15 +165,16 @@ class DashboardRepository:
                    latest.computed_at AS scored_at
               FROM wallets w
               LEFT JOIN performance_summaries ps ON ps.wallet_id = w.id
-              LEFT JOIN (
-                  SELECT wallet_id, final_score, verdict, computed_at
-                    FROM wallet_score_decisions wsd
-                   WHERE wsd.computed_at = (
-                       SELECT MAX(wsd2.computed_at)
-                         FROM wallet_score_decisions wsd2
-                        WHERE wsd2.wallet_id = wsd.wallet_id
-                   )
-              ) latest ON latest.wallet_id = w.id
+              LEFT JOIN wallet_score_decisions latest
+                ON latest.id = (
+                    SELECT wsd2.id
+                      FROM wallet_score_decisions wsd2
+                     WHERE wsd2.wallet_id = w.id
+                     ORDER BY wsd2.computed_at DESC,
+                              wsd2.created_at DESC,
+                              wsd2.id DESC
+                     LIMIT 1
+                )
             {where}
              ORDER BY
                -- Scored wallets come first (NULL final_score sorts to the end).

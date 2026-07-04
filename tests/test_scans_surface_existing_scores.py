@@ -12,7 +12,7 @@ kill switch.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -64,9 +64,16 @@ def _seed_score_decision(
     final_score: float,
     verdict: str,
     computed_at: str,
+    *,
+    idempotency_key: str | None = None,
+    created_at: str | None = None,
 ) -> None:
     """Insert one wallet_score_decisions row with the required unique key."""
     db = get_database()
+    if idempotency_key is None:
+        idempotency_key = f"idemp-{wallet_id}-{computed_at}"
+    if created_at is None:
+        created_at = computed_at
     db.execute(
         """
         INSERT INTO wallet_score_decisions (
@@ -78,11 +85,11 @@ def _seed_score_decision(
             wallet_id,
             FORMULA_NAME,
             FORMULA_VERSION,
-            f"idemp-{wallet_id}-{computed_at}",
+            idempotency_key,
             final_score,
             verdict,
             computed_at,
-            computed_at,
+            created_at,
         ),
     )
 
@@ -324,3 +331,100 @@ class TestScansSurfacesExistingScores:
         # total_count remains 3 across pages.
         assert page1["total_count"] == 3
         assert page2["total_count"] == 3
+
+    def test_same_computed_at_picks_deterministic_winner(self, api_client: TestClient):
+        """Two decisions with identical computed_at must produce exactly ONE
+        scan row, and the deterministic tie-breaker (id DESC) must pick a
+        stable winner across repeated calls.
+        """
+        _seed_wallets()
+        same_ts = "2026-07-04T10:00:00+00:00"
+        # Two decisions for the same wallet at the same computed_at — one with
+        # a higher PK id (later INSERT), one with a lower id. The deterministic
+        # tie-breaker is id DESC, so the LATER one (idemp_key="later") wins.
+        _seed_score_decision(
+            wallet_id=WALLET_SCORED_TWICE_ID,
+            final_score=12.0,
+            verdict="skip",
+            computed_at=same_ts,
+            idempotency_key="earlier",
+        )
+        _seed_score_decision(
+            wallet_id=WALLET_SCORED_TWICE_ID,
+            final_score=77.7,
+            verdict="watchlist",
+            computed_at=same_ts,
+            idempotency_key="later",
+        )
+
+        # The wallet appears EXACTLY ONCE (no duplicate join).
+        resp = api_client.get("/scans", params={"limit": 50})
+        rows = resp.json()["scans"]
+        scored_for_wallet = [r for r in rows if r["address"] == "0xBBB"]
+        assert len(scored_for_wallet) == 1, (
+            f"expected one row per wallet; got {len(scored_for_wallet)} — "
+            f"duplicate join on equal computed_at?"
+        )
+
+        # Determinism: the tie-breaker is id DESC, so the LATER inserted row
+        # (final_score=77.7) wins over the EARLIER one (final_score=12.0).
+        winner = scored_for_wallet[0]
+        assert winner["score"] == 77.7, (
+            f"tie-breaker must pick the later INSERT (id DESC); "
+            f"got score={winner['score']}"
+        )
+        assert winner["verdict"] == "watchlist"
+
+        # Stability: a second call must return the same winner.
+        resp2 = api_client.get("/scans", params={"limit": 50})
+        rows2 = resp2.json()["scans"]
+        winner2 = next(r for r in rows2 if r["address"] == "0xBBB")
+        assert winner2["score"] == winner["score"]
+        assert winner2["verdict"] == winner["verdict"]
+
+    def test_same_computed_at_and_created_at_picks_deterministic_winner(self, api_client: TestClient):
+        """Even when computed_at AND created_at collide, the PK id DESC
+        tie-breaker must pick a stable winner. This is the strictest
+        determinism check — nothing left to break ties except the PK.
+        """
+        _seed_wallets()
+        same_ts = "2026-07-04T10:00:00+00:00"
+        _seed_score_decision(
+            wallet_id=WALLET_SCORED_TWICE_ID,
+            final_score=12.0,
+            verdict="skip",
+            computed_at=same_ts,
+            created_at=same_ts,
+            idempotency_key="earliest",
+        )
+        _seed_score_decision(
+            wallet_id=WALLET_SCORED_TWICE_ID,
+            final_score=99.9,
+            verdict="watchlist",
+            computed_at=same_ts,
+            created_at=same_ts,
+            idempotency_key="middle",
+        )
+        _seed_score_decision(
+            wallet_id=WALLET_SCORED_TWICE_ID,
+            final_score=33.3,
+            verdict="skip",
+            computed_at=same_ts,
+            created_at=same_ts,
+            idempotency_key="latest",
+        )
+
+        resp = api_client.get("/scans", params={"limit": 50})
+        rows = resp.json()["scans"]
+        wallet_rows = [r for r in rows if r["address"] == "0xBBB"]
+        assert len(wallet_rows) == 1
+        # id DESC means the LAST insert wins. Inserts run in idempotency_key
+        # alphabetical order only as a side effect; the PK is auto-increment.
+        # The test just asserts stability + uniqueness + non-null score.
+        winner = wallet_rows[0]
+        assert winner["score"] is not None
+        # Stability across calls.
+        resp2 = api_client.get("/scans", params={"limit": 50}).json()
+        winner2 = next(r for r in resp2["scans"] if r["address"] == "0xBBB")
+        assert winner2["score"] == winner["score"]
+        assert winner2["verdict"] == winner["verdict"]
