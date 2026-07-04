@@ -176,20 +176,32 @@ class ScanResult:
         # wallet count the bounded slice helper saw (the full
         # discovery list size before slice resolution). It is the
         # denominator for the bounded-slice summary so operators can
-        # see "how much of the corpus are we actually processing
-        # this run".
-        # ``wallets_already_scored_for_scoring`` counts the addresses
-        # the slice included that already have a V1 wallet-score
-        # decision (no-op slots). ``wallets_in_slice_for_scoring`` is
-        # the budget-limited fresh-insert addresses included by the
-        # slice. ``wallets_deferred_to_next_run`` is the remainder
-        # that the bounded budget excluded from the slice.
+        # see "what fraction of the corpus this scan advanced over".
+        # ``wallets_in_slice_for_scoring_fresh`` counts the slots in
+        # the bounded slice that the helper classified as FRESH or
+        # MATERIAL-CHANGED (budget-consuming). These are the only
+        # slots that can cause downstream Steps 5b-5e to actually
+        # write a row.
+        # ``wallets_in_slice_for_scoring_already_scored`` counts the
+        # zero-budget filler slots (already-scored wallets that
+        # filled the cap after fresh ran out). They produce no
+        # downstream writes — Step 5b short-circuits via the
+        # existing skip-already-scored pre-flight cache.
+        # ``wallets_in_slice_for_scoring_total`` is the sum of the
+        # two; it equals ``len(addresses_in_slice)`` and is the
+        # ACTUAL bounded-slice size. The hard-cap invariant is
+        # ``wallets_in_slice_for_scoring_total <= max_wallet_scores``
+        # whenever ``max_wallet_scores`` is positive.
+        # ``wallets_deferred_to_next_run`` is the remainder the cap
+        # excluded; the next scheduled scan advances through it via
+        # the sorted-cursor pattern.
         # ``wallets_scored`` remains the legacy "how many wallets did
         # the loop actually call ``evaluate_wallet`` on" counter,
         # now bounded-slice rather than full-corpus.
         self.wallets_considered_for_scoring: int = 0
-        self.wallets_already_scored_for_scoring: int = 0
-        self.wallets_in_slice_for_scoring: int = 0
+        self.wallets_in_slice_for_scoring_fresh: int = 0
+        self.wallets_in_slice_for_scoring_already_scored: int = 0
+        self.wallets_in_slice_for_scoring_total: int = 0
         self.wallets_deferred_to_next_run: int = 0
         # Round-10 fetch-status counters (per-market, not per-row).
         self.market_fetches_complete: int = 0
@@ -210,8 +222,9 @@ class ScanResult:
             f"total_known={self.wallets_total_known}\n"
             f"  wallets discovered (back-compat alias for new): {self.wallets_discovered}\n"
             f"  wallets considered for scoring (denominator): {self.wallets_considered_for_scoring}\n"
-            f"    already_scored no-ops: {self.wallets_already_scored_for_scoring}\n"
-            f"    in bounded slice (budget=fresh inserts): {self.wallets_in_slice_for_scoring}\n"
+            f"    in bounded slice — fresh/material-changed (budget-consuming): {self.wallets_in_slice_for_scoring_fresh}\n"
+            f"    in bounded slice — already-scored (zero-budget filler): {self.wallets_in_slice_for_scoring_already_scored}\n"
+            f"    in bounded slice — TOTAL (hard-cap invariant: <= max_wallet_scores): {self.wallets_in_slice_for_scoring_total}\n"
             f"    deferred to next run: {self.wallets_deferred_to_next_run}\n"
             f"  wallets scored (bounded slice): {self.wallets_scored}\n"
             f"    copy_candidates: {self.copy_candidates}\n"
@@ -566,9 +579,13 @@ async def run_scan(
     # counters rather than full-corpus counters — i.e. they reflect
     # only the wallets this run actually acted on. New explicit
     # bounded-slice telemetry (``wallets_considered_for_scoring``,
-    # ``wallets_in_slice_for_scoring``, ``wallets_deferred_to_next_run``,
-    # ``wallets_already_scored_for_scoring``) is added so operators
-    # can see the rotation in action.
+    # ``wallets_in_slice_for_scoring_total``,
+    # ``wallets_in_slice_for_scoring_fresh``,
+    # ``wallets_in_slice_for_scoring_already_scored``,
+    # ``wallets_deferred_to_next_run``) is added so operators
+    # can see the rotation in action, plus a hard-cap assertion
+    # ``len(wallet_addresses) <= max_wallet_scores`` enforced at the
+    # scan boundary.
     from scripts.scan_pipeline_wiring import (
         canonical_addresses,
         resolve_bounded_wallet_slice,
@@ -587,20 +604,37 @@ async def run_scan(
         addresses=all_wallet_addresses,
         max_wallet_scores=max_wallet_scores,
     )
-    # Bounded-slice telemetry (PR 19).
+    # Bounded-slice telemetry (PR 19). The four new fields together
+    # prove the hard-cap invariant ``len(addresses_in_slice) <= cap``
+    # because ``in_slice_total = fresh + already_scored`` is computed
+    # by the slice helper and asserted against the cap.
     result.wallets_considered_for_scoring = sliced.wallets_considered
-    result.wallets_already_scored_for_scoring = sliced.wallets_already_scored
-    result.wallets_in_slice_for_scoring = sliced.wallets_in_slice
+    result.wallets_in_slice_for_scoring_fresh = sliced.wallets_in_slice_fresh
+    result.wallets_in_slice_for_scoring_already_scored = (
+        sliced.wallets_in_slice_already_scored
+    )
+    result.wallets_in_slice_for_scoring_total = sliced.wallets_in_slice_total
     result.wallets_deferred_to_next_run = sliced.wallets_deferred_to_next_run
     wallet_addresses = sliced.addresses_in_slice
     logger.info(
-        "  Step 5 slice: considered=%d, in_slice=%d, already_scored=%d, "
-        "deferred=%d",
+        "  Step 5 slice: considered=%d, in_slice_total=%d "
+        "(fresh=%d, already_scored=%d), deferred=%d",
         sliced.wallets_considered,
-        sliced.wallets_in_slice,
-        sliced.wallets_already_scored,
+        sliced.wallets_in_slice_total,
+        sliced.wallets_in_slice_fresh,
+        sliced.wallets_in_slice_already_scored,
         sliced.wallets_deferred_to_next_run,
     )
+    # Belt-and-braces guard. The helper enforces the invariant via
+    # an internal assertion; we mirror it at the run_scan boundary
+    # so any future regression that bypasses the helper still fails
+    # loudly instead of unboundedly expanding Step 5.
+    if max_wallet_scores and max_wallet_scores > 0:
+        assert len(wallet_addresses) <= max_wallet_scores, (
+            f"Step 5 hard-cap violated: len(wallet_addresses)="
+            f"{len(wallet_addresses)} > max_wallet_scores="
+            f"{max_wallet_scores}"
+        )
     metrics_by_address: dict[str, dict] = {}
     # PR-5: trade history by canonical address, used by Step 5d to
     # generate copy candidates. Keyed on the canonical address (not the

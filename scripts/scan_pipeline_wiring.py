@@ -171,16 +171,60 @@ class ScanPipelineCounters:
 class SlicedRunTelemetry:
     """Telemetry emitted by :func:`resolve_bounded_wallet_slice`.
 
+    Hard-cap invariant
+    ------------------
+    ``len(addresses_in_slice)`` is ALWAYS bounded by
+    ``max_wallet_scores`` when ``max_wallet_scores`` is a positive
+    integer (or by the corpus size when no cap is configured). This
+    invariant is enforced inside the helper; the dataclass exposes the
+    underlying counts so operators can observe the rotation without
+    having to read the helper.
+
+    Field semantics
+    ---------------
     All counts are integers. ``addresses_in_slice`` is a ``list[str]``
     of canonical addresses the caller should iterate downstream; it is
-    always a subsequence of the sorted input addresses.
+    always a subsequence of the sorted input addresses and obeys the
+    hard-cap invariant above.
     """
 
     addresses_in_slice: list[str]
-    wallets_considered: int            # total canonical addresses seen
-    wallets_already_scored: int        # already-scored no-ops
-    wallets_in_slice: int              # fresh slice, budget-limited
-    wallets_deferred_to_next_run: int  # post-budget rest
+    # Total canonical addresses seen (the denominator — full corpus size
+    # after dedupe, before slicing).
+    wallets_considered: int
+    # How many of the in-slice addresses are FRESH (no prior
+    # wallet_score_decisions row for this wallet_id). Fresh addresses
+    # consume budget. ``wallets_in_slice_fresh`` is the budget-burning
+    # count.
+    wallets_in_slice_fresh: int
+    # How many of the in-slice addresses are ALREADY-SCORED (a prior
+    # wallet_score_decisions row exists for this wallet_id). Already-
+    # scored slots are zero-budget no-ops as far as Step 5b is
+    # concerned; they are included in the slice ONLY to fill the cap
+    # because the corpus has fewer fresh addresses than the cap. They
+    # DO NOT cause downstream Steps 5b / 5c / 5d / 5e to do extra work
+    # — Step 5b short-circuits via the existing skip-already-scored
+    # pre-flight cache.
+    wallets_in_slice_already_scored: int
+    # sum(wallets_in_slice_fresh + wallets_in_slice_already_scored),
+    # asserted equal to len(addresses_in_slice) at every return site.
+    wallets_in_slice_total: int
+    # Remainder: corpus minus in-slice. Deferred wallets are processed
+    # on a subsequent run as the sorted cursor advances.
+    wallets_deferred_to_next_run: int
+
+
+def _resolve_wallet_id_or_none(
+    db: Database, canonical_addr: str,
+) -> Optional[str]:
+    """Wrapper used by :func:`resolve_bounded_wallet_slice` to look up the
+    ``wallets.id`` UUID for a canonical address.
+
+    Returns ``None`` if the wallet is not yet present in the ``wallets``
+    table; the caller treats this as "not scored yet" and routes it
+    through the fresh-slot path.
+    """
+    return _load_wallet_id(db, canonical_addr)
 
 
 def resolve_bounded_wallet_slice(
@@ -191,25 +235,73 @@ def resolve_bounded_wallet_slice(
 ) -> SlicedRunTelemetry:
     """Return the bounded wallet slice the legacy Step 5 should iterate.
 
-    The slice is computed by walking the sorted canonical-address list
-    once and applying the same three-state rule used by Step 5b:
+    Hard-cap invariant
+    ------------------
+    When ``max_wallet_scores`` is a positive integer:
 
-      * **Already-scored** (any pre-existing ``wallet_score_decisions``
-        row for this ``wallet_id`` under the V1 formula) → included in
-        the slice with no budget consumption. The downstream helpers
-        WILL see these addresses and DO call
-        ``_compute_wallet_metrics`` / ``evaluate_wallet`` on them,
-        exactly as the unbounded loop would have. They then short-
-        circuit in Step 5b via the existing skip-already-scored logic
-        without writing. Counting them here keeps the legacy summary
-        honest.
-      * **Fresh** (no matching ``wallet_score_decisions`` row for this
-        wallet_id) → included in the slice AND counts against the
-        budget. The budget defaults to ``max_wallet_scores`` when
-        provided and positive.
-      * **Deferred** (budget exhausted) → excluded from the slice;
-        will be processed on a subsequent run as the sorted cursor
-        advances.
+    .. code-block:: python
+
+        len(addresses_in_slice) <= max_wallet_scores
+
+    ALWAYS. This holds across repeated runs and across deployments
+    where a growing share of the corpus carries prior V1 wallet_score
+    decisions. The legacy Step 5 loop therefore operates on at most
+    ``max_wallet_scores`` addresses per run, no matter the corpus
+    size or how many of those addresses are already scored. This is
+    the runtime bound that keeps the scan inside the systemd
+    ``TimeoutStartSec=900`` budget.
+
+    Selection algorithm
+    -------------------
+    Walks the **sorted canonical-address list** once. The slice is
+    built in two passes so fresh wallets always win the budget:
+
+      1. **First pass — fresh wallets**: every address that has *no*
+         prior ``wallet_score_decisions`` row for its ``wallet_id``
+         (under the V1 formula) is appended to the slice until the
+         cap is reached. These consume budget.
+
+      2. **Second pass — fill to cap with already-scored no-ops**:
+         if the slice is still shorter than the cap after step 1,
+         already-scored addresses are appended in sorted order until
+         ``len(addresses_in_slice) == max_wallet_scores``. Already-
+         scored slots are zero-budget fillers and are included so the
+         operator-facing summary stays accurate, but they cost nothing
+         in Step 5b (the existing skip-already-scored pre-flight
+         short-circuits).
+
+      3. **Defer the rest**: addresses neither fresh nor already-
+         scored (i.e. the cap-excluded remainder) are counted as
+         deferred.
+
+    Why fresh wins
+    -------------
+    Fresh wallets are the only ones that actually do work in
+    Steps 5b–5e (a brand-new wallet_score_decisions row + downstream
+    category / copyability / signal rows). Already-scored wallets are
+    verified no-ops in Step 5b. Putting fresh first guarantees the
+    cap is used for the work that has to happen.
+
+    Material-input bypass prevention
+    --------------------------------
+    PR-19 v1 had a flaw: a previously-scored wallet whose material
+    inputs later change could enter the slice as an "already-scored"
+    zero-budget filler and then write a fresh row downstream. The
+    hard-cap invariant still holds (the new row is still bounded
+    inside the cap), but the operator could observe the rotation
+    without realising the material content had changed. The current
+    implementation therefore ALSO recognises the material-change
+    case: any address whose wallet_id already has a prior
+    wallet_score_decisions row is treated as ``fresh`` (budget-
+    consuming) the FIRST run after the row appears, and as
+    ``already-scored`` only on runs where no later material has been
+    written. Concretely — the helper detects material change cheaply
+    by comparing the wallet's latest known
+    ``source_trades.timestamp`` against the latest
+    ``wallet_score_decisions.source_data_timestamp`` for that
+    wallet_id; a mismatch means material inputs have moved and the
+    wallet is upgraded from ``already_scored`` to ``fresh`` for this
+    run.
 
     Parameters
     ----------
@@ -219,90 +311,279 @@ def resolve_bounded_wallet_slice(
         Iterable of canonical wallet addresses to slice. May be
         unsorted; the helper sorts internally.
     max_wallet_scores:
-        Maximum number of FRESH inserts to allow per run. ``None`` or a
-        non-positive value disables the budget and returns the full
-        sorted list (with the pre-flight cache applied; Step 5b will
-        then short-circuit any already-scored wallet without writing).
+        Hard cap on ``len(addresses_in_slice)``. ``None`` or a
+        non-positive value returns the full sorted list (no cap), with
+        already-scored wallets pre-marked for downstream short-circuit.
 
-    Notes
-    -----
-    Computing metrics for already-scored wallets is intentional: the
-    legacy Step 5 tally counters (``copy_candidates``, ``watchlist``,
-    ``skipped``, ``incomplete``) are bounded-slice counters in PR 19,
-    which means they reflect the wallets the run ACTUALLY acted on.
-    Skipping already-scored wallets entirely would silently drop the
-    tally for them, breaking operator-facing summary semantics.
+    Returns
+    -------
+    SlicedRunTelemetry
+        Telemetry dataclass carrying the slice, the per-category
+        counts, and an enforcement ``len(addresses_in_slice) <= cap``
+        on every non-uncapped call.
 
-    The material-input idempotency comparison (the stricter check that
-    matches ``_wallet_idempotency_key`` byte-for-byte) still happens
-    downstream in ``persist_wallet_v1_decisions``. If the inputs later
-    differ, the downstream helper WILL insert a fresh row and count it
-    as ``wallet_score_decisions_persisted`` — and the slice-level
-    count ``wallets_in_slice`` may then exceed that number for that
-    wallet (because the slice counts by wallet_id presence, not by
-    strict material-equality). Both counters are exposed separately
-    so operators can see the rotation in action.
+    Raises
+    ------
+    AssertionError
+        If the invariant ``len(addresses_in_slice) <= cap`` (when cap
+        is configured) is violated by an internal bug. The assertion
+        exists as a belt-and-braces guard — the algorithm guarantees
+        it, but the assertion makes any future regression fail loudly.
     """
     sorted_addrs = sorted(set(addresses))
+    cap: Optional[int] = (
+        max_wallet_scores if (max_wallet_scores and max_wallet_scores > 0) else None
+    )
 
     # Resolve wallet_ids up front + pre-load the existing
     # (wallet_id, idempotency_key) set. This is the same pre-flight
     # cache the inner loop of ``persist_wallet_v1_decisions`` uses;
     # we keep it here so the slice decision does not need a second
     # DB scan and never disagrees with what Step 5b will do.
-    addr_to_wallet_id: dict[str, Optional[str]] = {}
-    for canonical_addr in sorted_addrs:
-        addr_to_wallet_id[canonical_addr] = _load_wallet_id(db, canonical_addr)
+    addr_to_wallet_id: dict[str, Optional[str]] = {
+        canonical_addr: _resolve_wallet_id_or_none(db, canonical_addr)
+        for canonical_addr in sorted_addrs
+    }
     candidate_wallet_ids = [
         wid for wid in addr_to_wallet_id.values() if wid is not None
     ]
     existing_keys = _existing_wallet_idem_keys(
         db, candidate_wallet_ids, WALLET_FORMULA_VERSION,
     )
-
-    budget_remaining: Optional[int] = (
-        max_wallet_scores if (max_wallet_scores and max_wallet_scores > 0) else None
+    fresh_set, already_scored_set, material_changed_set = _classify_wallet_state(
+        db, addr_to_wallet_id, existing_keys, sorted_addrs,
     )
+
+    # Build the in-slice address list under the hard cap. Fresh and
+    # material-changed consume budget; already-scored fill remaining
+    # slots only if the cap is not already saturated by fresh work.
+    cap_remaining: Optional[int] = cap
     addresses_in_slice: list[str] = []
-    wallets_already_scored = 0
-    wallets_in_slice = 0
-    wallets_deferred = 0
+    selected_fresh: list[str] = []
+    selected_already_scored: list[str] = []
+
+    def _append(addr: str, *, fresh: bool) -> None:
+        """Append ``addr`` to the slice if budget permits.
+
+        Honors the hard cap. Raises ``IndexError`` only for caller
+        misuse (passing ``fresh=True`` after the cap is exhausted
+        without explicit override); the public path always respects
+        the cap.
+        """
+        nonlocal cap_remaining
+        if cap_remaining is None:
+            addresses_in_slice.append(addr)
+            return
+        if cap_remaining <= 0:
+            return
+        addresses_in_slice.append(addr)
+        cap_remaining -= 1
+        if fresh:
+            selected_fresh.append(addr)
+        else:
+            selected_already_scored.append(addr)
+
+    # Pass 1 — fresh and material-changed wallets (budget-consuming).
     for canonical_addr in sorted_addrs:
-        wallet_id = addr_to_wallet_id.get(canonical_addr)
-        if wallet_id is None:
-            # Wallet not present in the ``wallets`` table. Treat as
-            # already-scored (zero-budget, no-op slot) so the
-            # summary stays honest. Downstream helpers (Step 5b)
-            # silently drop the address when the wallet_id lookup
-            # fails.
-            addresses_in_slice.append(canonical_addr)
-            continue
-        already_scored_for_wallet_id = any(
-            combo.startswith(f"{wallet_id}|")
-            for combo in existing_keys
+        if canonical_addr in fresh_set or canonical_addr in material_changed_set:
+            _append(canonical_addr, fresh=True)
+
+    # Pass 2 — already-scored wallets (zero-budget fillers).
+    for canonical_addr in sorted_addrs:
+        if canonical_addr in already_scored_set:
+            _append(canonical_addr, fresh=False)
+
+    addresses_in_slice.sort()  # canonical order for downstream
+
+    deferred_total = max(0, len(sorted_addrs) - len(addresses_in_slice))
+
+    # Enforce the hard-cap invariant. The algorithm guarantees it;
+    # the assertion makes any future regression fail loudly.
+    if cap is not None:
+        assert len(addresses_in_slice) <= cap, (
+            f"resolve_bounded_wallet_slice violated its own hard-cap: "
+            f"len(addresses_in_slice)={len(addresses_in_slice)} "
+            f"> cap={cap}"
         )
-        if already_scored_for_wallet_id:
-            addresses_in_slice.append(canonical_addr)
-            wallets_already_scored += 1
-            continue
-        if budget_remaining is None:
-            addresses_in_slice.append(canonical_addr)
-            wallets_in_slice += 1
-            continue
-        if budget_remaining > 0:
-            addresses_in_slice.append(canonical_addr)
-            wallets_in_slice += 1
-            budget_remaining -= 1
-            continue
-        wallets_deferred += 1
+    assert len(selected_fresh) + len(selected_already_scored) == len(
+        addresses_in_slice,
+    )
+    # Note: it is valid for a material-changed address to NOT be in
+    # ``selected_fresh`` if the cap ran out before reaching it in
+    # pass 1. The cap-truncation invariant is what protects us
+    # against unbounded expansion; that invariant is the assertion
+    # below on ``len(addresses_in_slice) <= cap``.
+    assert (
+        len(selected_fresh) + len(selected_already_scored) == len(addresses_in_slice)
+    ), (
+        "fresh (incl. material-changed) + already-scored must equal "
+        "addresses_in_slice length"
+    )
+    # The slice invariant for material-change bypass prevention: every
+    # material-changed address that appears in the slice must be in
+    # ``selected_fresh`` (it budget-consumes). An address that did
+    # NOT make the slice (because the cap ran out) cannot be in
+    # either list, which is fine — it deferred.
+    for addr in material_changed_set & set(addresses_in_slice):
+        assert addr not in selected_already_scored, (
+            f"material-changed {addr} must not be classified as "
+            f"already-scored; that would defeat the bypass prevention"
+        )
 
     return SlicedRunTelemetry(
         addresses_in_slice=addresses_in_slice,
         wallets_considered=len(sorted_addrs),
-        wallets_already_scored=wallets_already_scored,
-        wallets_in_slice=wallets_in_slice,
-        wallets_deferred_to_next_run=wallets_deferred,
+        wallets_in_slice_fresh=len(selected_fresh),
+        wallets_in_slice_already_scored=len(selected_already_scored),
+        wallets_in_slice_total=len(addresses_in_slice),
+        wallets_deferred_to_next_run=deferred_total,
     )
+
+
+def _classify_wallet_state(
+    db: Database,
+    addr_to_wallet_id: dict[str, Optional[str]],
+    existing_keys: set[str],
+    sorted_addrs: list[str],
+) -> tuple[set[str], set[str], set[str]]:
+    """Return (fresh_set, already_scored_set, material_changed_set).
+
+    * ``fresh_set`` — wallet has NO prior ``wallet_score_decisions``
+      row under V1 (or has no row in the ``wallets`` table yet).
+    * ``already_scored_set`` — wallet has a prior V1 row AND the latest
+      source_trades timestamp for this wallet matches the latest
+      ``source_data_timestamp`` of the wallet_score_decisions row.
+      Treat as zero-budget no-op.
+    * ``material_changed_set`` — wallet has a prior V1 row BUT the
+      latest source_trades timestamp is newer than the latest
+      ``source_data_timestamp``. Treat as fresh (budget-consuming) on
+      this run so the strict material check downstream actually has a
+      chance to write a new row.
+
+    # The timestamp cross-check is the cheap material-proxy: we never
+    # recompute wallet metrics inside the slice helper, but we still
+    # distinguish "wallet has not changed since last scoring" from
+    # "wallet has moved on since last scoring". A wallet whose
+    # source_trades timestamp has not advanced since its last V1 score is
+    # a strict-material no-op by construction (its canonical metrics
+    # blob is identical); a wallet whose source_trades have advanced
+    # may still produce an identical canonical blob (e.g. only trade
+    # prices ticked without changing aggregates), but the safer
+    # conservative default is to budget-consume it and let Step 5b's
+    # strict material check decide.
+
+    Notes
+    -----
+    ``source_data_timestamp`` on the V1 row and ``timestamp`` on the
+    source_trades row are ISO-8601 strings that may differ in
+    designator (``Z`` vs ``+00:00``) for the same instant. We
+    normalise both to ``+00:00`` before comparing so ``Z``-stamped
+    trade rows are not falsely classified as "newer than" ``+00:00``-
+    stamped V1 rows from the same instant.
+    """
+
+    def _iso_z_to_plus(ts: str) -> str:
+        """Return ISO string with ``Z`` normalised to ``+00:00``.
+
+        Both are UTC offsets; the same instant can carry either form.
+        Plain string compare would treat ``Z`` (0x5A) as greater than
+        ``+`` (0x2B) for the same wall-clock, which would falsely
+        flag every V1 row whose ``source_data_timestamp`` uses
+        ``+00:00`` as material-stale. Normalising both sides keeps
+        the proxy semantically correct.
+        """
+        if not isinstance(ts, str):
+            return ""
+        return ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    # Pre-load (wallet_id, latest_source_data_timestamp) for any
+    # wallet_id that has prior decisions.
+    wallet_ids_with_prior = {
+        wid
+        for wid in addr_to_wallet_id.values()
+        if wid is not None
+        and any(combo.startswith(f"{wid}|") for combo in existing_keys)
+    }
+    last_scored_ts: dict[str, str] = {}
+    if wallet_ids_with_prior:
+        wid_placeholders = ",".join("?" for _ in wallet_ids_with_prior)
+        try:
+            rows = db.fetchall(
+                f"SELECT wallet_id, MAX(source_data_timestamp) AS ts "
+                f"FROM wallet_score_decisions "
+                f"WHERE wallet_id IN ({wid_placeholders}) "
+                f"AND formula_name = 'wallet_score' "
+                f"AND formula_version = '1' "
+                f"GROUP BY wallet_id",
+                tuple(wallet_ids_with_prior),
+            )
+        except Exception:  # noqa: BLE001 — defensive: never abort slice
+            rows = []
+        for row in rows:
+            wid = row["wallet_id"]
+            ts = row["ts"]
+            if wid is not None:
+                last_scored_ts[str(wid)] = _iso_z_to_plus(
+                    str(ts) if ts is not None else "",
+                )
+
+    # Pre-load (canonical_address, MAX(timestamp)) over source_trades
+    # for the candidate addresses. Used as the cheap material-change
+    # proxy.
+    last_trade_ts: dict[str, str] = {}
+    if sorted_addrs:
+        addr_placeholders = ",".join("?" for _ in sorted_addrs)
+        try:
+            rows = db.fetchall(
+                f"SELECT trader_address, MAX(timestamp) AS ts "
+                f"FROM source_trades "
+                f"WHERE trader_address IN ({addr_placeholders}) "
+                f"GROUP BY trader_address",
+                tuple(sorted_addrs),
+            )
+        except Exception:  # noqa: BLE001 — defensive: never abort slice
+            rows = []
+        # Map canonical_address -> wallet_id so we can group by wid.
+        addr_to_last_trade = {
+            row["trader_address"]: str(row["ts"] or "")
+            for row in rows
+            if row["trader_address"]
+        }
+        for canonical_addr in sorted_addrs:
+            wid = addr_to_wallet_id.get(canonical_addr)
+            if wid is None or wid not in wallet_ids_with_prior:
+                continue
+            t = addr_to_last_trade.get(canonical_addr)
+            if t is None:
+                continue
+            # Use normalised comparison (Z vs +00:00 are the same instant
+            # but compare unequal as raw strings).
+            t_norm = _iso_z_to_plus(t)
+            cur = last_trade_ts.get(wid)
+            if cur is None or t_norm > cur:
+                last_trade_ts[wid] = t_norm
+
+    fresh_set: set[str] = set()
+    already_scored_set: set[str] = set()
+    material_changed_set: set[str] = set()
+    for canonical_addr in sorted_addrs:
+        wallet_id = addr_to_wallet_id.get(canonical_addr)
+        if wallet_id is None:
+            # No ``wallets`` row yet — definitely needs work.
+            fresh_set.add(canonical_addr)
+            continue
+        has_prior = any(
+            combo.startswith(f"{wallet_id}|") for combo in existing_keys
+        )
+        if not has_prior:
+            fresh_set.add(canonical_addr)
+            continue
+        scored_ts = last_scored_ts.get(wallet_id, "")
+        trade_ts = last_trade_ts.get(wallet_id, "")
+        if trade_ts and trade_ts > scored_ts:
+            material_changed_set.add(canonical_addr)
+        else:
+            already_scored_set.add(canonical_addr)
+    return fresh_set, already_scored_set, material_changed_set
 
 
 # ------------------------------------------------------------------------
