@@ -365,7 +365,7 @@ data arrives.
 
 ---
 
-## 12. Safety confirmation (will be re-verified at PR-open time)
+## 11. Safety confirmation (re-verified after PR #20 review)
 
 - ❌ No broker credentials added
 - ❌ No `is_approved=1` ever written
@@ -379,3 +379,74 @@ data arrives.
 - ✅ Existing formulas consume no new inputs in this PR
 - ✅ PR19 hard-cap invariant preserved
 - ✅ PR19 bounded slice helper unchanged
+
+---
+
+## 12. Production activation — Option A (dormant audit / optional evidence layer)
+
+**This PR does NOT activate specialist aggregation rows in the
+production scan.** PR #20 ships:
+
+1. the schema (`wallet_specialist_aggregations`),
+2. the pure-function aggregator and idempotent persistence helper,
+3. a new bounded Step 5f in `run_scan` that *can* write evidence rows,
+4. CLI flags `--enable-pr20-specialist-aggregations` and
+   `--max-specialist-aggregations`,
+
+but the new flags default to OFF (`enable_pr20_specialist_aggregations
+= False`) and Step 5f is gated behind that flag. Concretely:
+
+* Existing production scans that do not change their systemd unit or
+  CLI invocation behave **exactly as before** — no new writes, no new
+  rows, no observable change.
+* The systemd unit file is **not modified** by this PR.
+* The `enable_pr20_specialist_aggregations` parameter on
+  `run_scan(...)` defaults to `False` — an explicit test
+  (`tests/test_pr20_specialist_metrics_persistence.py::
+  RunScanDefaultFlagTests::test_run_scan_default_aggregation_is_off`)
+  asserts this contract.
+
+**Activation is a follow-on decision**, owned by a later PR
+(candidate: PR #21 or a deployment-config PR) that will, at minimum:
+  1. observe the 24-hour PR #19 production scan is clean,
+  2. update the systemd unit (or `Makefile` target) to pass
+     `--enable-pr20-specialist-aggregations`,
+  3. add a deployment-validation step that asserts rows appear in
+     `wallet_specialist_aggregations` after a representative run,
+  4. confirm Step 5f only runs when the schema is at v13 or higher.
+
+Until that follow-on, `wallet_specialist_aggregations` is an unused
+table in production — present in the schema, writable via the helper,
+but never written by the live scan.
+
+---
+
+## 13. Idempotency contract (BLOCKER 1 fix)
+
+`persist_wallet_specialist_aggregation` returns **truthy only when a
+new row was actually inserted** (verified via `cursor.rowcount` on
+the underlying `sqlite3.Cursor` after `INSERT OR IGNORE`):
+
+* `rowcount == 1` → function returns `True` (new insert).
+* `rowcount == 0` → function returns `False` (UNIQUE collision, the
+  existing row was kept).
+* If a future DB wrapper hides `rowcount`, the function falls back
+  to a post-insert existence check so the return value is still
+  honest.
+
+This is enforced by
+`tests/test_pr20_specialist_metrics_persistence.py::ReturnValueTests`
+(3 tests) and exercised end-to-end by
+`Step5fIntegrationTests` (3 tests). The full set of BLOCKER-1
+tests:
+
+1. `test_first_insert_returns_true`
+2. `test_second_identical_insert_returns_false`
+3. `test_table_row_count_remains_one_after_duplicate`
+4. `test_first_run_reports_rows_written_one`
+5. `test_rerun_reports_rows_written_zero_skipped_one`
+6. `test_max_aggregations_cap_holds`
+7. `test_no_orders_positions_signals_balances_writes`
+8. `test_no_approved_paper_signals`
+
+All 8 pass on the current branch.

@@ -6,6 +6,15 @@ produces zero net rows because the UNIQUE constraint
 ``(wallet_id, category_label, formula_name, formula_version,
 idempotency_key)`` collapses duplicates.
 
+The return value of :func:`persist_wallet_specialist_aggregation`
+is **truthy only when a new row was actually inserted** (i.e. the
+``INSERT OR IGNORE`` affected a row). Re-runs with the same
+idempotency key return ``False``. This is enforced via
+``cursor.rowcount`` from the underlying ``sqlite3.Cursor`` (which
+reports 1 for new inserts and 0 for collisions), with a defensive
+post-insert existence check as a fallback if a future DB wrapper
+hides ``rowcount``.
+
 Design rules
 ============
 
@@ -20,7 +29,7 @@ Public API
 * :func:`generate_specialist_idempotency_key` — deterministic SHA-256
   hex digest over the canonical inputs.
 * :func:`persist_wallet_specialist_aggregation` — INSERT one
-  aggregation row.
+  aggregation row; returns True iff a new row was inserted.
 * :func:`load_specialist_aggregations_for_wallet` — convenience
   reader for tests / dashboards.
 """
@@ -64,6 +73,31 @@ def generate_specialist_idempotency_key(
     )
 
 
+def _row_exists(db: Database, *, wallet_id: str, category_label: str,
+                idempotency_key: str) -> bool:
+    """Defensive existence check used when ``cursor.rowcount`` is unavailable.
+
+    Returns ``True`` iff a row with the given (wallet, category,
+    formula_name, formula_version, idempotency_key) exists. This is
+    the post-INSERT fallback so the return value of
+    :func:`persist_wallet_specialist_aggregation` is always honest.
+    """
+    row = db.fetchone(
+        "SELECT 1 AS present FROM wallet_specialist_aggregations "
+        "WHERE wallet_id = ? AND category_label = ? "
+        "AND formula_name = ? AND formula_version = ? "
+        "AND idempotency_key = ?",
+        (
+            wallet_id,
+            category_label or "",
+            SPECIALIST_FORMULA_NAME,
+            SPECIALIST_FORMULA_VERSION,
+            idempotency_key,
+        ),
+    )
+    return row is not None
+
+
 def persist_wallet_specialist_aggregation(
     db: Database,
     *,
@@ -75,25 +109,23 @@ def persist_wallet_specialist_aggregation(
 ) -> bool:
     """Insert one aggregation row. Idempotent.
 
-    Parameters
-    ----------
-    db:
-        Connected :class:`polycopy.db.database.Database`.
-    wallet_id, category_label, source_data_timestamp:
-        Identity triple.
-    metrics:
-        The evidence dict returned by
-        :func:`polycopy.scoring.specialist_metrics.aggregate_specialist_metrics`.
-        Numeric fields are pulled by key from this dict.
-    now:
-        Optional wall-clock for ``created_at``. Defaults to UTC now.
-
     Returns
     -------
     bool
-        ``True`` if a new row was written, ``False`` if the
-        idempotency key already existed (re-run). Errors are
-        propagated to the caller.
+        ``True`` if a NEW row was inserted. ``False`` if the
+        idempotency key already existed (re-run; INSERT OR IGNORE
+        collapsed). Non-idempotency-key errors propagate.
+
+    Implementation
+    --------------
+    ``INSERT OR IGNORE`` plus ``cursor.rowcount`` is the authoritative
+    path. SQLite returns ``rowcount == 1`` on a fresh insert and
+    ``rowcount == 0`` when the UNIQUE constraint collapses the
+    INSERT — verified against the SQLite C docs and tested in
+    ``tests/test_pr20_specialist_metrics_persistence.py``. When the
+    wrapper hides ``rowcount`` we fall back to a post-insert
+    existence check; either way the return value reflects the
+    real on-disk state.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -118,7 +150,7 @@ def persist_wallet_specialist_aggregation(
     )
 
     try:
-        db.execute(
+        cursor = db.execute(
             """
             INSERT OR IGNORE INTO wallet_specialist_aggregations (
                 wallet_id, category_label, formula_name, formula_version,
@@ -175,14 +207,22 @@ def persist_wallet_specialist_aggregation(
                 now.isoformat(),
             ),
         )
-        # ``execute`` returns the cursor rowcount; a row was
-        # written iff rowcount > 0. The Database adapter returns
-        # ``None`` on most paths so we treat ``None`` as "best
-        # effort" and the caller can re-check via fetchone().
-        return True
+        # Authoritative path: cursor.rowcount. 1 == new insert, 0 == collision.
+        rowcount = getattr(cursor, "rowcount", None)
+        if rowcount is None:
+            # Defensive fallback so a future DB wrapper that hides
+            # rowcount still produces a truthful return value.
+            return _row_exists(
+                db,
+                wallet_id=wallet_id,
+                category_label=category_label,
+                idempotency_key=idempotency_key,
+            )
+        return int(rowcount) == 1
     except Exception as exc:  # noqa: BLE001 — defensive
-        # Duplicate idempotency key collapses to ``INSERT OR IGNORE``
-        # no-op. Other errors propagate.
+        # If for any reason the INSERT raises a UNIQUE violation
+        # (the wrapper path bypasses INSERT OR IGNORE), treat it
+        # as an idempotent no-op rather than a hard error.
         if "UNIQUE constraint failed" in str(exc):
             return False
         raise
