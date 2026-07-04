@@ -159,11 +159,17 @@ class ScanResult:
         # counters above are populated only when a row actually took
         # effect (insert or unique-match), so they can be smaller than
         # ``wallet_scores_processed`` when helpers encounter errors.
-        # ``wallet_scores_skipped`` is the count of wallets that
-        # ``metrics_by_address`` discovered but were deferred to a
-        # subsequent run because of ``max_wallet_scores``.
+        # ``wallet_scores_skipped`` and ``wallet_scores_deferred`` are
+        # the count of wallets that ``metrics_by_address`` discovered
+        # but were not persisted this run because the ``max_wallet_scores``
+        # budget was exhausted (deferred) or because the wallet was
+        # not present in ``wallets`` (skipped). Both fields are kept
+        # for back-compat with the second-review telemetry and the
+        # third-review telemetry respectively; they report the same
+        # number under the bounded-progression contract.
         self.wallet_scores_processed: int = 0
         self.wallet_scores_skipped: int = 0
+        self.wallet_scores_deferred: int = 0
         self.trades_scanned_for_candidates: int = 0
         # Round-10 fetch-status counters (per-market, not per-row).
         self.market_fetches_complete: int = 0
@@ -584,51 +590,54 @@ async def run_scan(
         )
         pr5c = ScanPipelineCounters()
 
-        # Step 5b — wallet score v1 (BOUNDED slice).
-        # ``max_wallet_scores`` caps how many wallets this run touches so a
-        # timer invocation cannot process 89k+ wallets in a single run.
-        # The slice is taken in deterministic wallet-id order so repeated
-        # runs progress through the wallet corpus without duplicating
-        # already-scored rows (UNIQUE(wallet_id, formula_name,
-        # formula_version, idempotency_key) suppresses duplicates and the
-        # counters differentiate "fresh insert" from "reused"). Wallets
-        # beyond the slice are deferred to subsequent runs and reported in
-        # ``result.wallet_scores_skipped``.
+        # Step 5b — wallet score v1 (BOUNDED, PROGRESSING).
+        # ``max_wallet_scores`` caps how many FRESH wallet-score
+        # inserts this run performs. The helper iterates the full
+        # discovered wallet list in deterministic sorted canonical-
+        # address order and applies the bounded-progression rules:
+        #
+        #   1. Wallets whose material inputs already match a persisted
+        #      ``wallet_score_decisions`` row are SKIPPED (counted as
+        #      reused). They do not consume the budget.
+        #   2. Wallets with no matching row that fit within the budget
+        #      are PERSISTED (counted as fresh inserts).
+        #   3. Wallets with no matching row that arrive after the
+        #      budget is exhausted are DEFERRED (counted as deferred).
+        #
+        # Because the iteration order is stable across runs, the corpus
+        # progresses automatically: on the next run the previously-
+        # deferred wallets appear in sorted order and (assuming their
+        # material inputs have not changed) get persisted. A material
+        # change to a wallet's metrics produces a new idempotency key
+        # and therefore a new immutable row on its next visit.
         all_wallet_addrs = list(metrics_by_address.keys())
-        if len(all_wallet_addrs) > max_wallet_scores:
-            # Stable ordering: sort by canonical address. This keeps
-            # repeated scans consuming the corpus in the same order
-            # rather than rediscovering the ordering from dict insertion
-            # (which depends on upstream discovery order).
-            all_wallet_addrs.sort()
-            bounded_wallet_addrs = all_wallet_addrs[:max_wallet_scores]
-            wallet_scores_skipped = len(all_wallet_addrs) - len(bounded_wallet_addrs)
-        else:
-            bounded_wallet_addrs = all_wallet_addrs
-            wallet_scores_skipped = 0
-        result.wallet_scores_skipped = wallet_scores_skipped
-        result.wallet_scores_processed = len(bounded_wallet_addrs)
-
+        all_wallet_addrs.sort()
+        result.wallet_scores_processed = len(all_wallet_addrs)
         logger.info(
             "Step 5b: Persisting v1 wallet-score decisions "
-            "(processing %d of %d wallets, %d deferred to next run)...",
-            len(bounded_wallet_addrs),
+            "(budget=%d fresh inserts, discovered=%d wallets)...",
+            max_wallet_scores,
             len(all_wallet_addrs),
-            wallet_scores_skipped,
         )
         persist_wallet_v1_decisions(
             db,
-            addresses=bounded_wallet_addrs,
+            addresses=all_wallet_addrs,
             metrics_by_address=metrics_by_address,
             now=now,
             counters=pr5c,
+            max_wallet_scores=max_wallet_scores,
         )
         result.wallet_score_decisions_persisted = pr5c.wallet_score_decisions_persisted
         result.wallet_score_decisions_reused = pr5c.wallet_score_decisions_reused
+        result.wallet_scores_deferred = pr5c.wallet_scores_deferred
+        result.wallet_scores_skipped = pr5c.wallet_scores_deferred
         logger.info(
-            "  wallet_score_decisions: %d persisted, %d reused",
+            "  wallet_score_decisions: %d persisted, %d reused, %d deferred "
+            "(budget=%d)",
             result.wallet_score_decisions_persisted,
             result.wallet_score_decisions_reused,
+            result.wallet_scores_deferred,
+            max_wallet_scores,
         )
 
         # Step 5c — category wallet score v1.
@@ -637,15 +646,16 @@ async def run_scan(
         # ``categories_per_wallet`` map so Step 5c persists nothing
         # rather than fabricating category labels. The helper is
         # unit-tested independently so the contract surface is complete.
-        # The address list is bounded to match Step 5b so Step 5e can
-        # reason about the same wallet slice.
+        # Step 5c iterates the FULL discovered wallet list so any
+        # category metadata that lands for previously-deferred wallets
+        # can still flow through.
         logger.info(
             "Step 5c: Persisting v1 category-wallet-score decisions..."
         )
         categories_per_wallet: dict[str, Sequence[str]] = {}
         applied_cats = persist_category_v1_decisions(
             db,
-            addresses=bounded_wallet_addrs,
+            addresses=all_wallet_addrs,
             categories_per_wallet=categories_per_wallet,
             now=now,
             counters=pr5c,
@@ -666,7 +676,7 @@ async def run_scan(
         )
         persist_copy_candidates_for_trades(
             db,
-            addresses=bounded_wallet_addrs,
+            addresses=all_wallet_addrs,
             metrics_by_address=metrics_by_address,
             trades_by_address=trades_by_address,
             now=now,
@@ -688,31 +698,31 @@ async def run_scan(
         )
 
         # Step 5e — decision_verdicts + score_component_inputs audit trail.
-        # IMPORTANT: both helpers are scoped to the BOUNDED Step 5b/5c
-        # slice so decision_verdicts and score_component_inputs only
-        # reflect wallets this run actually processed (not arbitrary
-        # latest rows from the whole wallet_score_decisions table). The
-        # cap ``max_wallet_scores`` is passed through so the LIMIT in
-        # those helpers never exceeds this run's processed slice.
+        # IMPORTANT: scoped to the FRESH-INSERT wallet IDs from Step 5b
+        # (the wallets this run actually wrote a new wallet_score_decisions
+        # row for). Skip-already-scored wallets keep their existing audit
+        # rows untouched; deferred wallets must NOT appear in this run's
+        # audit at all — they have no fresh decision to audit. This
+        # satisfies the third-review requirement: "decision_verdicts and
+        # score_component_inputs only reference wallets processed in each run".
+        fresh_insert_wallet_ids: list[str] = list(
+            pr5c._fresh_insert_wallet_ids or [],
+        )
         logger.info(
             "Step 5e: Persisting decision_verdicts + score_component_inputs "
-            "(bounded to %d wallets processed this run)...",
-            len(bounded_wallet_addrs),
+            "(scoped to %d fresh-insert wallets this run)...",
+            len(fresh_insert_wallet_ids),
         )
         persist_decision_verdicts_and_components(
             db,
             now=now,
             counters=pr5c,
-            scoped_wallet_ids=(
-                _resolve_wallet_ids(db, bounded_wallet_addrs)
-            ),
+            scoped_wallet_ids=fresh_insert_wallet_ids,
         )
         persist_score_component_inputs_for_wallet_decisions(
             db,
             counters=pr5c,
-            scoped_wallet_ids=(
-                _resolve_wallet_ids(db, bounded_wallet_addrs)
-            ),
+            scoped_wallet_ids=fresh_insert_wallet_ids,
         )
         result.decision_verdicts_persisted = pr5c.decision_verdicts_persisted
         result.score_component_inputs_persisted = pr5c.score_component_inputs_persisted

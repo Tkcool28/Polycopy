@@ -87,6 +87,7 @@ class ScanPipelineCounters:
     __slots__ = (
         "wallet_score_decisions_persisted",
         "wallet_score_decisions_reused",
+        "wallet_scores_deferred",
         "category_score_decisions_persisted",
         "category_score_decisions_reused",
         "copy_candidates_created",
@@ -95,12 +96,25 @@ class ScanPipelineCounters:
         "decision_verdicts_persisted",
         "score_component_inputs_persisted",
         "trades_scanned_for_candidates",
+        # Internal: fresh-insert wallet IDs from Step 5b so Step 5e can
+        # scope audit writes to the wallets that received a NEW row in
+        # this run (skip-already-scored wallets are excluded, deferred
+        # wallets are excluded). Not part of the public counters surface
+        # — callers should use it via ``counters._fresh_insert_wallet_ids``.
+        "_fresh_insert_wallet_ids",
     )
 
     def __init__(self) -> None:
         # PR-17 wallet-score table
         self.wallet_score_decisions_persisted: int = 0
         self.wallet_score_decisions_reused: int = 0
+        # PR 5 bounded-progression telemetry. ``wallet_scores_deferred``
+        # is the number of wallets that ``metrics_by_address`` discovered
+        # but were skipped because ``max_wallet_scores`` was already
+        # consumed by fresh inserts in this run. Deferred wallets
+        # remain eligible for the next scan (sorted iteration order is
+        # stable, so the next run continues where this one stopped).
+        self.wallet_scores_deferred: int = 0
         # PR-17 category-score table
         self.category_score_decisions_persisted: int = 0
         self.category_score_decisions_reused: int = 0
@@ -113,6 +127,11 @@ class ScanPipelineCounters:
         self.score_component_inputs_persisted: int = 0
         # Provenance
         self.trades_scanned_for_candidates: int = 0
+        # Internal — set by ``persist_wallet_v1_decisions`` so Step 5e
+        # can scope audit writes to exactly the wallets this run
+        # inserted a fresh row for. Initialized here so ``as_dict()``
+        # works before the helper runs.
+        self._fresh_insert_wallet_ids: list[str] = []
 
     def as_dict(self) -> dict[str, int]:
         return {name: getattr(self, name) for name in self.__slots__}
@@ -172,6 +191,41 @@ def _wallet_inputs_from_metrics(
     )
 
 
+def _existing_wallet_idem_keys(
+    db: Database,
+    wallet_ids: Sequence[str],
+    formula_version: str,
+) -> set[str]:
+    """Return the set of ``idempotency_key`` values already persisted for
+    the given wallet IDs under the V1 formula.
+
+    Used by the bounded Step 5b to skip wallets whose current material
+    inputs already match a persisted decision (no fresh insert needed).
+    The set keys are ``"wallet_id|idempotency_key"`` strings so the same
+    idempotency key for two different wallets does not collide.
+
+    Returns an empty set when ``wallet_ids`` is empty so callers do not
+    emit a degenerate ``IN ()`` query.
+    """
+    if not wallet_ids:
+        return set()
+    placeholders = ",".join("?" for _ in wallet_ids)
+    try:
+        rows = db.fetchall(
+            f"""
+            SELECT wallet_id, idempotency_key
+            FROM wallet_score_decisions
+            WHERE formula_name = 'wallet_score'
+              AND formula_version = ?
+              AND wallet_id IN ({placeholders})
+            """,
+            (formula_version, *wallet_ids),
+        )
+    except Exception:  # noqa: BLE001 — defensive
+        return set()
+    return {f"{str(r['wallet_id'])}|{str(r['idempotency_key'])}" for r in rows}
+
+
 def persist_wallet_v1_decisions(
     db: Database,
     *,
@@ -179,25 +233,92 @@ def persist_wallet_v1_decisions(
     metrics_by_address: dict[str, dict],
     now: Optional[datetime] = None,
     counters: ScanPipelineCounters,
+    max_wallet_scores: Optional[int] = None,
 ) -> int:
     """Compute + persist the v1 wallet score decision for every address.
 
+    The wallet list is iterated in sorted canonical-address order so the
+    corpus is consumed deterministically across runs. For each wallet the
+    helper computes the material-input idempotency key and either:
+
+      * **skips** the wallet — if a row with the same
+        ``(wallet_id, formula_name, formula_version, idempotency_key)``
+        already exists. The ``counters.wallet_score_decisions_reused``
+        counter is incremented; no DB write happens.
+      * **inserts** a new immutable row — when the wallet has no matching
+        existing row AND the budget ``max_wallet_scores`` has not been
+        exhausted. The ``counters.wallet_score_decisions_persisted``
+        counter is incremented.
+      * **defers** the wallet — when the budget is exhausted before this
+        wallet was reached. The ``counters.wallet_scores_deferred``
+        counter is incremented; the next scan will continue where this
+        one stopped because the sorted iteration order is stable.
+
+    This skip-already-scored progression ensures the scan makes forward
+    progress through the wallet corpus even when ``max_wallet_scores``
+    is much smaller than the discovered set: wallets already scored
+    with the same material inputs are no-ops, so the budget is consumed
+    only by fresh work and naturally rotates through previously-
+    deferred wallets across successive runs.
+
+    When ``max_wallet_scores`` is ``None`` (default), no budget is
+    applied and every wallet in ``addresses`` is processed. This
+    preserves the previous behavior for callers that don't want
+    bounded progression (e.g. one-shot backfills, the legacy unit
+    tests in ``tests/test_p04_*``).
+
     Returns the number of rows that took effect (inserted or reused).
-    Increments ``counters.wallet_score_decisions_persisted`` for fresh inserts
-    and ``counters.wallet_score_decisions_reused`` for pre-existing rows
-    matched by UNIQUE(wallet_id, formula_name, formula_version, idempotency_key).
     """
     if now is None:
         now = datetime.now(timezone.utc)
+
+    # Deterministic iteration order — the corpus is always consumed in
+    # sorted canonical-address order so repeated scans make progress.
+    sorted_addrs = sorted(set(addresses))
+
+    # Resolve wallet_ids up front and pre-load the existing
+    # (wallet_id, idempotency_key) set so the inner loop is one
+    # straight-line decision per wallet.
+    addr_to_wallet_id: dict[str, Optional[str]] = {}
+    for canonical_addr in sorted_addrs:
+        addr_to_wallet_id[canonical_addr] = _load_wallet_id(
+            db, canonical_addr,
+        )
+    candidate_wallet_ids = [
+        wid for wid in addr_to_wallet_id.values() if wid is not None
+    ]
+    existing_keys = _existing_wallet_idem_keys(
+        db, candidate_wallet_ids, WALLET_FORMULA_VERSION,
+    )
+
     applied = 0
-    for canonical_addr in addresses:
+    budget_remaining = max_wallet_scores
+    # Wallets that received a FRESH wallet_score_decisions insert in
+    # this run. Returned to the caller so Step 5e can scope its audit
+    # writes to exactly the rows this run produced (skip-already-scored
+    # wallets keep their existing audit rows untouched; deferred
+    # wallets must not appear in this run's audit at all).
+    fresh_insert_wallet_ids: list[str] = []
+    for canonical_addr in sorted_addrs:
         metrics = metrics_by_address.get(canonical_addr)
         if metrics is None:
             # Defensive: caller didn't pre-compute metrics for this wallet —
             # skip rather than fabricate a result.
             continue
-        wallet_id = _load_wallet_id(db, canonical_addr)
+        wallet_id = addr_to_wallet_id.get(canonical_addr)
         if wallet_id is None:
+            continue
+        idem_key = _wallet_idempotency_key(canonical_addr, metrics)
+        existing_combo = f"{wallet_id}|{idem_key}"
+        if existing_combo in existing_keys:
+            # Already persisted with identical material inputs. No-op
+            # so the budget is consumed only by fresh work. Counted as
+            # reused; never counted as deferred.
+            counters.wallet_score_decisions_reused += 1
+            continue
+        if budget_remaining is not None and budget_remaining <= 0:
+            # Budget exhausted; defer remaining wallets to next scan.
+            counters.wallet_scores_deferred += 1
             continue
         input_obj = _wallet_inputs_from_metrics(
             canonical_addr=canonical_addr,
@@ -211,9 +332,7 @@ def persist_wallet_v1_decisions(
                 db,
                 wallet_id,
                 result,
-                idempotency_key=_wallet_idempotency_key(
-                    canonical_addr, metrics,
-                ),
+                idempotency_key=idem_key,
                 source_data_timestamp=now.isoformat(),
             )
         except Exception as exc:  # noqa: BLE001 — defensive: never abort scan
@@ -226,9 +345,23 @@ def persist_wallet_v1_decisions(
         after = _count_rows(db, "wallet_score_decisions")
         if after > before:
             counters.wallet_score_decisions_persisted += 1
+            existing_keys.add(existing_combo)
+            applied += 1
+            fresh_insert_wallet_ids.append(wallet_id)
+            if budget_remaining is not None:
+                budget_remaining -= 1
         else:
+            # UNIQUE collision — the row already existed. This is the
+            # safety net for a race between this scan and another
+            # writer (e.g. another timer run). Treated as a reuse.
             counters.wallet_score_decisions_reused += 1
-        applied += 1
+            existing_keys.add(existing_combo)
+            applied += 1
+    # Stash the fresh-insert wallet IDs on the counters so the caller
+    # can scope Step 5e to exactly the wallets that received a new row
+    # in this run. Using a private attribute (leading underscore) keeps
+    # this out of the public counters surface.
+    counters._fresh_insert_wallet_ids = fresh_insert_wallet_ids
     return applied
 
 
