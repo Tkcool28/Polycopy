@@ -43,7 +43,7 @@ natively idempotent in SQLite.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Import v10 schema changes
 from polycopy.db.schema_v10 import _V10_DDL  # noqa: E402
@@ -53,6 +53,16 @@ from polycopy.db.schema_v11 import _V11_DDL  # noqa: E402
 
 # Import v12 schema changes (additive audit storage for paper-signal input)
 from polycopy.db.schema_v12 import _V12_DDL  # noqa: E402
+
+# Import v13 schema changes (additive wallet_specialist_aggregations evidence
+# table from PR #20). The PR20 runtime wiring (specialist_metrics.py,
+# specialist_metrics_persistence.py, specialist_aggregation_step.py,
+# POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED flag, and tests) is intentionally
+# NOT carried by this hotfix. This import only registers the schema DDL so
+# that main code can open a v13 DB. No scoring formula reads
+# wallet_specialist_aggregations, so the table stays empty and inert until
+# PR #20 is finalized and merged in a future PR.
+from polycopy.db.schema_v13 import _V13_DDL  # noqa: E402
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -786,6 +796,7 @@ MIGRATIONS: dict[int, list[str]] = {
     10: _V10_DDL,
     11: _V11_DDL,
     12: _V12_DDL,
+    13: _V13_DDL,
 }
 
 # Current DDL is the latest migration
