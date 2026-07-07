@@ -62,12 +62,46 @@ class Database:
             raise RuntimeError("Database not connected. Call connect() first.")
         return self._conn
 
+    # PR24C: Safety PRAGMAs enforced on every connect(). These are idempotent
+    # at the connection level (``journal_mode`` is also persisted in the
+    # database file header, but we still set it explicitly here so any caller
+    # opening the file — including fresh DB creation — gets WAL immediately).
+    _SAFETY_JOURNAL_MODE = "WAL"
+    _SAFETY_BUSY_TIMEOUT_MS = 30_000
+    _SAFETY_WAL_AUTOCHECKPOINT = 1_000
+
     def connect(self) -> "Database":
-        """Open (or create) the SQLite database and run pending migrations."""
+        """Open (or create) the SQLite database and run pending migrations.
+
+        Enforces safety PRAGMAs on every connection:
+
+        - ``PRAGMA foreign_keys = ON``  (per-connection, required for FKs)
+        - ``PRAGMA journal_mode = WAL`` (set explicitly + persisted in file header)
+        - ``PRAGMA busy_timeout = 30000`` (per-connection, ms)
+        - ``PRAGMA wal_autocheckpoint = 1000`` (per-connection, frames)
+        """
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # FKs must be enabled before migrations run so the v5 rewrite of
+        # source_trades sees the right referential state.
         self._conn.execute("PRAGMA foreign_keys = ON")
+        # journal_mode=WAL returns a row with the new mode (typically "wal");
+        # the value is also persisted in the file header so future reopens
+        # inherit it. Setting it explicitly here makes fresh-DB creation
+        # safe even before any read of the header.
+        self._conn.execute(f"PRAGMA journal_mode = {self._SAFETY_JOURNAL_MODE}")
+        # busy_timeout makes the writer wait instead of raising
+        # SQLITE_BUSY when another connection is mid-transaction.
+        self._conn.execute(
+            f"PRAGMA busy_timeout = {self._SAFETY_BUSY_TIMEOUT_MS}"
+        )
+        # wal_autocheckpoint bounds how many frames the WAL can hold
+        # before SQLite auto-checkpoints. 1000 frames is the
+        # well-trodden Polycopy operational value.
+        self._conn.execute(
+            f"PRAGMA wal_autocheckpoint = {self._SAFETY_WAL_AUTOCHECKPOINT}"
+        )
         if self.echo:
             self._conn.set_trace_callback(lambda sql: logger.debug("SQL: %s", sql))
         self._run_migrations()
