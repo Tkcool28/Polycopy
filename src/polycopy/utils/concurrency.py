@@ -87,7 +87,6 @@ class FileLock:
     def _acquire(self) -> None:
         """Acquire the exclusive lock, waiting up to self.timeout seconds."""
         start = time.monotonic()
-        deadline = start + self.timeout
 
         # Ensure parent directory exists
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,10 +126,18 @@ class FileLock:
                 return
 
             except (OSError, IOError) as e:
-                # Do NOT attempt any operations on fd here.
-                # On this kernel, fcntl/flock/close on a failed lock fd
-                # can block indefinitely. The fd will be reclaimed on
-                # process exit.
+                # Close the fd we just opened. Verified safe: closing a fd
+                # whose flock() failed with EWOULDBLOCK does NOT block on
+                # Linux (the kernel only blocks on flock()/fcntl() on
+                # already-locked fds, not on close). Without this close
+                # every retry leaks one fd and the process eventually hits
+                # EMFILE under contention. PR24D made this visible.
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                fd = None
 
                 # Determine if this is a lock-held error vs. a real failure
                 import errno as _errno
@@ -143,14 +150,14 @@ class FileLock:
                     raise
 
                 elapsed = time.monotonic() - start
-                if elapsed >= deadline:
+                if elapsed >= self.timeout:
                     raise LockError(
                         str(self.lock_path),
                         self.timeout,
                         pid=None,
                     ) from e
 
-                remaining = deadline - time.monotonic()
+                remaining = self.timeout - elapsed
                 wait = min(self.poll_interval, remaining)
                 if wait > 0:
                     time.sleep(wait)

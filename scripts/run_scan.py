@@ -54,7 +54,8 @@ from polycopy.domain.market import Market, MarketOutcome
 from polycopy.domain.order import OrderSide
 from polycopy.domain.source_trade import SourceTrade
 from polycopy.engine.evaluate import evaluate_wallet
-from polycopy.utils.concurrency import FileLock, LockError, lock_path
+from polycopy.utils.concurrency import LockError
+from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, operational_job_lock
 
 # Shared live-trade ingestion helper (PR #3 P2 fix). Imports are at module
 # scope so both run_scan and collect_smart_money_data consume the SAME
@@ -1667,15 +1668,15 @@ def main() -> int:
     )
     parser.add_argument("--db", type=str, default=None, help="SQLite database path")
     parser.add_argument("--use-sample", action="store_true", help="Use sample data instead of live API")
-    parser.add_argument("--lock-timeout", type=float, default=10.0, help="Lock timeout seconds")
+    parser.add_argument("--lock-timeout", type=float, default=DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, help="Lock timeout seconds")
     parser.add_argument("-v", "--verbose", action="count", default=0)
     args = parser.parse_args()
 
     setup_logging(args.verbose)
 
-    lock = FileLock(lock_path("scan"), timeout=args.lock_timeout)
+    # PR24D: shared global operational-jobs lock.
     try:
-        with lock:
+        with operational_job_lock("scan", timeout=args.lock_timeout):
             settings = get_settings()
             db_path = Path(args.db) if args.db else settings.db_path
             db = Database(db_path=db_path)
