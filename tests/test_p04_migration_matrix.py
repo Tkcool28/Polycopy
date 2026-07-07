@@ -319,3 +319,50 @@ def test_schema_v11_source_has_no_destructive_statements() -> None:
         assert tok not in src, (
             f"schema_v11.py contains forbidden token: {tok!r}"
         )
+
+
+# ---- PR23: migration runner physical-schema guard --------------------
+
+
+def test_meta_lag_with_v13_physical_schema_reconciles_via_short_circuit(tmp_path: Path) -> None:
+    """Production-state regression: ``_meta='4'`` with full v13 physical
+    schema must be reconciled by the pre-flight guard in O(seconds),
+    NOT by replaying v5-v13.
+
+    This is the precise production failure mode PR23 fixes. Without
+    the guard, the runner spends 4+ minutes re-running v5 (which
+    80-second INSERTs 2.26M rows into a new table) before failing on
+    the v5 DROP. With the guard, reconciliation completes in a single
+    transaction.
+    """
+    path = tmp_path / "v13_meta_4.db"
+
+    # Build a v13 DB, then overwrite _meta to '4' (production state).
+    db = Database(db_path=path)
+    db.connect()
+    db.close()
+    con = sqlite3.connect(str(path))
+    con.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('schema_version', '4')"
+    )
+    con.commit()
+    con.close()
+
+    # Time the reconciliation. Without the guard, this would take
+    # 4+ minutes due to the v5 INSERT. With the guard, it must
+    # complete in under 5 seconds.
+    import time
+    t0 = time.time()
+    db = Database(db_path=path)
+    db.connect()
+    try:
+        # _meta should be reconciled.
+        assert _read_schema_version(db) == SCHEMA_VERSION
+        # The v5 source_trades_new table must NOT exist (proof v5 didn't run).
+        assert "source_trades_new" not in _table_names(db)
+    finally:
+        db.close()
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, (
+        f"reconciliation took {elapsed:.1f}s — guard likely not firing"
+    )

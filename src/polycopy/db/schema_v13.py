@@ -100,4 +100,17 @@ _V13_DDL: list[str] = [
 
     "CREATE INDEX IF NOT EXISTS idx_wsa_wallet_category "
     "ON wallet_specialist_aggregations(wallet_id, category_label);",
+    # Forward-compatibility indexes for the planned specialist-aggregation
+    # query patterns. These are additive (CREATE INDEX IF NOT EXISTS) and
+    # do not change any existing index. The table itself is currently
+    # empty (PR #20 runtime is unmerged), so the indexes cost nothing
+    # at runtime. PR23 carries these so that a future PR landing the
+    # specialist-aggregation query path does not have to ship a
+    # follow-up schema migration.
+    "CREATE INDEX IF NOT EXISTS idx_wsa_category_score "
+    "ON wallet_specialist_aggregations(category_label, sample_reliability_score);",
+    "CREATE INDEX IF NOT EXISTS idx_wsa_sample "
+    "ON wallet_specialist_aggregations(quality, sample_reliability_score);",
+    "CREATE INDEX IF NOT EXISTS idx_wsa_computed_at "
+    "ON wallet_specialist_aggregations(created_at);",
 ]
