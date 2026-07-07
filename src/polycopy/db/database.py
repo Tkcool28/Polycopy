@@ -371,6 +371,14 @@ class Database:
         some of the indexes this PR adds to ``_V13_DDL`` are not yet on
         the live DB. All statements are additive (``CREATE INDEX IF NOT
         EXISTS``) and idempotent.
+
+        Hardening: after executing the matching ``CREATE INDEX``
+        statements, this method verifies that every requested index now
+        exists. If any are still missing (e.g. the SQL was filtered out
+        of ``_V13_DDL``, or a name no longer matches the substring
+        pattern, or the execute call silently failed), it raises
+        :class:`MigrationBlocked` listing the missing names. The caller
+        will not log a false-positive success.
         """
         from polycopy.db.schema_v13 import _V13_DDL  # local import to avoid cycle
         # _V13_DDL is a flat list of statements. We only need the ones
@@ -387,6 +395,22 @@ class Database:
                     self.conn.execute(stmt)
                     break
         self.conn.commit()
+
+        # Verify every requested index is now present. We do this in
+        # the same connection so the read-after-write sees the just-
+        # committed indexes (DELETE-mode journals make newly committed
+        # schema objects visible to subsequent reads on the same
+        # connection without requiring a reconnect).
+        still_missing = [name for name in missing if not self._index_exists(name)]
+        if still_missing:
+            raise MigrationBlocked(
+                f"post-reconciliation step failed to create v13 index(es): "
+                f"{still_missing}. The CREATE INDEX statement was found "
+                f"in _V13_DDL but did not result in a visible index — "
+                f"possible causes: DDL filter mismatch, permission "
+                f"issue, or the statement was silently ignored. Manual "
+                f"investigation required before the next startup."
+            )
         logger.info("Applied %d post-reconciliation v13 indexes.", len(missing))
 
     # ── Convenience query helpers ───────────────────────────────────────────

@@ -344,3 +344,43 @@ class TestMigrationRunnerPhysicalSchemaGuard:
             assert row is not None
             n = row["n"]
             assert n == 0, "wallet_specialist_aggregations must be empty on fresh init"
+
+    def test_apply_missing_v13_indexes_verifies_creation(self, tmp_path: Path):
+        """The post-reconciliation step must verify that every
+        requested index actually exists after execution. If a name
+        does not match any ``CREATE INDEX`` statement in ``_V13_DDL``
+        (e.g. because a future refactor renames the index), the method
+        must raise ``MigrationBlocked`` rather than silently logging
+        success.
+        """
+        db_path = tmp_path / "test.db"
+        with Database(db_path=db_path) as db:
+            # Call _apply_missing_v13_indexes with a name that does NOT
+            # exist in _V13_DDL. The internal loop will never find a
+            # matching statement, so nothing will be executed. The
+            # post-loop verification must then raise MigrationBlocked.
+            with pytest.raises(MigrationBlocked, match="failed to create"):
+                db._apply_missing_v13_indexes(["this_index_does_not_exist"])
+
+    def test_apply_missing_v13_indexes_succeeds_for_real_names(self, tmp_path: Path):
+        """When given real index names from _V13_DDL, the method must
+        create them and log success without raising.
+        """
+        db_path = tmp_path / "test.db"
+        with Database(db_path=db_path) as db:
+            # Use the actual PR23 v13 indexes. They were created on
+            # fresh init, so drop them first to force a real creation.
+            for idx in Database._PR23_V13_INDEXES:
+                db.conn.execute(f"DROP INDEX IF EXISTS {idx}")
+            db.conn.commit()
+
+            # Sanity: they are now missing.
+            for idx in Database._PR23_V13_INDEXES:
+                assert not db._index_exists(idx), f"setup: {idx} should be missing"
+
+            # Call the method with the real names. It must succeed.
+            db._apply_missing_v13_indexes(list(Database._PR23_V13_INDEXES))
+
+            # Verify they all exist now.
+            for idx in Database._PR23_V13_INDEXES:
+                assert db._index_exists(idx), f"{idx} should exist after applier"
