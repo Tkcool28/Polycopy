@@ -148,13 +148,16 @@ class TestDeriveWalletVerdictFromEvidence:
 
     def test_silent_skip_outside_resolution_gap_is_preserved(self):
         """A SKIP with empty reasons but sufficient resolved-market
-        evidence is a true score-driven skip and PR24E preserves it.
+        evidence is preserved as a TRUE score-driven skip.
 
-        This is the "existing real-skip behavior preserved" line of
-        the contract.
+        PR27 invariant: the verdict stays ``skip`` (no promotion to
+        incomplete), but the helper MUST attach the canonical
+        ``score_below_copy_threshold`` marker to
+        ``eligibility_failures`` so the persisted row is never silent.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
+            SCORE_BELOW_COPY_THRESHOLD,
         )
 
         out = derive_wallet_verdict_from_evidence(
@@ -164,9 +167,16 @@ class TestDeriveWalletVerdictFromEvidence:
             missing_essentials=[],
             eligibility_failures=[],
         )
+        # PR27: verdict is preserved (no promotion to incomplete).
         assert out["verdict"] == "skip", (
-            "PR24E preserves true score-driven skips when resolution "
+            "PR27 preserves true score-driven skips when resolution "
             "evidence is sufficient"
+        )
+        # PR27: but the row must carry the canonical marker so it is
+        # never silent (both buckets empty).
+        assert SCORE_BELOW_COPY_THRESHOLD in out["eligibility_failures"]
+        assert out["eligibility_failures"], (
+            "eligibility_failures must be non-empty for any skip"
         )
 
     def test_skip_with_explicit_eligibility_failures_preserved(self):
@@ -496,12 +506,18 @@ class TestPersistenceRowConsistency:
         )
 
     def test_silent_skip_is_corrected_at_persistence(self, tmp_path: Path):
-        """If a caller manually constructs a WalletScoreResult with
-        verdict=SKIP and EMPTY reason buckets, the persistence path's
-        guard must correct it ONLY when there's also a resolution-
-        evidence gap. If the resolution evidence is sufficient, the
-        SKIP is a true score-driven verdict and is preserved.
+        """A caller-constructed WalletScoreResult with verdict=SKIP and
+        EMPTY reason buckets must NOT be persisted silently.
+
+        PR27 invariant: when the resolution evidence is sufficient
+        the verdict stays ``skip`` (no promotion to incomplete), but
+        ``eligibility_failures_json`` MUST be non-empty so the row is
+        auditable. The canonical ``score_below_copy_threshold`` marker
+        is the contract.
         """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            SCORE_BELOW_COPY_THRESHOLD,
+        )
         from polycopy.scoring.wallet_score_v1 import (
             WalletScoreInputV1,
             WalletScoreResult,
@@ -520,9 +536,6 @@ class TestPersistenceRowConsistency:
             category_resolved_markets=20,
         )
 
-        # Manually craft a "buggy" result with empty reason buckets.
-        # With sufficient resolution evidence the PR24E guard
-        # preserves the verdict (this is the "real skip" path).
         legit_skip = WalletScoreResult(
             wallet_id=wid,
             score=0.0,
@@ -543,10 +556,19 @@ class TestPersistenceRowConsistency:
             (wid,),
         ).fetchone()
         assert row is not None
-        # PR24E preserves true score-driven skips when resolution evidence
-        # is sufficient — the verdict is 'skip' and reason buckets stay
-        # empty (the score formula produced the verdict deterministically).
+        # PR27: verdict is preserved as SKIP (no promotion to incomplete).
         assert row["verdict"] == "skip"
+        # PR27: eligibility_failures_json must NOT be empty — the row
+        # carries the canonical score-driven skip marker.
+        failures = json.loads(row["eligibility_failures_json"] or "[]")
+        assert failures, (
+            "PR27 invariant: persisted skip must have a non-empty "
+            "eligibility_failures_json"
+        )
+        assert SCORE_BELOW_COPY_THRESHOLD in failures, (
+            "PR27 invariant: persisted skip must carry the canonical "
+            "score_below_copy_threshold marker"
+        )
 
 
 class TestRegressionPostPR26SmokeTest:
@@ -614,3 +636,180 @@ def compute_wallet_score_v1_through_helper(inp):
     from polycopy.scoring.wallet_score_v1 import compute_wallet_score_v1
 
     return compute_wallet_score_v1(input=inp)
+
+
+# ────────────────────────────────────────────────────────────────────
+# 4. PR27 — "no skip is silent" invariant
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestPR27NoSilentSkip:
+    """The PR27 cleanup tightens the contract: a persisted wallet decision
+    whose ``verdict == "skip"`` must NEVER have BOTH
+    ``missing_essentials_json`` and ``eligibility_failures_json``
+    empty. Two canonical markers are the source of truth:
+
+      * ``no_resolved_market_evidence`` — Rule 1 territory.
+      * ``score_below_copy_threshold`` — Rule 2 territory (sufficient
+        resolution evidence, score formula legitimately produced SKIP).
+    """
+
+    def test_zero_resolved_skip_with_empty_reasons_becomes_incomplete(self):
+        """Case 1 (per task brief): zero resolution evidence + skip + empty
+        reason buckets ⇒ INCOMPLETE with ``no_resolved_market_evidence``.
+        """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            derive_wallet_verdict_from_evidence,
+        )
+
+        out = derive_wallet_verdict_from_evidence(
+            verdict="skip",
+            resolved_markets=None,  # zero-evidence path
+            category_resolved_markets=None,
+            missing_essentials=[],
+            eligibility_failures=[],
+        )
+        assert out["verdict"] == "incomplete"
+        assert out["verdict_family"] == "incomplete"
+        assert "no_resolved_market_evidence" in out["eligibility_failures"]
+        assert out["eligibility_failures"], (
+            "eligibility_failures must be non-empty for incomplete"
+        )
+
+    def test_sufficient_evidence_skip_gets_score_below_marker(self):
+        """Case 2 (per task brief): sufficient resolution evidence + skip
+        + empty reason buckets ⇒ verdict stays SKIP, but
+        ``score_below_copy_threshold`` is appended so the row is
+        non-silent.
+        """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            derive_wallet_verdict_from_evidence,
+            SCORE_BELOW_COPY_THRESHOLD,
+        )
+
+        out = derive_wallet_verdict_from_evidence(
+            verdict="skip",
+            resolved_markets=50,
+            category_resolved_markets=20,
+            missing_essentials=[],
+            eligibility_failures=[],
+        )
+        # Verdict preserved — no promotion.
+        assert out["verdict"] == "skip"
+        assert out["verdict_family"] == "skip"
+        # Marker attached so the row is auditable.
+        assert out["eligibility_failures"] == [SCORE_BELOW_COPY_THRESHOLD]
+
+    def test_sufficient_evidence_skip_with_existing_failure_preserved(self):
+        """Case 3 (per task brief): sufficient resolution evidence + skip
+        + non-empty eligibility_failures ⇒ existing failure is preserved,
+        canonical marker is NOT duplicated unless it would be the only
+        entry.
+        """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            derive_wallet_verdict_from_evidence,
+        )
+
+        out = derive_wallet_verdict_from_evidence(
+            verdict="skip",
+            resolved_markets=50,
+            category_resolved_markets=20,
+            missing_essentials=[],
+            eligibility_failures=["active_trading_days=5 < 20"],
+        )
+        assert out["verdict"] == "skip"
+        # Existing failure is preserved verbatim.
+        assert out["eligibility_failures"] == ["active_trading_days=5 < 20"]
+        # The canonical marker was NOT appended because the caller
+        # already supplied a reason — no duplication.
+        assert "score_below_copy_threshold" not in out["eligibility_failures"]
+
+    def test_persisted_skip_never_has_both_buckets_empty(self, tmp_path: Path):
+        """Case 4 (per task brief): no persisted wallet_score_decisions or
+        decision_verdicts row can represent SKIP with both reason
+        buckets empty.
+
+        Drives the full pipeline path: build a real ``WalletScoreResult``
+        via ``compute_wallet_score_v1`` and run the scan pipeline
+        writer. Verifies both rows.
+        """
+        sys.path.insert(  # noqa: E402
+            0, str(Path(__file__).resolve().parent.parent / "scripts")
+        )
+        from polycopy.scoring.incomplete_verdict_guard import (  # noqa: E402
+            SCORE_BELOW_COPY_THRESHOLD,
+        )
+        from polycopy.scoring.score_serialization import (  # noqa: E402
+            persist_wallet_score_v1,
+        )
+        from polycopy.scoring.wallet_score_v1 import (  # noqa: E402
+            WalletScoreInputV1,
+            compute_wallet_score_v1,
+        )
+        from scripts import scan_pipeline_wiring  # noqa: E402
+
+        db = _fresh_db(tmp_path)
+        wid = _insert_wallet(db, "0xPR27PROVE")
+
+        # Real scoring input — score formula will produce SKIP
+        # legitimately (low win_rate, sufficient evidence).
+        inp = WalletScoreInputV1(
+            wallet_id=wid,
+            win_rate=0.30,
+            trade_count=150,
+            resolved_markets=50,
+            category_resolved_markets=20,
+            active_trading_days=30,
+            distinct_events=20,
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
+        )
+        result = compute_wallet_score_v1(input=inp)
+        persist_wallet_score_v1(
+            db, wid, result, source_data_timestamp="2026-07-01T00:00:00Z"
+        )
+        db.conn.commit()
+
+        counters = scan_pipeline_wiring.ScanPipelineCounters()
+        scan_pipeline_wiring.persist_decision_verdicts_and_components(
+            db, counters=counters, max_verdicts=10
+        )
+
+        # wallet_score_decisions row invariant.
+        w_row = db.conn.execute(
+            "SELECT verdict, missing_essentials_json, eligibility_failures_json "
+            "FROM wallet_score_decisions WHERE wallet_id = ?",
+            (wid,),
+        ).fetchone()
+        assert w_row is not None
+        if w_row["verdict"] == "skip":
+            missing = json.loads(w_row["missing_essentials_json"] or "[]")
+            failures = json.loads(w_row["eligibility_failures_json"] or "[]")
+            assert not (not missing and not failures), (
+                "PR27 invariant violated: wallet_score_decisions row "
+                "has verdict='skip' AND empty missing_essentials_json "
+                "AND empty eligibility_failures_json"
+            )
+            # In the score-driven skip path the marker must be present.
+            assert SCORE_BELOW_COPY_THRESHOLD in failures, (
+                "PR27 invariant: score-driven skip must carry "
+                "score_below_copy_threshold"
+            )
+
+        # decision_verdicts row invariant.
+        d_row = db.conn.execute(
+            "SELECT verdict, verdict_family FROM decision_verdicts "
+            "WHERE wallet_id = ? AND formula_name = 'wallet_score'",
+            (wid,),
+        ).fetchone()
+        assert d_row is not None
+        if d_row["verdict"] == "skip":
+            assert d_row["verdict_family"] == "skip"
+            # The pipeline writer does not currently persist
+            # exclusion_reasons_json for wallet rows, but the parent
+            # wallet_score_decisions row carries the marker — confirmed
+            # above. Cross-table consistency is upheld because the
+            # pipeline writer re-derives verdict/family from the
+            # parent's evidence columns.
+            assert d_row["verdict"] == w_row["verdict"]
