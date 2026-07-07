@@ -96,6 +96,9 @@ def _strong_wallet_result(wallet_id: str) -> WalletScoreResult:
         resolved_markets=40,
         active_trading_days=30,
         distinct_events=20,
+        # PR24E: category_resolved_markets is required for a real
+        # wallet verdict. Without it the helper promotes to INCOMPLETE.
+        category_resolved_markets=20,
     )
     return compute_wallet_score_v1(input=inp)
 

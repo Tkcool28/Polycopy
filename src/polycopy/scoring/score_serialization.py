@@ -488,6 +488,19 @@ def persist_wallet_score_v1(
         category_active_days=inp.category_active_days,
     )
 
+    # PR24E — Incomplete-verdict resolution-evidence guard.
+    # Apply the helper on every persistence path so callers that build
+    # ``WalletScoreResult`` manually (and bypass ``compute_wallet_score_v1``)
+    # still produce a verdict/reason-bucket triple that is consistent with
+    # the PR24E contract. See ``incomplete_verdict_guard`` for the rule
+    # definitions; the helper is the single source of truth. The verdict
+    # enum already passed the canonical-set CHECK above (the guard
+    # never returns a non-canonical value), so we don't re-validate.
+    from polycopy.scoring.incomplete_verdict_guard import (
+        apply_to_wallet_score_result,
+    )
+    result = apply_to_wallet_score_result(result)
+
     if idempotency_key is None:
         idempotency_key = generate_idempotency_key(
             formula_name="wallet_score",

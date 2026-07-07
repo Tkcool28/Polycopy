@@ -1206,12 +1206,64 @@ def _count_rows(db: Database, table: str) -> int:
     return int(row["c"]) if row else 0
 
 
+def _safe_json_list(raw) -> list:  # noqa: ANN001 — defensive
+    """Best-effort parse of a JSON list column.
+
+    Returns ``[]`` for any input that isn't a JSON array of strings.
+    Defensive against pre-PR24E legacy rows that may have a non-list
+    payload, ``None``, or free-form JSON.
+    """
+    import json
+
+    if raw is None or raw == "":
+        return []
+    if not isinstance(raw, (str, bytes, bytearray)):
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if item is not None]
+
+
 def _decision_verdict_family(verdict_str: str) -> str:
-    """Map the wallet/category verdict enum string to its bounded family."""
-    v = (verdict_str or "").lower()
-    if v in ("copy_candidate", "watchlist", "skip", "incomplete"):
-        return v
-    return "incomplete"
+    """Map the wallet/category verdict enum string to its bounded family.
+
+    PR24E: this is now a thin pass-through. The real verdict-family
+    resolution lives in
+    :func:`polycopy.scoring.incomplete_verdict_guard.enforce_wallet_decision_eligibility`,
+    which is called by :func:`persist_decision_verdicts_and_components`
+    before each INSERT. Kept for backwards compatibility with any
+    external callers that imported the helper directly.
+    """
+    from polycopy.scoring.incomplete_verdict_guard import (
+        enforce_wallet_decision_eligibility,
+    )
+
+    corrected = enforce_wallet_decision_eligibility(
+        verdict=verdict_str,
+        verdict_family=None,
+        resolved_markets=None,
+    )
+    return corrected["verdict_family"]
+
+
+def _pr24e_correct_decision_row(row: dict) -> dict:
+    """Apply PR24E's incomplete-verdict guard to a decision-row dict.
+
+    Used by :func:`persist_decision_verdicts_and_components` so the
+    ``decision_verdicts`` row mirrors the parent
+    ``wallet_score_decisions`` row. Reads the resolved-evidence signals
+    from the row when present (the upstream SELECT includes them); falls
+    back to ``None`` for rows that don't carry them.
+    """
+    from polycopy.scoring.incomplete_verdict_guard import (
+        apply_to_decision_row,
+    )
+
+    return apply_to_decision_row(row)
 
 
 def persist_decision_verdicts_and_components(
@@ -1253,7 +1305,10 @@ def persist_decision_verdicts_and_components(
             placeholders = ",".join("?" for _ in scoped_wallet_ids)
             wallet_rows = db.fetchall(
                 f"""
-                SELECT id, wallet_id, final_score, verdict, source_data_timestamp
+                SELECT id, wallet_id, final_score, verdict, source_data_timestamp,
+                       resolved_markets, category_resolved_markets,
+                       sample_fraction, sharpe_ratio, max_drawdown,
+                       missing_essentials_json, eligibility_failures_json
                 FROM wallet_score_decisions
                 WHERE wallet_id IN ({placeholders})
                 ORDER BY id DESC
@@ -1264,7 +1319,10 @@ def persist_decision_verdicts_and_components(
         # Fallback: latest N rows by id (test-only path).
         wallet_rows = db.fetchall(
             """
-            SELECT id, wallet_id, final_score, verdict, source_data_timestamp
+            SELECT id, wallet_id, final_score, verdict, source_data_timestamp,
+                   resolved_markets, category_resolved_markets,
+                   sample_fraction, sharpe_ratio, max_drawdown,
+                   missing_essentials_json, eligibility_failures_json
             FROM wallet_score_decisions
             ORDER BY id DESC
             LIMIT ?
@@ -1277,6 +1335,32 @@ def persist_decision_verdicts_and_components(
         except (TypeError, ValueError):
             score = 0.0
         verdict_str = r["verdict"] or "incomplete"
+        # PR24E: re-derive verdict/verdict_family from the persisted
+        # evidence columns so the ``decision_verdicts`` row never
+        # disagrees with the parent ``wallet_score_decisions`` row on
+        # the resolved-evidence question. The wallet row's
+        # ``resolved_markets``, ``category_resolved_markets``,
+        # ``missing_essentials_json``, and ``eligibility_failures_json``
+        # are the source of truth here.
+        corrected_row = _pr24e_correct_decision_row(
+            {
+                "verdict": verdict_str,
+                "verdict_family": None,
+                "resolved_markets": r["resolved_markets"],
+                "category_resolved_markets": r["category_resolved_markets"],
+                "sample_fraction": r["sample_fraction"],
+                "sharpe_ratio": r["sharpe_ratio"],
+                "max_drawdown": r["max_drawdown"],
+                "missing_essentials": _safe_json_list(
+                    r["missing_essentials_json"]
+                ),
+                "eligibility_failures": _safe_json_list(
+                    r["eligibility_failures_json"]
+                ),
+            }
+        )
+        verdict_str = corrected_row["verdict"]
+        family_str = corrected_row["verdict_family"]
         try:
             db.conn.execute(
                 """
@@ -1292,7 +1376,7 @@ def persist_decision_verdicts_and_components(
                     "wallet_score",
                     WALLET_FORMULA_VERSION,
                     verdict_str,
-                    _decision_verdict_family(verdict_str),
+                    family_str,
                     score,
                     now_iso,
                     "wallet_id",
@@ -1310,7 +1394,10 @@ def persist_decision_verdicts_and_components(
             placeholders = ",".join("?" for _ in scoped_wallet_ids)
             cat_rows = db.fetchall(
                 f"""
-                SELECT id, wallet_id, category_label, final_score, verdict
+                SELECT id, wallet_id, category_label, final_score, verdict,
+                       category_resolved_markets, sample_fraction, sharpe_ratio,
+                       max_drawdown, missing_essentials_json,
+                       category_gate_failures_json
                 FROM category_wallet_score_decisions
                 WHERE wallet_id IN ({placeholders})
                 ORDER BY id DESC
@@ -1320,7 +1407,10 @@ def persist_decision_verdicts_and_components(
     else:
         cat_rows = db.fetchall(
             """
-            SELECT id, wallet_id, category_label, final_score, verdict
+            SELECT id, wallet_id, category_label, final_score, verdict,
+                   category_resolved_markets, sample_fraction, sharpe_ratio,
+                   max_drawdown, missing_essentials_json,
+                   category_gate_failures_json
             FROM category_wallet_score_decisions
             ORDER BY id DESC
             LIMIT ?
@@ -1333,6 +1423,33 @@ def persist_decision_verdicts_and_components(
         except (TypeError, ValueError):
             score = 0.0
         verdict_str = r["verdict"] or "incomplete"
+        # PR24E: re-derive verdict/verdict_family from the category row's
+        # evidence columns so the ``decision_verdicts`` row never
+        # disagrees with the parent ``category_wallet_score_decisions``
+        # row on the resolved-evidence question. The category table
+        # carries ``category_resolved_markets`` rather than the wallet
+        # table's ``resolved_markets``, and uses
+        # ``category_gate_failures_json`` rather than
+        # ``eligibility_failures_json``.
+        corrected_row = _pr24e_correct_decision_row(
+            {
+                "verdict": verdict_str,
+                "verdict_family": None,
+                "resolved_markets": r["category_resolved_markets"],
+                "category_resolved_markets": r["category_resolved_markets"],
+                "sample_fraction": r["sample_fraction"],
+                "sharpe_ratio": r["sharpe_ratio"],
+                "max_drawdown": r["max_drawdown"],
+                "missing_essentials": _safe_json_list(
+                    r["missing_essentials_json"]
+                ),
+                "eligibility_failures": _safe_json_list(
+                    r["category_gate_failures_json"]
+                ),
+            }
+        )
+        verdict_str = corrected_row["verdict"]
+        family_str = corrected_row["verdict_family"]
         try:
             db.conn.execute(
                 """
@@ -1348,7 +1465,7 @@ def persist_decision_verdicts_and_components(
                     "category_wallet_score",
                     "1",
                     verdict_str,
-                    _decision_verdict_family(verdict_str),
+                    family_str,
                     score,
                     now_iso,
                     "category_label",
