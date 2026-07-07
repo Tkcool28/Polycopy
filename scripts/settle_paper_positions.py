@@ -36,7 +36,8 @@ from polycopy.config.settings import get_settings
 from polycopy.db.database import Database
 from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.risk.settlement import SettlementEvidence, SettlementEngine
-from polycopy.utils.concurrency import FileLock, LockError, lock_path
+from polycopy.utils.concurrency import LockError
+from polycopy.runtime.locks import operational_job_lock
 
 logger = logging.getLogger(__name__)
 
@@ -360,9 +361,9 @@ def main() -> int:
 
     setup_logging(args.verbose)
 
-    lock = FileLock(lock_path("settlement"), timeout=args.lock_timeout)
+    # PR24D: shared global operational-jobs lock.
     try:
-        with lock:
+        with operational_job_lock("settle", timeout=args.lock_timeout):
             settings = get_settings()
             db_path = Path(args.db) if args.db else settings.db_path
             db = Database(db_path=db_path)

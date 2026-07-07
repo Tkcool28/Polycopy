@@ -55,7 +55,8 @@ from polycopy.domain.raw_snapshot import RawSnapshot
 from polycopy.domain.source_trade import SourceTrade
 from polycopy.domain.wallet import Wallet
 from polycopy.engine.evaluate import evaluate_wallet
-from polycopy.utils.concurrency import FileLock, LockError, lock_path
+from polycopy.utils.concurrency import LockError
+from polycopy.runtime.locks import operational_job_lock
 
 logger = logging.getLogger(__name__)
 
@@ -1151,10 +1152,10 @@ def main() -> int:
 
     setup_logging(args.verbose)
 
-    # Concurrency guard
-    lock = FileLock(lock_path("collect"), timeout=args.lock_timeout)
+    # PR24D: shared global operational-jobs lock. Replaces per-script
+    # FileLock so collect/scan/settle/update cannot overlap.
     try:
-        with lock:
+        with operational_job_lock("collect", timeout=args.lock_timeout):
             # Configure database
             settings = get_settings()
             db_path = Path(args.db) if args.db else settings.db_path
