@@ -243,10 +243,34 @@ class TestScriptsUseSharedLock:
         assert script.exists(), f"missing script: {script}"
         text = script.read_text()
         assert (
-            "from polycopy.runtime.locks import operational_job_lock" in text
+            "from polycopy.runtime.locks import" in text
+            and "operational_job_lock" in text
         ), (
             f"{script_relpath}: missing shared lock helper import"
         )
+
+    @pytest.mark.parametrize("script_relpath", OPERATIONAL_SCRIPTS)
+    def test_script_default_lock_timeout_matches_constant(
+        self, script_relpath: str, repo_root: Path
+    ):
+        """Each script's --lock-timeout argparse default must be the shared
+        DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S constant (currently 30s), not the
+        legacy 10.0 hard-coded value.
+        """
+        from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S
+
+        text = (repo_root / script_relpath).read_text()
+        # The constant must be referenced inside the argparse block.
+        assert "default=DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S" in text, (
+            f"{script_relpath}: --lock-timeout default does not use "
+            f"DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S"
+        )
+        assert "default=10.0" not in text, (
+            f"{script_relpath}: legacy default=10.0 still present"
+        )
+        # Sanity: the constant really is 30s. If this ever changes
+        # intentionally, this test will catch the contract drift.
+        assert DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S == 30.0
 
     @pytest.mark.parametrize("script_relpath", OPERATIONAL_SCRIPTS)
     def test_script_calls_shared_lock(

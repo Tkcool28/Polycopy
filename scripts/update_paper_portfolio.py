@@ -39,7 +39,7 @@ from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.domain.market import Market, MarketOutcome
 from polycopy.risk.marks import MarkEngine, MarkPrice
 from polycopy.utils.concurrency import LockError
-from polycopy.runtime.locks import operational_job_lock
+from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, operational_job_lock
 
 logger = logging.getLogger(__name__)
 
@@ -383,7 +383,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Update paper portfolio with current marks")
     parser.add_argument("--db", type=str, default=None, help="SQLite database path")
     parser.add_argument("--use-sample", action="store_true", help="Use sample pricing data")
-    parser.add_argument("--lock-timeout", type=float, default=10.0, help="Lock timeout seconds")
+    parser.add_argument("--lock-timeout", type=float, default=DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, help="Lock timeout seconds")
     parser.add_argument("-v", "--verbose", action="count", default=0)
     args = parser.parse_args()
 

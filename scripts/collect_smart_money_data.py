@@ -56,7 +56,7 @@ from polycopy.domain.source_trade import SourceTrade
 from polycopy.domain.wallet import Wallet
 from polycopy.engine.evaluate import evaluate_wallet
 from polycopy.utils.concurrency import LockError
-from polycopy.runtime.locks import operational_job_lock
+from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, operational_job_lock
 
 logger = logging.getLogger(__name__)
 
@@ -1134,8 +1134,8 @@ def main() -> int:
     parser.add_argument(
         "--lock-timeout",
         type=float,
-        default=10.0,
-        help="Seconds to wait for file lock (default: 10)",
+        default=DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S,
+        help=f"Seconds to wait for the global operational job lock (default: {DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S:g})",
     )
     parser.add_argument(
         "--dry-run",
