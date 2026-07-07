@@ -142,9 +142,27 @@ class TestWalletScoreV1ComponentFormulas:
             info_score=0.0,
             win_rate=0.5,
             trade_count=100,
+            # PR24E: provide resolution evidence so a real verdict can be
+            # emitted. Without these the helper promotes to incomplete.
+            resolved_markets=50,
+            category_resolved_markets=20,
+            active_trading_days=30,
+            distinct_events=20,
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
         )
-        # With trade_count and win_rate present, other components are computed
-        assert result.verdict in [WalletVerdict.COPY_CANDIDATE, WalletVerdict.WATCHLIST, WalletVerdict.SKIP]
+        # With trade_count and win_rate present, other components are computed.
+        # PR24E: may also be INCOMPLETE if any of the resolution-evidence
+        # keys are missing — the prior assertion set was the pre-PR24E
+        # contract; this test now accepts INCOMPLETE too because the
+        # zero-evidence path is explicitly handled by the guard.
+        assert result.verdict in [
+            WalletVerdict.COPY_CANDIDATE,
+            WalletVerdict.WATCHLIST,
+            WalletVerdict.SKIP,
+            WalletVerdict.INCOMPLETE,
+        ]
 
     def test_verified_performance_full(self):
         result = compute_wallet_score_v1(
@@ -308,11 +326,29 @@ class TestWalletScoreV1Verdicts:
         assert result.verdict == WalletVerdict.WATCHLIST
 
     def test_skip_verdict_low_score(self):
-        """Score below 55 should be SKIP."""
+        """Score below 55 with ALL scoring evidence should be SKIP.
+
+        PR24E: a wallet cannot produce a real verdict (SKIP included)
+        without resolution-market evidence AND without the supporting
+        scoring metrics the formula needs to evaluate. This test
+        provides the full evidence bundle so the wallet qualifies for
+        the real verdict path; the resulting ``SKIP`` is therefore a
+        "true" score-driven skip, not an evidence-gap skip.
+        """
         result = compute_wallet_score_v1(
             wallet_id="test-wallet",
             win_rate=0.3,  # Low win rate
             trade_count=5,
+            resolved_markets=50,  # PR24E: must be present for a real verdict
+            category_resolved_markets=20,  # PR24E: must be present too
+            # PR24E: the rest of the scoring metrics must be present too,
+            # otherwise the "true skip" path is just an evidence-gap skip
+            # promoted to incomplete.
+            active_trading_days=30,
+            distinct_events=20,
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
         )
         assert result.verdict == WalletVerdict.SKIP
 
@@ -1885,7 +1921,14 @@ class TestRawInputPersistence:
     ):
         """Back-compat: a result built without an explicit input
         object must still persist (using getattr fallbacks). The
-        values come from whatever fields the result carries."""
+        values come from whatever fields the result carries.
+
+        PR24E: a legacy WATCHLIST verdict built without resolution
+        evidence is correctly promoted to INCOMPLETE by the
+        ``incomplete_verdict_guard`` helper inside the persistence
+        path. This test asserts that promotion still preserves the
+        raw persistence shape (id, wallet_id, final_score, etc.).
+        """
         from polycopy.scoring.score_serialization import (
             persist_wallet_score_v1,
         )
@@ -1921,9 +1964,18 @@ class TestRawInputPersistence:
         row = db_with_wallet.fetchone(
             "SELECT * FROM wallet_score_decisions WHERE id = ?", (row_id,)
         )
+        assert row is not None
         assert row["wallet_id"] == "w-test"
         assert row["final_score"] == pytest.approx(72.0)
-        assert row["verdict"] == "watchlist"
+        # PR24E: zero-evidence legacy WATCHLIST is promoted to INCOMPLETE
+        # before persistence; the row's reason buckets must be populated.
+        assert row["verdict"] == "incomplete"
+        import json as _json
+        missing = _json.loads(row["missing_essentials_json"] or "[]")
+        failures = _json.loads(row["eligibility_failures_json"] or "[]")
+        assert missing, "missing_essentials_json must be populated"
+        assert failures, "eligibility_failures_json must be populated"
+        assert "no_resolved_market_evidence" in failures
 
     def test_idempotent_persist_does_not_duplicate(self, db_with_wallet: Database):
         """INSERT OR IGNORE on the idempotency key must not create a

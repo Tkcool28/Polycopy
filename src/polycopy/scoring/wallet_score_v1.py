@@ -495,19 +495,47 @@ def compute_wallet_score_v1(
     if input.category_active_days is not None and input.category_active_days < CATEGORY_MIN_ACTIVE_DAYS:
         gate_failures.append(f"category_active_days={input.category_active_days} < {CATEGORY_MIN_ACTIVE_DAYS}")
 
+    # PR24E — Incomplete-verdict resolution-evidence guard.
+    # The helper is the single source of truth for the rule that a
+    # wallet decision with no resolved-market evidence MUST be
+    # ``incomplete``. Apply it on every return path below so the
+    # returned verdict is always self-consistent with the persisted
+    # decision row (see ``polycopy.scoring.incomplete_verdict_guard``).
+    from polycopy.scoring.incomplete_verdict_guard import (
+        apply_to_wallet_score_result,
+    )
+
+    def _wrap(
+        *,
+        score_value: float,
+        verdict_value: "WalletVerdict",
+        components_list: list,
+        missing_essentials_list: list[str],
+        gate_failures_list: list[str],
+    ) -> "WalletScoreResult":
+        """Build a WalletScoreResult and run it through the PR24E guard."""
+        result = WalletScoreResult(
+            wallet_id=wallet_id,
+            score=score_value,
+            verdict=verdict_value,
+            input=input,
+            components=components_list,
+            missing_essentials=list(missing_essentials_list),
+            eligibility_gate_failures=list(gate_failures_list),
+            computed_at=now,
+            is_sample=is_sample,
+        )
+        return apply_to_wallet_score_result(result)
+
     # If essential evidence is missing, return INCOMPLETE
     if missing_essentials:
         # Still compute partial score for audit
-        return WalletScoreResult(
-            wallet_id=wallet_id,
-            score=0.0,
-            verdict=WalletVerdict.INCOMPLETE,
-            input=input,
-            components=components,
-            missing_essentials=missing_essentials,
-            eligibility_gate_failures=gate_failures,
-            computed_at=now,
-            is_sample=is_sample,
+        return _wrap(
+            score_value=0.0,
+            verdict_value=WalletVerdict.INCOMPLETE,
+            components_list=components,
+            missing_essentials_list=missing_essentials,
+            gate_failures_list=gate_failures,
         )
 
     # Compute components
@@ -600,14 +628,10 @@ def compute_wallet_score_v1(
     else:
         verdict = WalletVerdict.SKIP
 
-    return WalletScoreResult(
-        wallet_id=wallet_id,
-        score=final_score,
-        verdict=verdict,
-        input=input,
-        components=components,
-        missing_essentials=missing_essentials,
-        eligibility_gate_failures=gate_failures,
-        computed_at=now,
-        is_sample=is_sample,
+    return _wrap(
+        score_value=final_score,
+        verdict_value=verdict,
+        components_list=components,
+        missing_essentials_list=missing_essentials,
+        gate_failures_list=gate_failures,
     )
