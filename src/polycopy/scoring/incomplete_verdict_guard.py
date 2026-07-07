@@ -277,26 +277,32 @@ def derive_wallet_verdict_from_evidence(
     # (b) Sufficient resolution evidence and verdict is SKIP. The skip
     #     is the legitimate output of the score formula — DO NOT
     #     promote it to INCOMPLETE. But if the caller signalled no
-    #     eligibility failure, append the canonical score-driven SKIP
-    #     marker so the persisted row is non-silent.
-    caller_missing = list(missing_essentials) if missing_essentials is not None else None
-    caller_failures = list(eligibility_failures) if eligibility_failures is not None else None
+    #     eligibility failure (whether by passing an empty list OR by
+    #     passing ``None``), append the canonical score-driven SKIP
+    #     marker so the persisted row is never silent.
+    #
+    # Normalize ``None`` and the empty iterable into the same shape so
+    # ``None`` callers — i.e. every caller that doesn't already supply
+    # a reason bucket — are caught by the same invariant.
+    caller_missing = list(missing_essentials or [])
+    caller_failures = list(eligibility_failures or [])
 
     if lacks_resolution and v == VERDICT_SKIP:
         # Case (a) — Rule 1 already set v=INCOMPLETE; just populate
         # the persisted reason buckets if they were empty.
-        if caller_missing is not None and not caller_missing:
+        if not caller_missing:
             missing = list(RESOLUTION_EVIDENCE_KEYS)
-        if caller_failures is not None and not caller_failures:
+        if not caller_failures:
             if NO_RESOLVED_MARKET_EVIDENCE not in failures:
                 failures = [NO_RESOLVED_MARKET_EVIDENCE]
 
     elif v == VERDICT_SKIP:
         # Case (b) — sufficient resolution evidence; preserve the
-        # verdict but make sure ``eligibility_failures`` is non-empty
-        # so the row is auditable. Append the canonical marker only
-        # when the caller did not provide any failure of their own.
-        if caller_failures is not None and not caller_failures:
+        # verdict but guarantee ``eligibility_failures`` is non-empty.
+        # Use the stricter rule: every SKIP must carry at least one
+        # eligibility failure, regardless of whether the caller
+        # supplied a non-empty list, an empty list, or ``None``.
+        if not failures:
             failures = [SCORE_BELOW_COPY_THRESHOLD]
 
     return {

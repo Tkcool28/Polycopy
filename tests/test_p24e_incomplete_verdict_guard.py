@@ -813,3 +813,110 @@ class TestPR27NoSilentSkip:
             # pipeline writer re-derives verdict/family from the
             # parent's evidence columns.
             assert d_row["verdict"] == w_row["verdict"]
+
+
+# ────────────────────────────────────────────────────────────────────
+# 5. PR27 cleanup follow-up — None caller buckets must also be caught
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestPR27NoneBucketCleanup:
+    """PR27 follow-up: the no-silent-skip invariant must also fire when
+    the caller omits the reason buckets (``None``) rather than passing
+    an empty list. ``None`` and ``[]`` are equivalent for this check.
+
+    These tests use the pure ``derive_wallet_verdict_from_evidence``
+    helper directly so the contract is exercised in isolation from
+    ``compute_wallet_score_v1`` (which always supplies concrete bucket
+    values).
+    """
+
+    def test_skip_with_both_buckets_none_gets_marker(self):
+        """Sufficient-evidence skip with ``missing_essentials=None`` AND
+        ``eligibility_failures=None`` ⇒ verdict stays SKIP and
+        ``score_below_copy_threshold`` is appended.
+        """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            derive_wallet_verdict_from_evidence,
+            SCORE_BELOW_COPY_THRESHOLD,
+        )
+
+        out = derive_wallet_verdict_from_evidence(
+            verdict="skip",
+            resolved_markets=50,
+            category_resolved_markets=20,
+            missing_essentials=None,
+            eligibility_failures=None,
+        )
+        assert out["verdict"] == "skip"
+        assert out["verdict_family"] == "skip"
+        assert SCORE_BELOW_COPY_THRESHOLD in out["eligibility_failures"], (
+            "PR27: skip with None eligibility_failures must still "
+            "carry the canonical score-driven marker"
+        )
+        assert out["eligibility_failures"], (
+            "eligibility_failures must be non-empty for any skip"
+        )
+
+    def test_skip_with_empty_missing_and_none_failures_gets_marker(self):
+        """Sufficient-evidence skip with ``missing_essentials=[]`` AND
+        ``eligibility_failures=None`` ⇒ verdict stays SKIP and
+        ``score_below_copy_threshold`` is appended.
+        """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            derive_wallet_verdict_from_evidence,
+            SCORE_BELOW_COPY_THRESHOLD,
+        )
+
+        out = derive_wallet_verdict_from_evidence(
+            verdict="skip",
+            resolved_markets=50,
+            category_resolved_markets=20,
+            missing_essentials=[],
+            eligibility_failures=None,
+        )
+        assert out["verdict"] == "skip"
+        assert out["verdict_family"] == "skip"
+        assert SCORE_BELOW_COPY_THRESHOLD in out["eligibility_failures"]
+
+    def test_skip_with_existing_failure_preserved_when_none_buckets(self):
+        """Sufficient-evidence skip with non-empty eligibility_failures
+        preserves the existing failure; canonical marker is NOT
+        duplicated even when ``missing_essentials`` is ``None``.
+        """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            derive_wallet_verdict_from_evidence,
+        )
+
+        out = derive_wallet_verdict_from_evidence(
+            verdict="skip",
+            resolved_markets=50,
+            category_resolved_markets=20,
+            missing_essentials=None,
+            eligibility_failures=["active_trading_days=5 < 20"],
+        )
+        assert out["verdict"] == "skip"
+        assert out["eligibility_failures"] == ["active_trading_days=5 < 20"]
+        assert "score_below_copy_threshold" not in out["eligibility_failures"]
+
+    def test_zero_evidence_skip_with_none_buckets_becomes_incomplete(self):
+        """Zero-evidence skip with both buckets ``None`` ⇒ INCOMPLETE
+        with ``no_resolved_market_evidence`` (Rule 1 still fires).
+        """
+        from polycopy.scoring.incomplete_verdict_guard import (
+            derive_wallet_verdict_from_evidence,
+        )
+
+        out = derive_wallet_verdict_from_evidence(
+            verdict="skip",
+            resolved_markets=None,
+            category_resolved_markets=None,
+            missing_essentials=None,
+            eligibility_failures=None,
+        )
+        assert out["verdict"] == "incomplete"
+        assert out["verdict_family"] == "incomplete"
+        assert "no_resolved_market_evidence" in out["eligibility_failures"]
+        assert out["missing_essentials"], (
+            "missing_essentials must be populated for incomplete"
+        )
