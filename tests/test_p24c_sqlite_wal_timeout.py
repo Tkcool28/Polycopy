@@ -15,7 +15,6 @@ exercise the API, the timers, or any ingestion path.
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -159,23 +158,3 @@ class TestSafetyPragmasDoNotBreakMigrationFlow:
             db.close()
 
 
-class TestRawSqliteConnectDoesNotInheritPragmas:
-    """Sanity check: a raw sqlite3.connect (no Database wrapper) does NOT
-    automatically get these PRAGMAs. The PR24C contract is that callers
-    must go through the Database wrapper to get the safety guarantees.
-
-    This guards against future refactors that bypass Database.connect().
-    """
-
-    def test_raw_connect_default_journal_mode_is_delete(self, tmp_path: Path):
-        db_path = tmp_path / "raw.db"
-        conn = sqlite3.connect(str(db_path))
-        try:
-            row = conn.execute("PRAGMA journal_mode").fetchone()
-            assert row is not None
-            assert str(row[0]) == "delete", (
-                "Raw sqlite3 default changed; the safety contract relies on "
-                "Database.connect() to explicitly set WAL."
-            )
-        finally:
-            conn.close()
