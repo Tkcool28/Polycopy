@@ -650,6 +650,161 @@ class TestHotPathNoLongerFetchall:
         # We allow the phrase in the docstring but not in code.
         assert "SELECT * FROM source_trades" not in body
 
+    def test_run_scan_compute_wallet_metrics_no_timestamps_list(self) -> None:
+        """PR26 cleanup: the streaming loop must not append to a
+        ``timestamps`` list. Timestamps are tracked as scalar
+        ``latest_trade_ts`` / ``first_trade_ts`` so peak per-wallet
+        memory is O(1) regardless of trade count.
+        """
+        text = _read("scripts/run_scan.py")
+        body = self._function_body(
+            text,
+            "trades_sql = f\"\"\"SELECT side",
+            ["return None", "return {"],
+        )
+        # No list/set accumulator for timestamps inside the function
+        # body. We tolerate the words appearing in the docstring
+        # (where they describe the contract) but not in code.
+        assert "timestamps: list" not in body
+        assert "timestamps.append" not in body
+        assert "max(timestamps)" not in body
+        assert "min(timestamps)" not in body
+        # Scalar tracking must be present.
+        assert "latest_trade_ts:" in body
+        assert "first_trade_ts:" in body
+
+    def test_run_scan_compute_wallet_metrics_no_market_ids_set(self) -> None:
+        """PR26 cleanup: distinct-market counting moved to a scalar
+        ``SELECT COUNT(DISTINCT market_source_id)`` query. The
+        streaming loop must not accumulate a ``market_ids`` set.
+        """
+        text = _read("scripts/run_scan.py")
+        body = self._function_body(
+            text,
+            "trades_sql = f\"\"\"SELECT side",
+            ["return None", "return {"],
+        )
+        # No in-Python market_id accumulator.
+        assert "market_ids: set" not in body
+        assert "market_ids.add" not in body
+        # Scalar query must be present.
+        assert "COUNT(DISTINCT market_source_id)" in body
+
+    def test_run_scan_compute_wallet_metrics_timestamp_semantics(
+        self,
+    ) -> None:
+        """PR26 cleanup: latest_trade_ts / first_trade_ts must match
+        max(timestamps) / min(timestamps) for a known dataset.
+
+        Functional test: builds a real DB with three trades for one
+        wallet, calls the function, and checks scalar timestamps.
+        """
+        import sys
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+        from datetime import datetime, timezone
+
+        from polycopy.db.database import Database
+        from scripts.run_scan import _compute_wallet_metrics
+
+        fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        fd.close()
+        path = Path(fd.name)
+        try:
+            db = Database(db_path=path).connect()
+            # Database.connect() runs all migrations up to v13, which
+            # creates the source_trades table in the right shape. We
+            # just insert the test rows.
+            db.conn.executemany(  # type: ignore[attr-defined]
+                "INSERT INTO source_trades"
+                " (id, source, source_trade_id, market_source_id, side,"
+                "  outcome, quantity, price, trader_address, timestamp,"
+                "  is_sample, token_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("t1", "x", "x1", "m1", "buy", "Yes", 1.0, 0.4,
+                     "0xabc", "2024-01-02T00:00:00+00:00", 0, None),
+                    ("t2", "x", "x2", "m2", "sell", "Yes", 1.0, 0.6,
+                     "0xabc", "2024-01-01T00:00:00+00:00", 0, None),
+                    ("t3", "x", "x3", "m1", "buy", "No", 1.0, 0.3,
+                     "0xabc", "2024-01-03T00:00:00+00:00", 0, None),
+                ],
+            )
+            db.conn.commit()
+
+            metrics = _compute_wallet_metrics(
+                db, "0xabc", datetime(2024, 6, 1, tzinfo=timezone.utc)
+            )
+            assert metrics is not None
+            assert metrics["trade_count"] == 3
+            # The trade with the largest timestamp is t3 (2024-01-03).
+            assert metrics["latest_trade_ts"] == datetime(
+                2024, 1, 3, tzinfo=timezone.utc
+            )
+            # The smallest is t2 (2024-01-01). The function does not
+            # assume any sort order on the streaming cursor — it just
+            # tracks min/max as it goes.
+            assert metrics["first_trade_ts"] == datetime(
+                2024, 1, 1, tzinfo=timezone.utc
+            )
+            db.close()
+        finally:
+            path.unlink()
+
+    def test_run_scan_compute_wallet_metrics_markets_traded_count(
+        self,
+    ) -> None:
+        """PR26 cleanup: ``markets_traded`` must equal the count of
+        DISTINCT market_source_id for the wallet — verified by
+        building a real DB and comparing to a hand-computed count.
+        """
+        import sys
+        sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+        from datetime import datetime, timezone
+
+        from polycopy.db.database import Database
+        from scripts.run_scan import _compute_wallet_metrics
+
+        fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        fd.close()
+        path = Path(fd.name)
+        try:
+            db = Database(db_path=path).connect()
+            # Database.connect() runs all migrations up to v13, which
+            # creates the source_trades table in the right shape. We
+            # just insert the test rows.
+            rows = []
+            for i, mid in enumerate(
+                ["mA", "mA", "mB", "mC", "mC", "mC", "mD"]
+            ):
+                rows.append(
+                    (
+                        f"t{i}", "x", f"x{i}", mid, "buy", "Yes",
+                        1.0, 0.4, "0xdef",
+                        f"2024-01-{i+1:02d}T00:00:00+00:00", 0, None,
+                    )
+                )
+            db.conn.executemany(  # type: ignore[attr-defined]
+                "INSERT INTO source_trades"
+                " (id, source, source_trade_id, market_source_id, side,"
+                "  outcome, quantity, price, trader_address, timestamp,"
+                "  is_sample, token_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            db.conn.commit()
+
+            metrics = _compute_wallet_metrics(
+                db, "0xdef", datetime(2024, 6, 1, tzinfo=timezone.utc)
+            )
+            assert metrics is not None
+            assert metrics["trade_count"] == 7
+            assert metrics["markets_traded"] == 4
+            db.close()
+        finally:
+            path.unlink()
+
     def test_update_paper_portfolio_open_positions_uses_iter_rows(self) -> None:
         text = _read("scripts/update_paper_portfolio.py")
         body = self._function_body(

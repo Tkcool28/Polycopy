@@ -956,8 +956,16 @@ def _compute_wallet_metrics(
     with bounded cursor iteration via ``db.iter_rows(...)``. Only the five
     columns actually consumed below are projected, so each row is ~half the
     memory of the ``SELECT *`` form, and the cursor returns rows in
-    ``batch_size``-sized chunks so peak per-wallet memory stays bounded
-    regardless of how many trades the wallet has on file.
+    ``batch_size``-sized chunks.
+
+    Peak per-wallet memory contract (PR24B PR26 cleanup): the streaming
+    loop accumulates O(1) scalars only — ``trade_count`` int, ``wins``
+    int, ``all_sample`` bool, ``latest_trade_ts`` datetime, ``first_trade_ts``
+    datetime, and a per-row ``ts``/``side``/``price`` working set. The
+    distinct-market count is computed in a single bounded
+    ``SELECT COUNT(DISTINCT market_source_id)`` query *before* streaming,
+    so the loop body holds exactly one row at a time regardless of how
+    many trades the wallet has on file.
     """
     canonical = canonical_wallet_address(address)
     if canonical is None:
@@ -972,12 +980,28 @@ def _compute_wallet_metrics(
                        AND trader_address IS NOT NULL
                      ORDER BY timestamp DESC"""
 
+    # PR24B PR26: distinct-market count is a single bounded scalar query
+    # (SQLite computes it inside the engine and returns one integer).
+    # This avoids accumulating the per-wallet ``market_ids`` set inside
+    # the streaming loop. The query plan uses the
+    # ``idx_source_trades_market`` index plus the WHERE predicate; cost
+    # is O(distinct markets) inside SQLite and O(1) in Python.
+    markets_traded_row = db.fetchone(
+        f"""SELECT COUNT(DISTINCT market_source_id) AS n
+            FROM source_trades
+            WHERE {address_column_normalized('trader_address')} = ?
+              AND trader_address IS NOT NULL""",
+        (canonical,),
+    )
+    markets_traded = int(markets_traded_row["n"]) if markets_traded_row else 0
+
     # Counters accumulate across batches; per-batch memory stays small.
     trade_count = 0
     wins = 0
     all_sample = True
-    timestamps: list[datetime] = []
-    market_ids: set[str] = set()
+    # PR24B PR26: scalar-only timestamp tracking. No list.
+    latest_trade_ts: datetime | None = None
+    first_trade_ts: datetime | None = None
 
     try:
         for trade in db.iter_rows(
@@ -1015,10 +1039,12 @@ def _compute_wallet_metrics(
                     ts = datetime.fromisoformat(ts_str)
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=timezone.utc)
-                    timestamps.append(ts)
+                    if latest_trade_ts is None or ts > latest_trade_ts:
+                        latest_trade_ts = ts
+                    if first_trade_ts is None or ts < first_trade_ts:
+                        first_trade_ts = ts
                 except (ValueError, TypeError):
                     pass
-            market_ids.add(trade["market_source_id"])
     except MemoryLimitExceeded:
         # Bubble up; main() catches and exits nonzero with operational
         # lock already released by the context manager.
@@ -1028,9 +1054,6 @@ def _compute_wallet_metrics(
         return None
 
     win_rate = wins / trade_count if trade_count > 0 else None
-    latest_trade_ts = max(timestamps) if timestamps else None
-    first_trade_ts = min(timestamps) if timestamps else None
-    markets_traded = len(market_ids)
 
     # Sharpe ratio estimate (simplified)
     sharpe_ratio = None
