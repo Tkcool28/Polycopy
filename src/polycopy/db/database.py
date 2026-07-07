@@ -26,6 +26,17 @@ from polycopy.db.schema import SCHEMA_VERSION, MIGRATIONS
 logger = logging.getLogger(__name__)
 
 
+class MigrationBlocked(RuntimeError):
+    """Raised when a migration cannot run safely against the current database.
+
+    The classic case is the v5 rewrite of ``source_trades`` (DROP TABLE +
+    ALTER TABLE RENAME) hitting a foreign-key constraint from a child
+    table that was added by a later PR. The runner must not silently
+    swallow the error — the operator needs to know the migration was
+    intentionally blocked, and why.
+    """
+
+
 # Match an additive ``ALTER TABLE <name> ADD COLUMN <col> <type>`` statement
 # (case-insensitive, optional whitespace, semicolon tolerated). The regex is
 # intentionally narrow — only additive ADD COLUMN statements are recognized.
@@ -128,6 +139,69 @@ class Database:
                 return True
         return False
 
+    def _table_exists(self, name: str) -> bool:
+        """Return True if a base table named ``name`` exists in the schema."""
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def _index_exists(self, name: str) -> bool:
+        """Return True if an index named ``name`` exists in the schema."""
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    # Tables that must physically exist before the runner will consider
+    # the database to be at the target schema version. These are the
+    # 15 base tables the live production DB has today, plus the 4 v13
+    # indexes that ``_V13_DDL`` defines. Indexes added in this PR
+    # (``idx_wsa_category_score``, ``idx_wsa_sample``,
+    # ``idx_wsa_computed_at``) are NOT in this set — they are
+    # post-reconciliation additions handled by
+    # :meth:`_apply_missing_v13_indexes`.
+    _REQUIRED_V13_OBJECTS: tuple[str, ...] = (
+        # base tables
+        "wallets", "markets", "source_trades", "wallet_score_decisions",
+        "decision_verdicts", "score_component_inputs", "copy_candidates",
+        "paper_signal_decisions", "category_wallet_score_decisions",
+        "trade_copyability_decisions", "shadow_decisions",
+        "exit_experiment_registrations", "wallet_specialist_aggregations",
+        "orders", "positions",
+        # v13 indexes
+        "idx_wsa_wallet", "idx_wsa_category", "idx_wsa_quality",
+        "idx_wsa_wallet_category",
+    )
+
+    # Indexes this PR adds to ``_V13_DDL``. They are created as a
+    # post-reconciliation step when the rest of the v13 schema is
+    # already present but these specific indexes are missing.
+    _PR23_V13_INDEXES: tuple[str, ...] = (
+        "idx_wsa_category_score", "idx_wsa_sample", "idx_wsa_computed_at",
+    )
+
+    def _physical_schema_at_target(self) -> bool:
+        """Return True if the live DB already has every required v13 object.
+
+        Used by the migration runner to detect "schema metadata lag":
+        a database whose ``_meta.schema_version`` is behind the code's
+        ``SCHEMA_VERSION`` but whose physical schema is already at the
+        target. In that case the destructive migrations must NOT replay
+        (they would either fail, bloat the DB, or both — see PR23 for
+        the worked example with v5 rewriting ``source_trades``).
+        """
+        for obj in self._REQUIRED_V13_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        return True
+
+    def _missing_pr23_v13_indexes(self) -> list[str]:
+        """Return the subset of PR23 v13 indexes that are NOT yet on the DB."""
+        return [name for name in self._PR23_V13_INDEXES if not self._index_exists(name)]
+
     def _execute_migration_statement(self, stmt: str) -> None:
         """Execute one migration statement, guarded by column-existence check.
 
@@ -159,6 +233,14 @@ class Database:
         additive v7 migration safe to re-run on a database that has already
         reached v7 (e.g. after a partial application), without breaking the
         semantics of the destructive v1–v6 migrations.
+
+        PR23 adds a pre-flight physical-schema guard: if
+        ``_meta.schema_version`` is behind ``SCHEMA_VERSION`` but every
+        required v13 object already exists in the live database, the
+        runner reconciles ``_meta`` to the target without replaying any
+        migration. This protects the runner from the v5 case where the
+        destructive ``source_trades`` rewrite now collides with FKs
+        added by later PRs (e.g. ``copy_candidates.source_trade_internal_id``).
         """
         current = self._current_version()
         if current == SCHEMA_VERSION:
@@ -170,6 +252,33 @@ class Database:
                 f"Database schema version ({current}) is newer than code ({SCHEMA_VERSION}). "
                 "Upgrade polycopy or use a newer database."
             )
+
+        # PR23: physical-schema pre-flight. If every required v13 object
+        # is already present, the destructive migrations would either
+        # fail (e.g. v5 DROP TABLE source_trades blocked by a later FK)
+        # or do pointless work (CREATE TABLE IF NOT EXISTS on existing
+        # tables). Reconcile _meta in a single transaction and return.
+        if self._physical_schema_at_target():
+            integrity = self.conn.execute("PRAGMA integrity_check").fetchone()
+            fk_violations = list(self.conn.execute("PRAGMA foreign_key_check"))
+            missing_indexes = self._missing_pr23_v13_indexes()
+            logger.warning(
+                "schema metadata lag detected; physical schema matches target "
+                "(SCHEMA_VERSION=%d); reconciling _meta.schema_version from %d -> %d "
+                "without replaying migrations. integrity_check=%s foreign_key_check=%d rows",
+                SCHEMA_VERSION, current, SCHEMA_VERSION,
+                integrity[0] if integrity else "?",
+                len(fk_violations),
+            )
+            self._set_version(SCHEMA_VERSION)
+            if missing_indexes:
+                logger.warning(
+                    "physical schema at target but %d PR23 v13 indexes missing "
+                    "(%s); applying as a post-reconciliation step",
+                    len(missing_indexes), ", ".join(missing_indexes),
+                )
+                self._apply_missing_v13_indexes(missing_indexes)
+            return
 
         logger.info("Migrating schema from version %d to %d.", current, SCHEMA_VERSION)
         for target_version in range(current + 1, SCHEMA_VERSION + 1):
@@ -197,6 +306,12 @@ class Database:
                 from polycopy.db.schema_v12 import apply_v12_idempotent
 
                 apply_v12_idempotent(self.conn)
+            elif target_version == 5:
+                # PR23: route v5 through the FK guard so we never
+                # attempt DROP TABLE source_trades while a child FK
+                # exists. The migration is incompatible with any
+                # physical schema that already has v17+ tables.
+                self._apply_v5_with_fk_guard()
             else:
                 for stmt in statements:
                     self._execute_migration_statement(stmt)
@@ -204,6 +319,75 @@ class Database:
             logger.info("Applied migration to version %d.", target_version)
 
         self.conn.commit()
+
+    # ── PR23: migration guards ──────────────────────────────────────────────
+
+    def _apply_v5_with_fk_guard(self) -> None:
+        """Apply the v5 migration, but only if it is safe to drop ``source_trades``.
+
+        The v5 migration rebuilds ``source_trades`` with a nullable
+        ``trader_address`` via the standard SQLite rewrite pattern
+        (CREATE new, INSERT SELECT, DROP old, ALTER RENAME). That DROP
+        is unsafe if any child table has a foreign key into
+        ``source_trades.id`` — a condition introduced by later PRs
+        (e.g. ``copy_candidates.source_trade_internal_id``).
+
+        If a child FK is detected we raise :class:`MigrationBlocked`.
+        The runner surfaces this as a clear error to the operator; we
+        intentionally do NOT swallow it, because silently skipping v5
+        would leave ``_meta`` claiming v5 is applied when it is not.
+        """
+        # pragma_foreign_key_list returns 0 rows when the table doesn't
+        # exist. We use sqlite_master to enumerate tables that HAVE an
+        # FK into source_trades, which is more reliable than per-table
+        # pragmas (some pragma forms return no rows for missing tables
+        # without raising).
+        child_refs = self.conn.execute(
+            """
+            SELECT m.name AS child_table
+            FROM sqlite_master m, pragma_foreign_key_list(m.name) fk
+            WHERE fk."table" = 'source_trades'
+            """
+        ).fetchall()
+        if child_refs:
+            child_tables = sorted({row["child_table"] for row in child_refs})
+            raise MigrationBlocked(
+                f"v5 migration cannot drop source_trades: child table(s) "
+                f"{child_tables} reference it via foreign key. Manual "
+                f"reconciliation is required. See PR23 for the worked "
+                f"example and the physical-schema reconciliation path."
+            )
+        # No child FKs — the v5 DROP is safe. Run the original DDL.
+        for stmt in MIGRATIONS[5]:
+            self._execute_migration_statement(stmt)
+        self._set_version(5)
+        logger.info("Applied migration to version 5 (FK guard passed).")
+
+    def _apply_missing_v13_indexes(self, missing: list[str]) -> None:
+        """Create the named v13 indexes that the post-reconciliation step requires.
+
+        Called from the reconciliation branch of :meth:`_run_migrations`
+        when the rest of the physical v13 schema is already present but
+        some of the indexes this PR adds to ``_V13_DDL`` are not yet on
+        the live DB. All statements are additive (``CREATE INDEX IF NOT
+        EXISTS``) and idempotent.
+        """
+        from polycopy.db.schema_v13 import _V13_DDL  # local import to avoid cycle
+        # _V13_DDL is a flat list of statements. We only need the ones
+        # that create the missing indexes; map index name -> SQL by
+        # scanning the list. This is intentionally simple — the v13
+        # DDL is short and stable.
+        for stmt in _V13_DDL:
+            for index_name in missing:
+                # The DDL is a Python list of strings; some are
+                # concatenated across multiple literal fragments. The
+                # index name appears in a single fragment like
+                # ``"CREATE INDEX IF NOT EXISTS <name> "``.
+                if f"CREATE INDEX IF NOT EXISTS {index_name} " in stmt:
+                    self.conn.execute(stmt)
+                    break
+        self.conn.commit()
+        logger.info("Applied %d post-reconciliation v13 indexes.", len(missing))
 
     # ── Convenience query helpers ───────────────────────────────────────────
 
