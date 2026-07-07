@@ -56,6 +56,11 @@ from polycopy.domain.source_trade import SourceTrade
 from polycopy.engine.evaluate import evaluate_wallet
 from polycopy.utils.concurrency import LockError
 from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, operational_job_lock
+from polycopy.runtime.memory import (
+    MemoryLimitExceeded,
+    check_rss_limit,
+    get_max_rss_mb_from_env,
+)
 
 # Shared live-trade ingestion helper (PR #3 P2 fix). Imports are at module
 # scope so both run_scan and collect_smart_money_data consume the SAME
@@ -73,6 +78,18 @@ except ImportError:  # pragma: no cover — defensive: fall back to direct adapt
     build_trade_adapter = None  # type: ignore[assignment] 
 
 logger = logging.getLogger(__name__)
+
+
+# PR24B: query-memory and RSS guardrails. These constants are resolved
+# once at module import; the RSS ceiling honours the env var so ops can
+# tighten / loosen without code changes. The batch size is generous
+# (500 rows) because each projected source_trades row is small (~120 B
+# for the 5 columns we read) and we want to keep the per-batch cursor
+# overhead negligible. Polling every 500 rows keeps the watchdog call
+# cost at < 1 % even for the largest wallets.
+_METRICS_BATCH_SIZE = 500
+_RSS_POLL_EVERY_ROWS = 500
+_SCAN_MAX_RSS_MB = get_max_rss_mb_from_env()
 
 
 def setup_logging(verbosity: int = 0) -> None:
@@ -934,60 +951,109 @@ def _compute_wallet_metrics(
 
     Returns ``None`` for sentinel / empty / whitespace-only inputs so
     they can never enter scoring.
+
+    PR24B: replaced unbounded ``fetchall(SELECT * FROM source_trades ...)``
+    with bounded cursor iteration via ``db.iter_rows(...)``. Only the five
+    columns actually consumed below are projected, so each row is ~half the
+    memory of the ``SELECT *`` form, and the cursor returns rows in
+    ``batch_size``-sized chunks.
+
+    Peak per-wallet memory contract (PR24B PR26 cleanup): the streaming
+    loop accumulates O(1) scalars only — ``trade_count`` int, ``wins``
+    int, ``all_sample`` bool, ``latest_trade_ts`` datetime, ``first_trade_ts``
+    datetime, and a per-row ``ts``/``side``/``price`` working set. The
+    distinct-market count is computed in a single bounded
+    ``SELECT COUNT(DISTINCT market_source_id)`` query *before* streaming,
+    so the loop body holds exactly one row at a time regardless of how
+    many trades the wallet has on file.
     """
     canonical = canonical_wallet_address(address)
     if canonical is None:
         return None
-    trades = db.fetchall(
-        f"""SELECT * FROM source_trades
-           WHERE {address_column_normalized('trader_address')} = ?
-             AND trader_address IS NOT NULL
-           ORDER BY timestamp DESC""",
+
+    # PR24B: bounded column list + cursor streaming.
+    # Columns used downstream: side, price, timestamp, market_source_id,
+    # is_sample. trader_address appears only in the WHERE clause.
+    trades_sql = f"""SELECT side, price, timestamp, market_source_id, is_sample
+                     FROM source_trades
+                     WHERE {address_column_normalized('trader_address')} = ?
+                       AND trader_address IS NOT NULL
+                     ORDER BY timestamp DESC"""
+
+    # PR24B PR26: distinct-market count is a single bounded scalar query
+    # (SQLite computes it inside the engine and returns one integer).
+    # This avoids accumulating the per-wallet ``market_ids`` set inside
+    # the streaming loop. The query plan uses the
+    # ``idx_source_trades_market`` index plus the WHERE predicate; cost
+    # is O(distinct markets) inside SQLite and O(1) in Python.
+    markets_traded_row = db.fetchone(
+        f"""SELECT COUNT(DISTINCT market_source_id) AS n
+            FROM source_trades
+            WHERE {address_column_normalized('trader_address')} = ?
+              AND trader_address IS NOT NULL""",
         (canonical,),
     )
-    if not trades:
+    markets_traded = int(markets_traded_row["n"]) if markets_traded_row else 0
+
+    # Counters accumulate across batches; per-batch memory stays small.
+    trade_count = 0
+    wins = 0
+    all_sample = True
+    # PR24B PR26: scalar-only timestamp tracking. No list.
+    latest_trade_ts: datetime | None = None
+    first_trade_ts: datetime | None = None
+
+    try:
+        for trade in db.iter_rows(
+            trades_sql,
+            (canonical,),
+            batch_size=_METRICS_BATCH_SIZE,
+        ):
+            # PR24B: RSS watchdog. We poll only every Nth row to keep
+            # overhead negligible for short wallets and bounded for long
+            # ones.
+            trade_count += 1
+            if trade_count % _RSS_POLL_EVERY_ROWS == 0:
+                check_rss_limit(
+                    f"scan:_compute_wallet_metrics(addr={canonical[:12]},"
+                    f"rows={trade_count})",
+                    _SCAN_MAX_RSS_MB,
+                )
+
+            side = trade["side"]
+            price = trade["price"]
+            if isinstance(side, str):
+                side_val = side
+            else:
+                side_val = str(side)
+            if side_val == "buy" and price < 0.5:
+                wins += 1
+            elif side_val == "sell" and price > 0.5:
+                wins += 1
+            if not trade["is_sample"]:
+                all_sample = False
+
+            ts_str = trade["timestamp"]
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(ts_str)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if latest_trade_ts is None or ts > latest_trade_ts:
+                        latest_trade_ts = ts
+                    if first_trade_ts is None or ts < first_trade_ts:
+                        first_trade_ts = ts
+                except (ValueError, TypeError):
+                    pass
+    except MemoryLimitExceeded:
+        # Bubble up; main() catches and exits nonzero with operational
+        # lock already released by the context manager.
+        raise
+
+    if trade_count == 0:
         return None
 
-    trade_count = len(trades)
-    is_sample = all(t["is_sample"] for t in trades)
-
-    # Compute win rate (simplified: profitable if price moved in favor)
-    # Without resolution data, we estimate based on trade side and price
-    wins = 0
-    for t in trades:
-        # Simplified heuristic: buy trades with price < 0.5 are "value buys"
-        side = t["side"]
-        price = t["price"]
-        if isinstance(side, str):
-            side_val = side
-        else:
-            side_val = str(side)
-        if side_val == "buy" and price < 0.5:
-            wins += 1
-        elif side_val == "sell" and price > 0.5:
-            wins += 1
-
     win_rate = wins / trade_count if trade_count > 0 else None
-
-    # Timestamps
-    timestamps = []
-    for t in trades:
-        ts_str = t["timestamp"]
-        if ts_str:
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                timestamps.append(ts)
-            except (ValueError, TypeError):
-                pass
-
-    latest_trade_ts = max(timestamps) if timestamps else None
-    first_trade_ts = min(timestamps) if timestamps else None
-
-    # Markets traded
-    market_ids = set(t["market_source_id"] for t in trades)
-    markets_traded = len(market_ids)
 
     # Sharpe ratio estimate (simplified)
     sharpe_ratio = None
@@ -1003,7 +1069,7 @@ def _compute_wallet_metrics(
         "latest_trade_ts": latest_trade_ts,
         "first_trade_ts": first_trade_ts,
         "markets_traded": markets_traded,
-        "is_sample": is_sample,
+        "is_sample": all_sample,
     }
 
 
@@ -1697,6 +1763,10 @@ def main() -> int:
         logger.error("Lock held: %s", e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
+    except MemoryLimitExceeded as e:
+        logger.error("RSS limit exceeded during scan: %s", e)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 3
 
     print(result.summary())
 

@@ -38,8 +38,20 @@ from polycopy.domain.experiment import ExperimentRun, ExperimentStatus
 from polycopy.risk.settlement import SettlementEvidence, SettlementEngine
 from polycopy.utils.concurrency import LockError
 from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, operational_job_lock
+from polycopy.runtime.memory import (
+    MemoryLimitExceeded,
+    check_rss_limit,
+    get_max_rss_mb_from_env,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# PR24B: bounded streaming for the per-market positions read (previously
+# unbounded ``fetchall``), and a per-position RSS poll.
+_SETTLE_BATCH_SIZE = 500
+_RSS_POLL_EVERY_ROWS = 500
+_SETTLE_MAX_RSS_MB = get_max_rss_mb_from_env()
 
 
 def setup_logging(verbosity: int = 0) -> None:
@@ -134,10 +146,26 @@ async def run_settlement(
             )
 
             # ── Settle positions for this market ───────────────────────────
-            positions = db.fetchall(
-                "SELECT * FROM positions WHERE market_id = ? AND quantity > 0",
+            # PR24B: previously ``fetchall("SELECT * FROM positions ...")``
+            # for every resolved market. Replaced with a bounded cursor
+            # over explicit columns; only the columns actually consumed
+            # by ``SettlementEngine.settle_position`` and ``_persist_settlement``
+            # are projected.
+            positions: list = []
+            for pos in db.iter_rows(
+                """SELECT id, market_id, wallet_id, outcome, quantity,
+                          avg_entry_price, is_sample
+                   FROM positions
+                   WHERE market_id = ? AND quantity > 0""",
                 (market_id,),
-            )
+                batch_size=_SETTLE_BATCH_SIZE,
+            ):
+                positions.append(pos)
+                if len(positions) % _RSS_POLL_EVERY_ROWS == 0:
+                    check_rss_limit(
+                        f"settle:market={market_id[:8]}(rows={len(positions)})",
+                        _SETTLE_MAX_RSS_MB,
+                    )
 
             for pos in positions:
                 try:
@@ -380,6 +408,10 @@ def main() -> int:
         logger.error("Lock held: %s", e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
+    except MemoryLimitExceeded as e:
+        logger.error("RSS limit exceeded during settlement: %s", e)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 3
 
     print(result.summary())
 

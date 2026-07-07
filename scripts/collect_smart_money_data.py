@@ -57,8 +57,24 @@ from polycopy.domain.wallet import Wallet
 from polycopy.engine.evaluate import evaluate_wallet
 from polycopy.utils.concurrency import LockError
 from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, operational_job_lock
+from polycopy.runtime.memory import (
+    MemoryLimitExceeded,
+    check_rss_limit,
+    get_max_rss_mb_from_env,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# PR24B: per-iteration RSS poll so a runaway discovery loop cannot
+# balloon memory silently. Bounded upstream by ``--market-limit`` and
+# the discovery query, so the poll frequency is low — every 50 markets
+# and every 200 wallets is enough to catch any future regression
+# without adding noticeable overhead.
+_COLLECT_MARKET_POLL_EVERY = 50
+_COLLECT_WALLET_POLL_EVERY = 200
+_COLLECT_MAX_RSS_MB = get_max_rss_mb_from_env()
+
 
 # ── Logging setup ────────────────────────────────────────────────────────────────
 
@@ -984,7 +1000,13 @@ async def run_collection(
 
         # 2. Collect trades for each market
         if not skip_trades:
-            for market in markets:
+            for market_index, market in enumerate(markets):
+                # PR24B: per-market RSS poll (cheap, every Nth market).
+                if market_index > 0 and market_index % _COLLECT_MARKET_POLL_EVERY == 0:
+                    check_rss_limit(
+                        f"collect:market_loop(idx={market_index})",
+                        _COLLECT_MAX_RSS_MB,
+                    )
                 logger.debug("Fetching trades for market %s...", market.source_id)
                 trades = await collector.collect_trades(db, market.source_id, result)
                 # Discover wallets from trades
@@ -1010,7 +1032,13 @@ async def run_collection(
         # 3. Score discovered wallets
         wallets = _get_unique_trader_addresses(db)
         logger.info("Scoring %d discovered wallets...", len(wallets))
-        for address in wallets:
+        for wallet_index, address in enumerate(wallets):
+            # PR24B: per-wallet RSS poll (cheap, every Nth wallet).
+            if wallet_index > 0 and wallet_index % _COLLECT_WALLET_POLL_EVERY == 0:
+                check_rss_limit(
+                    f"collect:wallet_loop(idx={wallet_index})",
+                    _COLLECT_MAX_RSS_MB,
+                )
             try:
                 score_id, summary = evaluate_wallet(
                     wallet_address=address,
@@ -1178,6 +1206,10 @@ def main() -> int:
         logger.error("Lock held by another process: %s", e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 3
+    except MemoryLimitExceeded as e:
+        logger.error("RSS limit exceeded during collection: %s", e)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 4
 
     # Report
     print(result.summary())

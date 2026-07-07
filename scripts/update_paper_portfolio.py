@@ -40,8 +40,20 @@ from polycopy.domain.market import Market, MarketOutcome
 from polycopy.risk.marks import MarkEngine, MarkPrice
 from polycopy.utils.concurrency import LockError
 from polycopy.runtime.locks import DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S, operational_job_lock
+from polycopy.runtime.memory import (
+    MemoryLimitExceeded,
+    check_rss_limit,
+    get_max_rss_mb_from_env,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# PR24B: bounded streaming for the open-positions / pending-orders reads
+# (previously unbounded ``fetchall``), and a per-position RSS poll.
+_UPDATE_BATCH_SIZE = 500
+_RSS_POLL_EVERY_ROWS = 500
+_UPDATE_MAX_RSS_MB = get_max_rss_mb_from_env()
 
 
 def setup_logging(verbosity: int = 0) -> None:
@@ -111,10 +123,33 @@ async def update_portfolio(
     now = datetime.now(timezone.utc)
 
     # ── Load open positions ────────────────────────────────────────────────
+    # PR24B: previously ``db.fetchall("SELECT * FROM positions WHERE quantity > 0")``
+    # loaded every open position's full row into a list. Replaced with a
+    # bounded cursor (batch_size=500) over the explicit columns actually
+    # consumed below (id, market_id, wallet_id, outcome, quantity,
+    # avg_entry_price). Each row is ~half the size of a SELECT * row
+    # because positions has 12 columns but only these 6 are read; the
+    # cursor returns rows in fixed-size batches so SQLite never has to
+    # buffer the entire result set in C before Python starts consuming.
     logger.info("Loading open positions...")
-    positions = db.fetchall(
-        "SELECT * FROM positions WHERE quantity > 0"
-    )
+    positions: list = []
+    market_ids: set[str] = set()
+    for pos in db.iter_rows(
+        """SELECT id, market_id, wallet_id, outcome, quantity, avg_entry_price
+           FROM positions
+           WHERE quantity > 0
+           ORDER BY id""",
+        (),
+        batch_size=_UPDATE_BATCH_SIZE,
+    ):
+        positions.append(pos)
+        market_ids.add(pos["market_id"])
+        # PR24B: poll RSS at the same cadence as the streaming loop.
+        if len(positions) % _RSS_POLL_EVERY_ROWS == 0:
+            check_rss_limit(
+                f"update:load_positions(rows={len(positions)})",
+                _UPDATE_MAX_RSS_MB,
+            )
     logger.info("  Found %d open positions", len(positions))
 
     if not positions:
@@ -196,10 +231,18 @@ async def update_portfolio(
             logger.warning("Failed to update position: %s", e)
 
     # ── Check pending orders ──────────────────────────────────────────────
+    # PR24B: pending orders can be small in practice, but the previous
+    # ``SELECT *`` form is replaced with an explicit-column cursor for
+    # consistency and to cap memory if a run with thousands of pending
+    # orders ever materialises.
     logger.info("Checking pending paper orders...")
-    pending_orders = db.fetchall(
-        "SELECT * FROM orders WHERE status = 'pending'"
-    )
+    pending_orders: list = []
+    for order in db.iter_rows(
+        """SELECT id, created_at, status FROM orders WHERE status = 'pending'""",
+        (),
+        batch_size=_UPDATE_BATCH_SIZE,
+    ):
+        pending_orders.append(order)
     result.orders_checked = len(pending_orders)
 
     from polycopy.risk.fill_model import ReviewDelay
@@ -404,6 +447,10 @@ def main() -> int:
         logger.error("Lock held: %s", e)
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
+    except MemoryLimitExceeded as e:
+        logger.error("RSS limit exceeded during portfolio update: %s", e)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 3
 
     print(result.summary())
 

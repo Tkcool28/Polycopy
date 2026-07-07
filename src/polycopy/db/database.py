@@ -458,6 +458,65 @@ class Database:
     def fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         return self.conn.execute(sql, params).fetchall()
 
+    # ── Bounded query iteration (PR24B) ─────────────────────────────────────
+    #
+    # Operational scripts previously loaded unbounded result sets with
+    # ``fetchall``, which on the old 1.6 GB DB caused per-wallet RSS to
+    # grow without bound. These helpers stream rows in fixed-size batches
+    # via a server-side cursor so peak memory is bounded by ``batch_size``.
+    #
+    # All three are thin wrappers around the connection; the implementation
+    # lives in :mod:`polycopy.runtime.query_batches` so unit tests can
+    # exercise it without a full ``Database`` instance.
+
+    def iter_rows(
+        self,
+        sql: str,
+        params: tuple = (),
+        *,
+        batch_size: int = 200,
+    ):
+        from polycopy.runtime.query_batches import iter_rows as _iter_rows
+
+        return _iter_rows(self.conn, sql, params, batch_size=batch_size)
+
+    def iter_batches(
+        self,
+        sql: str,
+        params: tuple = (),
+        *,
+        batch_size: int = 200,
+    ):
+        from polycopy.runtime.query_batches import iter_batches as _iter_batches
+
+        return _iter_batches(self.conn, sql, params, batch_size=batch_size)
+
+    def iter_keyset_batches(
+        self,
+        *,
+        base_sql: str,
+        keyset_col: str,
+        last_value,
+        extra_where: str = "",
+        base_params: tuple = (),
+        batch_size: int = 200,
+        descending: bool = True,
+    ):
+        from polycopy.runtime.query_batches import (
+            iter_keyset_batches as _iter_keyset_batches,
+        )
+
+        return _iter_keyset_batches(
+            self.conn,
+            base_sql=base_sql,
+            keyset_col=keyset_col,
+            last_value=last_value,
+            extra_where=extra_where,
+            base_params=base_params,
+            batch_size=batch_size,
+            descending=descending,
+        )
+
 
 # ── Singleton accessor ──────────────────────────────────────────────────────────
 
