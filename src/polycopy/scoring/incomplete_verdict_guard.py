@@ -51,6 +51,7 @@ to import from any layer.
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import replace
 from typing import Any, Iterable, Mapping, Optional
 
@@ -569,3 +570,191 @@ def apply_to_decision_row(row: Mapping[str, Any]) -> dict[str, Any]:
     out["verdict"] = corrected["verdict"]
     out["verdict_family"] = corrected["verdict_family"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# PR24G — Legacy decision-row repair planning
+# ---------------------------------------------------------------------------
+#
+# Pre-PR27 / pre-PR24F / pre-PR24E rows can persist the old bad shape:
+#
+#   * verdict = "skip" with both reason buckets empty
+#   * no resolved-market evidence
+#
+# These rows are auditable evidence of a contract violation. We don't
+# want to silently delete them (that loses history), and we don't want
+# to manually patch them with raw SQL (that hides the bug). Instead we
+# want a tested, idempotent maintenance path that re-derives the row's
+# verdict and reason buckets through the current shared guard so the
+# persisted shape matches the current contract.
+#
+# This helper is the planning layer — it computes what WOULD change
+# without touching the database. The companion script
+# ``scripts/repair_legacy_decision_verdicts.py`` then either prints the
+# plan (dry-run) or applies the planned UPDATE (apply).
+
+
+def _coerce_json_list(raw: Any) -> list[str]:
+    """Best-effort parse of a JSON-list column into ``list[str]``.
+
+    SQLite TEXT columns store Python ``json.dumps(list)`` as ``"[]"``
+    or ``"[\\\"a\\\"]"``. Tolerates None, empty string, malformed
+    input, and non-list JSON values by returning ``[]``.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x is not None]
+    if not isinstance(raw, str):
+        return []
+    s = raw.strip()
+    if not s:
+        return []
+    try:
+        parsed = json.loads(s)
+    except (TypeError, ValueError):
+        return []
+    if isinstance(parsed, list):
+        return [str(x) for x in parsed if x is not None]
+    return []
+
+
+def _is_legacy_suspect_shape(
+    *,
+    verdict: Any,
+    missing_essentials: list[str],
+    eligibility_failures: list[str],
+) -> bool:
+    """Return True for the legacy pre-PR24F bad shape.
+
+    Criteria (from the brief):
+      * ``verdict`` is exactly the string ``"skip"`` (case-insensitive)
+      * ``missing_essentials`` is empty
+      * ``eligibility_failures`` is empty
+
+    A row that ALREADY has the correct shape (non-empty buckets) is
+    never re-repaired — the helper reports ``repair_needed=False``.
+    """
+    v = (str(verdict or "")).strip().lower()
+    return v == VERDICT_SKIP and not missing_essentials and not eligibility_failures
+
+
+def derive_legacy_wallet_decision_repair(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Compute the repair plan for a single ``wallet_score_decisions`` row.
+
+    Pure function — does NOT touch the database. Returns a plan dict
+    with the following keys::
+
+        repair_needed (bool)
+            True only when the row matches the legacy suspect shape AND
+            the current shared guard would change either the verdict
+            or the reason buckets. Rows that already satisfy PR24F are
+            reported as ``repair_needed=False`` (no-op).
+
+        old_verdict (str)
+        old_missing_essentials (list[str])
+        old_eligibility_failures (list[str])
+        old_verdict_family (str | None)
+
+        new_verdict (str)
+        new_verdict_family (str)
+        new_missing_essentials (list[str])
+        new_eligibility_failures (list[str])
+
+        wallet_id (str)
+            Carried through from the input row for logging / scripting.
+
+        row_id (int | None)
+            Carried through from the input row when present.
+
+        updated_payload (dict)
+            A copy of ``row`` with verdict / verdict_family /
+            missing_essentials / eligibility_failures fields rewritten
+            to the new values. Empty when ``repair_needed`` is False.
+
+        ambiguous_companion (bool)
+            Always False here. The companion (``decision_verdicts``)
+            linkage ambiguity is computed by the script, not the helper,
+            because it requires a separate DB query.
+
+    The helper is the single source of truth for "what should this row
+    look like under PR24F". The companion script only decides whether
+    the plan should be printed (dry-run) or applied (write).
+    """
+    # Parse the legacy JSON buckets safely.
+    old_missing = _coerce_json_list(row.get("missing_essentials_json"))
+    old_failures = _coerce_json_list(row.get("eligibility_failures_json"))
+    old_verdict = row.get("verdict")
+    old_family = row.get("verdict_family")
+
+    # Short-circuit when the row already has the correct shape.
+    legacy_shape = _is_legacy_suspect_shape(
+        verdict=old_verdict,
+        missing_essentials=old_missing,
+        eligibility_failures=old_failures,
+    )
+
+    # Read the five evidence columns. The caller passes whatever they
+    # have — None / 0 are both valid inputs to the guard.
+    resolved_markets = row.get("resolved_markets")
+    category_resolved_markets = row.get("category_resolved_markets")
+    sample_fraction = row.get("sample_fraction")
+    sharpe_ratio = row.get("sharpe_ratio")
+    max_drawdown = row.get("max_drawdown")
+
+    corrected = enforce_wallet_decision_eligibility(
+        verdict=str(old_verdict or ""),
+        verdict_family=old_family,
+        missing_essentials=old_missing,
+        eligibility_failures=old_failures,
+        resolved_markets=resolved_markets,
+        category_resolved_markets=category_resolved_markets,
+        sample_fraction=sample_fraction,
+        sharpe_ratio=sharpe_ratio,
+        max_drawdown=max_drawdown,
+    )
+
+    new_verdict = corrected["verdict"]
+    new_family = corrected["verdict_family"]
+    new_missing = list(corrected["missing_essentials"])
+    new_failures = list(corrected["eligibility_failures"])
+
+    # A row needs repair only if BOTH:
+    #   (a) it has the legacy suspect shape (verdict=skip + empty buckets), AND
+    #   (b) the current guard would actually rewrite it (verdict flipped
+    #       or any reason bucket differs).
+    # A row whose verdict is already correctly incomplete/skip with
+    # proper buckets is left alone — re-running is idempotent.
+    buckets_changed = (
+        new_verdict != (str(old_verdict or "").lower())
+        or new_missing != old_missing
+        or new_failures != old_failures
+    )
+    repair_needed = legacy_shape and buckets_changed
+
+    plan: dict[str, Any] = {
+        "repair_needed": repair_needed,
+        "old_verdict": str(old_verdict or ""),
+        "old_verdict_family": old_family,
+        "old_missing_essentials": old_missing,
+        "old_eligibility_failures": old_failures,
+        "new_verdict": new_verdict,
+        "new_verdict_family": new_family,
+        "new_missing_essentials": new_missing,
+        "new_eligibility_failures": new_failures,
+        "wallet_id": row.get("wallet_id"),
+        "row_id": row.get("id"),
+        "updated_payload": {},
+        "ambiguous_companion": False,
+    }
+
+    if repair_needed:
+        updated = dict(row)
+        updated["verdict"] = new_verdict
+        updated["verdict_family"] = new_family
+        # Persist reason buckets as JSON strings (matches the schema).
+        updated["missing_essentials_json"] = json.dumps(new_missing)
+        updated["eligibility_failures_json"] = json.dumps(new_failures)
+        plan["updated_payload"] = updated
+
+    return plan
