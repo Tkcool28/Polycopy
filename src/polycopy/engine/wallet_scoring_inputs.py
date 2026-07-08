@@ -98,7 +98,7 @@ def build_wallet_scoring_input_candidate(
         accounting_coverage_pct=readiness.accounting_coverage_pct,
         accountable_buy_coverage_pct=readiness.accountable_buy_coverage_pct,
         buy_only_limitation=readiness.buy_only_limitation,
-        total_realized_pnl=float(getattr(row, "total_realized_pnl")),
+        total_realized_pnl=getattr(row, "total_realized_pnl"),
         roi=getattr(row, "roi"),
         win_rate=getattr(row, "win_rate"),
         profit_factor=getattr(row, "profit_factor"),

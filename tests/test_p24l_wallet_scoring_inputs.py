@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from decimal import Decimal
+from types import SimpleNamespace
+import importlib
+import sqlite3
 
 import pytest
 
+import polycopy.engine.wallet_scoring_inputs as wallet_scoring_inputs
 from polycopy.engine.wallet_accounting_coverage import WalletAccountingCoverageRow
 from polycopy.engine.wallet_accounting_readiness import (
     AccountingReadinessConfig,
@@ -114,6 +119,37 @@ def test_limited_readiness_keeps_score_input_visible_without_blocked_reasons():
     assert_adapter_invariants(candidate)
 
 
+def test_limited_candidate_warnings_include_readiness_warnings_and_reasons(monkeypatch):
+    def fake_readiness(row, *, config=None):
+        return SimpleNamespace(
+            identity_key=row.identity_key,
+            identity_group_by=row.group_by,
+            ready_for_skill_score=True,
+            ready_for_auto_copy=False,
+            reasons=("limited_reason",),
+            warnings=("limited_warning",),
+            total_source_trades=row.source_trades,
+            total_ledger_rows=row.total_ledger_rows,
+            accounted_trades=row.accounted_trades,
+            accounting_coverage_pct=row.accounting_coverage_pct,
+            accountable_buy_coverage_pct=row.accountable_buy_coverage_pct,
+            buy_only_limitation=row.buy_only_limitation,
+        )
+
+    monkeypatch.setattr(
+        wallet_scoring_inputs,
+        "accounting_readiness_from_coverage_row",
+        fake_readiness,
+    )
+
+    candidate = build_wallet_scoring_input_candidate(coverage_row(identity_key="0xlimited"))
+
+    assert candidate.candidate_status == STATUS_SCORE_INPUT_LIMITED
+    assert candidate.blocked_reasons == ()
+    assert candidate.warnings == ("limited_warning", "limited_reason")
+    assert_adapter_invariants(candidate)
+
+
 def test_limited_candidate_warnings_include_readiness_reasons_once():
     candidate = build_wallet_scoring_input_candidate(coverage_row(buy_only_limitation=True))
 
@@ -123,11 +159,23 @@ def test_limited_candidate_warnings_include_readiness_reasons_once():
     assert_adapter_invariants(candidate)
 
 
-def test_blocked_readiness_becomes_blocked_with_ready_booleans_false():
+def test_parked_production_like_row_is_blocked_with_no_ledger_reason():
     candidate = build_wallet_scoring_input_candidate(
-        coverage_row(total_ledger_rows=0, accounted_trades=0, accounting_coverage_pct=None)
+        coverage_row(
+            identity_key="0xsample_trader_a_do_not_use",
+            group_by="trader_address",
+            source_trades=5,
+            buy_trades=5,
+            total_ledger_rows=0,
+            accounted_trades=0,
+            accounting_coverage_pct=None,
+            accountable_buy_coverage_pct=None,
+        )
     )
 
+    assert candidate.identity_key == "0xsample_trader_a_do_not_use"
+    assert candidate.identity_group_by == "trader_address"
+    assert candidate.source_trades == 5
     assert candidate.candidate_status == STATUS_BLOCKED
     assert candidate.ready_for_skill_score is False
     assert candidate.ready_for_auto_copy is False
@@ -154,7 +202,7 @@ def test_identity_and_metrics_are_copied_from_coverage_row():
             source_trades=13,
             total_ledger_rows=11,
             accounted_trades=8,
-            total_realized_pnl=-42.25,
+            total_realized_pnl=Decimal("-42.25"),
             roi=-0.125,
             win_rate=0.375,
             profit_factor=0.8,
@@ -168,7 +216,8 @@ def test_identity_and_metrics_are_copied_from_coverage_row():
     assert candidate.source_trades == 13
     assert candidate.total_ledger_rows == 11
     assert candidate.accounted_trades == 8
-    assert candidate.total_realized_pnl == pytest.approx(-42.25)
+    assert candidate.total_realized_pnl == Decimal("-42.25")
+    assert type(candidate.total_realized_pnl) is Decimal
     assert candidate.roi == pytest.approx(-0.125)
     assert candidate.win_rate == pytest.approx(0.375)
     assert candidate.profit_factor == pytest.approx(0.8)
@@ -247,6 +296,20 @@ def test_empty_batch_returns_empty_summary():
         auto_copy_blocked=0,
         candidates=(),
     )
+
+
+def test_module_import_and_helper_run_are_db_free_with_in_memory_rows(monkeypatch):
+    def fail_connect(*args, **kwargs):
+        raise AssertionError("wallet_scoring_inputs import/helper must not open sqlite")
+
+    monkeypatch.setattr(sqlite3, "connect", fail_connect)
+    module = importlib.reload(wallet_scoring_inputs)
+
+    candidate = module.build_wallet_scoring_input_candidate(coverage_row(identity_key="0xinmemory"))
+
+    assert candidate.identity_key == "0xinmemory"
+    assert candidate.candidate_status == STATUS_SCORE_INPUT_READY
+    assert_adapter_invariants(candidate)
 
 
 def test_candidate_exposes_no_score_rank_or_copy_candidate_fields_and_does_not_sort():
