@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,13 @@ import pytest
 # Resolve paths
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "backfill_resolution_truth.py"
-_VENV_PY = _REPO_ROOT / ".venv" / "bin" / "python3"
+# Use the Python interpreter that pytest itself is running under. The
+# backfill script only needs the project on sys.path (we set
+# ``PYTHONPATH=src`` in the env) and access to the standard library;
+# it does not require a venv-specific binary. This makes the test
+# work on the GitHub Actions runners (which use the system Python,
+# not a project venv) and on developer workstations alike.
+_PYTHON_EXECUTABLE = sys.executable
 
 
 def _run_script(
@@ -51,7 +58,7 @@ def _run_script(
     if lock_path is not None:
         env["POLYCOPY_OPERATIONAL_LOCK_PATH"] = str(lock_path)
     return subprocess.run(
-        [str(_VENV_PY), str(_SCRIPT), *args],
+        [str(_PYTHON_EXECUTABLE), str(_SCRIPT), *args],
         cwd=str(_REPO_ROOT),
         env=env,
         capture_output=True,

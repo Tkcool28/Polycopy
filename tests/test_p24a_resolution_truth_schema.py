@@ -223,7 +223,7 @@ class TestExistingDataPreserved:
         db2 = Database(db_path=db_path).connect()
         try:
             row = db2.conn.execute(
-                "SELECT id, address FROM wallets WHERE id='w-1'"
+                "SELECT id, address FROM wallets WHERE id = 'w-1'"
             ).fetchone()
             assert row is not None, "wallet row was destroyed by v14 migration"
             assert row["address"] == "0xabc"
