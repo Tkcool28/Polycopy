@@ -103,7 +103,7 @@ def test_json_output_uses_missing_trader_address_sentinel(tmp_path):
     result = run(path, "--json", "--include-rows")
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
-    assert data["rows"][0]["identity_key"] == "missing_trader_address"
+    assert data["rows"][0]["identity_key"] == "missing__trader_address"
 
 
 def test_human_output_contains_totals_and_buy_only_limitation(tmp_path):
@@ -134,7 +134,7 @@ def test_wallet_id_grouping_does_not_fabricate(tmp_path):
         db.close()
     result = run(path, "--group-by", "wallet_id", "--json", "--include-rows")
     data = json.loads(result.stdout)
-    assert data["rows"][0]["identity_key"] == "missing_wallet_id"
+    assert data["rows"][0]["identity_key"] == "missing__wallet_id"
     assert data["mapped_wallets"] == 0
 
 
