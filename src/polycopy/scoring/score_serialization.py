@@ -625,6 +625,19 @@ def persist_category_score_v1(
         category_active_days=inp.category_active_days,
     )
 
+    # ---- PR24H: apply the category evidence guard -------------------
+    # The compute path already returns INCOMPLETE for some evidence
+    # gaps (missing trade_count / win_rate / category gate values),
+    # but the persistence layer must not trust that. Apply the shared
+    # category guard to guarantee no SKIP / WATCHLIST / COPY_CANDIDATE
+    # is persisted without sufficient required evidence and a
+    # non-empty reason bucket.
+    from polycopy.scoring.incomplete_verdict_guard import (
+        apply_to_category_score_result,
+    )
+
+    guarded = apply_to_category_score_result(result)
+
     now = datetime.now(timezone.utc).isoformat()
 
     return _insert_or_ignore_returning_id(
@@ -646,7 +659,7 @@ def persist_category_score_v1(
             wallet_id,
             category_label,
             "category_wallet_score",
-            result.formula_version,
+            guarded.formula_version,
             idempotency_key,
             inp.info_score,
             inp.win_rate,
@@ -664,11 +677,11 @@ def persist_category_score_v1(
             inp.category_resolved_markets,
             inp.category_distinct_events,
             inp.category_active_days,
-            serialize_score_components(result.components),
-            result.score,
-            result.verdict.value,
-            json.dumps(result.missing_essentials),
-            json.dumps(result.category_gate_failures),
+            serialize_score_components(guarded.components),
+            guarded.score,
+            guarded.verdict.value,
+            json.dumps(guarded.missing_essentials),
+            json.dumps(guarded.category_gate_failures),
             source_data_timestamp,
             now,
             now,
@@ -679,7 +692,7 @@ def persist_category_score_v1(
             WHERE wallet_id = ? AND category_label = ? AND formula_name = ? AND formula_version = ? AND idempotency_key = ?
         """,
         existing_lookup_params=(
-            wallet_id, category_label, "category_wallet_score", result.formula_version, idempotency_key,
+            wallet_id, category_label, "category_wallet_score", guarded.formula_version, idempotency_key,
         ),
     )
 
