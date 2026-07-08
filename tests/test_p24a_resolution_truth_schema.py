@@ -49,10 +49,10 @@ _V14_NEW_INDEXES = (
 
 
 class TestSchemaVersionAndRegistry:
-    def test_schema_version_constant_is_14(self) -> None:
-        """PR24A: SCHEMA_VERSION must be 14."""
-        assert schema.SCHEMA_VERSION == 14, (
-            f"PR24A requires SCHEMA_VERSION=14, got {schema.SCHEMA_VERSION}"
+    def test_schema_version_constant_is_at_least_14(self) -> None:
+        """PR24A: SCHEMA_VERSION must include v14 or a later migration."""
+        assert schema.SCHEMA_VERSION >= 14, (
+            f"PR24A requires SCHEMA_VERSION>=14, got {schema.SCHEMA_VERSION}"
         )
 
     def test_migrations_registry_contains_v14(self) -> None:
@@ -99,8 +99,8 @@ class TestV14DdlIsAdditive:
 # ────────────────────────────────────────────────────────────────────
 
 
-class TestFreshDbMigratesToV14:
-    def test_fresh_db_reaches_schema_version_14(self, tmp_path: Path) -> None:
+class TestFreshDbMigratesToCurrentSchema:
+    def test_fresh_db_reaches_current_schema_version(self, tmp_path: Path) -> None:
         db_path = tmp_path / "fresh.db"
         db = Database(db_path=db_path).connect()
         try:
@@ -108,8 +108,9 @@ class TestFreshDbMigratesToV14:
                 "SELECT value FROM _meta WHERE key='schema_version'"
             ).fetchone()
             assert row is not None
-            assert row["value"] == "14", (
-                f"Expected schema_version=14 on a fresh DB, got {row['value']}"
+            assert row["value"] == str(schema.SCHEMA_VERSION), (
+                f"Expected schema_version={schema.SCHEMA_VERSION} on a fresh DB, "
+                f"got {row['value']}"
             )
         finally:
             db.close()
@@ -170,7 +171,7 @@ class TestMigrationIsIdempotent:
                 "SELECT value FROM _meta WHERE key='schema_version'"
             ).fetchone()
             assert row is not None
-            assert row["value"] == "14"
+            assert row["value"] == str(schema.SCHEMA_VERSION)
         finally:
             db2.close()
 
@@ -185,7 +186,7 @@ class TestMigrationIsIdempotent:
             row = db.conn.execute(
                 "SELECT value FROM _meta WHERE key='schema_version'"
             ).fetchone()
-            assert row["value"] == "14"
+            assert row["value"] == str(schema.SCHEMA_VERSION)
         finally:
             db.close()
 

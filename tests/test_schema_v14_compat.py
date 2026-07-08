@@ -30,11 +30,11 @@ import pytest
 from polycopy.config.settings import BrokerMode
 
 
-def test_schema_version_constant_is_14() -> None:
-    """Main code SCHEMA_VERSION must be 14 (was 13 before PR24A)."""
+def test_schema_version_constant_includes_v14() -> None:
+    """Main code SCHEMA_VERSION must include v14 or a later migration."""
     from polycopy.db import schema
-    assert schema.SCHEMA_VERSION == 14, (
-        f"PR24A requires SCHEMA_VERSION=14, got {schema.SCHEMA_VERSION}"
+    assert schema.SCHEMA_VERSION >= 14, (
+        f"PR24A requires SCHEMA_VERSION>=14, got {schema.SCHEMA_VERSION}"
     )
 
 
@@ -64,8 +64,8 @@ def test_v13_ddl_creates_only_additive_inert_table() -> None:
         assert f not in ddl, f"v13 DDL must not contain '{f}' (got: {ddl[:300]})"
 
 
-def test_fresh_db_migrates_to_v14(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A brand-new DB on a clean file should end at schema_version=14."""
+def test_fresh_db_migrates_to_current_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A brand-new DB on a clean file should end at current schema_version."""
     db_path = tmp_path / "fresh.db"
     monkeypatch.setenv("POLYCOPY_DB_PATH", str(db_path))
     # Ensure no other POLYCOPY_* env var leaks into Settings.
@@ -75,6 +75,7 @@ def test_fresh_db_migrates_to_v14(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     # Reset settings + db singletons so they pick up our env.
     from polycopy.config.settings import get_settings
     from polycopy.db import database as db_module
+    from polycopy.db import schema
     from polycopy.db.database import get_database
     get_settings(reload=True)
     get_database(reload=True)
@@ -83,8 +84,8 @@ def test_fresh_db_migrates_to_v14(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     # Read back the version from _meta.
     row = db.conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()
     assert row is not None, "_meta table missing after migration"
-    assert int(row["value"]) == 14, (
-        f"fresh DB should end at v14, got v{row['value']}"
+    assert int(row["value"]) == schema.SCHEMA_VERSION, (
+        f"fresh DB should end at v{schema.SCHEMA_VERSION}, got v{row['value']}"
     )
     # The v13 specialist aggregations table must still exist
     # (preserved by the additive v14 migration).
