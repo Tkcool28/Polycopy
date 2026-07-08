@@ -210,6 +210,27 @@ class Database:
         "idx_wsa_wallet_category",
     )
 
+    # PR24A: extend the physical-schema check with the v14 resolution-truth
+    # columns. The reconciliation path that protects against the v5 DROP
+    # replay must NOT fire if the v14 ADD COLUMNs haven't been applied —
+    # otherwise a DB at physical v13 / _meta v13 will be silently bumped to
+    # _meta v14 without the new columns, leaving the schema one step behind
+    # the code. We include the most important v14 columns here so the
+    # reconciliation short-circuit only fires when v14 is *physically*
+    # present.
+    _REQUIRED_V14_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("market_outcomes", "is_winner"),
+        ("markets", "winning_token_id"),
+        ("markets", "resolution_checked_at"),
+        ("markets", "resolution_source"),
+        ("source_trades", "resolution_status"),
+        ("source_trades", "resolved_at"),
+        ("source_trades", "winning_token_id"),
+        ("source_trades", "is_winning_trade"),
+        ("source_trades", "realized_pnl"),
+        ("source_trades", "settlement_source"),
+    )
+
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
     # already present but these specific indexes are missing.
@@ -218,7 +239,7 @@ class Database:
     )
 
     def _physical_schema_at_target(self) -> bool:
-        """Return True if the live DB already has every required v13 object.
+        """Return True if the live DB already has every required v13/v14 object.
 
         Used by the migration runner to detect "schema metadata lag":
         a database whose ``_meta.schema_version`` is behind the code's
@@ -226,9 +247,16 @@ class Database:
         target. In that case the destructive migrations must NOT replay
         (they would either fail, bloat the DB, or both — see PR23 for
         the worked example with v5 rewriting ``source_trades``).
+
+        PR24A extended this check to include the v14 resolution-truth
+        columns so the reconciliation path only short-circuits when v14
+        is *physically* present, not merely when v13 is.
         """
         for obj in self._REQUIRED_V13_OBJECTS:
             if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        for table, column in self._REQUIRED_V14_COLUMNS:
+            if not self._column_exists(table, column):
                 return False
         return True
 
