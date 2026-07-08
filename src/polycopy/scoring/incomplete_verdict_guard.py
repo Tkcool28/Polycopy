@@ -75,6 +75,12 @@ CANONICAL_FAMILY = {
 # Canonical eligibility-failure marker (single source of truth).
 NO_RESOLVED_MARKET_EVIDENCE = "no_resolved_market_evidence"
 
+# PR24F canonical marker: any required non-resolution evidence is
+# missing (``sample_fraction``, ``sharpe_ratio``, ``max_drawdown``,
+# or — when ``require_category_resolution`` is True —
+# ``category_resolved_markets``).
+MISSING_REQUIRED_EVIDENCE = "missing_required_evidence"
+
 # Canonical score-driven SKIP marker. PR27 invariant: a SKIP verdict
 # must NEVER persist with both ``missing_essentials_json`` and
 # ``eligibility_failures_json`` empty. When the SKIP is the legitimate
@@ -84,14 +90,27 @@ NO_RESOLVED_MARKET_EVIDENCE = "no_resolved_market_evidence"
 SCORE_BELOW_COPY_THRESHOLD = "score_below_copy_threshold"
 
 # The set of evidence keys the helper tracks when forcing INCOMPLETE.
-# Mirrors the user-facing contract in PR24E's PR body.
+# PR24F: this is the canonical "required evidence" set — every key
+# here MUST be present (None-or-zero for resolution keys, None-only
+# for non-resolution keys) before a real verdict can be emitted.
 RESOLUTION_EVIDENCE_KEYS: tuple[str, ...] = (
     "resolved_markets",
     "category_resolved_markets",
+)
+NON_RESOLUTION_REQUIRED_KEYS: tuple[str, ...] = (
     "sample_fraction",
     "sharpe_ratio",
     "max_drawdown",
 )
+REQUIRED_EVIDENCE_KEYS: tuple[str, ...] = (
+    *RESOLUTION_EVIDENCE_KEYS,
+    *NON_RESOLUTION_REQUIRED_KEYS,
+)
+
+# Backwards-compatibility alias: PR24E used this name as the union of
+# all five keys. Older code (e.g. ``persist_decision_verdicts_and_components``
+# in ``scripts/scan_pipeline_wiring.py``) imports it.
+ALL_EVIDENCE_KEYS: tuple[str, ...] = REQUIRED_EVIDENCE_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -120,13 +139,33 @@ def lacks_resolution_evidence(
     return False
 
 
-def _is_missing(value: Any) -> bool:
+def _is_missing(key: str, value: Any) -> bool:
+    """Return ``True`` when ``value`` is unusable as evidence for ``key``.
+
+    PR24F semantics — the rule depends on the key:
+
+    * ``resolved_markets`` and ``category_resolved_markets``: a wallet
+      has no usable resolution evidence when ``value`` is ``None`` OR
+      zero. ``resolved_markets=0`` means no resolved markets exist;
+      we don't treat zero as a positive count.
+    * ``sample_fraction``, ``sharpe_ratio``, ``max_drawdown``: ``None``
+      is missing, but a numeric zero is a real measured value and is
+      treated as present. A Sharpe of 0.0 means "no excess return per
+      unit risk" — that is information, not absence. Likewise zero
+      drawdown means "no observed drawdown", which is also information.
+
+    The ``key`` argument is the canonical evidence-field name; passing
+    a key outside the required set falls back to the conservative
+    rule (``None`` or zero ⇒ missing).
+    """
     if value is None:
         return True
-    # Treat zero as missing for the resolution-evidence sense so that
-    # ``resolved_markets=0`` is not silently treated as evidence.
-    if isinstance(value, (int, float)) and value == 0:
-        return True
+    if key in RESOLUTION_EVIDENCE_KEYS:
+        # Resolution counts: zero is missing.
+        if isinstance(value, (int, float)) and value == 0:
+            return True
+    # Non-resolution required evidence: ``None`` is the only missing
+    # form. Zero is a legitimate measurement.
     return False
 
 
@@ -174,7 +213,7 @@ def _build_missing_essentials(
         ("max_drawdown", max_drawdown),
     ]
     for key, value in candidates:
-        if _is_missing(value) and key not in seen:
+        if _is_missing(key, value) and key not in seen:
             out.append(key)
             seen.add(key)
     return out
@@ -230,10 +269,28 @@ def derive_wallet_verdict_from_evidence(
         missing_essentials (list[str])
         eligibility_failures (list[str])
 
-    The returned values are always self-consistent with the PR24E
-    invariant: a zero/missing resolution-evidence wallet can never
-    produce a real verdict, and a ``skip`` verdict cannot be silent
-    (both reason buckets empty).
+    PR24F contract — the helper enforces two completeness rules that
+    must hold BEFORE any real verdict (SKIP / WATCHLIST / COPY_CANDIDATE)
+    can be emitted:
+
+      Rule 1a (zero-resolution evidence): if ``resolved_markets`` is
+      ``None`` or zero, OR if ``category_resolved_markets`` is
+      ``None`` or zero (and ``require_category_resolution`` is True),
+      the verdict is forced to ``incomplete`` and ``eligibility_failures``
+      includes ``no_resolved_market_evidence``.
+
+      Rule 1b (missing required evidence): if Rule 1a does not fire
+      AND any of ``sample_fraction``, ``sharpe_ratio``, ``max_drawdown``
+      is ``None``, the verdict is forced to ``incomplete`` and
+      ``eligibility_failures`` includes ``missing_required_evidence``.
+      (Numeric zero values are treated as present for these three
+      fields — a Sharpe of 0.0 is a real measurement, not absence.)
+
+    When both rules leave the verdict untouched (i.e. all required
+    evidence is present and usable), PR27's no-silent-skip rule still
+    fires: a SKIP with no caller-supplied eligibility failure is
+    annotated with ``score_below_copy_threshold`` so the persisted row
+    is never silent.
 
     The function is pure and deterministic.
     """
@@ -247,6 +304,9 @@ def derive_wallet_verdict_from_evidence(
         require_category_resolution=require_category_resolution,
     )
 
+    # Build the canonical missing-essentials list using the key-aware
+    # missing rule. ``missing_essentials`` always reflects every key
+    # whose value is unusable for this wallet.
     missing = _build_missing_essentials(
         resolved_markets=resolved_markets,
         category_resolved_markets=category_resolved_markets,
@@ -260,48 +320,71 @@ def derive_wallet_verdict_from_evidence(
         existing=eligibility_failures,
     )
 
-    # Rule 1: no resolution evidence ⇒ force INCOMPLETE.
+    # ------------------------------------------------------------------
+    # Rule 1a — zero-resolution evidence ⇒ force INCOMPLETE.
+    # ------------------------------------------------------------------
     if lacks_resolution:
         v = VERDICT_INCOMPLETE
+        if NO_RESOLVED_MARKET_EVIDENCE not in failures:
+            failures = [*failures, NO_RESOLVED_MARKET_EVIDENCE]
 
-    # PR27 invariant: a persisted ``skip`` must never have BOTH
+    # ------------------------------------------------------------------
+    # Rule 1b — missing required non-resolution evidence ⇒ force
+    # INCOMPLETE (only when Rule 1a did not fire). A wallet with
+    # sufficient resolved-market evidence but a missing risk/sample
+    # field is still not eligible for a real verdict.
+    # ------------------------------------------------------------------
+    elif any(
+        key in missing
+        for key in NON_RESOLUTION_REQUIRED_KEYS
+    ):
+        v = VERDICT_INCOMPLETE
+        if MISSING_REQUIRED_EVIDENCE not in failures:
+            failures = [*failures, MISSING_REQUIRED_EVIDENCE]
+
+    # ------------------------------------------------------------------
+    # PR27 invariant — a persisted ``skip`` must never have BOTH
     # ``missing_essentials`` empty AND ``eligibility_failures`` empty.
     #
     # Two cases:
     #
-    # (a) No resolution evidence (Rule 1 territory). ``v`` is already
-    #     INCOMPLETE; we still want the persisted reason buckets to be
-    #     populated so an audit can tell the evidence-gap decision
-    #     apart from a deliberate skip.
+    # (a) Verdict was forced to INCOMPLETE by Rule 1a/1b. The persisted
+    #     reason buckets are populated by the rules above. Nothing more
+    #     to do here.
     #
-    # (b) Sufficient resolution evidence and verdict is SKIP. The skip
-    #     is the legitimate output of the score formula — DO NOT
-    #     promote it to INCOMPLETE. But if the caller signalled no
-    #     eligibility failure (whether by passing an empty list OR by
-    #     passing ``None``), append the canonical score-driven SKIP
-    #     marker so the persisted row is never silent.
-    #
-    # Normalize ``None`` and the empty iterable into the same shape so
-    # ``None`` callers — i.e. every caller that doesn't already supply
-    # a reason bucket — are caught by the same invariant.
+    # (b) Verdict is SKIP with all required evidence present. Preserve
+    #     the verdict but guarantee ``eligibility_failures`` is
+    #     non-empty: every SKIP must carry at least one eligibility
+    #     failure, regardless of whether the caller supplied a
+    #     non-empty list, an empty list, or ``None``.
+    # ------------------------------------------------------------------
     caller_missing = list(missing_essentials or [])
     caller_failures = list(eligibility_failures or [])
 
-    if lacks_resolution and v == VERDICT_SKIP:
-        # Case (a) — Rule 1 already set v=INCOMPLETE; just populate
-        # the persisted reason buckets if they were empty.
+    if v == VERDICT_INCOMPLETE:
+        # Case (a) — Rules 1a/1b already populated reason buckets. If
+        # the caller supplied empty buckets AND the rules didn't fill
+        # them in (which can only happen if Rule 1a/1b fired but the
+        # resolved-markets key was, e.g., a 0 that the rule treats as
+        # present), make sure the persisted row is still non-silent.
+        # This branch is normally a no-op because the rules above
+        # already populated ``failures``.
         if not caller_missing:
-            missing = list(RESOLUTION_EVIDENCE_KEYS)
-        if not caller_failures:
-            if NO_RESOLVED_MARKET_EVIDENCE not in failures:
+            # Re-derive from helper-computed missing list — this is
+            # already non-empty when a rule fired.
+            missing = list(missing) or list(REQUIRED_EVIDENCE_KEYS)
+        if not failures and not caller_failures:
+            # Defensive: if a caller passes ``verdict="incomplete"``
+            # with no other reason, attach a marker so the row is
+            # auditable.
+            if lacks_resolution:
                 failures = [NO_RESOLVED_MARKET_EVIDENCE]
+            else:
+                failures = [MISSING_REQUIRED_EVIDENCE]
 
     elif v == VERDICT_SKIP:
-        # Case (b) — sufficient resolution evidence; preserve the
-        # verdict but guarantee ``eligibility_failures`` is non-empty.
-        # Use the stricter rule: every SKIP must carry at least one
-        # eligibility failure, regardless of whether the caller
-        # supplied a non-empty list, an empty list, or ``None``.
+        # Case (b) — sufficient resolution evidence AND all required
+        # non-resolution evidence present. Preserve the verdict.
         if not failures:
             failures = [SCORE_BELOW_COPY_THRESHOLD]
 
