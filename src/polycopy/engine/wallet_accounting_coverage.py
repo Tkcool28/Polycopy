@@ -10,8 +10,8 @@ from polycopy.db.wallet_identity import canonical_wallet_address
 from polycopy.engine.settlement_accounting import ACCOUNTED, EXCLUDED_UNSUPPORTED_SIDE
 
 GroupBy = Literal["trader_address", "wallet_id"]
-MISSING_TRADER_ADDRESS = "missing__trader_address"
-MISSING_WALLET_ID = "missing__wallet_id"
+MISSING_TRADER_ADDRESS = "missing_trader_address"
+MISSING_WALLET_ID = "missing_wallet_id"
 # Backward-compatible aliases if earlier local code imported these names.
 MISSING_TRADER = MISSING_TRADER_ADDRESS
 MISSING_WALLET = MISSING_WALLET_ID
@@ -199,7 +199,7 @@ def build_wallet_accounting_coverage_report(
 
     Totals are computed across all identities before row filtering/limiting.
     ``source_trades`` has no wallet_id, so wallet grouping keeps source rows in
-    ``missing__wallet_id`` and does not infer/fabricate wallet ids.
+    ``missing_wallet_id`` and does not infer/fabricate wallet ids.
     """
     if group_by not in {"trader_address", "wallet_id"}:
         raise ValueError("group_by must be 'trader_address' or 'wallet_id'")

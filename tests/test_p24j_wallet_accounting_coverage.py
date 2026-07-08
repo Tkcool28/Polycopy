@@ -99,7 +99,7 @@ def test_source_trades_exist_ledger_empty(tmp_path):
     assert report.source_trades_missing_trader_address == 1
     assert report.total_ledger_rows == 0
     assert report.accounting_coverage_pct is None
-    assert MISSING_TRADER_ADDRESS == "missing__trader_address"
+    assert MISSING_TRADER_ADDRESS == "missing_trader_address"
     assert {r.identity_key for r in report.rows} == {"0xaaa", "0xbbb", MISSING_TRADER_ADDRESS}
     assert row(report, "0xaaa").ledger_rows == 0
     assert row(report, "0xaaa").accounting_coverage_pct is None
@@ -193,7 +193,7 @@ def test_wallet_id_grouping_does_not_fabricate_mapping(tmp_path):
         report = build_wallet_accounting_coverage_report(db, group_by="wallet_id")
     finally:
         db.close()
-    assert MISSING_WALLET_ID == "missing__wallet_id"
+    assert MISSING_WALLET_ID == "missing_wallet_id"
     assert {r.identity_key for r in report.rows} == {MISSING_WALLET_ID}
     assert row(report, MISSING_WALLET_ID).wallet_id is None
     assert report.mapped_wallets == 0
