@@ -147,13 +147,17 @@ class TestDeriveWalletVerdictFromEvidence:
         assert "no_resolved_market_evidence" in out["eligibility_failures"]
 
     def test_silent_skip_outside_resolution_gap_is_preserved(self):
-        """A SKIP with empty reasons but sufficient resolved-market
-        evidence is preserved as a TRUE score-driven skip.
+        """A SKIP with empty reasons but all required evidence present is
+        preserved as a TRUE score-driven skip.
 
         PR27 invariant: the verdict stays ``skip`` (no promotion to
         incomplete), but the helper MUST attach the canonical
         ``score_below_copy_threshold`` marker to
         ``eligibility_failures`` so the persisted row is never silent.
+
+        PR24F invariant: the wallet must also provide all required
+        non-resolution evidence (``sample_fraction``, ``sharpe_ratio``,
+        ``max_drawdown``); otherwise Rule 1b forces INCOMPLETE.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
@@ -164,13 +168,18 @@ class TestDeriveWalletVerdictFromEvidence:
             verdict="skip",
             resolved_markets=50,  # sufficient resolution evidence
             category_resolved_markets=20,
+            # PR24F: all required non-resolution evidence must be present
+            # for a real verdict (Rule 1b).
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
             missing_essentials=[],
             eligibility_failures=[],
         )
         # PR27: verdict is preserved (no promotion to incomplete).
         assert out["verdict"] == "skip", (
-            "PR27 preserves true score-driven skips when resolution "
-            "evidence is sufficient"
+            "PR27 preserves true score-driven skips when all required "
+            "evidence is present"
         )
         # PR27: but the row must carry the canonical marker so it is
         # never silent (both buckets empty).
@@ -182,8 +191,8 @@ class TestDeriveWalletVerdictFromEvidence:
     def test_skip_with_explicit_eligibility_failures_preserved(self):
         """A ``SKIP`` that already carries an explicit failure reason stays SKIP.
 
-        This is the existing real-skip path the PR24E contract
-        explicitly preserves.
+        PR24F: also provide all required non-resolution evidence so
+        Rule 1b does not promote the verdict to incomplete.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
@@ -193,6 +202,9 @@ class TestDeriveWalletVerdictFromEvidence:
             verdict="skip",
             resolved_markets=50,
             category_resolved_markets=20,
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
             missing_essentials=[],
             eligibility_failures=["active_trading_days=5 < 20"],
         )
@@ -514,6 +526,11 @@ class TestPersistenceRowConsistency:
         ``eligibility_failures_json`` MUST be non-empty so the row is
         auditable. The canonical ``score_below_copy_threshold`` marker
         is the contract.
+
+        PR24F invariant: the wallet's typed input must include all
+        required non-resolution evidence (``sample_fraction``,
+        ``sharpe_ratio``, ``max_drawdown``); otherwise the helper
+        promotes to INCOMPLETE.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             SCORE_BELOW_COPY_THRESHOLD,
@@ -534,6 +551,11 @@ class TestPersistenceRowConsistency:
             trade_count=150,
             resolved_markets=50,  # sufficient resolution evidence
             category_resolved_markets=20,
+            # PR24F: all required non-resolution evidence must be present
+            # for a real verdict (Rule 1b).
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
         )
 
         legit_skip = WalletScoreResult(
@@ -681,6 +703,9 @@ class TestPR27NoSilentSkip:
         + empty reason buckets ⇒ verdict stays SKIP, but
         ``score_below_copy_threshold`` is appended so the row is
         non-silent.
+
+        PR24F: also provide all required non-resolution evidence so
+        Rule 1b does not promote to incomplete.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
@@ -691,6 +716,11 @@ class TestPR27NoSilentSkip:
             verdict="skip",
             resolved_markets=50,
             category_resolved_markets=20,
+            # PR24F: all required non-resolution evidence must be present
+            # for a real verdict (Rule 1b).
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
             missing_essentials=[],
             eligibility_failures=[],
         )
@@ -705,6 +735,8 @@ class TestPR27NoSilentSkip:
         + non-empty eligibility_failures ⇒ existing failure is preserved,
         canonical marker is NOT duplicated unless it would be the only
         entry.
+
+        PR24F: also provide all required non-resolution evidence.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
@@ -714,6 +746,9 @@ class TestPR27NoSilentSkip:
             verdict="skip",
             resolved_markets=50,
             category_resolved_markets=20,
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
             missing_essentials=[],
             eligibility_failures=["active_trading_days=5 < 20"],
         )
@@ -835,6 +870,9 @@ class TestPR27NoneBucketCleanup:
         """Sufficient-evidence skip with ``missing_essentials=None`` AND
         ``eligibility_failures=None`` ⇒ verdict stays SKIP and
         ``score_below_copy_threshold`` is appended.
+
+        PR24F: also provide all required non-resolution evidence so
+        Rule 1b does not promote to incomplete.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
@@ -845,6 +883,11 @@ class TestPR27NoneBucketCleanup:
             verdict="skip",
             resolved_markets=50,
             category_resolved_markets=20,
+            # PR24F: all required non-resolution evidence must be present
+            # for a real verdict (Rule 1b).
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
             missing_essentials=None,
             eligibility_failures=None,
         )
@@ -862,6 +905,8 @@ class TestPR27NoneBucketCleanup:
         """Sufficient-evidence skip with ``missing_essentials=[]`` AND
         ``eligibility_failures=None`` ⇒ verdict stays SKIP and
         ``score_below_copy_threshold`` is appended.
+
+        PR24F: also provide all required non-resolution evidence.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
@@ -872,6 +917,9 @@ class TestPR27NoneBucketCleanup:
             verdict="skip",
             resolved_markets=50,
             category_resolved_markets=20,
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
             missing_essentials=[],
             eligibility_failures=None,
         )
@@ -883,6 +931,8 @@ class TestPR27NoneBucketCleanup:
         """Sufficient-evidence skip with non-empty eligibility_failures
         preserves the existing failure; canonical marker is NOT
         duplicated even when ``missing_essentials`` is ``None``.
+
+        PR24F: also provide all required non-resolution evidence.
         """
         from polycopy.scoring.incomplete_verdict_guard import (
             derive_wallet_verdict_from_evidence,
@@ -892,6 +942,9 @@ class TestPR27NoneBucketCleanup:
             verdict="skip",
             resolved_markets=50,
             category_resolved_markets=20,
+            sample_fraction=0.20,
+            sharpe_ratio=0.5,
+            max_drawdown=0.30,
             missing_essentials=None,
             eligibility_failures=["active_trading_days=5 < 20"],
         )

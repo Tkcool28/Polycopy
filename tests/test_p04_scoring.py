@@ -182,6 +182,9 @@ class TestWalletScoreV1ComponentFormulas:
             category_resolved_markets=20,
             category_distinct_events=15,
             category_active_days=20,
+            # PR24F: all required non-resolution evidence must be
+            # provided for a real verdict.
+            sample_fraction=0.5,
         )
         assert result.verdict == WalletVerdict.COPY_CANDIDATE
 
@@ -232,6 +235,9 @@ class TestWalletScoreV1ComponentFormulas:
             category_resolved_markets=20,
             category_distinct_events=15,
             category_active_days=20,
+            # PR24F: all required non-resolution evidence must be
+            # provided for a real verdict.
+            sample_fraction=0.5,
         )
         assert result.verdict == WalletVerdict.COPY_CANDIDATE
 
@@ -322,6 +328,9 @@ class TestWalletScoreV1Verdicts:
             category_active_days=15,
             category_trade_count=30,
             overall_trade_count=100,
+            # PR24F: all required non-resolution evidence must be
+            # provided for a real verdict.
+            sample_fraction=0.5,
         )
         assert result.verdict == WalletVerdict.WATCHLIST
 
