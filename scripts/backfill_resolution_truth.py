@@ -129,6 +129,7 @@ class BackfillReport:
     trades_seen: int
     trades_settled: int
     trades_skipped_unresolved: int
+    trades_skipped_missing_token: int = 0
     by_status: dict[str, int] = field(default_factory=dict)
     plan: list[dict[str, Any]] = field(default_factory=list)
     started_at: str = ""
@@ -234,6 +235,11 @@ def _fetch_unsettled_trades_for_market(
 
     Settlement requires a known winning token and a non-NULL trade
     token, so pre-filtering here keeps the planning loop small.
+
+    Note: trades with ``token_id IS NULL`` are NOT returned here —
+    they cannot be settled against a winning token. They ARE counted
+    separately via :func:`_count_unsettled_trades_missing_token` so
+    the dry-run report makes their existence visible (PR24A2 PART 4).
     """
     return list(
         db.conn.execute(
@@ -254,6 +260,61 @@ def _fetch_unsettled_trades_for_market(
             """,
             (market_id,),
         ).fetchall()
+    )
+
+
+def _count_unsettled_trades_missing_token(
+    db: Database,
+    market_id: str,
+) -> int:
+    """Count ``source_trades`` rows for this market that are still
+    ``unresolved`` but have ``token_id IS NULL``.
+
+    Such trades cannot be settled against a winning token — there is
+    no key to match on. PR24A2 PART 4 surfaced this as a reporting gap:
+    the dry-run JSON previously reported ``trades_seen=0`` for a market
+    whose only trade was missing a token, hiding the data entirely.
+    The count is now exposed as
+    ``report.trades_skipped_missing_token`` so downstream consumers
+    (and the upcoming PR24I accounting layer) know the trades exist.
+    """
+    row = db.conn.execute(
+        """
+        SELECT COUNT(*) AS n
+          FROM source_trades st
+         WHERE st.market_source_id = (
+                   SELECT source_id FROM markets WHERE id = ?
+               )
+           AND st.resolution_status = 'unresolved'
+           AND st.token_id IS NULL
+        """,
+        (market_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
+def _ambiguous_market_settlement(
+    trade_row: sqlite3.Row,
+    truth: MarketResolutionTruth,
+) -> Any:
+    """Construct a no-P/L settlement record for a trade whose market
+    is flagged ambiguous.
+
+    The trade record keeps ``winning_token_id`` (for audit), but
+    ``resolution_status='ambiguous'``, ``is_winning_trade=None``, and
+    ``realized_pnl=None``. PR24A2 PART 1 propagates market-level
+    ambiguity into per-trade settlement so accounting code never
+    silently rolls ambiguous trades into ``won`` / ``lost``.
+    """
+    from polycopy.engine.trade_settlement import SourceTradeSettlement
+
+    return SourceTradeSettlement(
+        resolution_status="ambiguous",
+        is_winning_trade=None,
+        winning_token_id=truth.winning_token_id,
+        realized_pnl=None,
+        settlement_source="backfill_resolution_truth",
+        resolved_at=_now_iso(),
     )
 
 
@@ -326,9 +387,40 @@ def _plan_trade_settlements(
     db: Database,
     market_id: str,
     truth: MarketResolutionTruth,
+    *,
+    application: Optional[MarketTruthApplication] = None,
 ) -> list[tuple[sqlite3.Row, Any]]:
-    """Compute settlement plans for every unresolved trade on this market."""
+    """Compute settlement plans for every unresolved trade on this market.
+
+    Behavior
+    --------
+
+    * If ``application.ambiguous is True`` (PR24A2 PART 1), every trade
+      gets a synthetic ``resolution_status="ambiguous"`` settlement
+      with ``is_winning_trade=None`` and ``realized_pnl=None``. The
+      truth's ``winning_token_id`` is preserved on the record for
+      audit. This stops the pre-PR24A2 behavior of silently settling
+      ambiguous-market trades as ``won`` / ``lost`` against the truth
+      record's ``winning_token_id``.
+
+    * If the truth is unresolved or has no winning token, every trade
+      gets a ``None`` settlement (counted as
+      ``trades_skipped_unresolved``).
+
+    * Trades with ``token_id IS NULL`` are NOT settled here (they
+      cannot match a winning token); they are counted separately via
+      :func:`_count_unsettled_trades_missing_token` so the report
+      makes their existence visible.
+    """
     trades = _fetch_unsettled_trades_for_market(db, market_id)
+
+    if application is not None and application.ambiguous:
+        # Propagate market-level ambiguity into per-trade settlement.
+        # Do NOT use ``truth.winning_token_id`` to decide won/lost
+        # here — the application already determined the market is
+        # ambiguous.
+        return [(t, _ambiguous_market_settlement(t, truth)) for t in trades]
+
     if not truth.resolved or truth.winning_token_id is None:
         return [(t, None) for t in trades]
     plans: list[tuple[sqlite3.Row, Any]] = []
@@ -462,6 +554,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         trades_seen=0,
         trades_settled=0,
         trades_skipped_unresolved=0,
+        trades_skipped_missing_token=0,
         by_status={s: 0 for s in SETTLEMENT_STATUSES},
         started_at=_now_iso(),
     )
@@ -512,8 +605,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             # Trade settlement planning.
             trade_plans: list[tuple[sqlite3.Row, Any]] = []
             if not args.skip_trades:
-                trade_plans = _plan_trade_settlements(db, market_id, truth)
+                trade_plans = _plan_trade_settlements(
+                    db, market_id, truth, application=application,
+                )
                 report.trades_seen += len(trade_plans)
+                # Count NULL-token trades separately (PR24A2 PART 4).
+                # These trades cannot be settled but must be visible.
+                report.trades_skipped_missing_token += (
+                    _count_unsettled_trades_missing_token(db, market_id)
+                )
                 for _, settlement in trade_plans:
                     if settlement is None:
                         report.trades_skipped_unresolved += 1
@@ -573,6 +673,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"  trades_seen:            {report.trades_seen}")
             print(f"  trades_settled (w/l):   {report.trades_settled}")
             print(f"  trades_skipped:         {report.trades_skipped_unresolved}")
+            print(f"  trades_skipped_missing_token: {report.trades_skipped_missing_token}")
             print(f"  by_status:              {report.by_status}")
 
         return 0
