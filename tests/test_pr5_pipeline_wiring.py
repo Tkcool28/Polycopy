@@ -316,11 +316,18 @@ def test_pr5_item03_category_score_decisions(tmp_path: Path):
     # INCOMPLETE to COPY_CANDIDATE depending on the sub-formulas. We just
     # assert that a row WAS persisted and that it is NOT the silent
     # fabrication behaviour. The truly INCOMPLETE branch is (b) below.
+    #
+    # PR24H: the category row also requires sample_fraction /
+    # sharpe_ratio / max_drawdown (alongside category_resolved_markets)
+    # before a real verdict (COPY_CANDIDATE / WATCHLIST / SKIP) is
+    # allowed. Provide all four so the test can still exercise the
+    # non-INCOMPLETE branch.
     good = CategoryWalletScoreInputV1(
         wallet_id=wid, category_label="crypto",
         trade_count=200, win_rate=0.6,
         category_resolved_markets=20, category_distinct_events=10,
         category_active_days=15,
+        sample_fraction=1.0, sharpe_ratio=2.0, max_drawdown=0.10,
     )
     res = compute_category_wallet_score_v1(input=good, now=now)
     persist_category_score_v1(db, wid, "crypto", res, source_data_timestamp=now.isoformat())
