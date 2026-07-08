@@ -1,16 +1,20 @@
-"""Hotfix tests: schema v13 compatibility without PR20 runtime activation.
+"""Hotfix tests: schema v14 compatibility without PR20 runtime activation.
 
 Proves the four key safety/invariants for the
-``fix/schema-v13-compat-main`` branch:
+``feat/resolution-truth-pipeline`` branch (PR24A):
 
-1. A DB whose ``_meta.schema_version`` is 13 can be opened by main code
+1. A DB whose ``_meta.schema_version`` is 14 can be opened by main code
    (i.e. the production scenario).
-2. A fresh DB migrates up to schema_version=13.
+2. A fresh DB migrates up to schema_version=14.
 3. No specialist aggregation runtime is enabled — the
-   ``POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED`` env var is NOT set by the
-   hotfix, and the Settings class has no such field reachable.
+   ``POLYCOPY_SPECIALIST_AGGREGATIONS_ENABLED`` env var is NOT set by
+   this PR, and the Settings class has no such field reachable.
 4. No trading setting changes — broker_mode, paper_mode, kill_switch,
    is_live remain at their default paper values.
+
+PR24A extends the schema to v14 with additive resolution-truth
+columns. No new scoring formula reads them. The v13 specialist
+aggregation table is preserved but remains inert.
 """
 
 from __future__ import annotations
@@ -26,11 +30,11 @@ import pytest
 from polycopy.config.settings import BrokerMode
 
 
-def test_schema_version_constant_is_13() -> None:
-    """Main code SCHEMA_VERSION must be 13 (was 12 before the hotfix)."""
+def test_schema_version_constant_is_14() -> None:
+    """Main code SCHEMA_VERSION must be 14 (was 13 before PR24A)."""
     from polycopy.db import schema
-    assert schema.SCHEMA_VERSION == 13, (
-        f"hotfix requires SCHEMA_VERSION=13, got {schema.SCHEMA_VERSION}"
+    assert schema.SCHEMA_VERSION == 14, (
+        f"PR24A requires SCHEMA_VERSION=14, got {schema.SCHEMA_VERSION}"
     )
 
 
@@ -60,8 +64,8 @@ def test_v13_ddl_creates_only_additive_inert_table() -> None:
         assert f not in ddl, f"v13 DDL must not contain '{f}' (got: {ddl[:300]})"
 
 
-def test_fresh_db_migrates_to_v13(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A brand-new DB on a clean file should end at schema_version=13."""
+def test_fresh_db_migrates_to_v14(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A brand-new DB on a clean file should end at schema_version=14."""
     db_path = tmp_path / "fresh.db"
     monkeypatch.setenv("POLYCOPY_DB_PATH", str(db_path))
     # Ensure no other POLYCOPY_* env var leaks into Settings.
@@ -79,15 +83,25 @@ def test_fresh_db_migrates_to_v13(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     # Read back the version from _meta.
     row = db.conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()
     assert row is not None, "_meta table missing after migration"
-    assert int(row["value"]) == 13, (
-        f"fresh DB should end at v13, got v{row['value']}"
+    assert int(row["value"]) == 14, (
+        f"fresh DB should end at v14, got v{row['value']}"
     )
-    # The new table must exist (created by the v13 DDL).
+    # The v13 specialist aggregations table must still exist
+    # (preserved by the additive v14 migration).
     tbl = db.conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' "
         "AND name='wallet_specialist_aggregations'"
     ).fetchone()
-    assert tbl is not None, "wallet_specialist_aggregations table not created by v13"
+    assert tbl is not None, (
+        "wallet_specialist_aggregations table not preserved by v14"
+    )
+    # The v14 columns must exist.
+    cols = {
+        row["name"]
+        for row in db.conn.execute("PRAGMA table_info(markets)").fetchall()
+    }
+    assert "winning_token_id" in cols, "v14 column winning_token_id missing"
+    assert "resolution_checked_at" in cols, "v14 column resolution_checked_at missing"
     db.close()
     # Reset singletons so other tests in the suite aren't affected.
     if db_module._db is not None:

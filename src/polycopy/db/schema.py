@@ -43,7 +43,7 @@ natively idempotent in SQLite.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Import v10 schema changes
 from polycopy.db.schema_v10 import _V10_DDL  # noqa: E402
@@ -63,6 +63,12 @@ from polycopy.db.schema_v12 import _V12_DDL  # noqa: E402
 # wallet_specialist_aggregations, so the table stays empty and inert until
 # PR #20 is finalized and merged in a future PR.
 from polycopy.db.schema_v13 import _V13_DDL  # noqa: E402
+
+# Import v14 schema changes (PR24A — additive resolution-truth columns
+# on markets / market_outcomes / source_trades). No scoring formula
+# reads these columns in this PR; the backfill script (which defaults
+# to --dry-run) is the only writer. No runtime job is added.
+from polycopy.db.schema_v14 import _V14_DDL  # noqa: E402
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -797,6 +803,7 @@ MIGRATIONS: dict[int, list[str]] = {
     11: _V11_DDL,
     12: _V12_DDL,
     13: _V13_DDL,
+    14: _V14_DDL,
 }
 
 # Current DDL is the latest migration
