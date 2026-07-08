@@ -17,7 +17,9 @@ from polycopy.scoring.wallet_skill_score_v1 import (
     REASON_INSUFFICIENT_ACCOUNTED_TRADE_SAMPLE,
     REASON_UNSUPPORTED_IDENTITY_GROUPING,
     VERDICT_INCOMPLETE,
+    VERDICT_WATCHLIST,
     WALLET_SKILL_SCORE_WEIGHTS_V1,
+    WalletSkillScoreComponentV1,
     WalletSkillScoreConfigV1,
     average_available,
     clamp_0_100,
@@ -81,6 +83,28 @@ def test_b_parked_production_like_blocked_candidate_is_incomplete():
     assert result.eligible_for_auto_copy is False
     assert "no_ledger_rows" in result.blocked_reasons
     assert "no_ledger_rows" in result.missing_essentials
+
+
+def test_blocked_candidate_normalizes_malformed_ready_flags_false():
+    result = compute_wallet_skill_score_v1(
+        candidate(
+            candidate_status="blocked",
+            ready_for_skill_score=True,
+            ready_for_auto_copy=True,
+            blocked_reasons=("no_ledger_rows",),
+            source_trades=5,
+            total_ledger_rows=0,
+            accounted_trades=0,
+            accounting_coverage_pct=None,
+            accountable_buy_coverage_pct=None,
+        )
+    )
+
+    assert result.verdict == VERDICT_INCOMPLETE
+    assert result.ready_for_skill_score is False
+    assert result.ready_for_auto_copy is False
+    assert result.eligible_for_ranking is False
+    assert result.eligible_for_auto_copy is False
 
 
 def test_c_score_input_ready_strong_realized_is_partial_but_incomplete():
@@ -172,6 +196,58 @@ def test_h_unsupported_wallet_id_identity_is_incomplete():
     assert result.verdict == VERDICT_INCOMPLETE
     assert REASON_UNSUPPORTED_IDENTITY_GROUPING in result.blocked_reasons
     assert result.eligible_for_ranking is False
+    assert result.eligible_for_auto_copy is False
+
+
+def test_unsupported_identity_normalizes_malformed_ready_flags_false():
+    result = compute_wallet_skill_score_v1(
+        candidate(
+            identity_key="wallet-1",
+            identity_group_by="wallet_id",
+            ready_for_skill_score=True,
+            ready_for_auto_copy=True,
+        )
+    )
+
+    assert result.verdict == VERDICT_INCOMPLETE
+    assert result.ready_for_skill_score is False
+    assert result.ready_for_auto_copy is False
+    assert result.eligible_for_ranking is False
+    assert result.eligible_for_auto_copy is False
+
+
+def test_insufficient_sample_downgrades_otherwise_copy_candidate_to_watchlist(monkeypatch):
+    import polycopy.scoring.wallet_skill_score_v1 as module
+
+    def high_evidence_components(_candidate, _config):
+        return tuple(
+            WalletSkillScoreComponentV1(
+                name=name,
+                weight=weight,
+                raw_value={"test": "synthetic_complete_evidence"},
+                normalized_score=100.0,
+                weighted_score=weight,
+                quality="strong",
+                missing=False,
+                blocking=False,
+                note="synthetic_complete_evidence_for_sample_gate_test",
+            )
+            for name, weight in WALLET_SKILL_SCORE_WEIGHTS_V1.items()
+        )
+
+    monkeypatch.setattr(module, "_components", high_evidence_components)
+
+    result = module.compute_wallet_skill_score_v1(
+        candidate(
+            accounted_trades=5,
+            accounting_coverage_pct=1.0,
+            accountable_buy_coverage_pct=1.0,
+        )
+    )
+
+    assert result.score == pytest.approx(100.0)
+    assert REASON_INSUFFICIENT_ACCOUNTED_TRADE_SAMPLE in result.blocked_reasons
+    assert result.verdict == VERDICT_WATCHLIST
     assert result.eligible_for_auto_copy is False
 
 

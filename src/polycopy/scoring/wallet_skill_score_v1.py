@@ -163,6 +163,8 @@ def compute_wallet_skill_score_v1(
             missing_essentials=_dedupe((*candidate.blocked_reasons,)),
             blocked_reasons=_dedupe((*blocked_reasons,)),
             warnings=_dedupe((*warnings,)),
+            ready_for_skill_score=False,
+            ready_for_auto_copy=False,
             eligible_for_ranking=False,
             eligible_for_auto_copy=False,
         )
@@ -177,6 +179,8 @@ def compute_wallet_skill_score_v1(
             missing_essentials=(REASON_UNSUPPORTED_IDENTITY_GROUPING,),
             blocked_reasons=_dedupe((*blocked_reasons,)),
             warnings=_dedupe((*warnings,)),
+            ready_for_skill_score=False,
+            ready_for_auto_copy=False,
             eligible_for_ranking=False,
             eligible_for_auto_copy=False,
         )
@@ -197,6 +201,11 @@ def compute_wallet_skill_score_v1(
     score = sum(component.weighted_score for component in components)
     if blocking_evidence_missing:
         verdict = VERDICT_INCOMPLETE
+    elif (
+        score >= active_config.copy_candidate_min_score
+        and REASON_INSUFFICIENT_ACCOUNTED_TRADE_SAMPLE in blocked_reasons
+    ):
+        verdict = VERDICT_WATCHLIST
     elif score >= active_config.copy_candidate_min_score:
         verdict = VERDICT_COPY_CANDIDATE
     elif score >= active_config.watchlist_min_score:
@@ -420,7 +429,19 @@ def _result(
     warnings: tuple[str, ...],
     eligible_for_ranking: bool,
     eligible_for_auto_copy: bool,
+    ready_for_skill_score: bool | None = None,
+    ready_for_auto_copy: bool | None = None,
 ) -> WalletSkillScoreResultV1:
+    result_ready_for_skill_score = (
+        candidate.ready_for_skill_score
+        if ready_for_skill_score is None
+        else ready_for_skill_score
+    )
+    result_ready_for_auto_copy = (
+        candidate.ready_for_auto_copy
+        if ready_for_auto_copy is None
+        else ready_for_auto_copy
+    )
     return WalletSkillScoreResultV1(
         identity_key=candidate.identity_key,
         identity_group_by=candidate.identity_group_by,
@@ -428,8 +449,8 @@ def _result(
         formula_version=WALLET_SKILL_FORMULA_VERSION,
         score=score,
         verdict=verdict,
-        ready_for_skill_score=candidate.ready_for_skill_score,
-        ready_for_auto_copy=candidate.ready_for_auto_copy,
+        ready_for_skill_score=result_ready_for_skill_score,
+        ready_for_auto_copy=result_ready_for_auto_copy,
         eligible_for_ranking=eligible_for_ranking,
         eligible_for_auto_copy=eligible_for_auto_copy,
         components=components,
