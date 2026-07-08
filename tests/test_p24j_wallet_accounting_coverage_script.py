@@ -92,6 +92,20 @@ def test_json_output_parseable_and_trader_group(tmp_path):
     assert data["rows"][0]["identity_key"] == "0xaaa"
 
 
+def test_json_output_uses_missing_trader_address_sentinel(tmp_path):
+    path = tmp_path / "script.db"
+    db = make_db(path)
+    try:
+        source(db, "missing", None)
+        db.conn.commit()
+    finally:
+        db.close()
+    result = run(path, "--json", "--include-rows")
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["rows"][0]["identity_key"] == "missing_trader_address"
+
+
 def test_human_output_contains_totals_and_buy_only_limitation(tmp_path):
     path = tmp_path / "script.db"
     db = make_db(path)

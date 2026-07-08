@@ -4,8 +4,8 @@ import pytest
 
 from polycopy.db.database import Database
 from polycopy.engine.wallet_accounting_coverage import (
-    MISSING_TRADER,
-    MISSING_WALLET,
+    MISSING_TRADER_ADDRESS,
+    MISSING_WALLET_ID,
     build_wallet_accounting_coverage_report,
 )
 
@@ -99,7 +99,8 @@ def test_source_trades_exist_ledger_empty(tmp_path):
     assert report.source_trades_missing_trader_address == 1
     assert report.total_ledger_rows == 0
     assert report.accounting_coverage_pct is None
-    assert {r.identity_key for r in report.rows} == {"0xaaa", "0xbbb", MISSING_TRADER}
+    assert MISSING_TRADER_ADDRESS == "missing_trader_address"
+    assert {r.identity_key for r in report.rows} == {"0xaaa", "0xbbb", MISSING_TRADER_ADDRESS}
     assert row(report, "0xaaa").ledger_rows == 0
     assert row(report, "0xaaa").accounting_coverage_pct is None
 
@@ -179,7 +180,7 @@ def test_multiple_traders_grouped_separately(tmp_path):
     assert len(report.rows) == 3
     assert row(report, "0xaaa").accounted_trades == 2
     assert row(report, "0xbbb").excluded_missing_token == 2
-    assert row(report, MISSING_TRADER).excluded_unresolved == 1
+    assert row(report, MISSING_TRADER_ADDRESS).excluded_unresolved == 1
     assert report.total_source_trades == sum(r.source_trades for r in report.rows)
 
 
@@ -192,8 +193,9 @@ def test_wallet_id_grouping_does_not_fabricate_mapping(tmp_path):
         report = build_wallet_accounting_coverage_report(db, group_by="wallet_id")
     finally:
         db.close()
-    assert {r.identity_key for r in report.rows} == {MISSING_WALLET}
-    assert row(report, MISSING_WALLET).wallet_id is None
+    assert MISSING_WALLET_ID == "missing_wallet_id"
+    assert {r.identity_key for r in report.rows} == {MISSING_WALLET_ID}
+    assert row(report, MISSING_WALLET_ID).wallet_id is None
     assert report.mapped_wallets == 0
 
 
