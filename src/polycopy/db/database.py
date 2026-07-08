@@ -231,6 +231,19 @@ class Database:
         ("source_trades", "settlement_source"),
     )
 
+    # PR24I: v15 ledger objects required before a schema-metadata-lag
+    # reconciliation can claim the physical schema is at target. Without
+    # this, a v14 database whose v13/v14 objects already exist could be
+    # bumped to _meta=15 without creating the new ledger table.
+    _REQUIRED_V15_OBJECTS: tuple[str, ...] = (
+        "settlement_accounting_ledger",
+        "idx_settlement_ledger_wallet",
+        "idx_settlement_ledger_trader",
+        "idx_settlement_ledger_market",
+        "idx_settlement_ledger_status",
+        "idx_settlement_ledger_source_trade",
+    )
+
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
     # already present but these specific indexes are missing.
@@ -257,6 +270,9 @@ class Database:
                 return False
         for table, column in self._REQUIRED_V14_COLUMNS:
             if not self._column_exists(table, column):
+                return False
+        for obj in self._REQUIRED_V15_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         return True
 

@@ -19,6 +19,7 @@ NOW = datetime.now(timezone.utc).isoformat()
 def _reset(monkeypatch, tmp_path, **env: object):
     monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "false")
     monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p19.sqlite"))
+    monkeypatch.setenv("POLYCOPY_ORDER_KILL_SWITCH", "false")
     monkeypatch.setenv("POLYCOPY_ORDER_PREVIEW_MAX_AGE_SECONDS", "86400")
     monkeypatch.setenv("POLYCOPY_STALENESS_SECONDS", "0")
     for key, value in env.items():

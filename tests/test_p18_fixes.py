@@ -23,6 +23,7 @@ NOW = datetime.now(timezone.utc).isoformat()
 def _reset_app_state(monkeypatch, tmp_path):
     monkeypatch.setenv("POLYCOPY_ENABLE_DEMO_DATA", "true")
     monkeypatch.setenv("POLYCOPY_DB_PATH", str(tmp_path / "p18.sqlite"))
+    monkeypatch.setenv("POLYCOPY_ORDER_KILL_SWITCH", "false")
 
     import polycopy.config.settings as settings_module
     import polycopy.db.database as database_module
@@ -392,7 +393,7 @@ class TestInvalidTransitions:
                 assert len(found) == 1
                 assert found[0]["status"] == "pending"
         finally:
-            os.environ.pop("POLYCOPY_ORDER_KILL_SWITCH", None)
+            os.environ["POLYCOPY_ORDER_KILL_SWITCH"] = "false"
             settings_module._settings = None
 
         db_mod._db.close()
