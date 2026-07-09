@@ -15,14 +15,25 @@ Verdict rules:
 - below 50 → SKIP
 - Missing essential evidence → INCOMPLETE
 
+IMPORTANT — Trade Copyability Score v1 is currently BUY-only.
+  * side=None or blank string    → INCOMPLETE (missing_essentials=["side"])
+  * side not exactly "BUY"/"SELL" → INCOMPLETE (rejection="invalid_side")
+  * side="SELL"                   → SKIP, score 0
+                                    (rejection="sell_side_copyability_not_supported_v1")
+  * side="BUY"                    → normal BUY-only v1 scoring
+  * SELL must never become watchlist or copy_candidate in v1.
+  * SELL support is deferred until settlement accounting supports SELL
+    cost basis, exits, partials, reductions, and realized P&L
+    (see PR24I sell_side_accounting_not_supported_in_pr24i).
+
 Duration rules:
-- Under 15 minutes: excluded
+- Under 15 minutes: excluded (SKIP, duration_excluded_short)
 - 15 minutes to under 6 hours: experimental only (score 40)
 - 6 hours to under 1 day: allowed, score 75
 - 1–14 days: preferred, score 100
 - 15–21 days: allowed, score 80
 - 22–45 days: penalized, score 40
-- Over 45 days: excluded
+- Over 45 days: excluded (SKIP, duration_excluded_long)
 - Unknown: INCOMPLETE
 """
 
@@ -41,6 +52,26 @@ from polycopy.scoring.depth_normalization import (
     DEPTH_NOT_CAPTURED,
     DEPTH_SNAPSHOT_MISMATCH,
 )
+
+# ── Formula identity (stable, persisted as formula_name/formula_version) ──
+# These MUST stay compatible with the existing persisted identity:
+#   formula_name  == "trade_copyability"
+#   formula_version == "1"
+TRADE_COPYABILITY_FORMULA_NAME = "trade_copyability"
+TRADE_COPYABILITY_FORMULA_DISPLAY_NAME = "Trade Copyability Score"
+TRADE_COPYABILITY_FORMULA_VERSION = "1"
+
+# Tolerance for comparing an explicit price_deterioration_pct against a
+# value derived from the raw BUY trace fields. Beyond this, the two
+# disagree and the trade is treated as INCOMPLETE (trace mismatch).
+PRICE_DETERIORATION_MISMATCH_TOLERANCE = 1e-4
+
+# A partial fill below this fraction may never become copy_candidate.
+MIN_COPY_CANDIDATE_FILL_PERCENTAGE = 0.80
+
+# Hard duration exclusions (seconds).
+DURATION_EXCLUDED_SHORT_MIN = 15 * 60          # 15 minutes
+DURATION_EXCLUDED_LONG_MAX = 45 * 24 * 3600    # 45 days
 
 
 class TradeVerdict(str, enum.Enum):
@@ -86,7 +117,8 @@ class TradeScoreResult:
     missing_essentials: list[str] = field(default_factory=list)
     rejection_reasons: list[str] = field(default_factory=list)
     computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    formula_version: str = "1"
+    formula_name: str = TRADE_COPYABILITY_FORMULA_NAME
+    formula_version: str = TRADE_COPYABILITY_FORMULA_VERSION
     is_sample: bool = False
 
 
@@ -140,6 +172,20 @@ class TradeCopyabilityInputV1:
     depth_status_reason: Optional[str] = None
     price_snapshot_id: Optional[str] = None
     depth_hash: Optional[str] = None
+    # PR24P: additive price-trace fields for traceability + deterministic
+    # replay. These are optional and are NOT used to silently invent scores.
+    #   source_entry_price        = price the source wallet got on the trade
+    #   current_copy_price        = visible current price when evaluating
+    #   estimated_fill_price      = actual estimated fill/VWAP from depth walk
+    #   source_trade_timestamp     = source trade's timestamp
+    #   price_snapshot_fetched_at  = time of the price/depth snapshot
+    #   evaluation_timestamp        = time the copyability score was computed
+    source_entry_price: Optional[float] = None
+    current_copy_price: Optional[float] = None
+    estimated_fill_price: Optional[float] = None
+    source_trade_timestamp: Optional[str] = None
+    price_snapshot_fetched_at: Optional[str] = None
+    evaluation_timestamp: Optional[str] = None
 
 
 # Frozen weights (must sum to 100)
@@ -165,6 +211,138 @@ DURATION_PREFERRED_MIN = 6 * 3600  # 6 hours
 DURATION_MAX = 24 * 3600  # 1 day (preferred threshold)
 DURATION_PENALIZED_MIN = 15 * 24 * 3600  # 15 days
 DURATION_PENALIZED_MAX = 45 * 24 * 3600  # 45 days
+
+
+# ── PR24P: pure BUY-only price deterioration helper ───────────────────────
+
+def calculate_buy_price_deterioration_pct(
+    *,
+    source_entry_price: Optional[float],
+    current_copy_price: Optional[float] = None,
+    estimated_fill_price: Optional[float] = None,
+) -> tuple[Optional[float], Optional[str]]:
+    """Compute BUY-only copy-price deterioration.
+
+    effective_copy_price = estimated_fill_price if present else
+    current_copy_price.
+
+    BUY deterioration (positive = worse copy price):
+        (effective_copy_price - source_entry_price) / source_entry_price
+
+    Returns (value, None) on success or (None, reason) on a blocking
+    gap/invalid input:
+        - missing_source_entry_price
+        - missing_copy_price
+        - invalid_source_entry_price   (<=0 or >1)
+        - invalid_copy_price           (<0 or >1)
+
+    This helper is BUY-only by design. Trade Copyability v1 does not
+    implement SELL-aware deterioration (deferred until settlement
+    accounting supports SELL). For a side-aware variant, see
+    ``calculate_side_aware_price_deterioration_pct`` below.
+    """
+    effective_copy_price = (
+        estimated_fill_price if estimated_fill_price is not None
+        else current_copy_price
+    )
+    if source_entry_price is None:
+        return None, "missing_source_entry_price"
+    if effective_copy_price is None:
+        return None, "missing_copy_price"
+    if source_entry_price <= 0 or source_entry_price > 1:
+        return None, "invalid_source_entry_price"
+    if effective_copy_price < 0 or effective_copy_price > 1:
+        return None, "invalid_copy_price"
+    deterioration = (
+        (effective_copy_price - source_entry_price) / source_entry_price
+    )
+    return deterioration, None
+
+
+def calculate_side_aware_price_deterioration_pct(
+    *,
+    side: Optional[str],
+    source_entry_price: Optional[float],
+    current_copy_price: Optional[float] = None,
+    estimated_fill_price: Optional[float] = None,
+) -> tuple[Optional[float], Optional[str]]:
+    """Side-aware wrapper kept for compatibility.
+
+    Trade Copyability v1 is currently BUY-only:
+
+      * side is None or blank       → (None, "invalid_side")
+      * side not exactly "BUY"/"SELL" → (None, "invalid_side")
+      * side == "SELL"              → (None, "sell_side_copyability_not_supported_v1")
+      * side == "BUY"               → delegate to the BUY-only helper
+
+    "invalid_side" is reserved for malformed/blank sides and must NOT
+    be reused for the SELL-unsupported case, which has its own distinct
+    reason string.
+    """
+    if side is None or (isinstance(side, str) and side.strip() == ""):
+        return None, "invalid_side"
+    if side not in ("BUY", "SELL"):
+        return None, "invalid_side"
+    if side == "SELL":
+        return None, "sell_side_copyability_not_supported_v1"
+    return calculate_buy_price_deterioration_pct(
+        source_entry_price=source_entry_price,
+        current_copy_price=current_copy_price,
+        estimated_fill_price=estimated_fill_price,
+    )
+
+
+# ── PR24P: snapshot point-in-time validation ──────────────────────────────
+
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    """Best-effort ISO-8601 parse; returns None on missing/malformed."""
+    if ts is None or not isinstance(ts, str) or ts.strip() == "":
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def validate_price_snapshot_timing(
+    *,
+    source_trade_timestamp: Optional[str],
+    price_snapshot_fetched_at: Optional[str],
+    evaluation_timestamp: Optional[str],
+) -> Optional[str]:
+    """Validate point-in-time consistency of the raw trace timestamps.
+
+    Returns a reason string when the provided evidence is impossible or
+    malformed, else None.
+
+      * If price_snapshot_fetched_at and source_trade_timestamp are both
+        present and snapshot precedes source trade →
+        "snapshot_before_source_trade"
+      * If price_snapshot_fetched_at and evaluation_timestamp are both
+        present and snapshot is after evaluation →
+        "snapshot_after_evaluation"
+      * Any provided timestamp that fails to parse →
+        "invalid_price_snapshot_timestamp"
+
+    Missing evidence is NOT an error: isolated synthetic scoring must
+    still work when the runtime bridge fields are not yet populated
+    (PR24R bridge blocker, not a hard failure here).
+    """
+    snap = _parse_iso(price_snapshot_fetched_at)
+    if price_snapshot_fetched_at is not None and snap is None:
+        return "invalid_price_snapshot_timestamp"
+    src = _parse_iso(source_trade_timestamp)
+    if source_trade_timestamp is not None and src is None:
+        return "invalid_price_snapshot_timestamp"
+    ev = _parse_iso(evaluation_timestamp)
+    if evaluation_timestamp is not None and ev is None:
+        return "invalid_price_snapshot_timestamp"
+
+    if snap is not None and src is not None and snap < src:
+        return "snapshot_before_source_trade"
+    if snap is not None and ev is not None and snap > ev:
+        return "snapshot_after_evaluation"
+    return None
 
 
 def _copy_price_quality_component(
@@ -511,8 +689,17 @@ def compute_trade_score_v1(
         wallet_id = input.wallet_id
         source_trade_id = input.source_trade_id
 
-    # Phase 4.D: side must be explicit. No silent BUY fallback.
-    if input.side is None or input.side not in ("BUY", "SELL"):
+    # ── PR24P: exact BUY-only side support (strict, case-sensitive) ──
+    # Ordering is load-bearing:
+    #   1. None or blank string -> INCOMPLETE, missing_essentials=["side"]
+    #   2. not exactly "BUY"/"SELL" -> INCOMPLETE, rejection="invalid_side"
+    #   3. exactly "SELL"        -> SKIP, score 0,
+    #                              rejection="sell_side_copyability_not_supported_v1"
+    #   4. exactly "BUY"         -> normal BUY-only scoring
+    # No case-normalization, no stripping-into-validity (beyond blank
+    # detection for the missing check). Only "BUY" / "SELL" are valid.
+    if input.side is None or (isinstance(input.side, str)
+                              and input.side.strip() == ""):
         return TradeScoreResult(
             wallet_id=wallet_id,
             source_trade_id=source_trade_id,
@@ -520,9 +707,40 @@ def compute_trade_score_v1(
             score=0.0,
             verdict=TradeVerdict.INCOMPLETE,
             missing_essentials=["side"],
+            rejection_reasons=["missing_side"],
             computed_at=now,
             is_sample=is_sample,
         )
+
+    if input.side not in ("BUY", "SELL"):
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.INCOMPLETE,
+            missing_essentials=["side"],
+            rejection_reasons=["invalid_side"],
+            computed_at=now,
+            is_sample=is_sample,
+        )
+
+    if input.side == "SELL":
+        # SELL is KNOWN but UNSUPPORTED. Settlement accounting (PR24I)
+        # excludes SELL trades (sell_side_accounting_not_supported_in_pr24i),
+        # so v1 must not confidently score SELL as copy_candidate/watchlist.
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.SKIP,
+            missing_essentials=[],
+            rejection_reasons=["sell_side_copyability_not_supported_v1"],
+            computed_at=now,
+            is_sample=is_sample,
+        )
+    # input.side == "BUY": proceed to normal BUY-only scoring below.
 
     # Phase 7: typed depth-walk integration.
     # The depth_walk_result (when supplied) is the SOLE source of truth
@@ -621,6 +839,114 @@ def compute_trade_score_v1(
     missing_essentials: list[str] = []
     rejection_reasons: list[str] = []
 
+    # ── PR24P PART 8: hard duration exclusions ──
+    # These must BLOCK copy_candidate outright, even when other
+    # components would otherwise qualify.
+    if input.seconds_to_market_end is not None:
+        # Negative holding periods are invalid (unknown), not merely
+        # "too short" — they fall through to the INCOMPLETE missing
+        # essentials check below. Only 0 <= seconds < 15min is treated
+        # as a hard short-exclusion (SKIP).
+        if input.seconds_to_market_end >= 0 and (
+                input.seconds_to_market_end < DURATION_EXCLUDED_SHORT_MIN):
+            return TradeScoreResult(
+                wallet_id=wallet_id,
+                source_trade_id=source_trade_id,
+                input=input,
+                score=0.0,
+                verdict=TradeVerdict.SKIP,
+                missing_essentials=[],
+                rejection_reasons=["duration_excluded_short"],
+                computed_at=now,
+                is_sample=is_sample,
+            )
+        if input.seconds_to_market_end > DURATION_EXCLUDED_LONG_MAX:
+            return TradeScoreResult(
+                wallet_id=wallet_id,
+                source_trade_id=source_trade_id,
+                input=input,
+                score=0.0,
+                verdict=TradeVerdict.SKIP,
+                missing_essentials=[],
+                rejection_reasons=["duration_excluded_long"],
+                computed_at=now,
+                is_sample=is_sample,
+            )
+
+    # ── PR24P PART 9: snapshot point-in-time validation ──
+    # Impossible/malformed point-in-time evidence must block scoring.
+    # Missing runtime bridge fields are NOT a hard failure (PR24R).
+    timing_reason = validate_price_snapshot_timing(
+        source_trade_timestamp=input.source_trade_timestamp,
+        price_snapshot_fetched_at=input.price_snapshot_fetched_at,
+        evaluation_timestamp=input.evaluation_timestamp,
+    )
+    if timing_reason is not None:
+        return TradeScoreResult(
+            wallet_id=wallet_id,
+            source_trade_id=source_trade_id,
+            input=input,
+            score=0.0,
+            verdict=TradeVerdict.INCOMPLETE,
+            missing_essentials=[timing_reason],
+            rejection_reasons=[timing_reason.upper()],
+            computed_at=now,
+            is_sample=is_sample,
+        )
+
+    # ── PR24P PART 5: BUY price deterioration must be ESSENTIAL ──
+    # Do not silently assume 0 deterioration or silently default to BUY.
+    # If the explicit value is missing, derive it from the raw BUY trace
+    # fields when they are sufficient; if both are present, compare them
+    # within tolerance and reject a mismatch.
+    effective_price_deterioration_pct: Optional[float] = None
+    if input.price_deterioration_pct is not None:
+        effective_price_deterioration_pct = input.price_deterioration_pct
+        # Compare against a derived value only when trace fields are
+        # sufficient to derive one (mismatch check rule from PART 6).
+        derived, derived_reason = calculate_buy_price_deterioration_pct(
+            source_entry_price=input.source_entry_price,
+            current_copy_price=input.current_copy_price,
+            estimated_fill_price=input.estimated_fill_price,
+        )
+        if derived is not None:
+            if abs(derived - input.price_deterioration_pct) > (
+                    PRICE_DETERIORATION_MISMATCH_TOLERANCE):
+                return TradeScoreResult(
+                    wallet_id=wallet_id,
+                    source_trade_id=source_trade_id,
+                    input=input,
+                    score=0.0,
+                    verdict=TradeVerdict.INCOMPLETE,
+                    missing_essentials=["price_deterioration_trace_mismatch"],
+                    rejection_reasons=["PRICE_DETERIORATION_TRACE_MISMATCH"],
+                    computed_at=now,
+                    is_sample=is_sample,
+                )
+            # Within tolerance: keep the explicit value (authoritative).
+        # else: trace fields insufficient to derive -> no comparison.
+    else:
+        derived, derived_reason = calculate_buy_price_deterioration_pct(
+            source_entry_price=input.source_entry_price,
+            current_copy_price=input.current_copy_price,
+            estimated_fill_price=input.estimated_fill_price,
+        )
+        if derived is not None:
+            effective_price_deterioration_pct = derived
+        else:
+            # No explicit value and trace cannot derive one -> incomplete.
+            return TradeScoreResult(
+                wallet_id=wallet_id,
+                source_trade_id=source_trade_id,
+                input=input,
+                score=0.0,
+                verdict=TradeVerdict.INCOMPLETE,
+                missing_essentials=["price_deterioration_pct"],
+                rejection_reasons=[],
+                computed_at=now,
+                is_sample=is_sample,
+            )
+
     # Check essential evidence (Phase 4.C + Phase 7). Holding period and
     # market_active are essential — without them the score silently
     # degrades with "unknown" quality on key components, which hides
@@ -673,7 +999,7 @@ def compute_trade_score_v1(
 
     # Compute components (read from input so persisters see consistent values)
     raw, quality, note = _copy_price_quality_component(
-        input.price_deterioration_pct, input.side
+        effective_price_deterioration_pct, input.side
     )
     components.append(TradeScoreComponent(
         name="copy_price_quality",
@@ -763,6 +1089,19 @@ def compute_trade_score_v1(
         verdict = TradeVerdict.WATCHLIST
     else:
         verdict = TradeVerdict.SKIP
+
+    # ── PR24P PART 7: severe partial fill cannot become copy_candidate ──
+    # A preliminary copy_candidate with an effective fill below the
+    # minimum is downgraded to WATCHLIST (score preserved for
+    # transparency). fill_percentage from a depth walk of 0 must not
+    # become copy_candidate.
+    if (
+        verdict == TradeVerdict.COPY_CANDIDATE
+        and effective_fill_percentage is not None
+        and effective_fill_percentage < MIN_COPY_CANDIDATE_FILL_PERCENTAGE
+    ):
+        verdict = TradeVerdict.WATCHLIST
+        rejection_reasons.append("partial_fill_below_copy_candidate_threshold")
 
     return TradeScoreResult(
         wallet_id=wallet_id,

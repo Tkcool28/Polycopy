@@ -244,6 +244,20 @@ class Database:
         "idx_settlement_ledger_source_trade",
     )
 
+    # PR24P: v16 price-trace columns required on trade_copyability_decisions
+    # before a schema-metadata-lag reconciliation can claim the physical
+    # schema is at target. Without this, a v15 DB whose v13/v14/v15 objects
+    # already exist could be bumped to _meta=16 without adding the new
+    # trace columns.
+    _REQUIRED_V16_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("trade_copyability_decisions", "source_entry_price"),
+        ("trade_copyability_decisions", "current_copy_price"),
+        ("trade_copyability_decisions", "estimated_fill_price"),
+        ("trade_copyability_decisions", "source_trade_timestamp"),
+        ("trade_copyability_decisions", "price_snapshot_fetched_at"),
+        ("trade_copyability_decisions", "evaluation_timestamp"),
+    )
+
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
     # already present but these specific indexes are missing.
@@ -273,6 +287,9 @@ class Database:
                 return False
         for obj in self._REQUIRED_V15_OBJECTS:
             if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        for table, column in self._REQUIRED_V16_COLUMNS:
+            if not self._column_exists(table, column):
                 return False
         return True
 

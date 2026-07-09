@@ -445,10 +445,17 @@ class TestTradeScoreV1HoldingPeriods:
     """Test holding period duration buckets."""
 
     def test_excluded_under_15_minutes(self):
+        # PR24P PART 8: durations < 15m are hard-excluded (SKIP, score 0),
+        # not merely penalized. The holding_period_quality component is
+        # not computed in that path.
+        from polycopy.scoring.trade_score_v1 import TradeVerdict
+
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -456,14 +463,17 @@ class TestTradeScoreV1HoldingPeriods:
             seconds_to_market_end=14 * 60,  # 14 minutes
             market_active=True,
         )
-        hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
-        assert hp_comp.raw_score == 0.0
+        assert result.verdict == TradeVerdict.SKIP
+        assert "duration_excluded_short" in result.rejection_reasons
+        assert result.score == 0.0
 
     def test_experimental_15_min_to_6_hours(self):
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -480,6 +490,8 @@ class TestTradeScoreV1HoldingPeriods:
             wallet_id="test-wallet",
             source_trade_id="test-trade",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -496,6 +508,8 @@ class TestTradeScoreV1HoldingPeriods:
             wallet_id="test-wallet",
             source_trade_id="test-trade",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -511,6 +525,8 @@ class TestTradeScoreV1HoldingPeriods:
             wallet_id="test-wallet",
             source_trade_id="test-trade",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -522,10 +538,17 @@ class TestTradeScoreV1HoldingPeriods:
         assert hp_comp.raw_score == 40.0
 
     def test_excluded_over_45d(self):
+        # PR24P PART 8: durations > 45d are hard-excluded (SKIP, score 0),
+        # not merely penalized. The holding_period_quality component is
+        # not computed in that path.
+        from polycopy.scoring.trade_score_v1 import TradeVerdict
+
         result = compute_trade_score_v1(
             wallet_id="test-wallet",
             source_trade_id="test-trade",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -533,8 +556,9 @@ class TestTradeScoreV1HoldingPeriods:
             seconds_to_market_end=60 * 24 * 3600,  # 60 days
             market_active=True,
         )
-        hp_comp = next(c for c in result.components if c.name == "holding_period_quality")
-        assert hp_comp.raw_score == 0.0
+        assert result.verdict == TradeVerdict.SKIP
+        assert "duration_excluded_long" in result.rejection_reasons
+        assert result.score == 0.0
 
 
 class TestTradeScoreV1BUYPenalty:
@@ -1177,6 +1201,8 @@ class TestV2ShadowIsolation:
             wallet_id="test-wallet",
             source_trade_id="test-trade",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -1434,6 +1460,8 @@ class TestFillFeasibilityMath:
             wallet_id="w",
             source_trade_id="t",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0,
             executable_depth=200.0,
             spread=0.05,
@@ -1512,6 +1540,8 @@ class TestTradeScoreV1HoldingPeriodBoundaries:
         result = compute_trade_score_v1(
             wallet_id="w", source_trade_id="t",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0, executable_depth=200.0,
             spread=0.05, trade_age_seconds=100,
             seconds_to_market_end=seconds,
@@ -1526,13 +1556,41 @@ class TestTradeScoreV1HoldingPeriodBoundaries:
 
     # --- < 15 minutes: excluded ---
     def test_14m59s_excluded_zero(self):
-        c = self._hp(14 * 60 + 59)
-        assert c.raw_score == 0.0
-        assert "duration_excluded_short" in c.note
+        # PR24P PART 8: < 15 min is a hard short-exclusion (SKIP, 0).
+        # The holding_period_quality component is not computed.
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        result = compute_trade_score_v1(
+            wallet_id="w", source_trade_id="t",
+            side="BUY",
+            price_deterioration_pct=0.0,
+            intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=14 * 60 + 59,
+            market_active=True,
+        )
+        assert result.verdict == TradeVerdict.SKIP
+        assert "duration_excluded_short" in result.rejection_reasons
+        assert result.score == 0.0
 
     def test_0s_excluded_zero(self):
-        c = self._hp(0)
-        assert c.raw_score == 0.0
+        # PR24P PART 8: 0 seconds (< 15 min) is a hard short-exclusion.
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        result = compute_trade_score_v1(
+            wallet_id="w", source_trade_id="t",
+            side="BUY",
+            price_deterioration_pct=0.0,
+            intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=0,
+            market_active=True,
+        )
+        assert result.verdict == TradeVerdict.SKIP
+        assert "duration_excluded_short" in result.rejection_reasons
+        assert result.score == 0.0
 
     def test_15m00s_experimental_40(self):
         c = self._hp(15 * 60)
@@ -1605,15 +1663,41 @@ class TestTradeScoreV1HoldingPeriodBoundaries:
         assert "duration_penalized" in c.note
 
     def test_45d00h00m01s_excluded_long_zero(self):
-        # One second past 45d → excluded (0)
-        c = self._hp(45 * 24 * 3600 + 1)
-        assert c.raw_score == 0.0
-        assert "duration_excluded_long" in c.note
+        # PR24P PART 8: one second past 45d → hard-excluded (SKIP, 0).
+        # The holding_period_quality component is not computed.
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        result = compute_trade_score_v1(
+            wallet_id="w", source_trade_id="t",
+            side="BUY",
+            price_deterioration_pct=0.0,
+            intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=45 * 24 * 3600 + 1,
+            market_active=True,
+        )
+        assert result.verdict == TradeVerdict.SKIP
+        assert "duration_excluded_long" in result.rejection_reasons
+        assert result.score == 0.0
 
     def test_60d_excluded_long_zero(self):
-        c = self._hp(60 * 24 * 3600)
-        assert c.raw_score == 0.0
-        assert "duration_excluded_long" in c.note
+        # PR24P PART 8: 60d → hard-excluded (SKIP, 0).
+        from polycopy.scoring.trade_score_v1 import (
+            compute_trade_score_v1, TradeVerdict,
+        )
+        result = compute_trade_score_v1(
+            wallet_id="w", source_trade_id="t",
+            side="BUY",
+            price_deterioration_pct=0.0,
+            intended_stake=100.0, executable_depth=200.0,
+            spread=0.05, trade_age_seconds=100,
+            seconds_to_market_end=60 * 24 * 3600,
+            market_active=True,
+        )
+        assert result.verdict == TradeVerdict.SKIP
+        assert "duration_excluded_long" in result.rejection_reasons
+        assert result.score == 0.0
 
     # --- unknown → INCOMPLETE upstream ---
     def test_unknown_seconds_yields_incomplete(self):
@@ -1623,6 +1707,8 @@ class TestTradeScoreV1HoldingPeriodBoundaries:
         result = compute_trade_score_v1(
             wallet_id="w", source_trade_id="t",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0, executable_depth=200.0,
             spread=0.05, trade_age_seconds=100,
             # no seconds_to_market_end
@@ -1638,12 +1724,15 @@ class TestTradeScoreV1HoldingPeriodBoundaries:
         result = compute_trade_score_v1(
             wallet_id="w", source_trade_id="t",
             side="BUY",
+            # PR24P: price deterioration is now ESSENTIAL.
+            price_deterioration_pct=0.0,
             intended_stake=100.0, executable_depth=200.0,
             spread=0.05, trade_age_seconds=100,
             seconds_to_market_end=-1,
             market_active=True,
         )
         assert result.verdict == TradeVerdict.INCOMPLETE
+        assert "seconds_to_market_end" in result.missing_essentials
 
 
 class TestRawInputPersistence:
@@ -2800,6 +2889,9 @@ def _make_base_input(**overrides):
         wallet_id="wallet-depth-1",
         source_trade_id="trade-depth-1",
         side="BUY",
+        # PR24P: price deterioration is now ESSENTIAL. Tests that exercise
+        # depth/fill behavior must supply it explicitly (0.0 = no change).
+        price_deterioration_pct=0.0,
         intended_stake=100.0,
         executable_depth=200.0,
         fill_percentage=1.0,
