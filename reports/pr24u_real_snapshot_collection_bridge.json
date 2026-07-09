@@ -36,6 +36,8 @@
   "skip_reason_counts": {
     "missing_token_id": 4
   },
+  "sample_like_row_count": 4,
+  "db_path_inspected": "/root/Polycopy/data/polycopy.db",
   "row_reports": [
     {
       "source_trade_id": "sample-trade-sample-market-001-001",
@@ -128,7 +130,7 @@
       "depth_available": false,
       "spread_available": false,
       "market_state_available": false,
-      "snapshot_timestamp": "2026-07-09T18:45:42.547271+00:00",
+      "snapshot_timestamp": "2026-07-09T19:33:23.471560+00:00",
       "pr24s_evidence_compatibility": "incompatible",
       "skip_reason": null,
       "error_reason": null,
@@ -154,6 +156,18 @@
         }
       },
       "recommendation": "Leave existing rows as-is (no backfill per PR24T). Future writes normalize via normalize_side_for_persistence."
+    },
+    {
+      "key": "source_trade_sample_data_present",
+      "severity": "info",
+      "summary": "Of 5 source_trades inspected, 4 appear to be seeded/sample/placeholder rows (wallet/market/trade_id contain sample markers such as 0xsample_trader_*_do_not_use and sample-market-*). Real usable production-like evidence coverage is effectively n=1. This is report text only; the rows are NOT deleted, mutated, backfilled, or normalized.",
+      "count": 4,
+      "evidence": {
+        "source_trade_count": 5,
+        "sample_like_row_count": 4,
+        "effective_real_coverage_n": 1
+      },
+      "recommendation": "Treat the single non-sample eligible row (test_trade_1) as the only currently-real evidence-collection target. A future ingestion PR should populate real rows with token_id for broader coverage."
     },
     {
       "key": "collection_skip_reason_summary",

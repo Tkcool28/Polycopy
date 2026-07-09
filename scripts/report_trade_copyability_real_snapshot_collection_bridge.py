@@ -126,7 +126,8 @@ def main(argv: list[str] | None = None) -> int:
             collector = _build_live_collector()
             live_preview = True
         report = build_trade_copyability_real_snapshot_collection_bridge(
-            conn, limit=args.limit, collector=collector, live_preview=live_preview
+            conn, limit=args.limit, collector=collector, live_preview=live_preview,
+            db_path=db_path,
         )
     finally:
         conn.close()

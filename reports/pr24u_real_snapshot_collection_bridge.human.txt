@@ -5,6 +5,8 @@ ready_to_persist_decisions = False
 ready_to_create_candidates = False
 live_preview_enabled = False
 
+DB path inspected: /root/Polycopy/data/polycopy.db
+
 == Production counts (read-only; must be unchanged by this PR) ==
   source_trades: 5
   trade_copyability_decisions: 0
@@ -20,6 +22,8 @@ live_preview_enabled = False
 == Source trades inspected: 5 ==
   eligible_for_collection: 1
   ineligible_for_collection: 4
+  sample_like_rows: 4 (seeded/placeholder; NOT deleted/mutated/backfilled)
+  effective_real_production_like_coverage: n=1
 
 == Raw source side distribution (exact casing) ==
   buy: 4
@@ -51,6 +55,10 @@ live_preview_enabled = False
     count=5
     evidence={"canonical_side_distribution": {"BUY": 5}, "raw_side_distribution": {"BUY": 1, "buy": 4}}
     -> Leave existing rows as-is (no backfill per PR24T). Future writes normalize via normalize_side_for_persistence.
+  [info] source_trade_sample_data_present: Of 5 source_trades inspected, 4 appear to be seeded/sample/placeholder rows (wallet/market/trade_id contain sample markers such as 0xsample_trader_*_do_not_use and sample-market-*). Real usable production-like evidence coverage is effectively n=1. This is report text only; the rows are NOT deleted, mutated, backfilled, or normalized.
+    count=4
+    evidence={"effective_real_coverage_n": 1, "sample_like_row_count": 4, "source_trade_count": 5}
+    -> Treat the single non-sample eligible row (test_trade_1) as the only currently-real evidence-collection target. A future ingestion PR should populate real rows with token_id for broader coverage.
   [info] collection_skip_reason_summary: Rows skipped from real evidence collection (expected gaps: no token_id, non-BUY side, missing price/size/id). NULL token_id rows cannot be collected and are blocked honestly, never invented.
     count=4
     evidence={"skip_reason_counts": {"missing_token_id": 4}}
@@ -76,7 +84,7 @@ live_preview_enabled = False
     skip_reason=missing_token_id
     note: row cannot collect real evidence without token_id
   source_trade_id=test_trade_1 wallet=0xtest market=0xeb348b65a59bb2752d3dd10636d17de501df76a424e978e136d22e76d07c84e9 token=72753295727566659208677964635039361717871718602259295378609650323504626128275 side=BUY
-    eligibility=eligible cur_price=False depth=False spread=False market_state=False ts=2026-07-09T18:45:42.232945+00:00 pr24s=incompatible
+    eligibility=eligible cur_price=False depth=False spread=False market_state=False ts=2026-07-09T19:33:23.180613+00:00 pr24s=incompatible
     note: no order-book depth collected (no_depth_levels)
 
 == Recommended next step ==

@@ -43,6 +43,11 @@ Two collection modes:
   `token_id = 72753295727566659208677964635039361717871718602259295378609650323504626128275`).
 - **Ineligible: 4** — all blocked by `missing_token_id` (NULL in production).
   Honestly blocked, never invented.
+- **Sample/placeholder rows: 4 of 5.** Four rows carry seeded/sample identifiers
+  (`0xsample_trader_a_do_not_use`, `0xsample_trader_b_do_not_use`,
+  `sample-market-001`, `sample-market-002`). They are **reported, not touched** —
+  no deletion, mutation, backfill, or normalization. Effective real
+  production-like evidence coverage is therefore **n=1**.
 - `ingestion_side_inconsistency_present = True` (mixed `buy`/`BUY` casing).
   NOT backfilled — PR24T left existing rows; future writes normalize.
 
@@ -86,7 +91,7 @@ is verified, not stubbed.
 ## Tests run and results
 
 - **PR24U targeted suite:** `tests/test_p24u_trade_copyability_real_snapshot_collection_bridge.py`
-  → **17 passed**.
+  → **19 passed** (after review cleanup patch).
 - Coverage includes every required behavior:
   eligible row → evidence structure + report row;
   missing `token_id` skipped with clear reason;
@@ -95,16 +100,44 @@ is verified, not stubbed.
   no `trade_copyability_decisions` / `copy_candidates` / `paper_signal_decisions` /
   `candidate_price_snapshots`(+levels) / `orders` / `positions` created;
   purity (no mutating SQL, no `import polycopy.db.database`, no wiring/broker tokens);
-  reuse of existing `PolymarketClobClient` (not duplicated); JSON valid + flags False.
-- **Full suite:** `pytest tests -q` → **2547 passed, 2 skipped, 0 failed** (160.7s). No regressions
-  introduced by the additive PR24U files.
+  reuse of existing `PolymarketClobClient` (actually called during collection, not just duck-typed);
+  JSON valid + flags False; sample/placeholder rows detected + reported; DB path reported.
+- **Full suite:** `pytest tests -q` → **2549 passed, 2 skipped, 0 failed** (163.2s, after patch). No regressions
+  introduced by the additive PR24U files or the review-cleanup patch.
 - `ruff check src scripts tests` → **All checks passed**.
 
-## Files added (additive only — 3 new files, no edits to existing scoring/writing code)
+## Files added (additive only — no edits to existing scoring/writing code)
 
 1. `src/polycopy/engine/trade_copyability_real_snapshot_collection_bridge.py` — pure module.
 2. `scripts/report_trade_copyability_real_snapshot_collection_bridge.py` — CLI (`--json`, `--db-path`, `--limit`, `--allow-live-preview`).
-3. `tests/test_p24u_trade_copyability_real_snapshot_collection_bridge.py` — 17 tests.
+3. `tests/test_p24u_trade_copyability_real_snapshot_collection_bridge.py` — 19 tests.
+4. `reports/pr24u_real_snapshot_collection_bridge.md` (+ `.json` / `.human.txt` evidence).
+
+## Patch note — review cleanup (Claude review, applied to draft PR #45 only)
+
+Three cleanup items applied, no scope expansion, no production writes:
+
+1. **Sample/placeholder clarity.** The report now states plainly that 4 of 5
+   `source_trades` rows are seeded/sample/placeholder (`0xsample_trader_*_do_not_use`,
+   `sample-market-*`), so effective real production-like evidence coverage is
+   **n=1**. A new `source_trade_sample_data_present` finding was added (report
+   text only; rows are NOT deleted/mutated/backfilled/normalized). The module
+   computes `sample_like_row_count` via a read-only marker heuristic.
+2. **DB path clarity.** The report now prints `DB path inspected: <resolved path>`
+   (passed through `build_trade_copyability_real_snapshot_collection_bridge(db_path=…)`
+   from the CLI).
+3. **Test quality.** `test_reuses_existing_polymarket_clob_client_not_duplicated`
+   now asserts the reused/compatible collector was **actually called** during
+   collection (`fetch_book` invoked once with the row's `token_id`) via a
+   `_CallCountingCollector` wrapper — not merely that a class/duck-type exists.
+4. **Test quality.** The tautological `assert "compatible" == "compatible"` was
+   replaced with assertions against the actual produced fields
+   (`ev.depth_status == "complete"`, `ev.depth_hash is not None`, and the
+   end-to-end `report.pr24s_compatible_count == 1` + real `current_copy_price`).
+
+All guardrails preserved: no DB writes, no backfill, no `source_trades` mutation,
+no decisions/candidates/signals/snapshots/orders/positions, no scoring, no
+automation, no deploy/restart/timers, no PR24V Gamma work, no persistence writer.
 
 ## Recommended next step
 

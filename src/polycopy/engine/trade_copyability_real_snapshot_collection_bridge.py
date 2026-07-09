@@ -263,6 +263,8 @@ class TradeCopyabilityRealSnapshotCollectionBridgeReport:
     pr24s_partial_count: int
     pr24s_incompatible_count: int
     skip_reason_counts: dict[str, int]
+    sample_like_row_count: int
+    db_path_inspected: Optional[str]
     row_reports: tuple[TradeCopyabilityRealSnapshotCollectionRowReport, ...]
     findings: tuple[TradeCopyabilityRealSnapshotCollectionFinding, ...]
     recommended_next_step: str
@@ -288,6 +290,8 @@ class TradeCopyabilityRealSnapshotCollectionBridgeReport:
             "pr24s_partial_count": self.pr24s_partial_count,
             "pr24s_incompatible_count": self.pr24s_incompatible_count,
             "skip_reason_counts": self.skip_reason_counts,
+            "sample_like_row_count": self.sample_like_row_count,
+            "db_path_inspected": self.db_path_inspected,
             "row_reports": [r.to_dict() for r in self.row_reports],
             "findings": [f.to_dict() for f in self.findings],
             "recommended_next_step": self.recommended_next_step,
@@ -336,6 +340,40 @@ def _maybe_float(value: Any) -> Optional[float]:
 
 def _norm_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+# Tokens that strongly indicate a seeded/sample/placeholder row rather than a
+# real production trade. Used ONLY for report clarity; the rows are never
+# mutated, deleted, backfilled, or normalized.
+_SAMPLE_WALLET_MARKERS = ("_do_not_use", "sample_trader", "sample_wallet", "0xsample")
+_SAMPLE_MARKET_MARKERS = ("sample-market", "sample_market", "sample-market-")
+_SAMPLE_TRADE_ID_MARKERS = ("sample-trade", "sample_trade")
+
+
+def _row_looks_sample_like(row: sqlite3.Row) -> bool:
+    """Heuristic: does this source_trades row look seeded/sample/placeholder?
+
+    Pure read-only inspection of a single row. Returns True when the wallet
+    address, market identifier, or source_trade_id contains a known sample
+    marker. This is REPORT TEXT ONLY — it does not classify eligibility, does
+    not change behavior, and never mutates the row.
+    """
+    wallet = _norm_text(_row_get(row, "trader_address"))
+    market = _norm_text(_row_get(row, "market_source_id"))
+    trade_id = _norm_text(_row_get(row, "source_trade_id"))
+    low_wallet = wallet.lower()
+    low_market = market.lower()
+    low_trade = trade_id.lower()
+    for marker in _SAMPLE_WALLET_MARKERS:
+        if marker in low_wallet:
+            return True
+    for marker in _SAMPLE_MARKET_MARKERS:
+        if marker in low_market:
+            return True
+    for marker in _SAMPLE_TRADE_ID_MARKERS:
+        if marker in low_trade:
+            return True
+    return False
 
 
 def _to_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -593,6 +631,7 @@ def build_trade_copyability_real_snapshot_collection_bridge(
     limit: int = 20,
     collector: Optional[RealSnapshotEvidenceCollector] = None,
     live_preview: bool = False,
+    db_path: Optional[str] = None,
 ) -> TradeCopyabilityRealSnapshotCollectionBridgeReport:
     """Build a read-only Trade Copyability REAL snapshot-collection report.
 
@@ -625,6 +664,10 @@ def build_trade_copyability_real_snapshot_collection_bridge(
                 row, field_map, collector, live_preview=live_preview, loop=loop
             )
             row_reports.append(rr)
+
+        # Report-clarity only: count rows that look seeded/sample/placeholder.
+        # Heuristic markers in wallet/market/trade_id. Never mutates the rows.
+        sample_like_row_count = sum(1 for row in source_rows if _row_looks_sample_like(row))
 
         # --- Distributions ---
         raw_side_distribution: Counter[str] = Counter()
@@ -686,6 +729,32 @@ def build_trade_copyability_real_snapshot_collection_bridge(
                 recommendation=(
                     "Leave existing rows as-is (no backfill per PR24T). Future writes "
                     "normalize via normalize_side_for_persistence."
+                ),
+            ))
+
+        if sample_like_row_count:
+            effective_real_n = len(row_reports) - sample_like_row_count
+            findings.append(TradeCopyabilityRealSnapshotCollectionFinding(
+                key="source_trade_sample_data_present",
+                severity="info",
+                summary=(
+                    f"Of {len(row_reports)} source_trades inspected, {sample_like_row_count} "
+                    "appear to be seeded/sample/placeholder rows (wallet/market/trade_id "
+                    "contain sample markers such as 0xsample_trader_*_do_not_use and "
+                    "sample-market-*). Real usable production-like evidence coverage is "
+                    f"effectively n={max(effective_real_n, 0)}. This is report text only; "
+                    "the rows are NOT deleted, mutated, backfilled, or normalized."
+                ),
+                count=sample_like_row_count,
+                evidence={
+                    "source_trade_count": len(row_reports),
+                    "sample_like_row_count": sample_like_row_count,
+                    "effective_real_coverage_n": max(effective_real_n, 0),
+                },
+                recommendation=(
+                    "Treat the single non-sample eligible row (test_trade_1) as the only "
+                    "currently-real evidence-collection target. A future ingestion PR should "
+                    "populate real rows with token_id for broader coverage."
                 ),
             ))
 
@@ -775,6 +844,8 @@ def build_trade_copyability_real_snapshot_collection_bridge(
             pr24s_partial_count=pr24s_partial_count,
             pr24s_incompatible_count=pr24s_incompatible_count,
             skip_reason_counts=dict(skip_reason_counts),
+            sample_like_row_count=sample_like_row_count,
+            db_path_inspected=db_path,
             row_reports=tuple(row_reports[: max(limit, 0)] or row_reports),
             findings=tuple(findings),
             recommended_next_step=recommended_next_step,
@@ -796,7 +867,9 @@ def report_to_human(report: TradeCopyabilityRealSnapshotCollectionBridgeReport) 
     lines.append(f"ready_to_create_candidates = {report.ready_to_create_candidates}")
     lines.append(f"live_preview_enabled = {report.live_preview_enabled}")
     lines.append("")
+    lines.append(f"DB path inspected: {report.db_path_inspected}")
 
+    lines.append("")
     lines.append("== Production counts (read-only; must be unchanged by this PR) ==")
     for k, v in report.production_counts.items():
         lines.append(f"  {k}: {v}")
@@ -805,6 +878,15 @@ def report_to_human(report: TradeCopyabilityRealSnapshotCollectionBridgeReport) 
     lines.append(f"== Source trades inspected: {report.source_trade_count} ==")
     lines.append(f"  eligible_for_collection: {report.eligible_count}")
     lines.append(f"  ineligible_for_collection: {report.ineligible_count}")
+    if report.sample_like_row_count:
+        effective = max(report.source_trade_count - report.sample_like_row_count, 0)
+        lines.append(
+            f"  sample_like_rows: {report.sample_like_row_count} "
+            f"(seeded/placeholder; NOT deleted/mutated/backfilled)"
+        )
+        lines.append(
+            f"  effective_real_production_like_coverage: n={effective}"
+        )
     lines.append("")
 
     lines.append("== Raw source side distribution (exact casing) ==")
