@@ -1,0 +1,268 @@
+{
+  "ready_to_wire_to_automation": false,
+  "ready_to_persist_decisions": false,
+  "ready_to_create_candidates": false,
+  "production_counts": {
+    "source_trades": 5,
+    "trade_copyability_decisions": 0,
+    "copy_candidates": 0,
+    "paper_signal_decisions": 0,
+    "candidate_price_snapshots": 0,
+    "candidate_price_snapshot_levels": 0,
+    "wallet_score_decisions": 1,
+    "settlement_accounting_ledger": 0,
+    "orders": 0,
+    "positions": 0
+  },
+  "db_path_inspected": "/root/Polycopy/data/polycopy.db",
+  "source_trade_count": 5,
+  "raw_side_distribution": {
+    "buy": 4,
+    "BUY": 1
+  },
+  "canonical_side_distribution": {
+    "BUY": 5
+  },
+  "ingestion_side_inconsistency_present": true,
+  "coverage_bucket_counts": {
+    "sample_placeholder": 4,
+    "real_like_complete": 1
+  },
+  "sample_placeholder_count": 4,
+  "real_like_count": 1,
+  "effective_real_usable_coverage": 1,
+  "identifier_quality_counts": {
+    "neither": 4,
+    "both": 1
+  },
+  "has_token_id_count": 1,
+  "has_condition_id_count": 1,
+  "both_token_and_condition_count": 1,
+  "neither_token_nor_condition_count": 4,
+  "non_condition_placeholder_market_id_count": 0,
+  "pr24u_book_ready_count": 1,
+  "pr24v_gamma_ready_count": 1,
+  "both_ready_count": 1,
+  "neither_ready_count": 4,
+  "token_to_condition_mapping_needed_count": 0,
+  "copyability_evidence_readiness_counts": {
+    "blocked_no_usable_identifier": 4,
+    "ready_both_paths": 1
+  },
+  "token_condition_mapping_feasibility": {
+    "mapping_join_possible_via_market_outcomes": true,
+    "market_outcomes_table_present": true,
+    "market_outcomes_with_clob_token_id": 2,
+    "markets_table_present": true,
+    "resolve_trade_to_outcome_helper_exists": true,
+    "mapping_helper_already_exists": true,
+    "smallest_future_helper": "Read-only helper map_token_to_condition_id(conn, token_id) -> Optional[str]: SELECT m.source_id FROM market_outcomes mo JOIN markets m ON m.id = mo.market_id WHERE mo.clob_token_id = ? LIMIT 1. This reuses the existing join; it is NOT a persistence writer and must not backfill production rows. PR24W does NOT implement it.",
+    "notes": [
+      "token\u2192condition join is feasible now: market_outcomes has 2 row(s) with a populated clob_token_id that can join to markets.source_id (conditionId).",
+      "resolve_trade_to_outcome (engine/trade_resolution.py) already resolves token_id \u2192 market_outcomes \u2192 markets.source_id (conditionId) read-only; no new writer is required to READ the mapping."
+    ]
+  },
+  "ingestion_gap_summary": "source_trades total = 5; sample/placeholder = 4; real-like = 1; effective REAL usable coverage = n=1. Why n=1: 4 of 5 rows are seeded sample/placeholder rows (source='sample', is_sample=1, market_source_id='sample-market-*', token_id=NULL) created by scripts/run_scan.py _get_sample_trades; only test_trade_1 carries real identifiers (a conditionId-shaped market_source_id AND a real token_id). Real rows are NOT being collected at scale, and the sample rows were intentionally seeded and are still present. To unlock persistence/scoring, a real source_trade must have: canonical BUY side, parseable price, parseable size/quantity, AND at least one of (token_id for PR24U /book, conditionId-shaped market_source_id for PR24V Gamma). A token-only row additionally needs a token\u2192condition mapping before PR24V market-state can attach.",
+  "findings": [
+    {
+      "key": "sample_placeholder_rows_present",
+      "severity": "info",
+      "summary": "Of 5 source_trades, 4 are seeded/sample/placeholder rows (non-condition market ids like 'sample-market-*' + NULL token_id + sample markers). Real usable production-like coverage is effectively n=1. This is report text only; the rows are NOT deleted, mutated, backfilled, or normalized.",
+      "count": 4,
+      "evidence": {
+        "source_trade_count": 5,
+        "sample_placeholder_count": 4,
+        "real_like_count": 1,
+        "effective_real_usable_coverage": 1
+      },
+      "recommendation": "Treat the single real-like row (test_trade_1: real conditionId + real token_id) as the only currently-usable evidence target. A future ingestion PR should populate real wallet trades with both token_id and conditionId-shaped market_source_id for broader real coverage."
+    },
+    {
+      "key": "no_token_only_rows_currently",
+      "severity": "info",
+      "summary": "Current data has ZERO token-only rows (the 4 sample rows carry neither token nor condition; the 1 real-like row carries both). The token\u2192condition mapping gap is a future risk, not a present blocker for the single usable row.",
+      "count": 0,
+      "evidence": {
+        "token_to_condition_mapping_needed_count": 0,
+        "has_token_count": 1,
+        "has_condition_count": 1,
+        "both_count": 1
+      },
+      "recommendation": "No mapping writer needed for current data, but the helper should be added before real token-only ingestion lands."
+    },
+    {
+      "key": "ingestion_side_inconsistency",
+      "severity": "warning",
+      "summary": "source_trades.side contains multiple exact string forms for the same logical side (e.g. buy vs BUY). PR24T normalization guard handles future writes; existing production rows were intentionally not backfilled. This PR does not normalize them.",
+      "count": 5,
+      "evidence": {
+        "raw_side_distribution": {
+          "buy": 4,
+          "BUY": 1
+        },
+        "canonical_side_distribution": {
+          "BUY": 5
+        }
+      },
+      "recommendation": "Leave existing rows as-is (no backfill per PR24T). Future writes normalize via normalize_side_for_persistence."
+    },
+    {
+      "key": "token_condition_mapping_feasibility",
+      "severity": "info",
+      "summary": "Token\u2192condition mapping is ALREADY feasible read-only via the existing market_outcomes.clob_token_id \u2192 markets.source_id join (which resolve_trade_to_outcome already performs). PR24W does NOT implement a production mapping writer.",
+      "count": 2,
+      "evidence": {
+        "mapping_join_possible_via_market_outcomes": true,
+        "market_outcomes_table_present": true,
+        "market_outcomes_with_clob_token_id": 2,
+        "markets_table_present": true,
+        "resolve_trade_to_outcome_helper_exists": true,
+        "mapping_helper_already_exists": true,
+        "smallest_future_helper": "Read-only helper map_token_to_condition_id(conn, token_id) -> Optional[str]: SELECT m.source_id FROM market_outcomes mo JOIN markets m ON m.id = mo.market_id WHERE mo.clob_token_id = ? LIMIT 1. This reuses the existing join; it is NOT a persistence writer and must not backfill production rows. PR24W does NOT implement it.",
+        "notes": [
+          "token\u2192condition join is feasible now: market_outcomes has 2 row(s) with a populated clob_token_id that can join to markets.source_id (conditionId).",
+          "resolve_trade_to_outcome (engine/trade_resolution.py) already resolves token_id \u2192 market_outcomes \u2192 markets.source_id (conditionId) read-only; no new writer is required to READ the mapping."
+        ]
+      },
+      "recommendation": "Reuse the existing resolver; add a thin read-only map_token_to_condition_id helper when token-only rows appear. No backfill of production rows."
+    }
+  ],
+  "row_reports": [
+    {
+      "source_trade_id": "sample-trade-sample-market-001-001",
+      "wallet_address": "0xsample_trader_a_do_not_use",
+      "market_source_id": "sample-market-001",
+      "token_id": null,
+      "raw_side": "buy",
+      "canonical_side": "BUY",
+      "price": 0.72,
+      "quantity": 50.0,
+      "timestamp": "2026-07-07T22:27:19.630960+00:00",
+      "sample_placeholder_status": "sample_placeholder",
+      "sample_reason": "seeded/sample/placeholder row: market_source_id is a non-condition placeholder and token_id is NULL; row carries sample markers (e.g. source/market/wallet/trade_id). is_sample flag = 1.",
+      "coverage_bucket": "sample_placeholder",
+      "identifier_quality": "neither",
+      "has_token_id": false,
+      "has_condition_id": false,
+      "both_token_and_condition": false,
+      "neither_token_nor_condition": true,
+      "non_condition_placeholder_market_id": false,
+      "pr24u_book_ready": false,
+      "pr24v_gamma_ready": false,
+      "both_ready": false,
+      "neither_ready": true,
+      "token_to_condition_mapping_needed": false,
+      "copyability_evidence_readiness": "blocked_no_usable_identifier",
+      "notes": []
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-001-002",
+      "wallet_address": "0xsample_trader_b_do_not_use",
+      "market_source_id": "sample-market-001",
+      "token_id": null,
+      "raw_side": "buy",
+      "canonical_side": "BUY",
+      "price": 0.7,
+      "quantity": 30.0,
+      "timestamp": "2026-07-07T22:27:19.630960+00:00",
+      "sample_placeholder_status": "sample_placeholder",
+      "sample_reason": "seeded/sample/placeholder row: market_source_id is a non-condition placeholder and token_id is NULL; row carries sample markers (e.g. source/market/wallet/trade_id). is_sample flag = 1.",
+      "coverage_bucket": "sample_placeholder",
+      "identifier_quality": "neither",
+      "has_token_id": false,
+      "has_condition_id": false,
+      "both_token_and_condition": false,
+      "neither_token_nor_condition": true,
+      "non_condition_placeholder_market_id": false,
+      "pr24u_book_ready": false,
+      "pr24v_gamma_ready": false,
+      "both_ready": false,
+      "neither_ready": true,
+      "token_to_condition_mapping_needed": false,
+      "copyability_evidence_readiness": "blocked_no_usable_identifier",
+      "notes": []
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-002-001",
+      "wallet_address": "0xsample_trader_a_do_not_use",
+      "market_source_id": "sample-market-002",
+      "token_id": null,
+      "raw_side": "buy",
+      "canonical_side": "BUY",
+      "price": 0.72,
+      "quantity": 50.0,
+      "timestamp": "2026-07-07T22:27:19.634150+00:00",
+      "sample_placeholder_status": "sample_placeholder",
+      "sample_reason": "seeded/sample/placeholder row: market_source_id is a non-condition placeholder and token_id is NULL; row carries sample markers (e.g. source/market/wallet/trade_id). is_sample flag = 1.",
+      "coverage_bucket": "sample_placeholder",
+      "identifier_quality": "neither",
+      "has_token_id": false,
+      "has_condition_id": false,
+      "both_token_and_condition": false,
+      "neither_token_nor_condition": true,
+      "non_condition_placeholder_market_id": false,
+      "pr24u_book_ready": false,
+      "pr24v_gamma_ready": false,
+      "both_ready": false,
+      "neither_ready": true,
+      "token_to_condition_mapping_needed": false,
+      "copyability_evidence_readiness": "blocked_no_usable_identifier",
+      "notes": []
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-002-002",
+      "wallet_address": "0xsample_trader_b_do_not_use",
+      "market_source_id": "sample-market-002",
+      "token_id": null,
+      "raw_side": "buy",
+      "canonical_side": "BUY",
+      "price": 0.7,
+      "quantity": 30.0,
+      "timestamp": "2026-07-07T22:27:19.634150+00:00",
+      "sample_placeholder_status": "sample_placeholder",
+      "sample_reason": "seeded/sample/placeholder row: market_source_id is a non-condition placeholder and token_id is NULL; row carries sample markers (e.g. source/market/wallet/trade_id). is_sample flag = 1.",
+      "coverage_bucket": "sample_placeholder",
+      "identifier_quality": "neither",
+      "has_token_id": false,
+      "has_condition_id": false,
+      "both_token_and_condition": false,
+      "neither_token_nor_condition": true,
+      "non_condition_placeholder_market_id": false,
+      "pr24u_book_ready": false,
+      "pr24v_gamma_ready": false,
+      "both_ready": false,
+      "neither_ready": true,
+      "token_to_condition_mapping_needed": false,
+      "copyability_evidence_readiness": "blocked_no_usable_identifier",
+      "notes": []
+    },
+    {
+      "source_trade_id": "test_trade_1",
+      "wallet_address": "0xtest",
+      "market_source_id": "0xeb348b65a59bb2752d3dd10636d17de501df76a424e978e136d22e76d07c84e9",
+      "token_id": "72753295727566659208677964635039361717871718602259295378609650323504626128275",
+      "raw_side": "BUY",
+      "canonical_side": "BUY",
+      "price": 0.4,
+      "quantity": 100.0,
+      "timestamp": "2026-07-01T00:00:00+00:00",
+      "sample_placeholder_status": "real_like",
+      "sample_reason": "real-like: row carries real conditionId-shaped market_source_id and real token_id. (is_sample flag = 1, but the identifiers are production-shaped and resolvable; this is the single usable row.)",
+      "coverage_bucket": "real_like_complete",
+      "identifier_quality": "both",
+      "has_token_id": true,
+      "has_condition_id": true,
+      "both_token_and_condition": true,
+      "neither_token_nor_condition": false,
+      "non_condition_placeholder_market_id": false,
+      "pr24u_book_ready": true,
+      "pr24v_gamma_ready": true,
+      "both_ready": true,
+      "neither_ready": false,
+      "token_to_condition_mapping_needed": false,
+      "copyability_evidence_readiness": "ready_both_paths",
+      "notes": []
+    }
+  ],
+  "recommended_next_step": "PR24W is report-only. It proves effective real coverage is n=1 and that a token\u2192condition mapping path already exists read-only. Next: (a) a guarded ingestion PR that populates REAL wallet trades with both token_id and conditionId-shaped market_source_id; (b) a thin read-only map_token_to_condition_id helper for token-only rows; (c) only then, a persistence/scoring PR that lands real coverage into candidates/signals. Do NOT wire automation or persist decisions until those land and are reviewed."
+}
