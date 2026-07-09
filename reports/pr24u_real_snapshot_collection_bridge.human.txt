@@ -1,0 +1,85 @@
+TRADE COPYABILITY REAL SNAPSHOT/DEPTH/PRICE COLLECTION BRIDGE — READ ONLY / DRY RUN / REPORT-ONLY
+
+ready_to_wire_to_automation = False
+ready_to_persist_decisions = False
+ready_to_create_candidates = False
+live_preview_enabled = False
+
+== Production counts (read-only; must be unchanged by this PR) ==
+  source_trades: 5
+  trade_copyability_decisions: 0
+  copy_candidates: 0
+  paper_signal_decisions: 0
+  candidate_price_snapshots: 0
+  candidate_price_snapshot_levels: 0
+  wallet_score_decisions: 1
+  settlement_accounting_ledger: 0
+  orders: 0
+  positions: 0
+
+== Source trades inspected: 5 ==
+  eligible_for_collection: 1
+  ineligible_for_collection: 4
+
+== Raw source side distribution (exact casing) ==
+  buy: 4
+  BUY: 1
+
+== Canonical side distribution ==
+  BUY: 5
+
+== INGESTION SIDE NORMALIZATION AUDIT ==
+  ingestion_side_inconsistency_present = True
+  NOTE: mixed casing present; NOT backfilled (PR24T left existing rows).
+
+== Eligible-row field availability (real collection) ==
+  current_price_available_count: 0
+  depth_available_count: 0
+  spread_available_count: 0
+  market_state_available_count: 0 (/book does not expose market state)
+
+== PR24S evidence compatibility (collected shaped into PR24S structs) ==
+  compatible: 0
+  partial: 0
+  incompatible: 1
+
+== Skip reasons (ineligible rows) ==
+  missing_token_id: 4
+
+== Findings ==
+  [warning] ingestion_side_inconsistency: source_trades.side contains multiple exact string forms for the same logical side (e.g. buy vs BUY). PR24T normalization guard handles future writes; existing production rows were intentionally not backfilled. This PR does not normalize them.
+    count=5
+    evidence={"canonical_side_distribution": {"BUY": 5}, "raw_side_distribution": {"BUY": 1, "buy": 4}}
+    -> Leave existing rows as-is (no backfill per PR24T). Future writes normalize via normalize_side_for_persistence.
+  [info] collection_skip_reason_summary: Rows skipped from real evidence collection (expected gaps: no token_id, non-BUY side, missing price/size/id). NULL token_id rows cannot be collected and are blocked honestly, never invented.
+    count=4
+    evidence={"skip_reason_counts": {"missing_token_id": 4}}
+    -> A future ingestion PR should populate token_id for real trades so real /book evidence can be collected. Until then, collection is limited to rows that already carry a token_id.
+  [info] dry_run_offline_no_network: Default dry-run mode performed NO network fetch. Eligibility and field-availability were proven structurally against source_trades. Use --allow-live-preview to perform a real read-only /book fetch (still non-persisting).
+    -> Run with --allow-live-preview for a live evidence preview.
+
+== Per-row report (exact PR24U required fields) ==
+  source_trade_id=sample-trade-sample-market-001-001 wallet=0xsample_trader_a_do_not_use market=sample-market-001 token=None side=buy
+    eligibility=not_eligible cur_price=False depth=False spread=False market_state=False ts=None pr24s=incompatible
+    skip_reason=missing_token_id
+    note: row cannot collect real evidence without token_id
+  source_trade_id=sample-trade-sample-market-001-002 wallet=0xsample_trader_b_do_not_use market=sample-market-001 token=None side=buy
+    eligibility=not_eligible cur_price=False depth=False spread=False market_state=False ts=None pr24s=incompatible
+    skip_reason=missing_token_id
+    note: row cannot collect real evidence without token_id
+  source_trade_id=sample-trade-sample-market-002-001 wallet=0xsample_trader_a_do_not_use market=sample-market-002 token=None side=buy
+    eligibility=not_eligible cur_price=False depth=False spread=False market_state=False ts=None pr24s=incompatible
+    skip_reason=missing_token_id
+    note: row cannot collect real evidence without token_id
+  source_trade_id=sample-trade-sample-market-002-002 wallet=0xsample_trader_b_do_not_use market=sample-market-002 token=None side=buy
+    eligibility=not_eligible cur_price=False depth=False spread=False market_state=False ts=None pr24s=incompatible
+    skip_reason=missing_token_id
+    note: row cannot collect real evidence without token_id
+  source_trade_id=test_trade_1 wallet=0xtest market=0xeb348b65a59bb2752d3dd10636d17de501df76a424e978e136d22e76d07c84e9 token=72753295727566659208677964635039361717871718602259295378609650323504626128275 side=BUY
+    eligibility=eligible cur_price=False depth=False spread=False market_state=False ts=2026-07-09T18:45:42.232945+00:00 pr24s=incompatible
+    note: no order-book depth collected (no_depth_levels)
+
+== Recommended next step ==
+  PR24U proves the real /book collection path is wireable and reuses PolymarketClobClient. Next: (a) a guarded persistence writer that lands collected evidence into candidate_price_snapshots read-only by PR24S, and (b) a Gamma market-state client for market_active/closed/resolved + seconds_to_market_end. Do not wire automation or persist decisions until those land and are reviewed.
+
+This report performs NO production writes: no snapshots, decisions, candidates, paper signals, orders, or positions. Default mode is dry-run.

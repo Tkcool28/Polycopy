@@ -1,0 +1,180 @@
+{
+  "ready_to_wire_to_automation": false,
+  "ready_to_persist_decisions": false,
+  "ready_to_create_candidates": false,
+  "production_counts": {
+    "source_trades": 5,
+    "trade_copyability_decisions": 0,
+    "copy_candidates": 0,
+    "paper_signal_decisions": 0,
+    "candidate_price_snapshots": 0,
+    "candidate_price_snapshot_levels": 0,
+    "wallet_score_decisions": 1,
+    "settlement_accounting_ledger": 0,
+    "orders": 0,
+    "positions": 0
+  },
+  "source_trade_count": 5,
+  "eligible_count": 1,
+  "ineligible_count": 4,
+  "raw_side_distribution": {
+    "buy": 4,
+    "BUY": 1
+  },
+  "canonical_side_distribution": {
+    "BUY": 5
+  },
+  "ingestion_side_inconsistency_present": true,
+  "live_preview_enabled": false,
+  "current_price_available_count": 0,
+  "depth_available_count": 0,
+  "spread_available_count": 0,
+  "market_state_available_count": 0,
+  "pr24s_compatible_count": 0,
+  "pr24s_partial_count": 0,
+  "pr24s_incompatible_count": 1,
+  "skip_reason_counts": {
+    "missing_token_id": 4
+  },
+  "row_reports": [
+    {
+      "source_trade_id": "sample-trade-sample-market-001-001",
+      "wallet_address": "0xsample_trader_a_do_not_use",
+      "market_source_id": "sample-market-001",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "not_eligible",
+      "current_price_available": false,
+      "depth_available": false,
+      "spread_available": false,
+      "market_state_available": false,
+      "snapshot_timestamp": null,
+      "pr24s_evidence_compatibility": "incompatible",
+      "skip_reason": "missing_token_id",
+      "error_reason": null,
+      "collected_evidence": null,
+      "notes": [
+        "row cannot collect real evidence without token_id"
+      ]
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-001-002",
+      "wallet_address": "0xsample_trader_b_do_not_use",
+      "market_source_id": "sample-market-001",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "not_eligible",
+      "current_price_available": false,
+      "depth_available": false,
+      "spread_available": false,
+      "market_state_available": false,
+      "snapshot_timestamp": null,
+      "pr24s_evidence_compatibility": "incompatible",
+      "skip_reason": "missing_token_id",
+      "error_reason": null,
+      "collected_evidence": null,
+      "notes": [
+        "row cannot collect real evidence without token_id"
+      ]
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-002-001",
+      "wallet_address": "0xsample_trader_a_do_not_use",
+      "market_source_id": "sample-market-002",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "not_eligible",
+      "current_price_available": false,
+      "depth_available": false,
+      "spread_available": false,
+      "market_state_available": false,
+      "snapshot_timestamp": null,
+      "pr24s_evidence_compatibility": "incompatible",
+      "skip_reason": "missing_token_id",
+      "error_reason": null,
+      "collected_evidence": null,
+      "notes": [
+        "row cannot collect real evidence without token_id"
+      ]
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-002-002",
+      "wallet_address": "0xsample_trader_b_do_not_use",
+      "market_source_id": "sample-market-002",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "not_eligible",
+      "current_price_available": false,
+      "depth_available": false,
+      "spread_available": false,
+      "market_state_available": false,
+      "snapshot_timestamp": null,
+      "pr24s_evidence_compatibility": "incompatible",
+      "skip_reason": "missing_token_id",
+      "error_reason": null,
+      "collected_evidence": null,
+      "notes": [
+        "row cannot collect real evidence without token_id"
+      ]
+    },
+    {
+      "source_trade_id": "test_trade_1",
+      "wallet_address": "0xtest",
+      "market_source_id": "0xeb348b65a59bb2752d3dd10636d17de501df76a424e978e136d22e76d07c84e9",
+      "token_id": "72753295727566659208677964635039361717871718602259295378609650323504626128275",
+      "side": "BUY",
+      "eligibility_status": "eligible",
+      "current_price_available": false,
+      "depth_available": false,
+      "spread_available": false,
+      "market_state_available": false,
+      "snapshot_timestamp": "2026-07-09T18:45:42.547271+00:00",
+      "pr24s_evidence_compatibility": "incompatible",
+      "skip_reason": null,
+      "error_reason": null,
+      "collected_evidence": null,
+      "notes": [
+        "no order-book depth collected (no_depth_levels)"
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "key": "ingestion_side_inconsistency",
+      "severity": "warning",
+      "summary": "source_trades.side contains multiple exact string forms for the same logical side (e.g. buy vs BUY). PR24T normalization guard handles future writes; existing production rows were intentionally not backfilled. This PR does not normalize them.",
+      "count": 5,
+      "evidence": {
+        "raw_side_distribution": {
+          "buy": 4,
+          "BUY": 1
+        },
+        "canonical_side_distribution": {
+          "BUY": 5
+        }
+      },
+      "recommendation": "Leave existing rows as-is (no backfill per PR24T). Future writes normalize via normalize_side_for_persistence."
+    },
+    {
+      "key": "collection_skip_reason_summary",
+      "severity": "info",
+      "summary": "Rows skipped from real evidence collection (expected gaps: no token_id, non-BUY side, missing price/size/id). NULL token_id rows cannot be collected and are blocked honestly, never invented.",
+      "count": 4,
+      "evidence": {
+        "skip_reason_counts": {
+          "missing_token_id": 4
+        }
+      },
+      "recommendation": "A future ingestion PR should populate token_id for real trades so real /book evidence can be collected. Until then, collection is limited to rows that already carry a token_id."
+    },
+    {
+      "key": "dry_run_offline_no_network",
+      "severity": "info",
+      "summary": "Default dry-run mode performed NO network fetch. Eligibility and field-availability were proven structurally against source_trades. Use --allow-live-preview to perform a real read-only /book fetch (still non-persisting).",
+      "count": null,
+      "evidence": {},
+      "recommendation": "Run with --allow-live-preview for a live evidence preview."
+    }
+  ],
+  "recommended_next_step": "PR24U proves the real /book collection path is wireable and reuses PolymarketClobClient. Next: (a) a guarded persistence writer that lands collected evidence into candidate_price_snapshots read-only by PR24S, and (b) a Gamma market-state client for market_active/closed/resolved + seconds_to_market_end. Do not wire automation or persist decisions until those land and are reviewed."
+}
