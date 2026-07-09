@@ -1,0 +1,244 @@
+{
+  "ready_to_wire_to_automation": false,
+  "ready_to_persist_decisions": false,
+  "ready_to_create_candidates": false,
+  "production_counts": {
+    "source_trades": 5,
+    "trade_copyability_decisions": 0,
+    "copy_candidates": 0,
+    "paper_signal_decisions": 0,
+    "candidate_price_snapshots": 0,
+    "candidate_price_snapshot_levels": 0,
+    "wallet_score_decisions": 1,
+    "settlement_accounting_ledger": 0,
+    "orders": 0,
+    "positions": 0
+  },
+  "source_trade_count": 5,
+  "eligible_count": 5,
+  "ineligible_count": 0,
+  "mappable_count": 1,
+  "unmappable_count": 4,
+  "resolved_count": 0,
+  "market_state_available_count": 0,
+  "end_time_available_count": 0,
+  "seconds_available_count": 0,
+  "raw_side_distribution": {
+    "buy": 4,
+    "BUY": 1
+  },
+  "canonical_side_distribution": {
+    "BUY": 5
+  },
+  "ingestion_side_inconsistency_present": true,
+  "live_preview_enabled": false,
+  "mapping_status_counts": {
+    "sample_skipped": 4,
+    "mappable": 1
+  },
+  "skip_reason_counts": {
+    "market_identifier_not_condition_id": 4,
+    "missing_token_id": 4
+  },
+  "sample_like_row_count": 4,
+  "db_path_inspected": "data/polycopy.db",
+  "row_reports": [
+    {
+      "source_trade_id": "sample-trade-sample-market-001-001",
+      "wallet_address": "0xsample_trader_a_do_not_use",
+      "market_source_id": "sample-market-001",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "eligible",
+      "mappability_status": "sample_skipped",
+      "metadata_lookup_identifier_used": "sample-market-001",
+      "market_active_available": false,
+      "market_active_value": null,
+      "market_closed_available": false,
+      "market_closed_value": null,
+      "market_resolved_available": false,
+      "market_resolved_value": null,
+      "market_end_time_available": false,
+      "market_end_time_value": null,
+      "seconds_to_market_end_available": false,
+      "seconds_to_market_end_value": null,
+      "market_identifier_mapping_status": "unresolvable_non_condition_id",
+      "metadata_fetched_at": null,
+      "pr24u_pr24s_combinable": false,
+      "pr24u_pr24s_combination_note": "sample/placeholder row; excluded from any combination (report-only).",
+      "skip_reason": "market_identifier_not_condition_id;missing_token_id",
+      "error_reason": null,
+      "notes": [
+        "no resolvable market identifier present; market-state metadata could not be fetched (honest: not invented)"
+      ]
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-001-002",
+      "wallet_address": "0xsample_trader_b_do_not_use",
+      "market_source_id": "sample-market-001",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "eligible",
+      "mappability_status": "sample_skipped",
+      "metadata_lookup_identifier_used": "sample-market-001",
+      "market_active_available": false,
+      "market_active_value": null,
+      "market_closed_available": false,
+      "market_closed_value": null,
+      "market_resolved_available": false,
+      "market_resolved_value": null,
+      "market_end_time_available": false,
+      "market_end_time_value": null,
+      "seconds_to_market_end_available": false,
+      "seconds_to_market_end_value": null,
+      "market_identifier_mapping_status": "unresolvable_non_condition_id",
+      "metadata_fetched_at": null,
+      "pr24u_pr24s_combinable": false,
+      "pr24u_pr24s_combination_note": "sample/placeholder row; excluded from any combination (report-only).",
+      "skip_reason": "market_identifier_not_condition_id;missing_token_id",
+      "error_reason": null,
+      "notes": [
+        "no resolvable market identifier present; market-state metadata could not be fetched (honest: not invented)"
+      ]
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-002-001",
+      "wallet_address": "0xsample_trader_a_do_not_use",
+      "market_source_id": "sample-market-002",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "eligible",
+      "mappability_status": "sample_skipped",
+      "metadata_lookup_identifier_used": "sample-market-002",
+      "market_active_available": false,
+      "market_active_value": null,
+      "market_closed_available": false,
+      "market_closed_value": null,
+      "market_resolved_available": false,
+      "market_resolved_value": null,
+      "market_end_time_available": false,
+      "market_end_time_value": null,
+      "seconds_to_market_end_available": false,
+      "seconds_to_market_end_value": null,
+      "market_identifier_mapping_status": "unresolvable_non_condition_id",
+      "metadata_fetched_at": null,
+      "pr24u_pr24s_combinable": false,
+      "pr24u_pr24s_combination_note": "sample/placeholder row; excluded from any combination (report-only).",
+      "skip_reason": "market_identifier_not_condition_id;missing_token_id",
+      "error_reason": null,
+      "notes": [
+        "no resolvable market identifier present; market-state metadata could not be fetched (honest: not invented)"
+      ]
+    },
+    {
+      "source_trade_id": "sample-trade-sample-market-002-002",
+      "wallet_address": "0xsample_trader_b_do_not_use",
+      "market_source_id": "sample-market-002",
+      "token_id": null,
+      "side": "buy",
+      "eligibility_status": "eligible",
+      "mappability_status": "sample_skipped",
+      "metadata_lookup_identifier_used": "sample-market-002",
+      "market_active_available": false,
+      "market_active_value": null,
+      "market_closed_available": false,
+      "market_closed_value": null,
+      "market_resolved_available": false,
+      "market_resolved_value": null,
+      "market_end_time_available": false,
+      "market_end_time_value": null,
+      "seconds_to_market_end_available": false,
+      "seconds_to_market_end_value": null,
+      "market_identifier_mapping_status": "unresolvable_non_condition_id",
+      "metadata_fetched_at": null,
+      "pr24u_pr24s_combinable": false,
+      "pr24u_pr24s_combination_note": "sample/placeholder row; excluded from any combination (report-only).",
+      "skip_reason": "market_identifier_not_condition_id;missing_token_id",
+      "error_reason": null,
+      "notes": [
+        "no resolvable market identifier present; market-state metadata could not be fetched (honest: not invented)"
+      ]
+    },
+    {
+      "source_trade_id": "test_trade_1",
+      "wallet_address": "0xtest",
+      "market_source_id": "0xeb348b65a59bb2752d3dd10636d17de501df76a424e978e136d22e76d07c84e9",
+      "token_id": "72753295727566659208677964635039361717871718602259295378609650323504626128275",
+      "side": "BUY",
+      "eligibility_status": "eligible",
+      "mappability_status": "mappable",
+      "metadata_lookup_identifier_used": "0xeb348b65a59bb2752d3dd10636d17de501df76a424e978e136d22e76d07c84e9",
+      "market_active_available": false,
+      "market_active_value": null,
+      "market_closed_available": false,
+      "market_closed_value": null,
+      "market_resolved_available": false,
+      "market_resolved_value": null,
+      "market_end_time_available": false,
+      "market_end_time_value": null,
+      "seconds_to_market_end_available": false,
+      "seconds_to_market_end_value": null,
+      "market_identifier_mapping_status": "resolved_via_market_source_id",
+      "metadata_fetched_at": null,
+      "pr24u_pr24s_combinable": true,
+      "pr24u_pr24s_combination_note": "market_active/closed/resolved/end_time/seconds_to_market_end can be merged into PR24S SnapshotEvidenceResult and PR24U row report (both already carry these fields, currently None).",
+      "skip_reason": null,
+      "error_reason": null,
+      "notes": [
+        "offline dry-run; no Gamma fetch performed"
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "key": "ingestion_side_inconsistency",
+      "severity": "warning",
+      "summary": "source_trades.side contains multiple exact string forms for the same logical side (e.g. buy vs BUY). PR24T normalization guard handles future writes; existing production rows were intentionally not backfilled. This PR does not normalize them.",
+      "count": 5,
+      "evidence": {
+        "raw_side_distribution": {
+          "buy": 4,
+          "BUY": 1
+        },
+        "canonical_side_distribution": {
+          "BUY": 5
+        }
+      },
+      "recommendation": "Leave existing rows as-is (no backfill per PR24T). Future writes normalize via normalize_side_for_persistence."
+    },
+    {
+      "key": "source_trade_sample_data_present",
+      "severity": "info",
+      "summary": "Of 5 source_trades inspected, 4 appear to be seeded/sample/placeholder rows (wallet/market/trade_id contain sample markers such as 0xsample_trader_*_do_not_use and sample-market-*). Real usable production-like market-state coverage is effectively n=1. This is report text only; the rows are NOT deleted, mutated, backfilled, or normalized.",
+      "count": 4,
+      "evidence": {
+        "source_trade_count": 5,
+        "sample_like_row_count": 4,
+        "effective_real_coverage_n": 1
+      },
+      "recommendation": "Treat the single non-sample mappable row (test_trade_1) as the only currently-real market-state resolution target. A future ingestion PR should populate real rows with conditionId-shaped market_source_id for broader coverage."
+    },
+    {
+      "key": "identifier_mapping_status_summary",
+      "severity": "info",
+      "summary": "Per-row market-identifier mapping status. 'mappable' means a conditionId-shaped market_source_id is present and resolvable via Gamma get_market. 'unresolvable_token_id_only' means only token_id is present (Gamma get_market keys on conditionId; a deferred token->condition helper is required). 'sample_skipped' / 'missing_identifier' are excluded.",
+      "count": 5,
+      "evidence": {
+        "mapping_status_counts": {
+          "sample_skipped": 4,
+          "mappable": 1
+        }
+      },
+      "recommendation": "Persist/ingest a conditionId-shaped market_source_id per real trade; add a token->condition mapping helper if token_id-only resolution is needed."
+    },
+    {
+      "key": "dry_run_offline_no_network",
+      "severity": "info",
+      "summary": "Default dry-run mode performed NO network fetch. Mappability and field-availability were proven structurally against source_trades. Use --allow-live-preview to perform a real read-only Gamma get_market fetch (still non-persisting).",
+      "count": null,
+      "evidence": {},
+      "recommendation": "Run with --allow-live-preview for a live metadata preview."
+    }
+  ],
+  "recommended_next_step": "PR24V proves the market-state / end-time evidence path is wireable by REUSING PolymarketPublicAdapter.get_market (Gamma /markets/{conditionId}) and reports which identifiers can resolve. Next: (a) a guarded persistence writer landing these fields into PR24S SnapshotEvidenceResult + PR24U row report (both already carry them, currently None), and (b) a token->condition mapping helper for token_id-only rows. Do not wire automation or persist decisions until those land and are reviewed."
+}
