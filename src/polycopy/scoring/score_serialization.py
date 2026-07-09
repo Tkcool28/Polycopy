@@ -225,6 +225,14 @@ def _trade_input(result) -> Any:
         has_valid_strategy=getattr(result, "has_valid_strategy", None),
         has_complete_data=getattr(result, "has_complete_data", None),
         market_category=getattr(result, "market_category", None),
+        # PR24P: trace fields (additive; None when absent).
+        source_entry_price=getattr(result, "source_entry_price", None),
+        current_copy_price=getattr(result, "current_copy_price", None),
+        estimated_fill_price=getattr(result, "estimated_fill_price", None),
+        source_trade_timestamp=getattr(result, "source_trade_timestamp", None),
+        price_snapshot_fetched_at=getattr(
+            result, "price_snapshot_fetched_at", None),
+        evaluation_timestamp=getattr(result, "evaluation_timestamp", None),
     )
 
 
@@ -773,11 +781,13 @@ def persist_trade_score_v1(
                 price_deterioration_pct, side, intended_stake, executable_depth, fill_percentage,
                 spread, best_bid_size, best_ask_size, trade_age_seconds, seconds_to_market_end,
                 market_active, market_closed, market_resolved,
+                source_entry_price, current_copy_price, estimated_fill_price,
+                source_trade_timestamp, price_snapshot_fetched_at, evaluation_timestamp,
                 depth_walk_json, insufficient_depth_reason,
                 component_scores_json, final_score, verdict, missing_essentials_json,
                 rejection_reasons_json, source_data_timestamp, computed_at, created_at,
                 candidate_id, price_snapshot_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
         """,
         params=(
@@ -799,6 +809,13 @@ def persist_trade_score_v1(
             inp.market_active,
             inp.market_closed,
             inp.market_resolved,
+            # PR24P price-trace columns (additive; None when absent)
+            inp.source_entry_price,
+            inp.current_copy_price,
+            inp.estimated_fill_price,
+            inp.source_trade_timestamp,
+            inp.price_snapshot_fetched_at,
+            inp.evaluation_timestamp,
             # Depth-walk audit evidence (Phase 7 + Phase 9)
             depth_walk_json,
             insufficient_reason,

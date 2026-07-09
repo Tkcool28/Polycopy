@@ -43,7 +43,7 @@ natively idempotent in SQLite.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Import v10 schema changes
 from polycopy.db.schema_v10 import _V10_DDL  # noqa: E402
@@ -75,6 +75,14 @@ from polycopy.db.schema_v14 import _V14_DDL  # noqa: E402
 # scoring formula, PR20 runtime, timer, live fetch, or production apply
 # is enabled by this migration.
 from polycopy.db.schema_v15 import _V15_DDL  # noqa: E402
+
+# Import v16 schema changes (PR24P — additive Trade Copyability v1 price-trace
+# columns on trade_copyability_decisions). No scoring formula, timer,
+# automation, or production DB write is enabled by this migration. The
+# production DB is migrated only later, when a service is intentionally
+# deployed/restarted (the runner applies this migration idempotently on
+# next connect).
+from polycopy.db.schema_v16 import _V16_DDL  # noqa: E402
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -811,6 +819,7 @@ MIGRATIONS: dict[int, list[str]] = {
     13: _V13_DDL,
     14: _V14_DDL,
     15: _V15_DDL,
+    16: _V16_DDL,
 }
 
 # Current DDL is the latest migration
