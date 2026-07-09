@@ -95,40 +95,93 @@ def test_writer_persists_uppercase_sell():
 
 
 # ---------------------------------------------------------------------------
-# 6. Writer rejects malformed side before persistence
+# 6. Malformed side -> controlled per-trade skip (no crash, no persist)
 # ---------------------------------------------------------------------------
-def test_writer_rejects_malformed_side():
+def test_writer_skips_malformed_side_cleanly(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="polycopy.discovery.wallet_discovery")
     disc = TradeDetector()
-    with pytest.raises(ValueError):
-        disc.process_trade(
-            source="test",
-            source_trade_id="st-bad-1",
-            wallet_address="0xtrader_do_not_use",
-            market_source_id="mkt-do-not-use",
-            side="unknown",  # not a valid logical side
-            outcome="Yes",
-            quantity=10.0,
-            price=0.5,
-            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
-            is_sample=True,
-        )
+    result = disc.process_trade(
+        source="test",
+        source_trade_id="st-bad-1",
+        wallet_address="0xtrader_do_not_use",
+        market_source_id="mkt-do-not-use",
+        side="unknown",  # not a valid logical side
+        outcome="Yes",
+        quantity=10.0,
+        price=0.5,
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        is_sample=True,
+    )
+    # Controlled skip: no exception escapes, nothing persisted.
+    assert result is None
+    assert any("invalid side" in r.message for r in caplog.records)
 
 
-def test_writer_rejects_missing_side():
+def test_writer_skips_missing_side_cleanly(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="polycopy.discovery.wallet_discovery")
     disc = TradeDetector()
-    with pytest.raises(ValueError):
-        disc.process_trade(
-            source="test",
-            source_trade_id="st-none-1",
-            wallet_address="0xtrader_do_not_use",
-            market_source_id="mkt-do-not-use",
-            side=None,
-            outcome="Yes",
-            quantity=10.0,
-            price=0.5,
-            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
-            is_sample=True,
-        )
+    result = disc.process_trade(
+        source="test",
+        source_trade_id="st-none-1",
+        wallet_address="0xtrader_do_not_use",
+        market_source_id="mkt-do-not-use",
+        side="",  # missing/blank side -> invalid, must skip
+        outcome="Yes",
+        quantity=10.0,
+        price=0.5,
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        is_sample=True,
+    )
+    assert result is None
+    assert any("invalid side" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 2 (PATCH 2). Batch continuation: bad trade #1 does not block valid trade #2
+# ---------------------------------------------------------------------------
+def test_invalid_side_skips_only_bad_trade_and_next_trade_still_processes(caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="polycopy.discovery.wallet_discovery")
+    disc = TradeDetector()
+
+    bad = disc.process_trade(
+        source="test",
+        source_trade_id="st-bad-1",
+        wallet_address="0xtrader_do_not_use",
+        market_source_id="mkt-do-not-use",
+        side="BID",  # malformed
+        outcome="Yes",
+        quantity=10.0,
+        price=0.5,
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        is_sample=True,
+    )
+    # Bad trade #1: skipped, nothing persisted, no exception escapes.
+    assert bad is None
+    assert any("st-bad-1" in r.message for r in caplog.records)
+
+    good = disc.process_trade(
+        source="test",
+        source_trade_id="st-good-2",
+        wallet_address="0xtrader_do_not_use",
+        market_source_id="mkt-do-not-use",
+        side="buy",  # valid, lowercase
+        outcome="Yes",
+        quantity=10.0,
+        price=0.5,
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        is_sample=True,
+    )
+    # Valid trade #2: still processed and normalized to uppercase BUY.
+    assert good is not None
+    assert good.source_trade_id == "st-good-2"
+    assert good.side == "BUY"
+
 
 
 # ---------------------------------------------------------------------------
