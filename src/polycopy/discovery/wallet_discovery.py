@@ -23,6 +23,9 @@ from polycopy.discovery.models import (
     TrackedTrade,
     WalletSource,
 )
+from polycopy.discovery.source_trade_side import (
+    normalize_source_trade_side_for_persistence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -354,12 +357,18 @@ class TradeDetector:
         is_stale = age_seconds > self.staleness_seconds
         staleness_seconds = max(age_seconds - self.staleness_seconds, 0.0)
 
+        # PR24T: normalize side at the persistence boundary so future
+        # source_trades.side rows are canonical (BUY/SELL uppercase).
+        # Raises ValueError on malformed/missing side instead of persisting
+        # inconsistent casing. This does NOT backfill existing production rows.
+        side_for_persistence = normalize_source_trade_side_for_persistence(side)
+
         trade = TrackedTrade(
             source_trade_id=source_trade_id,
             source=source,
             wallet_address=wallet_address.lower().strip(),
             market_source_id=market_source_id,
-            side=side,
+            side=side_for_persistence,
             outcome=outcome,
             quantity=quantity,
             price=price,
