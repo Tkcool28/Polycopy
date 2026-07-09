@@ -23,6 +23,9 @@ from polycopy.discovery.models import (
     TrackedTrade,
     WalletSource,
 )
+from polycopy.discovery.source_trade_side import (
+    normalize_source_trade_side_for_persistence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -304,11 +307,14 @@ class TradeDetector:
         timestamp: datetime,
         now: Optional[datetime] = None,
         is_sample: bool = False,
-    ) -> TrackedTrade:
+    ) -> Optional[TrackedTrade]:
         """Process an incoming trade through dedup and staleness checks.
 
-        The trade is always returned as a TrackedTrade, with
-        is_duplicate and is_stale flags set appropriately.
+        Returns a ``TrackedTrade`` with ``is_duplicate`` and ``is_stale`` flags
+        set appropriately, OR ``None`` when the trade is skipped before
+        persistence (e.g. invalid/missing side — PR24T controlled per-trade
+        skip). A skipped trade is never persisted and its error is logged;
+        it does not abort sibling trades in the collection batch.
         """
         if now is None:
             now = datetime.now(timezone.utc)
@@ -354,12 +360,33 @@ class TradeDetector:
         is_stale = age_seconds > self.staleness_seconds
         staleness_seconds = max(age_seconds - self.staleness_seconds, 0.0)
 
+        # PR24T: normalize side at the persistence boundary so future
+        # source_trades.side rows are canonical (BUY/SELL uppercase).
+        # Invalid/missing side must never be persisted. Instead of letting the
+        # ValueError abort the whole collection batch, skip this one trade
+        # cleanly (log context, return None, persist nothing). This keeps the
+        # persistence guard strict while not crashing sibling trades.
+        try:
+            side_for_persistence = normalize_source_trade_side_for_persistence(side)
+        except ValueError as exc:
+            logger.warning(
+                "Skipping source trade with invalid side before persistence: "
+                "source_trade_id=%s wallet_address=%s market_source_id=%s "
+                "side=%r error=%s",
+                source_trade_id,
+                wallet_address,
+                market_source_id,
+                side,
+                exc,
+            )
+            return None
+
         trade = TrackedTrade(
             source_trade_id=source_trade_id,
             source=source,
             wallet_address=wallet_address.lower().strip(),
             market_source_id=market_source_id,
-            side=side,
+            side=side_for_persistence,
             outcome=outcome,
             quantity=quantity,
             price=price,
