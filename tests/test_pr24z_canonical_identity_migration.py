@@ -13,6 +13,7 @@ from polycopy.migrations.pr24z_canonical_identity import (
     migrate,
     trust_gate,
 )
+from polycopy.migrations.pr24z_marker import validate_pr24z_migration_marker
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -295,6 +296,14 @@ def test_20_marker_created_only_after_complete_verification(tmp_path):
     res = migrate(path, apply=True, marker_path=marker, reports_dir=tmp_path / "reports")
     data = json.loads(marker.read_text())
     assert res.ok and marker.exists() and data["canonical_row_count"] == 14 and data["legacy_row_count"] == 0 and data["integrity_result"] == "ok"
+
+
+def test_20b_migration_marker_conforms_to_shared_validator(tmp_path):
+    path = _db(tmp_path)
+    marker = tmp_path / "marker.json"
+    res = migrate(path, apply=True, marker_path=marker, reports_dir=tmp_path / "reports")
+    validation = validate_pr24z_migration_marker(marker, path)
+    assert res.ok and validation.valid
 
 
 def test_21_normal_ingestion_still_contains_no_permanent_legacy_alias_behavior():
