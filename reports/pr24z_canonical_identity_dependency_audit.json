@@ -1,0 +1,79 @@
+{
+  "no_unsafe_dependent_reference_exists": true,
+  "tables": {
+    "candidate_price_snapshot_levels": {
+      "exists": true,
+      "references": [],
+      "target_reference_count": 0
+    },
+    "candidate_price_snapshots": {
+      "exists": true,
+      "references": [],
+      "target_reference_count": 0
+    },
+    "copy_candidates": {
+      "exists": true,
+      "references": [
+        {
+          "column": "source_trade_id",
+          "legacy_source_trade_id_rows": 0,
+          "source_trades_id_rows": 0
+        },
+        {
+          "column": "source_trade_internal_id",
+          "source_trades_id_rows": 0
+        }
+      ],
+      "target_reference_count": 0
+    },
+    "orders": {
+      "exists": true,
+      "references": [],
+      "target_reference_count": 0
+    },
+    "paper_signal_decisions": {
+      "exists": true,
+      "references": [
+        {
+          "column": "source_trade_id",
+          "legacy_source_trade_id_rows": 0,
+          "source_trades_id_rows": 0
+        }
+      ],
+      "target_reference_count": 0
+    },
+    "positions": {
+      "exists": true,
+      "references": [],
+      "target_reference_count": 0
+    },
+    "settlement_accounting_ledger": {
+      "exists": true,
+      "references": [
+        {
+          "column": "source_trade_id",
+          "legacy_source_trade_id_rows": 0,
+          "source_trades_id_rows": 0
+        }
+      ],
+      "target_reference_count": 0
+    },
+    "trade_copyability_decisions": {
+      "exists": true,
+      "references": [
+        {
+          "column": "source_trade_id",
+          "legacy_source_trade_id_rows": 0,
+          "source_trades_id_rows": 0
+        }
+      ],
+      "target_reference_count": 0
+    },
+    "wallet_score_decisions": {
+      "exists": true,
+      "references": [],
+      "target_reference_count": 0,
+      "wallet_score_decisions_linkage": "otherwise trade-linked"
+    }
+  }
+}
