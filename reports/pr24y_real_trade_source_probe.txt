@@ -1,72 +1,99 @@
-PR24Y — REAL WALLET TRADE SOURCE PROBE (human summary)
-=========================================================
+# PR24Y — Real Wallet Trade Source Probe
 
-STATUS: SAFE / PARKED / PAPER-ONLY / NON-AUTOMATED
-SCOPE: Step 1/Step 2 source probe only. Read-only, no ingestion.
-PROBE VERSION: PR24Y-1
+**Probe version:** PR24Y-1  
+**Generated at:** 2026-07-10T03:37:42.104098+00:00  
+**Live preview enabled:** True  
+**Network calls attempted/succeeded:** 1/1  
+**Mode:** read-only source probe (no DB, no writes)
 
-SELECTED SOURCE: polymarket_data_api_trades_user
-  Endpoint : GET https://data-api.polymarket.com/trades?user=<addr>
-  Client   : PolymarketPublicAdapter.get_trades_by_address (EXISTING, reused)
-  Auth     : NONE (unauthenticated public endpoint)
-  Verdict  : SOURCE_PARTIAL until a live preview demonstrates real records;
-             structurally confirmed by repo audit as the right source.
+## Source Selection
+- selected_source: **polymarket_data_api_trades_user**
+- source_selection_verdict: **SOURCE_CONFIRMED**
+- source_candidates_examined: 5
 
-WHY THIS SOURCE:
-  - Unauthenticated wallet-attributed trade history.
-  - Wallet-filterable via user=<addr>.
-  - Paginated (offset+limit), bounded.
-  - Returns every field Polycopy needs:
-      * proxyWallet  (trader address)      YES
-      * side         (BUY/SELL)             YES
-      * asset        (CLOB token_id)        YES
-      * conditionId  (market identifier)    YES
-      * size         (quantity)             YES
-      * price        ([0,1] probability)    YES
-      * timestamp    (Unix seconds)         YES
-      * transactionHash (stable trade id)   YES
-      * title/slug   (market metadata)      YES
-  - Stable identity: transactionHash is unique per trade -> natural dedup key
-    (UNIQUE(source, source_trade_id)); row-distinguishing key available
-    (deterministic_source_trade_id_v2) if needed.
+## Counters
+- wallet_count: 1
+- record_limit: 25
+- pages_fetched: 1
+- raw_records: 25
+- raw_buy_records: 14
+- raw_sell_records: 11
+- unknown_side_records: 0
+- eligible_buy_records: 14
+- excluded_unsupported_side: 11
+- excluded_missing_fields: 0
 
-SOURCES REJECTED / NOT USED:
-  - polymarket_clob_trades (CLOB /trades): REQUIRES AUTH (HTTP 401). Not used.
-  - polymarket_gamma_markets: market metadata only, no trade history.
-  - run_scan / collect_smart_money_data: duplicated collector-owned source_trades
-    WRITERS (PR24X). Excluded as probe sources; future ingestion must delegate
-    to ONE centralized writer, not these.
+## Field Coverage
+- token_id_available_count: 25
+- condition_id_available_count: 25
+- price_available_count: 25
+- size_available_count: 25
+- timestamp_available_count: 25
+- pr24u_ready_count: 25
+- pr24v_ready_count: 25
+- both_ready_count: 25
 
-BUY-ONLY V1 RULE:
-  - BUY records evaluated for eligibility (all required fields present).
-  - SELL records classified excluded_unsupported_side (observed, never eligible).
-  - Missing/unknown side -> excluded_missing_fields.
+## Stable Identity
+- stable_source_trade_id_available: **True**
+- identity_field: transactionHash (source trade/fill id)
+- identity_uniqueness_confidence: high
+- fallback_components_available: ['wallet_address', 'token_id/conditionId', 'side', 'price', 'size', 'timestamp']
+- collision_risk_notes: transactionHash unique across observed records; suitable as natural dedup key (UNIQUE(source, source_trade_id)).
 
-READINESS (observational; no mapping performed here):
-  - PR24U-ready : token_id present and non-placeholder.
-  - PR24V-ready : conditionId present OR token->condition mapping available (PR24W).
-  - both-ready  : PR24U-ready AND PR24V-ready.
+## Pagination
+- pagination_supported: True
+- incremental_cursor_supported: True
+- response_shape_stable: True
+- notes: Observed 25 records across 1 page(s); 14 eligible BUY. data-api GET /trades?user=<addr> is unauthenticated, wallet-filterable, paginated (offset+limit), and returns proxyWallet, side, asset (token_id), conditionId, size, price, timestamp, and transactionHash. CLOB /trades requires auth; Gamma is market-metadata only; run_scan/collect are writer-owning collectors (excluded as probe sources).
 
-NETWORK SAFETY (enforced in core + CLI):
-  - Default mode: NO network, NO DB, NO writes (fixture provider).
-  - Live mode requires --allow-live-preview AND explicit wallet.
-  - Default limit 25, hard max 100 records.
-  - PR24Y fetches at most 2 pages per wallet.
-  - Single wallet default; explicit hard max 5.
-  - No concurrent workers, no timers, no background process.
-  - No rate-limit hammering (provider throttles; bounded retries on 429).
+## Source Candidates Examined
+- **polymarket_data_api_trades_user** (`PolymarketPublicAdapter.get_trades_by_address`)
+  - endpoint: GET https://data-api.polymarket.com/trades?user=<addr>
+  - auth_required: False | wallet_filter: True | pagination: True
+  - returns side/price/size/token_id/condition_id/tx_hash: True/True/True/True/True/True
+  - fetch_only_safe: True | used_by_production_scan: False
+  - Unauthenticated wallet-attributed trades; best PR24Y fit.
+- **polymarket_data_api_trades_market** (`PolymarketPublicAdapter.fetch_trades_for_market`)
+  - endpoint: GET https://data-api.polymarket.com/trades?market=<conditionId>
+  - auth_required: False | wallet_filter: False | pagination: True
+  - returns side/price/size/token_id/condition_id/tx_hash: True/True/True/True/True/True
+  - fetch_only_safe: True | used_by_production_scan: True
+  - Used by collectors; market-scoped, not wallet-scoped.
+- **polymarket_clob_trades** (`PolymarketClobAdapter.fetch_book (book only)`)
+  - endpoint: GET https://clob.polymarket.com/trades
+  - auth_required: True | wallet_filter: False | pagination: False
+  - returns side/price/size/token_id/condition_id/tx_hash: False/True/True/True/False/False
+  - fetch_only_safe: True | used_by_production_scan: False
+  - Authenticated; order book only, not trade history.
+- **polymarket_gamma_markets** (`PolymarketPublicAdapter (Gamma)`)
+  - endpoint: GET https://gamma-api.polymarket.com/markets
+  - auth_required: False | wallet_filter: False | pagination: True
+  - returns side/price/size/token_id/condition_id/tx_hash: False/False/False/False/True/False
+  - fetch_only_safe: True | used_by_production_scan: False
+  - Market metadata; no trade history.
+- **run_scan_collector_writer** (`scripts/run_scan.py / collect_smart_money_data.py`)
+  - endpoint: collector-owned source_trades writers (duplicated)
+  - auth_required: False | wallet_filter: True | pagination: True
+  - returns side/price/size/token_id/condition_id/tx_hash: True/True/True/True/True/True
+  - fetch_only_safe: False | used_by_production_scan: True
+  - PR24X: duplicated collector-owned writers; NOT a probe source. Future ingestion must delegate to one centralized writer.
 
-SAFETY FLAGS (always False in PR24Y):
-  - production_db_opened          = False
-  - production_db_written          = False
-  - ready_for_PR24Z                = True ONLY if real records confirm fields
-  - ready_to_persist_source_trades = False
-  - ready_to_wire_to_automation    = False
+## Safety / Guardrails
+- production_db_opened: **False**
+- production_db_written: **False**
+- main_db_size_before: **520192**
+- main_db_mtime_before: **1783652676**
+- main_db_size_after: **520192**
+- main_db_mtime_after: **1783652676**
+- db_mtime_change_mechanism: **None**
+- adapter_gap_notes: **None**
+- ready_for_pr24z: **True**
+- ready_to_persist_source_trades: **False**
+- ready_to_wire_to_automation: **False**
 
-NEXT STEP (PR24Z): generate in-memory normalized source_trade candidate rows
-from this source (no DB writes), proving field coverage on real fetched data.
-Do NOT implement ingestion in PR24Y.
-
-HARD GUARDRAILS HONORED: no deploy/service restart/timer; no production DB
-writes; no source_trades mutation; no backfill; no real ingestion; no scoring/
-decisions/candidates/signals/snapshots/orders/positions; no automation; BUY-only.
+## Sample Previews (first 5 of 25)
+- #0 side=BUY token_id=YES cond=YES elig=eligible_buy pr24u=True pr24v=True
+- #2 side=SELL token_id=YES cond=YES elig=excluded_unsupported_side pr24u=True pr24v=True
+- #4 side=BUY token_id=YES cond=YES elig=eligible_buy pr24u=True pr24v=True
+- #6 side=BUY token_id=YES cond=YES elig=eligible_buy pr24u=True pr24v=True
+- #8 side=SELL token_id=YES cond=YES elig=excluded_unsupported_side pr24u=True pr24v=True

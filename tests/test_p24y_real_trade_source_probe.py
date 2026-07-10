@@ -21,7 +21,8 @@ PR24Y (Step 1/Step 2 source probe only; no ingestion):
   * no INSERT/UPDATE/DELETE/CREATE/DROP/ALTER execution path
   * no decisions/candidates/signals/snapshots/orders/positions
   * no timer/service/deploy behavior
-  * production DB size+mtime unchanged if optional mode=ro mapping tested
+  * production DB never opened by the probe; size/mtime captured via
+    os.stat only (separate from the probe) and reported in the result
 
 No automated test calls the real API (fake providers + fixtures only).
 """
@@ -73,7 +74,11 @@ class _FakeProvider:
 
     Each entry in ``pages`` is a full API page (not offset-sliced); this
     matches the real data-api contract where page N is fetched independently.
+    ``made_network_call`` is False to signal the probe this is NOT a real
+    external HTTP request (so network counters stay 0).
     """
+
+    made_network_call = False
 
     def __init__(self, pages):
         self.pages = pages
@@ -88,16 +93,31 @@ class _FakeProvider:
 
 # ── 1. Default probe makes no network call ───────────────────────────────────
 def test_default_probe_makes_no_network_call():
-    provider = _FakeProvider([[]])  # empty -> no records, but a call is made
+    # Default (fixture) provider does NOT count as a network call.
+    provider = _FakeProvider([[]])  # empty -> no records
     res = __import__("asyncio").run(
         run_real_trade_source_probe(provider, [FAKE_WALLET])
     )
-    # The probe always issues at least one provider call; "no network" means
-    # the *real* provider is never constructed in default mode. We assert the
-    # fake provider was used (no real httpx) and DB flags are False.
-    assert res.network_calls_attempted >= 1
+    # Fixture/in-memory providers are never counted as external HTTP requests.
+    assert res.network_calls_attempted == 0
+    assert res.network_calls_succeeded == 0
+    assert res.pages_fetched == 0
     assert res.production_db_opened is False
     assert res.production_db_written is False
+
+
+def test_default_fixture_run_reports_zero_network_and_pages():
+    # Explicit exact-value assertion required by the PR24Y correction.
+    provider = _FakeProvider([[]])
+    res = __import__("asyncio").run(
+        run_real_trade_source_probe(provider, [FAKE_WALLET])
+    )
+    assert res.live_preview_enabled is False
+    assert res.network_calls_attempted == 0
+    assert res.network_calls_succeeded == 0
+    assert res.pages_fetched == 0
+    assert res.raw_records == 0
+    assert res.source_selection_verdict == "SOURCE_PARTIAL"
 
 
 # ── 2. Live provider cannot run without --allow-live-preview ────────────────

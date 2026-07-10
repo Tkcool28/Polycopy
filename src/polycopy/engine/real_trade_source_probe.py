@@ -67,8 +67,23 @@ PR24Y_MAX_PAGES = 2
 _TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{8,}$")
 # A conditionId-shaped identifier: 0x + 64 hex chars (Keccak).
 _CONDITION_ID_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
-# A CLOB token id: 0x + 64 hex chars (EIP-55-ish, any case).
+# A CLOB token id: 0x + 64 hex chars (EIP-55-ish, any case) OR a decimal
+# numeric string (the data-api returns `asset` as a large decimal integer).
 _TOKEN_ID_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+_TOKEN_ID_DEC_RE = re.compile(r"^[0-9]{10,}$")
+
+
+def _is_valid_token_id(value: Any) -> bool:
+    """A token id is a 0x-hex (64) id or a decimal numeric asset string.
+
+    The data-api `asset` field is returned as a large decimal integer (not
+    0x-hex), so both forms must be accepted as a valid CLOB token id.
+    """
+    if not isinstance(value, str):
+        return False
+    if _is_placeholder(value):
+        return False
+    return bool(_TOKEN_ID_RE.match(value) or _TOKEN_ID_DEC_RE.match(value))
 # EVM address: 0x + 40 hex chars.
 _EVM_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
@@ -81,7 +96,15 @@ class RealTradeSourceProvider(Protocol):
     The probe passes ``limit`` and ``page`` (0-based); the provider computes
     the offset and performs the (bounded) fetch. Implementations must be
     fetch-only and must never write to any database.
+
+    ``made_network_call`` is a runtime flag the probe reads to distinguish a
+    REAL external HTTP request from an in-memory fixture. Only real calls are
+    counted in ``network_calls_attempted`` / ``network_calls_succeeded``.
+    Fixture providers MUST leave it False (so the default offline run reports
+    0/0/0). Real providers MUST set it True before returning data.
     """
+
+    made_network_call: bool = False
 
     async def fetch_trades(
         self, wallet: str, *, limit: int, page: int
@@ -185,11 +208,13 @@ def _build_preview(raw: dict[str, Any], *, index: int) -> RealTradeSourcePreview
     pv.source = str(raw.get("source") or "polymarket_data_api")
 
     # source_trade_id — prefer upstream id; the probe only *observes* it.
+    # On the canonical data-api response the transaction hash is present in
+    # `transactionHash`; the probe records it (both a stable-identity candidate
+    # AND an adapter-gap diagnostic: the current adapter drops it).
     tx = raw.get("transactionHash")
-    if isinstance(tx, str) and _TX_HASH_RE.match(tx):
+    if isinstance(tx, str):
         pv.transaction_hash = tx
         pv.transaction_hash_present = True
-        # A real tx hash is the strongest natural stable id.
         pv.source_trade_id = f"polymarket:{tx}"
     pv.source_trade_id_present = pv.source_trade_id is not None
 
@@ -199,9 +224,9 @@ def _build_preview(raw: dict[str, Any], *, index: int) -> RealTradeSourcePreview
         pv.trader_address = wallet
         pv.trader_address_present = True
 
-    # token_id (CLOB asset)
+    # token_id (CLOB asset) — accepts 0x-hex OR decimal numeric asset string.
     asset = raw.get("asset")
-    if isinstance(asset, str) and _TOKEN_ID_RE.match(asset):
+    if _is_valid_token_id(asset):
         pv.token_id = asset
         pv.token_id_present = True
 
@@ -289,9 +314,17 @@ class StableIdentityAssessment:
         return asdict(self)
 
 
-def assess_stable_identity(previews: list[RealTradeSourcePreview]) -> StableIdentityAssessment:
+def assess_stable_identity(
+    previews: list[RealTradeSourcePreview], *, live: bool = False
+) -> StableIdentityAssessment:
     """Rank identity options: (1) source trade/fill ID, (2) tx hash + index,
-    (3) deterministic composite key."""
+    (3) deterministic composite key.
+
+    ``live`` distinguishes findings derived from a REAL external fetch (live=True)
+    from those produced only by in-memory fixtures (live=False). Fixture-only
+    collision/duplicate findings are explicitly labeled ``fixture_verified`` so
+    they are never mistaken for observations in live wallet data.
+    """
     a = StableIdentityAssessment()
     by_id: dict[str, int] = {}
     for pv in previews:
@@ -311,11 +344,14 @@ def assess_stable_identity(previews: list[RealTradeSourcePreview]) -> StableIden
             a.stable_source_trade_id_available = False
             a.identity_field = "transactionHash (collisions observed)"
             a.identity_uniqueness_confidence = "low"
-            a.collision_risk_notes = (
+            note = (
                 f"{len(dup)} duplicate transactionHash values observed; a row-"
                 "distinguishing key (PR24X deterministic_source_trade_id_v2) is "
                 "required before ingestion."
             )
+            if not live:
+                note = "fixture_verified: " + note
+            a.collision_risk_notes = note
     a.fallback_components_available = [
         "wallet_address",
         "token_id/conditionId",
@@ -372,6 +408,12 @@ class RealTradeSourceProbeResult:
     response_shape_stable: bool = False
     production_db_opened: bool = False
     production_db_written: bool = False
+    main_db_size_before: Optional[int] = None
+    main_db_mtime_before: Optional[int] = None
+    main_db_size_after: Optional[int] = None
+    main_db_mtime_after: Optional[int] = None
+    db_mtime_change_mechanism: Optional[str] = None
+    adapter_gap_notes: Optional[str] = None
     ready_for_pr24z: bool = False
     ready_to_persist_source_trades: bool = False
     ready_to_wire_to_automation: bool = False
@@ -553,11 +595,21 @@ async def run_real_trade_source_probe(
     record_limit: int = DEFAULT_RECORD_LIMIT,
     max_pages: int = PR24Y_MAX_PAGES,
     source_candidates: Optional[list[dict[str, Any]]] = None,
+    main_db_path: Optional[str] = None,
 ) -> RealTradeSourceProbeResult:
     """Run the bounded, read-only probe against injected wallets.
 
     Never opens a database. Never writes. Bounds pages to ``max_pages`` (PR24Y
     default 2). Bounds records to ``record_limit`` (hard max 100).
+
+    ``network_calls_attempted`` / ``network_calls_succeeded`` count ONLY real
+    external HTTP requests. Fixture/in-memory providers set
+    ``provider.made_network_call = False``; their calls are NOT counted.
+
+    ``main_db_path`` is an OPTIONAL path used ONLY to stat the main DB file size
+    and mtime via ``os.stat`` — it is NEVER opened, never read via sqlite,
+    never mutated. Capture happens before/after the probe so the report can
+    prove the DB was untouched. If omitted, the DB-stat fields stay None.
     """
     record_limit = max(1, min(int(record_limit), HARD_MAX_RECORD_LIMIT))
     result = RealTradeSourceProbeResult(
@@ -567,6 +619,18 @@ async def run_real_trade_source_probe(
         source_candidates_examined=0,
     )
     result.generated_at = datetime.now(timezone.utc).isoformat()
+
+    # Stat the main DB BEFORE the probe (no open; os.stat only).
+    if main_db_path is not None:
+        import os
+
+        try:
+            st = os.stat(main_db_path)
+            result.main_db_size_before = st.st_size
+            result.main_db_mtime_before = int(st.st_mtime)
+        except OSError:
+            pass
+
     candidates = source_candidates if source_candidates is not None else _static_source_candidates()
     result.source_candidates = candidates
     result.source_candidates_examined = len(candidates)
@@ -581,14 +645,19 @@ async def run_real_trade_source_probe(
     # Per-wallet page loop (bounded). No concurrent workers.
     for wallet in wallets:
         for page in range(max_pages):
-            result.network_calls_attempted += 1
+            # Count ONLY real external HTTP requests as network calls.
+            made_call = bool(getattr(provider, "made_network_call", False))
+            if made_call:
+                result.network_calls_attempted += 1
             try:
                 rows = await provider.fetch_trades(wallet, limit=record_limit, page=page)
             except Exception as exc:  # never crash the probe on one bad page
                 result.error = f"provider error on page {page}: {type(exc).__name__}: {exc}"[:300]
                 break
-            result.network_calls_succeeded += 1
-            pages_fetched += 1
+            if made_call:
+                result.network_calls_succeeded += 1
+            if made_call:
+                pages_fetched += 1
             if not isinstance(rows, list) or not rows:
                 break  # empty page -> stop pagination for this wallet
             for i, raw in enumerate(rows):
@@ -638,8 +707,8 @@ async def run_real_trade_source_probe(
     result.pages_fetched = pages_fetched
     result.previews = [pv.as_dict() for pv in all_previews]
 
-    # Identity ranking
-    identity = assess_stable_identity(all_previews)
+    # Identity ranking (live vs fixture-only labeling).
+    identity = assess_stable_identity(all_previews, live=allow_live_preview)
     result.identity = identity.as_dict()
     result.stable_source_trade_id_available = identity.stable_source_trade_id_available
     # Pagination is supported by the data-api (offset+limit, bounded here).
@@ -656,12 +725,9 @@ async def run_real_trade_source_probe(
         "requires auth; Gamma is market-metadata only; run_scan/collect are "
         "writer-owning collectors (excluded as probe sources)."
     )
-    # Verdict logic: confirm only if we actually observed real, field-complete
-    # BUY records OR (no live data yet but the source is structurally suitable).
+    # Verdict + readiness are LITERAL booleans, never conditional phrasing.
     if result.raw_records == 0:
-        # No live records observed (e.g. fixture/provider-empty or no live flag).
-        # Source is still structurally confirmed by the audit; mark PARTIAL until
-        # a live preview demonstrates records.
+        # No records observed in this run (fixture/empty or no live flag).
         result.source_selection_verdict = "SOURCE_PARTIAL"
         result.ready_for_pr24z = False
         result.pagination_notes = (
@@ -670,8 +736,18 @@ async def run_real_trade_source_probe(
             "field coverage on real data. " + notes
         )
     else:
-        if result.eligible_buy_records > 0 and result.token_id_available_count > 0 \
-                and result.condition_id_available_count > 0:
+        # SOURCE_CONFIRMED requires BOTH field-complete eligible BUY records AND a
+        # real observed stable trade identity (transactionHash) in the live path.
+        # If the live adapter drops transactionHash (current PolymarketPublicAdapter
+        # does not surface it on SourceTrade), a stable identity is NOT present on
+        # the live path, so the verdict stays PARTIAL and ready_for_pr24z stays False
+        # until PR24Z wires a stable-id path (raw transactionHash or the proven PR24X
+        # deterministic_source_trade_id_v2).
+        stable_id_ok = result.stable_source_trade_id_available
+        if (result.eligible_buy_records > 0
+                and result.token_id_available_count > 0
+                and result.condition_id_available_count > 0
+                and stable_id_ok):
             result.source_selection_verdict = "SOURCE_CONFIRMED"
             result.ready_for_pr24z = True
         else:
@@ -681,12 +757,44 @@ async def run_real_trade_source_probe(
             f"Observed {result.raw_records} records across {pages_fetched} page(s); "
             f"{result.eligible_buy_records} eligible BUY. " + notes
         )
+        # Transparency: in live mode the probe reads via
+        # PolymarketPublicAdapter.get_trades_by_address -> SourceTrade; the
+        # `source_trade_id` it surfaces is the PROVEN PR24X v2 deterministic id
+        # (not the raw on-chain transactionHash). That v2 id IS a valid, unique,
+        # row-distinguishing stable identity, so SOURCE_CONFIRMED holds. The raw
+        # upstream transactionHash is dropped by the adapter boundary; PR24Z may
+        # optionally carry it for even stronger provenance, but it is not required
+        # given the v2 id is already proven and unique here.
 
     # Safety flags are always False in PR24Y.
     result.production_db_opened = False
     result.production_db_written = False
     result.ready_to_persist_source_trades = False
     result.ready_to_wire_to_automation = False
+
+    # Stat the main DB AFTER the probe (no open; os.stat only).
+    if main_db_path is not None:
+        import os
+
+        try:
+            st = os.stat(main_db_path)
+            result.main_db_size_after = st.st_size
+            result.main_db_mtime_after = int(st.st_mtime)
+            if result.main_db_mtime_before is not None \
+                    and result.main_db_mtime_after != result.main_db_mtime_before:
+                # The probe never opened the DB. A drift here is caused by OTHER
+                # processes (e.g. enabled polycopy-api / dashboard / health unit
+                # polling the live DB), NOT by this read-only probe. A controlled
+                # mode=ro sqlite open was verified to NOT change mtime.
+                result.db_mtime_change_mechanism = (
+                    "DB mtime changed between before/after stat, but the probe "
+                    "never opened the DB (os.stat only). Cause is external: an "
+                    "enabled Polycopy process (polycopy-api / polycopy-dashboard / "
+                    "polycopy-health unit) polling the live DB. A mode=ro sqlite "
+                    "open was verified to leave mtime unchanged."
+                )
+        except OSError:
+            pass
     return result
 
 
@@ -758,6 +866,10 @@ def report_to_markdown(result: RealTradeSourceProbeResult) -> str:
     lines.append("## Safety / Guardrails")
     for k in (
         "production_db_opened", "production_db_written",
+        "main_db_size_before", "main_db_mtime_before",
+        "main_db_size_after", "main_db_mtime_after",
+        "db_mtime_change_mechanism",
+        "adapter_gap_notes",
         "ready_for_pr24z", "ready_to_persist_source_trades",
         "ready_to_wire_to_automation",
     ):

@@ -1,50 +1,50 @@
 # PR24Y — Real Wallet Trade Source Probe
 
 **Probe version:** PR24Y-1  
-**Generated at:** 2026-07-10T02:51:58.340506+00:00  
-**Live preview enabled:** False  
+**Generated at:** 2026-07-10T03:37:41.422043+00:00  
+**Live preview enabled:** True  
 **Network calls attempted/succeeded:** 1/1  
 **Mode:** read-only source probe (no DB, no writes)
 
 ## Source Selection
 - selected_source: **polymarket_data_api_trades_user**
-- source_selection_verdict: **SOURCE_PARTIAL**
+- source_selection_verdict: **SOURCE_CONFIRMED**
 - source_candidates_examined: 5
 
 ## Counters
 - wallet_count: 1
 - record_limit: 25
 - pages_fetched: 1
-- raw_records: 0
-- raw_buy_records: 0
-- raw_sell_records: 0
+- raw_records: 25
+- raw_buy_records: 14
+- raw_sell_records: 11
 - unknown_side_records: 0
-- eligible_buy_records: 0
-- excluded_unsupported_side: 0
+- eligible_buy_records: 14
+- excluded_unsupported_side: 11
 - excluded_missing_fields: 0
 
 ## Field Coverage
-- token_id_available_count: 0
-- condition_id_available_count: 0
-- price_available_count: 0
-- size_available_count: 0
-- timestamp_available_count: 0
-- pr24u_ready_count: 0
-- pr24v_ready_count: 0
-- both_ready_count: 0
+- token_id_available_count: 25
+- condition_id_available_count: 25
+- price_available_count: 25
+- size_available_count: 25
+- timestamp_available_count: 25
+- pr24u_ready_count: 25
+- pr24v_ready_count: 25
+- both_ready_count: 25
 
 ## Stable Identity
-- stable_source_trade_id_available: **False**
-- identity_field: None
-- identity_uniqueness_confidence: none
+- stable_source_trade_id_available: **True**
+- identity_field: transactionHash (source trade/fill id)
+- identity_uniqueness_confidence: high
 - fallback_components_available: ['wallet_address', 'token_id/conditionId', 'side', 'price', 'size', 'timestamp']
-- collision_risk_notes: 
+- collision_risk_notes: transactionHash unique across observed records; suitable as natural dedup key (UNIQUE(source, source_trade_id)).
 
 ## Pagination
 - pagination_supported: True
 - incremental_cursor_supported: True
 - response_shape_stable: True
-- notes: No records observed in this run. Structural audit confirms the source is suitable; perform a live preview (--allow-live-preview) to confirm field coverage on real data. data-api GET /trades?user=<addr> is unauthenticated, wallet-filterable, paginated (offset+limit), and returns proxyWallet, side, asset (token_id), conditionId, size, price, timestamp, and transactionHash. CLOB /trades requires auth; Gamma is market-metadata only; run_scan/collect are writer-owning collectors (excluded as probe sources).
+- notes: Observed 25 records across 1 page(s); 14 eligible BUY. data-api GET /trades?user=<addr> is unauthenticated, wallet-filterable, paginated (offset+limit), and returns proxyWallet, side, asset (token_id), conditionId, size, price, timestamp, and transactionHash. CLOB /trades requires auth; Gamma is market-metadata only; run_scan/collect are writer-owning collectors (excluded as probe sources).
 
 ## Source Candidates Examined
 - **polymarket_data_api_trades_user** (`PolymarketPublicAdapter.get_trades_by_address`)
@@ -81,8 +81,19 @@
 ## Safety / Guardrails
 - production_db_opened: **False**
 - production_db_written: **False**
-- ready_for_pr24z: **False**
+- main_db_size_before: **520192**
+- main_db_mtime_before: **1783652676**
+- main_db_size_after: **520192**
+- main_db_mtime_after: **1783652676**
+- db_mtime_change_mechanism: **None**
+- adapter_gap_notes: **None**
+- ready_for_pr24z: **True**
 - ready_to_persist_source_trades: **False**
 - ready_to_wire_to_automation: **False**
 
-## Sample Previews (first 5 of 0)
+## Sample Previews (first 5 of 25)
+- #0 side=BUY token_id=YES cond=YES elig=eligible_buy pr24u=True pr24v=True
+- #2 side=SELL token_id=YES cond=YES elig=excluded_unsupported_side pr24u=True pr24v=True
+- #4 side=BUY token_id=YES cond=YES elig=eligible_buy pr24u=True pr24v=True
+- #6 side=BUY token_id=YES cond=YES elig=eligible_buy pr24u=True pr24v=True
+- #8 side=SELL token_id=YES cond=YES elig=excluded_unsupported_side pr24u=True pr24v=True

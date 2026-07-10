@@ -33,7 +33,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Ensure the repo ``src`` is importable when run as a script.
 _HERE = Path(__file__).resolve().parent
@@ -75,6 +75,7 @@ class _RealDataApiProvider:
     async def fetch_trades(
         self, wallet: str, *, limit: int, page: int
     ) -> list[dict[str, Any]]:
+        self.made_network_call = True
         offset = page * limit
         from datetime import datetime, timezone
 
@@ -139,10 +140,16 @@ def main(argv: list[str] | None = None) -> int:
                              "explicit wallet. Still non-persisting.")
     parser.add_argument("--limit", type=int, default=DEFAULT_RECORD_LIMIT,
                         help=f"Records per page (hard max {HARD_MAX_RECORD_LIMIT}).")
+    parser.add_argument("--max-pages", type=int, default=PR24Y_MAX_PAGES,
+                        help=f"Max pages per wallet in PR24Y (hard cap {PR24Y_MAX_PAGES}).")
     parser.add_argument("--json", action="store_true",
                         help="Emit the report as valid JSON.")
     parser.add_argument("--out", default=None,
                         help="Optional file to write the report to.")
+    parser.add_argument("--main-db-path", default=None,
+                        help="OPTIONAL main DB path for stat-only size/mtime capture "
+                             "(os.stat; never opened). Defaults to data/polycopy.db "
+                             "when the file exists; pass empty to disable.")
     args = parser.parse_args(argv)
 
     # Wallet resolution (explicit only; no discovery, no DB list).
@@ -157,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     limit = max(1, min(args.limit, HARD_MAX_RECORD_LIMIT))
+    max_pages = max(1, min(args.max_pages, PR24Y_MAX_PAGES))
 
     # Provider selection: live only with the explicit flag; else fixture.
     if args.allow_live_preview:
@@ -167,6 +175,18 @@ def main(argv: list[str] | None = None) -> int:
         provider: Any = _RealDataApiProvider()
     else:
         provider = _FixtureProvider()
+        provider.made_network_call = False  # explicit; not counted as network
+
+    # OPTIONAL stat-only DB capture (os.stat; never opens the DB).
+    main_db_path: Optional[str] = None
+    if args.main_db_path == "":
+        main_db_path = None
+    elif args.main_db_path:
+        main_db_path = args.main_db_path
+    else:
+        default_db = _REPO_ROOT / "data" / "polycopy.db"
+        if default_db.exists():
+            main_db_path = str(default_db)
 
     try:
         result = asyncio.run(
@@ -175,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
                 wallets,
                 allow_live_preview=args.allow_live_preview,
                 record_limit=limit,
-                max_pages=PR24Y_MAX_PAGES,
+                max_pages=max_pages,
+                main_db_path=main_db_path,
             )
         )
     finally:
