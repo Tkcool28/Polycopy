@@ -86,6 +86,29 @@
 - inserted: 14
 - deduplicated: 0
 
+## Historical production rows (the REAL 14-row live write, NOT fixtures)
+- source_report_commit: 56fbd0ee67770af4df5c2dcd93d65eec4c2df583
+- mode: production-write
+- live: True
+- historical wallet (redacted): `0x…0579`
+- rows_inserted: 14
+- report→DB rows matched (exact source_trade_id selection): 14
+- fixture_rows_found: 0
+- reconciliation artifact: reports/pr24z_historical_production_row_reconciliation.json
+
+These 14 rows came from the first live production-write run against wallet `0x…0579` (mode=production-write, live=true, network 2/2). They are proven real by field-for-field reconciliation against the production DB (14/14 exact matches, 0 placeholder/fixture patterns).
+
+## Fixture verification rows (NO production write — separate read-only safety run)
+- mode: safety-verification
+- live: False
+- network_calls_attempted: 0
+- fixture wallet (redacted): `0x…1111`
+- valid_fixture_rows: 3
+- write: null
+- rows_written_to_production: 0
+
+The 3 fixture `valid_rows` in the latest safety-verification report are deterministic test fixtures (0x1111…/0x2222…/0x3333…). They were NEVER written to production and must not be mistaken for the historical 14 production rows above.
+
 ## Database safety
 - db_path: /root/Polycopy/data/polycopy.db
 - size before/after: 528384 / 528384

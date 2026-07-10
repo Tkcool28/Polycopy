@@ -402,7 +402,11 @@ def normalize_source_trade(
 
     # ── token_id / conditionId (reject placeholders) ──
     asset = raw.get("asset")
+    if asset is None:
+        asset = raw.get("token_id")  # DB-row style field name
     cond = raw.get("conditionId")
+    if cond is None:
+        cond = raw.get("market_source_id")  # DB-row style field name
     token_ok = _is_valid_token_id(asset)
     cond_ok = isinstance(cond, str) and _CONDITION_ID_RE.match(cond) is not None
     # Placeholder detection: present-but-sentinel OR present-but-malformed
@@ -434,6 +438,8 @@ def normalize_source_trade(
 
     # ── quantity ──
     qty = _as_float(raw.get("size") if raw.get("size") is not None else raw.get("quantity"))
+    if qty is None:
+        qty = _as_float(raw.get("quantity"))  # DB-row style field name
     if qty is not None and qty > 0.0:
         candidate.quantity = qty
     else:
@@ -450,7 +456,8 @@ def normalize_source_trade(
 
     # ── trader address ──
     wallet = _canonicalize_wallet(
-        str(raw.get("proxyWallet") or raw.get("maker") or raw.get("trader") or "")
+        str(raw.get("proxyWallet") or raw.get("maker") or raw.get("trader")
+            or raw.get("trader_address") or "")
     )
     candidate.trader_address = wallet
     if requested_wallet is not None:

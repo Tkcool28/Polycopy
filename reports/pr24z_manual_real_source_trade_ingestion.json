@@ -254,5 +254,25 @@
     "attempted": 14,
     "inserted": 14,
     "deduplicated": 0
+  },
+  "historical_production_rows": {
+    "source_report_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "mode": "production-write",
+    "live": true,
+    "historical_wallet_redacted": "0x…0579",
+    "wallet_address": "0xcac76b761231464900cce5da7c20233d59b20579",
+    "rows_inserted": 14,
+    "report_db_rows_matched": 14,
+    "fixture_rows_found": 0,
+    "reconciliation_artifact": "reports/pr24z_historical_production_row_reconciliation.json"
+  },
+  "fixture_verification_rows": {
+    "mode": "safety-verification",
+    "live": false,
+    "network_calls_attempted": 0,
+    "fixture_wallet_redacted": "0x…1111",
+    "valid_fixture_rows": 3,
+    "write": null,
+    "rows_written_to_production": 0
   }
 }

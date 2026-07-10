@@ -74,10 +74,12 @@ from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
     SOURCE_NAME,
 )
 from polycopy.engine.real_trade_source_probe import is_valid_wallet_address  # noqa: E402
+
 from polycopy.ingestion.source_trade_writer import (  # noqa: E402
     write_valid_rows,
     create_verified_backup,
     assert_unique_dedupe_constraint,
+    run_identity_compatibility_gate,
     BackupResult,
     UniqueConstraintResult,
     legacy_fallback_id_from_db_row,
@@ -422,6 +424,33 @@ def _make_backup_legacy(db_path: str) -> Optional[str]:
         return None
 
 
+# Path to the committed historical 14-row production reference (read-only).
+_HISTORICAL_REFERENCE = _REPO_ROOT / "reports" / "pr24z_historical_production_reference.json"
+
+
+def _run_historical_compatibility_gate(db_path: str):
+    """Load the committed historical reference and run the HARD identity gate.
+
+    Returns an :class:`IdentityCompatibilityGate`. Pure read-only against the
+    production DB; never writes. Used by the production-write path BEFORE backup,
+    writer, and transaction begin.
+    """
+    if not _HISTORICAL_REFERENCE.exists():
+        # Fail closed if the reference artifact is missing.
+        gate = run_identity_compatibility_gate(SOURCE_NAME, [], db_path=db_path, expected=14)
+        gate.error = "historical reference missing: " + str(_HISTORICAL_REFERENCE)
+        gate.safe_for_future_production_write = False
+        return gate
+    try:
+        records = json.loads(_HISTORICAL_REFERENCE.read_text())
+    except Exception as exc:
+        gate = run_identity_compatibility_gate(SOURCE_NAME, [], db_path=db_path, expected=14)
+        gate.error = f"reference parse failed: {exc}"
+        gate.safe_for_future_production_write = False
+        return gate
+    return run_identity_compatibility_gate(SOURCE_NAME, records, db_path=db_path, expected=14)
+
+
 # ── Report rendering ───────────────────────────────────────────────────────────
 def _identity_block(c: IngestionCounters) -> dict[str, Any]:
     return {
@@ -447,6 +476,7 @@ def _build_report_payload(
     unique_constraint: Optional[UniqueConstraintResult] = None,
     process_gate: Optional[dict] = None,
     compatibility: Optional[dict] = None,
+    identity_compatibility_gate: Optional[dict] = None,
     db_path: Optional[str] = None,
     db_before: Optional[dict] = None,
     db_after: Optional[dict] = None,
@@ -508,6 +538,7 @@ def _build_report_payload(
         "unique_constraint": unique_constraint.as_dict() if unique_constraint is not None else None,
         "process_gate": process_gate,
         "compatibility": compatibility,
+        "identity_compatibility_gate": identity_compatibility_gate,
         "integrity_check": integrity,
         "foreign_key_check": fk,
     }
@@ -592,6 +623,21 @@ def _render_markdown(p: dict[str, Any]) -> str:
             f"- legacy_identity_aliases_used: {comp['legacy_identity_aliases_used']}",
             f"- rerun_would_insert: {comp['rerun_would_insert']}",
             f"- reconciliation_error: {comp['reconciliation_error']}",
+            "",
+        ]
+    if p.get("identity_compatibility_gate") is not None:
+        g = p["identity_compatibility_gate"]
+        lines += [
+            "## HARD GATE — identity compatibility (legacy 14 rows)",
+            f"- checked: {g['checked']}",
+            f"- historical_rows_expected: {g['historical_rows_expected']}",
+            f"- historical_rows_examined: {g['historical_rows_examined']}",
+            f"- canonical_matches: {g['canonical_matches']}",
+            f"- legacy_alias_matches: {g['legacy_alias_matches']}",
+            f"- unmatched: {g['unmatched']}",
+            f"- rerun_would_insert: {g['rerun_would_insert']}",
+            f"- safe_for_future_production_write: {g['safe_for_future_production_write']}",
+            f"- error: {g['error']}",
             "",
         ]
     if p.get("backup") is not None:
@@ -714,6 +760,17 @@ def _render_txt(p: dict[str, Any]) -> str:
             f"deduplicated={hw['deduplicated']}",
             "",
         ]
+    if p.get("identity_compatibility_gate") is not None:
+        g = p["identity_compatibility_gate"]
+        lines += [
+            "HARD GATE — identity compatibility (legacy 14 rows)",
+            f"  checked={g['checked']} expected={g['historical_rows_expected']} "
+            f"examined={g['historical_rows_examined']} canonical={g['canonical_matches']} "
+            f"legacy_alias={g['legacy_alias_matches']} unmatched={g['unmatched']} "
+            f"rerun_would_insert={g['rerun_would_insert']} "
+            f"safe={g['safe_for_future_production_write']} error={g['error']}",
+            "",
+        ]
     if p.get("db_before") or p.get("db_after"):
         lines += [
             "DATABASE SAFETY",
@@ -833,6 +890,7 @@ def main(argv: list[str] | None = None) -> int:
     unique_constraint: Optional[UniqueConstraintResult] = None
     process_gate: Optional[dict] = None
     compatibility: Optional[dict] = None
+    identity_compatibility_gate: Optional[dict] = None
     integrity = None
     fk = None
     mode = "dry-run"
@@ -891,6 +949,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: competing writer process(es) detected: {details}; "
                   f"aborting production write.", file=sys.stderr)
             return 2
+        # HARD GATE: legacy identity compatibility for the historical 14 rows.
+        # Must pass BEFORE backup creation, writer invocation, or transaction begin.
+        identity_gate = _run_historical_compatibility_gate(db_path)
+        if not identity_gate.safe_for_future_production_write:
+            print(
+                "error: identity_compatibility_gate FAILED -> refusing production write.\n"
+                f"  examined={identity_gate.historical_rows_examined} "
+                f"expected={identity_gate.historical_rows_expected} "
+                f"canonical={identity_gate.canonical_matches} "
+                f"legacy_alias={identity_gate.legacy_alias_matches} "
+                f"unmatched={identity_gate.unmatched} "
+                f"rerun_would_insert={identity_gate.rerun_would_insert}\n"
+                f"  error={identity_gate.error}\n"
+                "source_trades unchanged; do NOT rely on UNIQUE(source, source_trade_id) alone.",
+                file=sys.stderr,
+            )
+            return 2
+        # Capture the gate result for the report (read-only; already passed).
+        identity_compatibility_gate = identity_gate.as_dict()
         # Pre-flight: backup (hard gate).
         pre_size, pre_mtime = _db_stat(db_path)
         db_before = {"size": pre_size, "mtime": pre_mtime, "path": db_path,
@@ -987,6 +1064,9 @@ def main(argv: list[str] | None = None) -> int:
             unique_constraint = assert_unique_dedupe_constraint(db)
             integrity = _integrity(db)
             fk = _fk_check(db)
+            # HARD GATE proved read-only (evidence; never a write).
+            identity_gate = _run_historical_compatibility_gate(db_path)
+            identity_compatibility_gate = identity_gate.as_dict()
             db_before = {"size": _db_stat(db_path)[0], "mtime": _db_stat(db_path)[1],
                          "path": db_path, "counts": _table_counts(db)}
             # Compatibility analysis when allowed-live (bounded dry-run).
@@ -1029,6 +1109,7 @@ def main(argv: list[str] | None = None) -> int:
         unique_constraint=unique_constraint,
         process_gate=process_gate,
         compatibility=compatibility,
+        identity_compatibility_gate=identity_compatibility_gate,
         db_path=db_path if production_write else db_path,
         db_before=db_before,
         db_after=db_after,
