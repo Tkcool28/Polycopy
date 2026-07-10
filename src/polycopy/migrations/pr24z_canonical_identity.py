@@ -425,7 +425,11 @@ def migrate(db_path: Path, *, reference_path: Path = DEFAULT_REFERENCE_PATH, mar
                 })
                 mapping2.append(MappingRow(**d))
             result.mapping = mapping2
-            result.mapping_artifact_sha256 = write_mapping_csv(result.mapping, reports_dir / "pr24z_canonical_identity_migration_mapping.csv")
+            # Hygiene: the approved mapping artifact is a committed historical record of
+            # the old -> canonical conversion. Only the real migration (apply=True) may
+            # rewrite it; read-only preflight / idempotency runs must NOT mutate it.
+            if apply:
+                result.mapping_artifact_sha256 = write_mapping_csv(result.mapping, reports_dir / "pr24z_canonical_identity_migration_mapping.csv")
             if result.ok and apply and not result.already_migrated:
                 if canon == 14 and legacy == 0 and result.integrity_result == "ok" and result.foreign_key_result == 0 and result.source_trades_count == 19 and replay == 0:
                     marker = {
@@ -458,7 +462,16 @@ def migrate(db_path: Path, *, reference_path: Path = DEFAULT_REFERENCE_PATH, mar
     return result
 
 
-def write_reports(result: MigrationResult, reports_dir: Path) -> None:
+def write_reports(result: MigrationResult, reports_dir: Path, *, allow_write: bool = True) -> None:
+    """Write migration result artifacts.
+
+    Hygiene: when ``allow_write`` is False (read-only preflight / idempotency
+    run), this function is a no-op and never rewrites the committed result
+    artifacts, so a dry-run cannot silently overwrite the recorded production
+    migration evidence.
+    """
+    if not allow_write:
+        return
     reports_dir.mkdir(parents=True, exist_ok=True)
     (reports_dir / "pr24z_canonical_identity_migration_result.json").write_text(json.dumps(result.as_dict(), indent=2, sort_keys=True) + "\n")
     (reports_dir / "pr24z_canonical_identity_dependency_audit.json").write_text(json.dumps(result.dependency_audit, indent=2, sort_keys=True) + "\n")

@@ -34,7 +34,7 @@ def main() -> int:
         apply=args.apply,
         reports_dir=Path(args.reports_dir),
     )
-    write_reports(res, Path(args.reports_dir))
+    write_reports(res, Path(args.reports_dir), allow_write=args.apply)
     if args.json:
         print(json.dumps(res.as_dict(), indent=2, sort_keys=True))
     else:
