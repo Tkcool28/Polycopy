@@ -19,8 +19,8 @@ required safety-correction cases are covered here WITHOUT calling the real API:
     11. real transaction hash remains separate
     12. fallback used only when both strong options absent
     13. strong identity counters are correct
-    14. legacy fallback row matches new strong identity
-    15. rerun against existing 14 produces zero inserts
+    14. normal writer path does not use PR24Z legacy alias matching
+    15. production write is blocked until the canonical migration is complete
     16. ambiguous identity never silently overwrites
 
   Constraint (17-19):
@@ -37,7 +37,7 @@ required safety-correction cases are covered here WITHOUT calling the real API:
     23. db_before counts present
     24. db_after counts present
     25. backup evidence serializes
-    26. compatibility section serializes
+    26. migration-not-complete block serializes as a fail-closed production error
     27. human reports redact wallet
     28. first-write and post-write verification counters distinct
 
@@ -378,78 +378,37 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(fb, 1)
         self.assertEqual(sp + tx, 3)  # strong = source_provided + transaction
 
-    def test_14_legacy_fallback_matches_new_strong(self):
-        # An existing legacy fallback id (from a pre-correction row) should be
-        # recomputable and recognized as a duplicate of the new strong id.
-        cand = normalize_source_trade(
-            _raw(sourceProvidedTradeId="polymarket:" + "a" * 64), record_index=0
-        )
-        legacy = writer_mod.legacy_fallback_id_from_db_row(_candidate_to_row(cand))
-        # Build a fresh candidate from the SAME immutable attributes (no source id);
-        # its legacy fallback must equal the stored legacy id.
-        cand2 = normalize_source_trade(_raw(), record_index=0)
-        legacy2 = writer_mod.legacy_fallback_id_from_db_row(_candidate_to_row(cand2))
-        self.assertEqual(legacy, legacy2)
-
-    def test_15_rerun_zero_inserts(self):
-        # Existing DB has 14 rows under legacy fallback ids. The new strong-id
-        # ingestion must dedupe to zero inserts.
-        fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24z_compat_")
+    def test_14_writer_does_not_use_pr24z_legacy_alias_matching(self):
+        # Existing DB has one legacy fallback row. Re-ingesting the same immutable
+        # trade with a new source-provided canonical id must NOT be skipped via a
+        # PR24Z-specific alias path. In an isolated temp DB it inserts a second
+        # canonical row, proving normal writer dedupe is canonical-only.
+        fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24z_no_alias_")
         os.close(fd)
         os.remove(path)
         db = _Conn(path)
         try:
             _make_source_trades(db.conn)
-            # Seed 14 legacy fallback rows (no source-provided id). The real 14
-            # rows have DISTINCT immutable attributes; mirror that so the legacy
-            # fallback ids are distinct (no UNIQUE collision) and match later.
-            seeded = []
-            for i in range(14):
-                cand = normalize_source_trade(
-                    _raw(price=str(0.30 + i * 0.01), size=str(10 + i),
-                         timestamp=1700000000 + i * 60),
-                    record_index=i,
-                )
-                seeded.append(cand)
-                db.conn.execute(
-                    "INSERT INTO source_trades (id, source, source_trade_id, "
-                    "market_source_id, side, outcome, quantity, price, trader_address, "
-                    "timestamp, is_sample, token_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (f"leg{i}", SOURCE_NAME, cand.source_trade_id, cand.market_source_id,
-                     cand.side, cand.outcome, cand.quantity, cand.price,
-                     cand.trader_address, cand.timestamp.isoformat(), 0, cand.token_id),
-                )
+            legacy = normalize_source_trade(_raw(), record_index=0)
+            db.conn.execute(
+                "INSERT INTO source_trades (id, source, source_trade_id, "
+                "market_source_id, side, outcome, quantity, price, trader_address, "
+                "timestamp, is_sample, token_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("legacy", SOURCE_NAME, legacy.source_trade_id, legacy.market_source_id,
+                 legacy.side, legacy.outcome, legacy.quantity, legacy.price,
+                 legacy.trader_address, legacy.timestamp.isoformat(), 0, legacy.token_id),
+            )
             db.conn.commit()
-            # Existing ids (canonical + legacy fallback). Build canonical id set
-            # and legacy-fallback id set directly from the seeded candidates so we
-            # exercise the SAME dual-key recognition the writer uses.
-            pre_ids = {c.source_trade_id for c in seeded}
-            pre_legacy = {lid for c in seeded
-                          if (lid := writer_mod.derive_legacy_fallback_id(c))}
-            # Re-ingest the SAME immutable trades but now with a source-provided
-            # id. Keep the SAME immutable attributes so the recomputed legacy
-            # fallback id matches what we seeded (proving compatibility).
-            new_cands = [normalize_source_trade(
-                _raw(sourceProvidedTradeId=f"polymarket:{i:064d}",
-                     price=str(0.30 + i * 0.01), size=str(10 + i),
-                     timestamp=1700000000 + i * 60),
-                record_index=i)
-                for i in range(14)]
-            # Dry-run first.
-            wr_dry = write_valid_rows(db, new_cands, dry_run=True,
-                                      pre_existing_ids=pre_ids,
-                                      legacy_fallback_ids=pre_legacy)
-            self.assertEqual(wr_dry.attempted, 14)
-            self.assertEqual(wr_dry.existing_duplicates_recognized, 14)
-            # Real temp write (this IS an isolated temp DB, allowed):
-            wr = write_valid_rows(db, new_cands, dry_run=False,
-                                  pre_existing_ids=pre_ids,
-                                  legacy_fallback_ids=pre_legacy)
-            self.assertEqual(wr.inserted, 0)
-            self.assertEqual(wr.deduplicated, 14)
-            final = db.conn.execute(
-                "SELECT COUNT(*) FROM source_trades").fetchone()[0]
-            self.assertEqual(final, 14)  # NO duplicates inserted.
+            canonical = normalize_source_trade(
+                _raw(sourceProvidedTradeId="polymarket:" + "a" * 64), record_index=0
+            )
+            wr = write_valid_rows(
+                db, [canonical], dry_run=False, pre_existing_ids={legacy.source_trade_id}
+            )
+            self.assertEqual(wr.existing_duplicates_recognized, 0)
+            self.assertEqual(wr.inserted, 1)
+            final = db.conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
+            self.assertEqual(final, 2)
         finally:
             db.close()
             for ext in ("", "-wal", "-shm"):
@@ -457,6 +416,37 @@ class IdentityTests(unittest.TestCase):
                     os.remove(path + ext)
                 except OSError:
                     pass
+
+    def test_15_production_write_blocked_until_migration_complete(self):
+        from scripts import ingest_real_source_trades as cli
+
+        # The block is checked before backup/DB writer work. Patch the network
+        # provider and process/timer gates so this stays fast and no production
+        # DB write can occur.
+        marker = Path("/tmp/pr24z_missing_marker_for_test")
+        if marker.exists():
+            marker.unlink()
+
+        class Provider:
+            made_network_call = False
+
+            async def fetch_trades(self, wallet, *, limit, page):
+                return []
+
+            async def aclose(self):
+                return None
+
+        with mock.patch.object(cli, "_CANONICAL_MIGRATION_COMPLETE_MARKER", marker), \
+             mock.patch.object(cli, "_RealDataApiProvider", lambda: Provider()), \
+             mock.patch.object(cli, "_check_timers", lambda: {}), \
+             mock.patch.object(cli, "_check_competing_writers", lambda pid: (False, [])), \
+             mock.patch.object(cli, "write_valid_rows") as writer:
+            rc = cli.main([
+                "--allow-live", "--write", "--confirm-production-db",
+                "--wallet-address", "0x" + "1" * 40,
+            ])
+        self.assertEqual(rc, 2)
+        writer.assert_not_called()
 
     def test_16_ambiguous_never_silent_overwrite(self):
         # A row with no id source, no tx hash, and insufficient fields -> ambiguous.
@@ -506,7 +496,7 @@ class ConstraintTests(unittest.TestCase):
         try:
             res = assert_unique_dedupe_constraint(db)
             self.assertFalse(res.present)
-            # A non-dry-run write_in the absence of the constraint must NOT write.
+            # A non-dry-run write in the absence of the constraint must NOT write.
             cand = normalize_source_trade(_raw(sourceProvidedTradeId="polymarket:x"), record_index=0)
             wr = write_valid_rows(db, [cand], dry_run=False)
             self.assertFalse(wr.committed)

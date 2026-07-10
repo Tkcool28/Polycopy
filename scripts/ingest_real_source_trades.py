@@ -32,7 +32,7 @@ Hard guardrails
 
 This PR is a SAFETY-CORRECTION only. It must NOT perform a second production
 write. Allowed: fixture/temp-DB tests, production DB read-only inspection,
-bounded live dry-run, compatibility analysis, a verified SQLite online backup
+bounded live dry-run, canonical-id analysis, a verified SQLite online backup
 (no new trades), report regeneration. The first historical production write
 (attempted=14, inserted=14, deduplicated=0) is preserved in the report and is
 NEVER overwritten by verification-run counters.
@@ -49,7 +49,6 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -79,10 +78,8 @@ from polycopy.ingestion.source_trade_writer import (  # noqa: E402
     write_valid_rows,
     create_verified_backup,
     assert_unique_dedupe_constraint,
-    run_identity_compatibility_gate,
     BackupResult,
     UniqueConstraintResult,
-    legacy_fallback_id_from_db_row,
 )
 from polycopy.db.database import Database  # noqa: E402
 
@@ -107,6 +104,12 @@ _INGESTION_TIMER_UNITS = (
     "polycopy-update.timer",
     "polycopy-wc-fixture-refresh.timer",
 )
+
+# Temporary fail-closed marker: production ingestion writes remain blocked until
+# the separate canonical-ID migration PR has completed and leaves this marker.
+# This is intentionally global; it does not inspect or adapt individual trades
+# through PR24Z legacy aliases.
+_CANONICAL_MIGRATION_COMPLETE_MARKER = _REPO_ROOT / "data" / ".pr24z_canonical_migration_complete"
 
 # Known writer-capable processes to exclude before a production write.
 _WRITER_PROCESS_HINTS = (
@@ -424,32 +427,6 @@ def _make_backup_legacy(db_path: str) -> Optional[str]:
         return None
 
 
-# Path to the committed historical 14-row production reference (read-only).
-_HISTORICAL_REFERENCE = _REPO_ROOT / "reports" / "pr24z_historical_production_reference.json"
-
-
-def _run_historical_compatibility_gate(db_path: str):
-    """Load the committed historical reference and run the HARD identity gate.
-
-    Returns an :class:`IdentityCompatibilityGate`. Pure read-only against the
-    production DB; never writes. Used by the production-write path BEFORE backup,
-    writer, and transaction begin.
-    """
-    if not _HISTORICAL_REFERENCE.exists():
-        # Fail closed if the reference artifact is missing.
-        gate = run_identity_compatibility_gate(SOURCE_NAME, [], db_path=db_path, expected=14)
-        gate.error = "historical reference missing: " + str(_HISTORICAL_REFERENCE)
-        gate.safe_for_future_production_write = False
-        return gate
-    try:
-        records = json.loads(_HISTORICAL_REFERENCE.read_text())
-    except Exception as exc:
-        gate = run_identity_compatibility_gate(SOURCE_NAME, [], db_path=db_path, expected=14)
-        gate.error = f"reference parse failed: {exc}"
-        gate.safe_for_future_production_write = False
-        return gate
-    return run_identity_compatibility_gate(SOURCE_NAME, records, db_path=db_path, expected=14)
-
 
 # ── Report rendering ───────────────────────────────────────────────────────────
 def _identity_block(c: IngestionCounters) -> dict[str, Any]:
@@ -476,7 +453,6 @@ def _build_report_payload(
     unique_constraint: Optional[UniqueConstraintResult] = None,
     process_gate: Optional[dict] = None,
     compatibility: Optional[dict] = None,
-    identity_compatibility_gate: Optional[dict] = None,
     db_path: Optional[str] = None,
     db_before: Optional[dict] = None,
     db_after: Optional[dict] = None,
@@ -523,6 +499,21 @@ def _build_report_payload(
             "ready_for_scoring": bool(c.ready_for_scoring),
             "ready_for_automation": bool(c.ready_for_automation),
         },
+        "canonical_migration": {
+            "existing_production_rows_with_legacy_fallback_ids": 14,
+            "corrected_canonical_ids_differ": True,
+            "canonical_migration_required_before_next_production_write": True,
+            "migration_work_separated_into_stacked_pr": True,
+            "future_production_write_allowed_now": False,
+            "supersedes_prior_canonical_compatibility_claim": True,
+            "temporary_write_block": "missing canonical migration completion marker",
+        },
+        "backup_inventory_correction": {
+            "distinct_sha256_groups_listed_by_inspection": 4,
+            "do_not_assume_logical_identity_from_size_integrity_and_count": True,
+            "later_cleanup_requires_logical_table_counts_and_row_hashes_or_normalized_dumps": True,
+            "backup_files_deleted_in_this_task": False,
+        },
         "safety": {
             "downstream_tables_changed": bool(c.downstream_tables_changed),
             "timers_changed": bool(c.timers_changed),
@@ -538,7 +529,6 @@ def _build_report_payload(
         "unique_constraint": unique_constraint.as_dict() if unique_constraint is not None else None,
         "process_gate": process_gate,
         "compatibility": compatibility,
-        "identity_compatibility_gate": identity_compatibility_gate,
         "integrity_check": integrity,
         "foreign_key_check": fk,
     }
@@ -587,6 +577,21 @@ def _render_markdown(p: dict[str, Any]) -> str:
         f"- duplicate_records_existing_db: {ident['duplicate_records_existing_db']}",
         f"- collision_errors: {ident['collision_errors']}",
         "",
+        "## Canonical migration status",
+        "- existing_production_rows_with_legacy_fallback_ids: 14",
+        "- corrected_canonical_ids_differ: True",
+        "- canonical_migration_required_before_next_production_write: True",
+        "- migration_work_separated_into_stacked_pr: True",
+        "- future_production_write_allowed_now: False",
+        "- prior compatibility claim: invalid and superseded",
+        "- temporary_write_block: missing canonical migration completion marker",
+        "",
+        "## Backup inventory correction",
+        "- distinct_sha256_groups_listed_by_inspection: 4",
+        "- do_not_assume_logical_identity_from_equal_size_integrity_ok_and_source_trades_19: True",
+        "- later_cleanup_requires_logical_table_counts_and_row_hashes_or_normalized_dumps: True",
+        "- backup_files_deleted_in_this_task: False",
+        "",
         "## Safety",
         f"- downstream_tables_changed: {p['safety']['downstream_tables_changed']}",
         f"- timers_changed: {p['safety']['timers_changed']}",
@@ -623,21 +628,6 @@ def _render_markdown(p: dict[str, Any]) -> str:
             f"- legacy_identity_aliases_used: {comp['legacy_identity_aliases_used']}",
             f"- rerun_would_insert: {comp['rerun_would_insert']}",
             f"- reconciliation_error: {comp['reconciliation_error']}",
-            "",
-        ]
-    if p.get("identity_compatibility_gate") is not None:
-        g = p["identity_compatibility_gate"]
-        lines += [
-            "## HARD GATE — identity compatibility (legacy 14 rows)",
-            f"- checked: {g['checked']}",
-            f"- historical_rows_expected: {g['historical_rows_expected']}",
-            f"- historical_rows_examined: {g['historical_rows_examined']}",
-            f"- canonical_matches: {g['canonical_matches']}",
-            f"- legacy_alias_matches: {g['legacy_alias_matches']}",
-            f"- unmatched: {g['unmatched']}",
-            f"- rerun_would_insert: {g['rerun_would_insert']}",
-            f"- safe_for_future_production_write: {g['safe_for_future_production_write']}",
-            f"- error: {g['error']}",
             "",
         ]
     if p.get("backup") is not None:
@@ -723,6 +713,21 @@ def _render_txt(p: dict[str, Any]) -> str:
         f"  dup_in_fetch={ident['duplicate_records_in_fetch']} "
         f"dup_existing_db={ident['duplicate_records_existing_db']} collisions={ident['collision_errors']}",
         "",
+        "CANONICAL MIGRATION STATUS",
+        "  existing_production_rows_with_legacy_fallback_ids=14",
+        "  corrected_canonical_ids_differ=True",
+        "  canonical_migration_required_before_next_production_write=True",
+        "  migration_work_separated_into_stacked_pr=True",
+        "  future_production_write_allowed_now=False",
+        "  prior compatibility claim: invalid and superseded",
+        "  temporary_write_block=missing canonical migration completion marker",
+        "",
+        "BACKUP INVENTORY CORRECTION",
+        "  distinct_sha256_groups_listed_by_inspection=4",
+        "  do_not_assume_logical_identity_from_equal_size_integrity_ok_and_source_trades_19=True",
+        "  later_cleanup_requires_logical_table_counts_and_row_hashes_or_normalized_dumps=True",
+        "  backup_files_deleted_in_this_task=False",
+        "",
         "SAFETY",
         f"  downstream_changed={p['safety']['downstream_tables_changed']} "
         f"timers_changed={p['safety']['timers_changed']}",
@@ -758,17 +763,6 @@ def _render_txt(p: dict[str, Any]) -> str:
             "HISTORICAL FIRST WRITE (preserved)",
             f"  attempted={hw['attempted']} inserted={hw['inserted']} "
             f"deduplicated={hw['deduplicated']}",
-            "",
-        ]
-    if p.get("identity_compatibility_gate") is not None:
-        g = p["identity_compatibility_gate"]
-        lines += [
-            "HARD GATE — identity compatibility (legacy 14 rows)",
-            f"  checked={g['checked']} expected={g['historical_rows_expected']} "
-            f"examined={g['historical_rows_examined']} canonical={g['canonical_matches']} "
-            f"legacy_alias={g['legacy_alias_matches']} unmatched={g['unmatched']} "
-            f"rerun_would_insert={g['rerun_would_insert']} "
-            f"safe={g['safe_for_future_production_write']} error={g['error']}",
             "",
         ]
     if p.get("db_before") or p.get("db_after"):
@@ -890,7 +884,6 @@ def main(argv: list[str] | None = None) -> int:
     unique_constraint: Optional[UniqueConstraintResult] = None
     process_gate: Optional[dict] = None
     compatibility: Optional[dict] = None
-    identity_compatibility_gate: Optional[dict] = None
     integrity = None
     fk = None
     mode = "dry-run"
@@ -949,25 +942,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: competing writer process(es) detected: {details}; "
                   f"aborting production write.", file=sys.stderr)
             return 2
-        # HARD GATE: legacy identity compatibility for the historical 14 rows.
-        # Must pass BEFORE backup creation, writer invocation, or transaction begin.
-        identity_gate = _run_historical_compatibility_gate(db_path)
-        if not identity_gate.safe_for_future_production_write:
+        # Temporary global block: production contains 14 legacy fallback IDs and
+        # must not receive another ingestion write until the separate canonical
+        # migration PR completes. This is fail-closed and does not implement
+        # legacy alias matching or per-trade adaptation.
+        if not _CANONICAL_MIGRATION_COMPLETE_MARKER.exists():
             print(
-                "error: identity_compatibility_gate FAILED -> refusing production write.\n"
-                f"  examined={identity_gate.historical_rows_examined} "
-                f"expected={identity_gate.historical_rows_expected} "
-                f"canonical={identity_gate.canonical_matches} "
-                f"legacy_alias={identity_gate.legacy_alias_matches} "
-                f"unmatched={identity_gate.unmatched} "
-                f"rerun_would_insert={identity_gate.rerun_would_insert}\n"
-                f"  error={identity_gate.error}\n"
-                "source_trades unchanged; do NOT rely on UNIQUE(source, source_trade_id) alone.",
+                "error: canonical source_trade_id migration is not complete; "
+                "refusing production ingestion write. "
+                f"Missing marker: {_CANONICAL_MIGRATION_COMPLETE_MARKER}",
                 file=sys.stderr,
             )
             return 2
-        # Capture the gate result for the report (read-only; already passed).
-        identity_compatibility_gate = identity_gate.as_dict()
         # Pre-flight: backup (hard gate).
         pre_size, pre_mtime = _db_stat(db_path)
         db_before = {"size": pre_size, "mtime": pre_mtime, "path": db_path,
@@ -994,29 +980,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: pre-flight integrity={integrity} fk={fk}; aborting.",
                       file=sys.stderr)
                 return 2
-            # Existing ids (canonical + legacy fallback) for dedupe recognition.
+            # Existing canonical ids for normal duplicate recognition only.
             pre_ids = {r[0] for r in db.conn.execute(
                 "SELECT source_trade_id FROM source_trades WHERE source = ?",
                 (SOURCE_NAME,)).fetchall()}
-            pre_legacy = set()
-            # Use sqlite3.Row so rows behave like mappings for legacy-id recompute.
-            prev_row_factory = db.conn.row_factory
-            db.conn.row_factory = sqlite3.Row
-            try:
-                for row in db.conn.execute(
-                    "SELECT * FROM source_trades WHERE source = ?", (SOURCE_NAME,)
-                ).fetchall():
-                    lid = legacy_fallback_id_from_db_row(row)
-                    if lid is not None:
-                        pre_legacy.add(lid)
-            finally:
-                db.conn.row_factory = prev_row_factory
             for r in result.valid_rows:
                 if r.source_trade_id in pre_ids:
                     result.counters.duplicate_records_existing_db += 1
             write_result = write_valid_rows(
-                db, result.valid_rows, dry_run=False,
-                pre_existing_ids=pre_ids, legacy_fallback_ids=pre_legacy,
+                db, result.valid_rows, dry_run=False, pre_existing_ids=pre_ids,
             )
             result.counters.rows_attempted = write_result.attempted
             result.counters.rows_inserted = write_result.inserted
@@ -1043,7 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         # Safety-corrected verification run: create a verified SQLite online
         # backup (no new trades), run the process gate + UNIQUE preflight as a
-        # read-only check, and perform a bounded live dry-run compatibility
+        # read-only check, and perform a bounded live dry-run canonical duplicate
         # analysis when allowed. Never writes source_trades.
         mode = "safety-verification"
         # Verified online backup (no trades written).
@@ -1064,9 +1036,6 @@ def main(argv: list[str] | None = None) -> int:
             unique_constraint = assert_unique_dedupe_constraint(db)
             integrity = _integrity(db)
             fk = _fk_check(db)
-            # HARD GATE proved read-only (evidence; never a write).
-            identity_gate = _run_historical_compatibility_gate(db_path)
-            identity_compatibility_gate = identity_gate.as_dict()
             db_before = {"size": _db_stat(db_path)[0], "mtime": _db_stat(db_path)[1],
                          "path": db_path, "counts": _table_counts(db)}
             # Compatibility analysis when allowed-live (bounded dry-run).
@@ -1109,7 +1078,6 @@ def main(argv: list[str] | None = None) -> int:
         unique_constraint=unique_constraint,
         process_gate=process_gate,
         compatibility=compatibility,
-        identity_compatibility_gate=identity_compatibility_gate,
         db_path=db_path if production_write else db_path,
         db_before=db_before,
         db_after=db_after,

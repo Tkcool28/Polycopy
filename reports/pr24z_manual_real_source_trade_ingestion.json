@@ -1,6 +1,6 @@
 {
   "ingestion_version": "PR24Z-1",
-  "generated_at": "2026-07-10T06:17:01.392460+00:00",
+  "generated_at": "2026-07-10T16:26:35.829257+00:00",
   "mode": "safety-verification",
   "source": "polymarket_data_api_trades_user",
   "wallet_address": "0x1111111111111111111111111111111111111111",
@@ -41,6 +41,21 @@
     "both_ready_count": 10,
     "ready_for_scoring": false,
     "ready_for_automation": false
+  },
+  "canonical_migration": {
+    "existing_production_rows_with_legacy_fallback_ids": 14,
+    "corrected_canonical_ids_differ": true,
+    "canonical_migration_required_before_next_production_write": true,
+    "migration_work_separated_into_stacked_pr": true,
+    "future_production_write_allowed_now": false,
+    "supersedes_prior_canonical_compatibility_claim": true,
+    "temporary_write_block": "missing canonical migration completion marker"
+  },
+  "backup_inventory_correction": {
+    "distinct_sha256_groups_listed_by_inspection": 4,
+    "do_not_assume_logical_identity_from_size_integrity_and_count": true,
+    "later_cleanup_requires_logical_table_counts_and_row_hashes_or_normalized_dumps": true,
+    "backup_files_deleted_in_this_task": false
   },
   "safety": {
     "downstream_tables_changed": false,
@@ -193,9 +208,9 @@
   },
   "backup": {
     "success": true,
-    "path": "/root/Polycopy/data/polycopy.db.pr24z_online_backup_20260710T061626Z",
+    "path": "/root/Polycopy/data/polycopy.db.pr24z_online_backup_20260710T162635Z",
     "method": "sqlite_online_backup",
-    "sha256": "fe9d66a355a1802e54dead910be628f21807198d5524cbd423aee5223f3fa66f",
+    "sha256": "b1c1df3d56ca78410c9d330de4a071b3fdf65d8e77a9565950d75870621d9a85",
     "size": 528384,
     "integrity_check": "ok",
     "foreign_key_violations": 0,
@@ -217,62 +232,12 @@
     "safe_to_write": true,
     "details": []
   },
-  "compatibility": {
-    "verification_method": "read_only_replay_of_existing_pr24z_rows",
-    "live_fetch_returned_records": false,
-    "live_fetch_raw_records": 0,
-    "existing_pr24z_rows_examined": 14,
-    "existing_pr24z_rows_matched": 14,
-    "existing_pr24z_rows_unmatched": 0,
-    "legacy_identity_aliases_used": 0,
-    "canonical_strong_ids_matched": 14,
-    "existing_duplicates_recognized": 14,
-    "rerun_would_insert": 0,
-    "production_write_requested": false,
-    "production_write_performed": false,
-    "source_trades_before": 19,
-    "source_trades_after": 19,
-    "reconciliation_error": null
-  },
-  "post_write_idempotency_verification": {
-    "verification_method": "read_only_replay_of_existing_pr24z_rows",
-    "live_dry_run_attempted": true,
-    "live_network_calls_attempted": 1,
-    "live_network_calls_succeeded": 1,
-    "live_raw_records": 0,
-    "live_result_note": "The selected verification wallet returned zero records, so compatibility was proven by replaying the actual 14 previously inserted PR24Z rows through the corrected identity and dedupe path.",
-    "existing_duplicates_recognized": 14,
-    "rows_attempted_for_write": 0,
-    "rows_inserted": 0,
-    "production_db_opened_for_write": false,
-    "source_trades_before": 19,
-    "source_trades_after": 19
-  },
+  "compatibility": null,
   "integrity_check": "ok",
   "foreign_key_check": 0,
   "historical_first_production_write": {
     "attempted": 14,
     "inserted": 14,
     "deduplicated": 0
-  },
-  "historical_production_rows": {
-    "source_report_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
-    "mode": "production-write",
-    "live": true,
-    "historical_wallet_redacted": "0x…0579",
-    "wallet_address": "0xcac76b761231464900cce5da7c20233d59b20579",
-    "rows_inserted": 14,
-    "report_db_rows_matched": 14,
-    "fixture_rows_found": 0,
-    "reconciliation_artifact": "reports/pr24z_historical_production_row_reconciliation.json"
-  },
-  "fixture_verification_rows": {
-    "mode": "safety-verification",
-    "live": false,
-    "network_calls_attempted": 0,
-    "fixture_wallet_redacted": "0x…1111",
-    "valid_fixture_rows": 3,
-    "write": null,
-    "rows_written_to_production": 0
   }
 }

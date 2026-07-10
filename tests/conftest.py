@@ -17,3 +17,8 @@ os.environ.setdefault("POLYCOPY_ORDER_KILL_SWITCH", "false")
 _SRC = str(pathlib.Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
+
+# The historical PR24Z reconciliation suite and its generator are now migration-only
+# evidence. Clean PR #50 keeps permanent ingestion canonical-only; the corrected
+# reconciliation tests are applied in the stacked canonical-migration PR.
+collect_ignore = ["test_pr24z_historical_production_reconciliation.py"]

@@ -40,6 +40,7 @@ from polycopy.ingestion.normalized_source_trade import (
     generate_identity,
     IDENTITY_FALLBACK,
     IDENTITY_AMBIGUOUS,
+    IDENTITY_STRONG,
 )
 from polycopy.ingestion.source_trade_writer import write_valid_rows
 from polycopy.db.database import Database
@@ -227,6 +228,56 @@ def test_identity_ambiguous_count_increments():
     counters.identity_ambiguous_count += 1
     assert counters.identity_ambiguous_count == 1
 
+
+
+def test_source_provided_trade_id_is_canonical_identity():
+    raw = _build_raw(sourceProvidedTradeId="polymarket:" + "d" * 64, transactionHash=_tx("a"))
+    ident = generate_identity(raw)
+    assert ident.strategy == IDENTITY_STRONG
+    assert ident.source_trade_id == "polymarket:" + "d" * 64
+
+
+def test_adapter_source_trade_id_maps_to_source_provided_trade_id():
+    from scripts.ingest_real_source_trades import _RealDataApiProvider
+
+    class Trade:
+        source_trade_id = "polymarket:" + "e" * 64
+        side = type("Side", (), {"value": "BUY"})()
+        timestamp = None
+        trader_address = "0x" + "1" * 40
+        token_id = _tx("2")
+        market_source_id = _tx("3")
+        outcome = "Yes"
+        quantity = 1
+        price = 0.5
+
+    raw = _RealDataApiProvider._to_raw(Trade())
+    assert raw["sourceProvidedTradeId"] == "polymarket:" + "e" * 64
+    assert raw["transactionHash"] is None
+    cand = normalize_source_trade(raw)
+    assert cand.source_trade_id == "polymarket:" + "e" * 64
+
+
+def test_permanent_ingestion_has_no_static_14_row_reference_dependency():
+    import inspect as _inspect
+    from scripts import ingest_real_source_trades as cli
+
+    src = _inspect.getsource(cli)
+    assert "pr24z_historical_production_reference.json" not in src
+    assert "_HISTORICAL_REFERENCE" not in src
+    assert "run_identity_compatibility_gate" not in src
+
+
+def test_writer_source_has_no_pr24z_legacy_alias_path():
+    src = inspect.getsource(writer_mod)
+    forbidden = (
+        "legacy_fallback",
+        "derive_legacy",
+        "IdentityCompatibilityGate",
+        "run_identity_compatibility_gate",
+        "legacy_alias",
+    )
+    assert not any(token in src for token in forbidden)
 
 # ── Writer (22–32) ────────────────────────────────────────────────────────────
 def test_exactly_one_new_writer_role_exists():
