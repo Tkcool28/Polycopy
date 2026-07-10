@@ -92,13 +92,26 @@ def _is_sequential_fixture(source_trade_id: str) -> bool:
 
 
 def load_historical_rows():
+    """Load the 14 historical production rows from the historical report.
+
+    CRITICAL: the REAL upstream source-provided id lives in the historical
+    report under ``transaction_hash`` (the old adapter mislabeled it there),
+    NOT in ``source_trade_id`` (which is the already-stored DB id). We must
+    preserve both separately and never treat one as the other.
+    """
     rep = json.loads(HIST_REPORT.read_text())
     rows = rep.get("valid_rows") or []
     out = []
-    for r in rows:
+    for i, r in enumerate(rows):
+        stored = r.get("source_trade_id")
+        upstream = r.get("transaction_hash")  # real upstream adapter id (mislabeled)
         out.append({
             "source": r.get("source"),
-            "source_trade_id": r.get("source_trade_id"),
+            "source_trade_id": stored,
+            "historical_stored_source_trade_id": stored,
+            "historical_upstream_source_provided_trade_id": upstream,
+            "sourceProvidedTradeId": upstream,  # corrected canonical input
+            "transaction_hash": upstream,
             "market_source_id": r.get("market_source_id"),
             "token_id": r.get("token_id"),
             "trader_address": r.get("trader_address"),
@@ -108,6 +121,7 @@ def load_historical_rows():
             "price": r.get("price"),
             "timestamp": r.get("timestamp"),
             "is_sample": r.get("is_sample"),
+            "_hist_index": i,
         })
     return rep, out
 
@@ -233,68 +247,116 @@ def reconcile(hist_rows, db_rows_by_id):
 
 
 def identity_reconciliation(hist_rows, db_rows_by_id):
-    """Per-row identity-pipeline reconciliation (historical bug vs correction)."""
+    """Per-row identity-pipeline reconciliation (historical bug vs correction).
+
+    NON-TAUTOLOGICAL. For each historical row we load the REAL upstream
+    source-provided id (from ``historical_upstream_source_provided_trade_id``,
+    which was historically mislabeled as ``transaction_hash`` in the production
+    report) and feed it to the ACTUAL current production identity function
+    ``generate_identity()``. We then independently recompute the historical
+    legacy fallback id from the immutable trade fields and compare BOTH the
+    corrected canonical id and the recomputed legacy fallback id against the
+    stored DB ``source_trade_id``.
+    """
+    from polycopy.ingestion.normalized_source_trade import generate_identity, _fallback_identity
+
     out = []
     cur_src_prov = 0
     cur_tx = 0
     cur_fb = 0
     cur_amb = 0
     recon = 0
+    missing_upstream = 0
+    missing_db = 0
+    ambiguous = 0
+    no_legacy = 0
     for h in hist_rows:
         hid = h["source_trade_id"]
+        # The REAL upstream id (NOT the stored DB id).
+        upstream = h.get("historical_upstream_source_provided_trade_id") or h.get("sourceProvidedTradeId")
         d = db_rows_by_id.get(hid)
-        # historical: upstream id was mislabeled as transactionHash -> fallback
-        hist_fallback_id = h["source_trade_id"]  # the polymarket:<64hex> value
-        upstream_src_provided = h["source_trade_id"]  # what it actually was
-        # current: adapter source_trade_id -> sourceProvidedTradeId (preferred strong)
-        current_canonical = h["source_trade_id"]
-        equals = hist_fallback_id == current_canonical
-        # current classification: the historical ids are polymarket:<64hex>,
-        # which the CURRENT code maps to sourceProvidedTradeId (preferred strong).
-        # Derive via the actual current model so this reflects real logic, not a guess.
-        from polycopy.ingestion.normalized_source_trade import normalize_source_trade
-        cand = normalize_source_trade({
+        stored_db_id = d["source_trade_id"] if d is not None else None
+
+        # Build the corrected raw dict with the REAL upstream id, exactly as the
+        # current live-write path does (adapter source_trade_id -> sourceProvidedTradeId).
+        raw = {
+            "sourceProvidedTradeId": upstream,
+            "transactionHash": None,
             "proxyWallet": h["trader_address"],
             "asset": h["token_id"],
             "conditionId": h["market_source_id"],
             "side": h["side"],
             "outcome": h["outcome"],
-            "price": str(h["price"]),
             "size": str(h["quantity"]),
+            "price": str(h["price"]),
             "timestamp": h["timestamp"],
-            "sourceProvidedTradeId": h["source_trade_id"],
-        }, record_index=0)
-        src_prov = bool(cand.identity_source_provided)
-        fb_used = bool(cand.identity_fallback)
-        amb = bool(cand.identity_ambiguous)
-        tx = bool(cand.identity_transaction_hash)
-        if src_prov:
-            cur_src_prov += 1
-        if tx:
-            cur_tx += 1
-        if fb_used:
-            cur_fb += 1
-        if amb:
-            cur_amb += 1
-        matched_canonical = d is not None and d["source_trade_id"] == current_canonical
-        # legacy fallback alias: recompute from immutable fields (would match if different canonical)
-        legacy_alias = None
-        if d is not None:
-            # Use legacy_fallback_id_from_db_row to confirm an alias exists
-            from polycopy.ingestion.source_trade_writer import legacy_fallback_id_from_db_row
-            legacy_alias = legacy_fallback_id_from_db_row(d)
-        row_res = {
-            "source_trade_id": hid,
-            "historical_fallback_source_trade_id": hist_fallback_id,
-            "upstream_source_provided_trade_id": upstream_src_provided,
-            "current_canonical_strong_id": current_canonical,
-            "historical_id_equals_current_strong_id": equals,
-            "matched_by_canonical_id": matched_canonical,
-            "matched_by_legacy_fallback_alias": legacy_alias is not None,
-            "identity_reconciliation_result": "match" if matched_canonical else "MISSING_DB_ROW",
         }
-        if matched_canonical:
+        # Call the REAL current production identity function (no reimplementation).
+        ident = generate_identity(raw, record_index=h.get("_hist_index", 0))
+        corrected_id = ident.source_trade_id
+        corrected_strategy = ident.strategy
+        corrected_strong = bool(ident.strong)
+        corrected_fallback = bool(ident.fallback)
+        corrected_ambiguous = bool(ident.ambiguous)
+
+        cur_src_prov += int(corrected_strong)
+        cur_fb += int(corrected_fallback)
+        cur_amb += int(corrected_ambiguous)
+
+        # Independently recompute the exact historical legacy fallback id from
+        # the SAME immutable fields (the historical algorithm, not normalization).
+        legacy_raw = {
+            "proxyWallet": h["trader_address"],
+            "asset": h["token_id"],
+            "conditionId": h["market_source_id"],
+            "side": h["side"],
+            "outcome": h["outcome"],
+            "price": h["price"],
+            "size": h["quantity"],
+            "timestamp": h["timestamp"],
+        }
+        recomputed_legacy = _fallback_identity(legacy_raw)
+
+        # Recognition against the stored DB id.
+        recognized_by_canonical = (stored_db_id is not None) and (corrected_id == stored_db_id)
+        recognized_by_legacy_alias = (stored_db_id is not None) and (
+            recomputed_legacy is not None and recomputed_legacy == stored_db_id
+        )
+        recognized_as_existing = recognized_by_canonical or recognized_by_legacy_alias
+        would_insert = not recognized_as_existing
+
+        # Fail-closed bookkeeping.
+        if not upstream:
+            missing_upstream += 1
+        if stored_db_id is None:
+            missing_db += 1
+        if corrected_ambiguous:
+            ambiguous += 1
+        if recomputed_legacy is None:
+            no_legacy += 1
+        if recognized_as_existing:
             recon += 1
+
+        row_res = {
+            "row_number": h.get("_hist_index", 0) + 1,
+            "db_source_trade_id": stored_db_id,
+            "historical_report_source_trade_id": h.get("historical_stored_source_trade_id"),
+            "historical_report_transaction_hash": h.get("historical_upstream_source_provided_trade_id"),
+            "real_upstream_source_provided_trade_id": upstream,
+            "corrected_generate_identity_input_source_id": upstream,
+            "corrected_generate_identity_output_id": corrected_id,
+            "corrected_identity_strategy": corrected_strategy,
+            "corrected_identity_strong": corrected_strong,
+            "corrected_identity_fallback": corrected_fallback,
+            "corrected_identity_ambiguous": corrected_ambiguous,
+            "corrected_id_equals_db_id": bool(recognized_by_canonical),
+            "recomputed_legacy_fallback_id": recomputed_legacy,
+            "recomputed_legacy_equals_db_id": bool(recognized_by_legacy_alias),
+            "recognized_by_canonical": bool(recognized_by_canonical),
+            "recognized_by_legacy_alias": bool(recognized_by_legacy_alias),
+            "recognized_as_existing": bool(recognized_as_existing),
+            "would_insert_on_rerun": int(would_insert),
+        }
         out.append(row_res)
     summary = {
         "historical_mapping_bug_confirmed": True,
@@ -305,8 +367,15 @@ def identity_reconciliation(hist_rows, db_rows_by_id):
         "current_transaction_hash_count_for_14_rows": cur_tx,
         "current_fallback_count_for_14_rows": cur_fb,
         "current_ambiguous_count_for_14_rows": cur_amb,
-        "duplicate_rows_that_would_be_inserted": 0,
-        "correction_verified": True,
+        "missing_real_upstream_id_count": missing_upstream,
+        "missing_db_row_count": missing_db,
+        "ambiguous_count": ambiguous,
+        "legacy_fallback_unrecomputable_count": no_legacy,
+        "duplicate_rows_that_would_be_inserted": sum(r["would_insert_on_rerun"] for r in out),
+        "correction_verified": (
+            missing_upstream == 0 and missing_db == 0 and ambiguous == 0
+            and no_legacy == 0 and all(r["recognized_as_existing"] for r in out)
+        ),
     }
     return out, summary, recon
 
@@ -394,42 +463,33 @@ def main():
     (ROOT / "reports" / "pr24z_historical_production_row_reconciliation.json").write_text(
         json.dumps(artifact, indent=2, default=str))
 
-    # ---------- CSV artifact ----------
+    # ---------- CSV artifact (18-col identity reconciliation) ----------
     csv_path = ROOT / "reports" / "pr24z_historical_production_row_reconciliation.csv"
-    cols = ["row_number", "report_source", "db_source", "source_match",
-            "report_source_trade_id", "db_source_trade_id", "source_trade_id_match",
-            "report_market_source_id", "db_market_source_id", "market_source_id_match",
-            "report_token_id", "db_token_id", "token_id_match",
-            "report_trader_address", "db_trader_address", "trader_address_match",
-            "report_side", "db_side", "side_match",
-            "report_outcome", "db_outcome", "outcome_match",
-            "report_quantity", "db_quantity", "quantity_match",
-            "report_price", "db_price", "price_match",
-            "report_timestamp", "db_timestamp", "timestamp_match",
-            "report_is_sample", "db_is_sample", "is_sample_match",
-            "placeholder_pattern_detected", "placeholder_pattern_reasons", "all_fields_match",
-            "gate_existing_db_source_trade_id", "gate_historical_fallback_source_trade_id",
-            "gate_upstream_source_provided_trade_id", "gate_corrected_canonical_strong_id",
-            "gate_existing_id_equals_corrected_id", "gate_legacy_fallback_alias_matches_existing",
-            "gate_recognized_as_existing", "gate_would_insert_on_rerun"]
-    gate_by_id = {g["existing_db_source_trade_id"]: g for g in (_gate.rows or [])}
+    cols = [
+        "row_number",
+        "db_source_trade_id",
+        "historical_report_source_trade_id",
+        "historical_report_transaction_hash",
+        "real_upstream_source_provided_trade_id",
+        "corrected_generate_identity_input_source_id",
+        "corrected_generate_identity_output_id",
+        "corrected_identity_strategy",
+        "corrected_identity_strong",
+        "corrected_identity_fallback",
+        "corrected_identity_ambiguous",
+        "corrected_id_equals_db_id",
+        "recomputed_legacy_fallback_id",
+        "recomputed_legacy_equals_db_id",
+        "recognized_by_canonical",
+        "recognized_by_legacy_alias",
+        "recognized_as_existing",
+        "would_insert_on_rerun",
+    ]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
-        for r in recon_rows:
-            row = {k: r.get(k) for k in cols[:len(cols) - 8]}
-            g = gate_by_id.get(r["report_source_trade_id"], {})
-            row.update({
-                "gate_existing_db_source_trade_id": g.get("existing_db_source_trade_id"),
-                "gate_historical_fallback_source_trade_id": g.get("historical_fallback_source_trade_id"),
-                "gate_upstream_source_provided_trade_id": g.get("upstream_source_provided_trade_id"),
-                "gate_corrected_canonical_strong_id": g.get("corrected_canonical_strong_id"),
-                "gate_existing_id_equals_corrected_id": g.get("existing_id_equals_corrected_id"),
-                "gate_legacy_fallback_alias_matches_existing": g.get("legacy_fallback_alias_matches_existing"),
-                "gate_recognized_as_existing": g.get("recognized_as_existing"),
-                "gate_would_insert_on_rerun": g.get("would_insert_on_rerun"),
-            })
-            w.writerow(row)
+        for r in id_rows:
+            w.writerow({k: r.get(k) for k in cols})
 
     # ---------- MD artifact ----------
     md = []

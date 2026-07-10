@@ -2,6 +2,10 @@
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:11ae80be5e1566fda292d78b0150629ef29c828a1ed3c6df81bc00ba8b9ffe90",
+    "sourceProvidedTradeId": "polymarket:e0c9d495b892a136f1053473e3cb96d4a721e1fce7bb46bf1019d911ad441dbb",
+    "transaction_hash": "polymarket:e0c9d495b892a136f1053473e3cb96d4a721e1fce7bb46bf1019d911ad441dbb",
+    "historical_stored_source_trade_id": "polymarket:11ae80be5e1566fda292d78b0150629ef29c828a1ed3c6df81bc00ba8b9ffe90",
+    "historical_upstream_source_provided_trade_id": "polymarket:e0c9d495b892a136f1053473e3cb96d4a721e1fce7bb46bf1019d911ad441dbb",
     "market_source_id": "0x29283b56d3eec6d1d89fff51793d9d2e01579d2379b1d3e9ebda175d3561e809",
     "token_id": "81633484456710374417231462107666791993850637546563366185897100962157481970040",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -10,11 +14,18 @@
     "quantity": 180.0,
     "price": 0.007,
     "timestamp": "2026-07-10T04:05:40+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[0].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:9b9b74c36aec602b1fd5dc43d10664b8ecee3254a8af9c1b65bc92d333e26a75",
+    "sourceProvidedTradeId": "polymarket:9b811fe6d9f115c5c23d9e73c960e2566ad7e442cfff3d5215d8c16a15705671",
+    "transaction_hash": "polymarket:9b811fe6d9f115c5c23d9e73c960e2566ad7e442cfff3d5215d8c16a15705671",
+    "historical_stored_source_trade_id": "polymarket:9b9b74c36aec602b1fd5dc43d10664b8ecee3254a8af9c1b65bc92d333e26a75",
+    "historical_upstream_source_provided_trade_id": "polymarket:9b811fe6d9f115c5c23d9e73c960e2566ad7e442cfff3d5215d8c16a15705671",
     "market_source_id": "0x46dbd48d6bde5b81edb480e0f676a2cdda6c6b592c4d86a9367c7ad5a9870195",
     "token_id": "63802361760137863513735993346883582181207639895442036953936089060482564982249",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -23,11 +34,18 @@
     "quantity": 200.0,
     "price": 0.993,
     "timestamp": "2026-07-10T03:23:53+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[1].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:bd05d2c65e8c76b3017e2ae76b917311dfca8eb64d80b31c0c35f4dc6bdca54c",
+    "sourceProvidedTradeId": "polymarket:781e5be438576fb655f4eb233474ad0da25d5213d432c100ce574dcb0a8bbb32",
+    "transaction_hash": "polymarket:781e5be438576fb655f4eb233474ad0da25d5213d432c100ce574dcb0a8bbb32",
+    "historical_stored_source_trade_id": "polymarket:bd05d2c65e8c76b3017e2ae76b917311dfca8eb64d80b31c0c35f4dc6bdca54c",
+    "historical_upstream_source_provided_trade_id": "polymarket:781e5be438576fb655f4eb233474ad0da25d5213d432c100ce574dcb0a8bbb32",
     "market_source_id": "0xc586d15be76278848a26c761c2fcf70f8cebca71815cfab83e656ff5c6ec13a9",
     "token_id": "56215025902031889702122383201324191240581604266667334383154318117703136383150",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -36,11 +54,18 @@
     "quantity": 160.0,
     "price": 0.993,
     "timestamp": "2026-07-10T03:03:41+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[2].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:bf5384d36afcfb132658b11e703d79a088f9b5821a02290d0652216fb6c8958f",
+    "sourceProvidedTradeId": "polymarket:a5a0a5c73e49717c2e3c062fc01edb8f24ff64437d76972ab3271c505e4083f6",
+    "transaction_hash": "polymarket:a5a0a5c73e49717c2e3c062fc01edb8f24ff64437d76972ab3271c505e4083f6",
+    "historical_stored_source_trade_id": "polymarket:bf5384d36afcfb132658b11e703d79a088f9b5821a02290d0652216fb6c8958f",
+    "historical_upstream_source_provided_trade_id": "polymarket:a5a0a5c73e49717c2e3c062fc01edb8f24ff64437d76972ab3271c505e4083f6",
     "market_source_id": "0xfd6176f8c9a59105f80e060a77c4099881c5f2d9e0ceab88e55cf978462fab7f",
     "token_id": "4999047257294547885970323631312419427544062131054733229841947946130772277335",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -49,11 +74,18 @@
     "quantity": 220.0,
     "price": 0.007,
     "timestamp": "2026-07-09T23:42:23+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[3].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:e9bd9ceacfb86240db805877269795d95773868a4fe497f92d76bd43cdd18536",
+    "sourceProvidedTradeId": "polymarket:c113f439b543445b928acef06737eec10caf4c5239261ac31df5e2ec73cbea33",
+    "transaction_hash": "polymarket:c113f439b543445b928acef06737eec10caf4c5239261ac31df5e2ec73cbea33",
+    "historical_stored_source_trade_id": "polymarket:e9bd9ceacfb86240db805877269795d95773868a4fe497f92d76bd43cdd18536",
+    "historical_upstream_source_provided_trade_id": "polymarket:c113f439b543445b928acef06737eec10caf4c5239261ac31df5e2ec73cbea33",
     "market_source_id": "0x29283b56d3eec6d1d89fff51793d9d2e01579d2379b1d3e9ebda175d3561e809",
     "token_id": "114507466536734360808195115190160357255467689128176113085692265197019898971527",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -62,11 +94,18 @@
     "quantity": 210.0,
     "price": 0.994,
     "timestamp": "2026-07-09T16:47:40+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[4].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:b3fbc4a16770ccde262588878b8d52169550098e92aa0c2e7ea54a22b3c99943",
+    "sourceProvidedTradeId": "polymarket:ef34763e25be92c60b4d16a26d696fc819ea059ac374c23660bec1445efc7153",
+    "transaction_hash": "polymarket:ef34763e25be92c60b4d16a26d696fc819ea059ac374c23660bec1445efc7153",
+    "historical_stored_source_trade_id": "polymarket:b3fbc4a16770ccde262588878b8d52169550098e92aa0c2e7ea54a22b3c99943",
+    "historical_upstream_source_provided_trade_id": "polymarket:ef34763e25be92c60b4d16a26d696fc819ea059ac374c23660bec1445efc7153",
     "market_source_id": "0xe883f2fda25a605a184bb5fe583afce6cc21ea0b348b6a3728ec3067553c548d",
     "token_id": "108650988487983371520585351370999192979899647080710024226285750050382033453124",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -75,11 +114,18 @@
     "quantity": 210.0,
     "price": 0.991,
     "timestamp": "2026-07-09T12:54:28+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[5].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:1c69cda9e635a0e8e483c148c89c26cdbfa7953785f8c99f9b5d0ccbafd557a3",
+    "sourceProvidedTradeId": "polymarket:de8b24e7e5b04c4840ee889d13cde943f0995f9eecef633712f9be256f406a22",
+    "transaction_hash": "polymarket:de8b24e7e5b04c4840ee889d13cde943f0995f9eecef633712f9be256f406a22",
+    "historical_stored_source_trade_id": "polymarket:1c69cda9e635a0e8e483c148c89c26cdbfa7953785f8c99f9b5d0ccbafd557a3",
+    "historical_upstream_source_provided_trade_id": "polymarket:de8b24e7e5b04c4840ee889d13cde943f0995f9eecef633712f9be256f406a22",
     "market_source_id": "0xa9549c44687993a9a154347c6907092341459b927efaa3f2b49009ca2c4e40a1",
     "token_id": "23692929455124171734375794579007643086071570310019729232490607671061438183936",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -88,11 +134,18 @@
     "quantity": 190.0,
     "price": 0.009,
     "timestamp": "2026-07-09T09:28:47+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[6].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:afc7a199a17cfc3a12588e6457299e6ea8cc73d6d162f1883fe91f4d46077e86",
+    "sourceProvidedTradeId": "polymarket:87750f305c61d53ed0c80b86f0e62a8a3d281ce67fcbe8c6ba821ec240e85334",
+    "transaction_hash": "polymarket:87750f305c61d53ed0c80b86f0e62a8a3d281ce67fcbe8c6ba821ec240e85334",
+    "historical_stored_source_trade_id": "polymarket:afc7a199a17cfc3a12588e6457299e6ea8cc73d6d162f1883fe91f4d46077e86",
+    "historical_upstream_source_provided_trade_id": "polymarket:87750f305c61d53ed0c80b86f0e62a8a3d281ce67fcbe8c6ba821ec240e85334",
     "market_source_id": "0x9d4f94f82de9d13ff1d3318639ab9000ee2533949e525343156f374fb00bd9b1",
     "token_id": "58378309871183461257693288827678410871907006920578755035402846056315798427503",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -101,11 +154,18 @@
     "quantity": 210.0,
     "price": 0.01,
     "timestamp": "2026-07-09T06:44:29+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[7].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:74f08b2cf54cd9170ed2a18d452198b1e3155cab6162fb96b2e428f3eb51a210",
+    "sourceProvidedTradeId": "polymarket:e6dfc3d111e9f8996097206c2a2477ccf5ef0ec2075c94f05155fbcbb2961ec8",
+    "transaction_hash": "polymarket:e6dfc3d111e9f8996097206c2a2477ccf5ef0ec2075c94f05155fbcbb2961ec8",
+    "historical_stored_source_trade_id": "polymarket:74f08b2cf54cd9170ed2a18d452198b1e3155cab6162fb96b2e428f3eb51a210",
+    "historical_upstream_source_provided_trade_id": "polymarket:e6dfc3d111e9f8996097206c2a2477ccf5ef0ec2075c94f05155fbcbb2961ec8",
     "market_source_id": "0x8b203037c7c0e21b500314f8398d2a8ea294b7ce1f4f9185f426425a3505bc45",
     "token_id": "46254744034025107660239982269249567113656697231872036621777316158933638064598",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -114,11 +174,18 @@
     "quantity": 180.0,
     "price": 0.993,
     "timestamp": "2026-07-09T04:28:14+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[8].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:d638d2140198a51f5796078389cff4ce936f983aa8522c5b28b6ec8d552a0607",
+    "sourceProvidedTradeId": "polymarket:fa060215882d411ad30307f3877f07a49b9dac4f83d4b3cc89130017f53a75be",
+    "transaction_hash": "polymarket:fa060215882d411ad30307f3877f07a49b9dac4f83d4b3cc89130017f53a75be",
+    "historical_stored_source_trade_id": "polymarket:d638d2140198a51f5796078389cff4ce936f983aa8522c5b28b6ec8d552a0607",
+    "historical_upstream_source_provided_trade_id": "polymarket:fa060215882d411ad30307f3877f07a49b9dac4f83d4b3cc89130017f53a75be",
     "market_source_id": "0x6685b25cc7c89032efcdf81eb27fdc6bbf04a3e4299bcd99c9f3d62c8471001e",
     "token_id": "54840717483866263964304723492966182979723045222316848733193673523986124053075",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -127,11 +194,18 @@
     "quantity": 300.0,
     "price": 0.005,
     "timestamp": "2026-07-09T03:38:52+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[9].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:763644f6c36eba47a92ec9c4c01ec10c6dfb4d9ad87503a718c01f9a493f71ca",
+    "sourceProvidedTradeId": "polymarket:ec13850bbc33b1a1cc3174fcadd5f01bbb769101a8055dc43ceee734b94181e3",
+    "transaction_hash": "polymarket:ec13850bbc33b1a1cc3174fcadd5f01bbb769101a8055dc43ceee734b94181e3",
+    "historical_stored_source_trade_id": "polymarket:763644f6c36eba47a92ec9c4c01ec10c6dfb4d9ad87503a718c01f9a493f71ca",
+    "historical_upstream_source_provided_trade_id": "polymarket:ec13850bbc33b1a1cc3174fcadd5f01bbb769101a8055dc43ceee734b94181e3",
     "market_source_id": "0xa9549c44687993a9a154347c6907092341459b927efaa3f2b49009ca2c4e40a1",
     "token_id": "30050897091642315762983745166096629857367320723415212749446858994810226049012",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -140,11 +214,18 @@
     "quantity": 190.0,
     "price": 0.992,
     "timestamp": "2026-07-09T02:53:37+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[10].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:ec5d86981161be068734dcde26c957a16c4584f4c2c8bbb1856b77b5f7d96ecd",
+    "sourceProvidedTradeId": "polymarket:bbe760b9f65f383737473acc2d25fadc1d7152bb6759d4fc4320311b60564481",
+    "transaction_hash": "polymarket:bbe760b9f65f383737473acc2d25fadc1d7152bb6759d4fc4320311b60564481",
+    "historical_stored_source_trade_id": "polymarket:ec5d86981161be068734dcde26c957a16c4584f4c2c8bbb1856b77b5f7d96ecd",
+    "historical_upstream_source_provided_trade_id": "polymarket:bbe760b9f65f383737473acc2d25fadc1d7152bb6759d4fc4320311b60564481",
     "market_source_id": "0x8b203037c7c0e21b500314f8398d2a8ea294b7ce1f4f9185f426425a3505bc45",
     "token_id": "46254744034025107660239982269249567113656697231872036621777316158933638064598",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -153,11 +234,18 @@
     "quantity": 210.0,
     "price": 0.993,
     "timestamp": "2026-07-08T21:55:11+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[11].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:d84dbf96d8e00266b6de83a0604a0da425ab32441ab2d1c18223f51a5be7c106",
+    "sourceProvidedTradeId": "polymarket:81965b4867e0f41564a0e938006678638a4d7c5fb643c5bf8e33aed87bd18ebd",
+    "transaction_hash": "polymarket:81965b4867e0f41564a0e938006678638a4d7c5fb643c5bf8e33aed87bd18ebd",
+    "historical_stored_source_trade_id": "polymarket:d84dbf96d8e00266b6de83a0604a0da425ab32441ab2d1c18223f51a5be7c106",
+    "historical_upstream_source_provided_trade_id": "polymarket:81965b4867e0f41564a0e938006678638a4d7c5fb643c5bf8e33aed87bd18ebd",
     "market_source_id": "0xbbbece074c2d4010e39e39c85ed67b1131180fcea616073c893fb6beaf51d783",
     "token_id": "1970496541508335019913900195809032484597886384784144327835472760880523550630",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -166,11 +254,18 @@
     "quantity": 180.0,
     "price": 0.993,
     "timestamp": "2026-07-08T17:50:25+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[12].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   },
   {
     "source": "polymarket_data_api_trades_user",
     "source_trade_id": "polymarket:ccbcc9265c2d3578f6dc5732fef92f88b1f864d4ceaa380b6aa670afc5ec6d18",
+    "sourceProvidedTradeId": "polymarket:a2d2bdb1c64c651760ff93d4fc2c6e91850bdf6adc729c4edbf9ed3d3f2e9d38",
+    "transaction_hash": "polymarket:a2d2bdb1c64c651760ff93d4fc2c6e91850bdf6adc729c4edbf9ed3d3f2e9d38",
+    "historical_stored_source_trade_id": "polymarket:ccbcc9265c2d3578f6dc5732fef92f88b1f864d4ceaa380b6aa670afc5ec6d18",
+    "historical_upstream_source_provided_trade_id": "polymarket:a2d2bdb1c64c651760ff93d4fc2c6e91850bdf6adc729c4edbf9ed3d3f2e9d38",
     "market_source_id": "0x01dffa7abae7e5d9b7fb44b06d537c5ac932e2ca422ab4b53366672f5e2dc7d6",
     "token_id": "104431860535489654020481219089291817898241901940037260095979653681449084465327",
     "trader_address": "0xcac76b761231464900cce5da7c20233d59b20579",
@@ -179,6 +274,9 @@
     "quantity": 200.0,
     "price": 0.992,
     "timestamp": "2026-07-08T13:25:38+00:00",
-    "is_sample": 0
+    "is_sample": 0,
+    "upstream_id_source_commit": "56fbd0ee67770af4df5c2dcd93d65eec4c2df583",
+    "upstream_id_source_json_path": "valid_rows[13].transaction_hash",
+    "upstream_id_historically_mislabeled_as_transaction_hash": true
   }
 ]

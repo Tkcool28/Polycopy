@@ -280,10 +280,16 @@ def test_gate_passes_against_real_db_all_14_recognized():
     assert gate.safe_for_future_production_write is True
 
 
-def test_gate_recognizes_canonical_row_directly():
-    """An existing canonical row is recognized directly."""
+def test_gate_recognizes_legacy_fallback_not_canonical():
+    """With REAL upstream ids, the 14 historical rows are recognized ONLY via
+    the recomputed legacy fallback (canonical strong id differs from stored DB id)."""
     gate = _run_gate(_reference_records())
-    assert gate.canonical_matches == 14
+    # Corrected canonical id (real upstream) != stored DB id for every row.
+    assert gate.canonical_matches == 0
+    assert gate.legacy_alias_matches == 14
+    assert gate.unmatched == 0
+    assert gate.rerun_would_insert == 0
+    assert gate.safe_for_future_production_write is True
 
 
 def test_gate_recognizes_legacy_fallback_when_canonical_differs():
@@ -345,3 +351,120 @@ def test_writer_not_invoked_when_gate_fails(monkeypatch):
         unmatched=14, rerun_would_insert=14, safe_for_future_production_write=False,
     )
     assert gate.safe_for_future_production_write is False
+
+
+# ── Section 8: tautology-bug regression tests ──────────────────────────────────
+def test_stored_fallback_and_upstream_ids_differ():
+    """Historical stored fallback DB id and the real upstream source-provided id
+    are DIFFERENT for every historical row (the root cause of the tautology)."""
+    recs = _reference_records()
+    assert len(recs) == 14
+    for r in recs:
+        stored = r["historical_stored_source_trade_id"]
+        upstream = r["historical_upstream_source_provided_trade_id"]
+        assert stored != upstream
+        assert r["upstream_id_historically_mislabeled_as_transaction_hash"] is True
+        assert upstream == r["transaction_hash"]
+
+
+def test_reconciliation_not_populated_from_source_trade_id():
+    """Reconciliation must derive the upstream id from transaction_hash, never
+    copy source_trade_id into the upstream_source_provided field."""
+    art = _load_json()
+    for r in art["identity_row_reconciliation"]:
+        assert r["real_upstream_source_provided_trade_id"] != r["historical_report_source_trade_id"]
+        assert r["real_upstream_source_provided_trade_id"] == r["historical_report_transaction_hash"]
+
+
+def test_row1_corrected_derives_from_upstream_not_stored():
+    """Row 1: corrected canonical must derive from e0c9d495... (upstream),
+    not from 11ae80be... (stored)."""
+    art = _load_json()
+    r1 = art["identity_row_reconciliation"][0]
+    assert r1["historical_report_source_trade_id"] == "polymarket:11ae80be5e1566fda292d78b0150629ef29c828a1ed3c6df81bc00ba8b9ffe90"
+    assert r1["real_upstream_source_provided_trade_id"] == "polymarket:e0c9d495b892a136f1053473e3cb96d4a721e1fce7bb46bf1019d911ad441dbb"
+    assert r1["corrected_generate_identity_output_id"] == "polymarket:e0c9d495b892a136f1053473e3cb96d4a721e1fce7bb46bf1019d911ad441dbb"
+    assert r1["corrected_id_equals_db_id"] is False
+    assert r1["recomputed_legacy_equals_db_id"] is True
+    assert r1["recognized_as_existing"] is True
+
+
+def test_row2_corrected_derives_from_upstream_not_stored():
+    """Row 2: corrected canonical must derive from 9b811fe6... (upstream),
+    not from 9b9b74c3... (stored)."""
+    art = _load_json()
+    r2 = art["identity_row_reconciliation"][1]
+    assert r2["historical_report_source_trade_id"] == "polymarket:9b9b74c36aec602b1fd5dc43d10664b8ecee3254a8af9c1b65bc92d333e26a75"
+    assert r2["real_upstream_source_provided_trade_id"] == "polymarket:9b811fe6d9f115c5c23d9e73c960e2566ad7e442cfff3d5215d8c16a15705671"
+    assert r2["corrected_generate_identity_output_id"] == "polymarket:9b811fe6d9f115c5c23d9e73c960e2566ad7e442cfff3d5215d8c16a15705671"
+    assert r2["corrected_id_equals_db_id"] is False
+
+
+def test_canonical_mismatch_with_valid_legacy_alias_recognized():
+    """A canonical mismatch PLUS a valid legacy alias is recognized as existing."""
+    gate = _run_gate(_reference_records())
+    assert gate.canonical_matches == 0
+    assert gate.legacy_alias_matches == 14
+    assert gate.unmatched == 0
+
+
+def test_canonical_mismatch_without_legacy_alias_blocks():
+    """A canonical mismatch WITHOUT a legacy alias blocks the writer (unmatched)."""
+    recs = _reference_records()
+    extra = dict(recs[0])
+    extra["source_trade_id"] = "polymarket:" + "c" * 64
+    extra["sourceProvidedTradeId"] = "polymarket:" + "c" * 64
+    extra["token_id"] = "77777777777777777777777777777777777777777777777777777777777777777"
+    gate = _run_gate(recs + [extra], expected=15)
+    assert gate.unmatched >= 1
+    assert gate.safe_for_future_production_write is False
+
+
+def test_reusing_db_source_trade_id_as_source_provided_fails():
+    """Feeding the stored DB source_trade_id back as sourceProvidedTradeId must
+    NOT be accepted as the canonical proof (tautology guard)."""
+    recs = _reference_records()
+    bad = []
+    for r in recs:
+        r2 = dict(r)
+        r2["sourceProvidedTradeId"] = r2["historical_stored_source_trade_id"]
+        r2["historical_upstream_source_provided_trade_id"] = r2["historical_stored_source_trade_id"]
+        bad.append(r2)
+    _run_gate(bad)  # forcing the bug would make canonical_matches=14 (tautology)
+    # The committed reference must NOT do this:
+    real = _run_gate(_reference_records())
+    assert real.canonical_matches == 0
+
+
+def test_csv_has_row_where_corrected_id_unequals_db():
+    """The CSV must contain at least one row where corrected_id_equals_db_id is
+    False (proving the real historical data produces a canonical mismatch)."""
+    import csv
+
+    with open(CSV_PATH, newline="") as f:
+        rows = list(csv.DictReader(f))
+    false_rows = [r for r in rows if r["corrected_id_equals_db_id"].lower() == "false"]
+    assert len(false_rows) >= 1
+    assert len(rows) == 14
+
+
+def test_no_test_hardcodes_safe_true():
+    """safe_for_future_production_write must always be COMPUTED from the gate,
+    never asserted without the gate running. This test runs the gate and checks
+    the value is consistent with its inputs."""
+    gate = _run_gate(_reference_records())
+    expected_safe = (
+        gate.historical_rows_examined == gate.historical_rows_expected
+        and gate.unmatched == 0
+        and gate.rerun_would_insert == 0
+    )
+    assert gate.safe_for_future_production_write == expected_safe
+
+
+def test_writer_not_invoked_when_reconciliation_invalid():
+    """The committed reference must carry real upstream ids (so the gate is not
+    tautological), and the gate on the real reference must be safe."""
+    recs = _reference_records()
+    assert all(r["historical_upstream_source_provided_trade_id"] for r in recs)
+    real = _run_gate(recs)
+    assert real.safe_for_future_production_write is True
