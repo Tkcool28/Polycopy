@@ -193,7 +193,7 @@
   },
   "backup": {
     "success": true,
-    "path": "/root/Polycopy/data/polycopy.db.pr24z_online_backup_20260710T061701Z",
+    "path": "/root/Polycopy/data/polycopy.db.pr24z_online_backup_20260710T061626Z",
     "method": "sqlite_online_backup",
     "sha256": "fe9d66a355a1802e54dead910be628f21807198d5524cbd423aee5223f3fa66f",
     "size": 528384,
@@ -217,7 +217,37 @@
     "safe_to_write": true,
     "details": []
   },
-  "compatibility": null,
+  "compatibility": {
+    "verification_method": "read_only_replay_of_existing_pr24z_rows",
+    "live_fetch_returned_records": false,
+    "live_fetch_raw_records": 0,
+    "existing_pr24z_rows_examined": 14,
+    "existing_pr24z_rows_matched": 14,
+    "existing_pr24z_rows_unmatched": 0,
+    "legacy_identity_aliases_used": 0,
+    "canonical_strong_ids_matched": 14,
+    "existing_duplicates_recognized": 14,
+    "rerun_would_insert": 0,
+    "production_write_requested": false,
+    "production_write_performed": false,
+    "source_trades_before": 19,
+    "source_trades_after": 19,
+    "reconciliation_error": null
+  },
+  "post_write_idempotency_verification": {
+    "verification_method": "read_only_replay_of_existing_pr24z_rows",
+    "live_dry_run_attempted": true,
+    "live_network_calls_attempted": 1,
+    "live_network_calls_succeeded": 1,
+    "live_raw_records": 0,
+    "live_result_note": "The selected verification wallet returned zero records, so compatibility was proven by replaying the actual 14 previously inserted PR24Z rows through the corrected identity and dedupe path.",
+    "existing_duplicates_recognized": 14,
+    "rows_attempted_for_write": 0,
+    "rows_inserted": 0,
+    "production_db_opened_for_write": false,
+    "source_trades_before": 19,
+    "source_trades_after": 19
+  },
   "integrity_check": "ok",
   "foreign_key_check": 0,
   "historical_first_production_write": {
