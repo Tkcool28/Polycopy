@@ -1,0 +1,1254 @@
+{
+  "audit_version": "PR24X-1",
+  "repo_root": "/root/Polycopy",
+  "db_safety_layer": {
+    "foreign_keys_on": true,
+    "journal_mode_wal": true,
+    "busy_timeout_ms": 30000,
+    "wal_autocheckpoint": 1000,
+    "applied_in_connect": true,
+    "source_reference": "src/polycopy/db/database.py:connect()",
+    "wal_sufficient_alone": false,
+    "note": "WAL + busy_timeout avoid SQLITE_BUSY and allow concurrent readers, but they do NOT make SQLite multi-writer. An application-level single-writer rule is still required. | direct sqlite3.connect (non-ro) opens in src/: ['src/polycopy/db/database.py:84 self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)', 'src/polycopy/engine/source_trade_ingestion_writer_audit.py:65 \"sqlite3.connect(\",', 'src/polycopy/engine/source_trade_ingestion_writer_audit.py:334 \"\"\"Find raw sqlite3.connect() opens outside tests/migration debug.']"
+  },
+  "source_trades_inventory": {
+    "source_trades": 5,
+    "side_distribution": {
+      "BUY": 1,
+      "buy": 4
+    },
+    "trade_copyability_decisions": 0,
+    "copy_candidates": 0,
+    "paper_signal_decisions": 0,
+    "candidate_price_snapshots": 0,
+    "candidate_price_snapshot_levels": 0,
+    "orders": 0,
+    "positions": 0,
+    "wallet_score_decisions": 1,
+    "settlement_accounting_ledger": 0
+  },
+  "write_paths": [
+    {
+      "path": "scripts/backfill_resolution_truth.py",
+      "line": 449,
+      "verb": "update",
+      "classification": "production_write_path",
+      "writes_db": true,
+      "uses_database_connect": true,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "scripts/collect_smart_money_data.py",
+      "line": 703,
+      "verb": "insert or ignore into",
+      "classification": "production_write_path",
+      "writes_db": true,
+      "uses_database_connect": true,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "scripts/live_smoke_pr3_fixes.py",
+      "line": 202,
+      "verb": "insert or ignore into",
+      "classification": "production_write_path",
+      "writes_db": true,
+      "uses_database_connect": true,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "scripts/run_scan.py",
+      "line": 1419,
+      "verb": "insert or ignore into",
+      "classification": "production_write_path",
+      "writes_db": true,
+      "uses_database_connect": true,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "scripts/seed_demo_data.py",
+      "line": 472,
+      "verb": "insert or replace into",
+      "classification": "sample_test_seed_path",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "src/polycopy/db/schema.py",
+      "line": 432,
+      "verb": "insert into",
+      "classification": "migration_schema_path",
+      "writes_db": true,
+      "uses_database_connect": true,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 154,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 365,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 422,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 484,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 542,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 593,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 670,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 738,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 758,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 969,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 1045,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 1076,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 1185,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 1197,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p01_trade_outcome_identity.py",
+      "line": 1287,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p02_copy_candidates.py",
+      "line": 186,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p02_copy_candidates.py",
+      "line": 403,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p03_price_snapshots.py",
+      "line": 211,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p03_price_snapshots.py",
+      "line": 463,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_behavior_classification.py",
+      "line": 612,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_chunk4_runtime_paper_signal.py",
+      "line": 112,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_constraints.py",
+      "line": 410,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_constraints.py",
+      "line": 450,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_constraints.py",
+      "line": 491,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_full_contract.py",
+      "line": 49,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_immutability.py",
+      "line": 50,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_migration_matrix.py",
+      "line": 157,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p04_migration_matrix.py",
+      "line": 200,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p10_category_schema_migration.py",
+      "line": 147,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p10_category_schema_migration.py",
+      "line": 405,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 131,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 236,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 324,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 368,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 411,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 435,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 479,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 589,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 755,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 773,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 824,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 1036,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 1096,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 1152,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 1211,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_fixes.py",
+      "line": 1279,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_trade_ingestion.py",
+      "line": 367,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p21_trade_ingestion.py",
+      "line": 382,
+      "verb": "insert or ignore into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 119,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 491,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 578,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 726,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 811,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 927,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1043,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1180,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1190,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1208,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1227,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1246,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1423,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1435,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1615,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_backfill.py",
+      "line": 1768,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24a_resolution_truth_schema.py",
+      "line": 404,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24b_query_memory_guards.py",
+      "line": 719,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24b_query_memory_guards.py",
+      "line": 789,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24i_settlement_accounting_ledger.py",
+      "line": 55,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24j_wallet_accounting_coverage.py",
+      "line": 20,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24j_wallet_accounting_coverage_script.py",
+      "line": 22,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24q_trade_copyability_review_report.py",
+      "line": 133,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24r_trade_copyability_bridge_audit.py",
+      "line": 152,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24r_trade_copyability_bridge_audit.py",
+      "line": 202,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24s_trade_copyability_snapshot_evidence_bridge.py",
+      "line": 120,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24u_trade_copyability_real_snapshot_collection_bridge.py",
+      "line": 88,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24u_trade_copyability_real_snapshot_collection_bridge.py",
+      "line": 498,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24v_trade_copyability_market_state_evidence_bridge.py",
+      "line": 90,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24v_trade_copyability_market_state_evidence_bridge.py",
+      "line": 524,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24w_source_trade_real_coverage_mapping_audit.py",
+      "line": 90,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p24x_source_trade_ingestion_writer_audit.py",
+      "line": 93,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p30_wallet_identity_normalization.py",
+      "line": 241,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p30_wallet_identity_normalization.py",
+      "line": 266,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p30_wallet_identity_normalization.py",
+      "line": 300,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p31_wallet_uniqueness.py",
+      "line": 177,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p31_wallet_uniqueness.py",
+      "line": 202,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_p32_wallet_normalization_matrix.py",
+      "line": 283,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr19_legacy_step5_bound.py",
+      "line": 100,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr19_legacy_step5_bound.py",
+      "line": 715,
+      "verb": "delete from",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr19_legacy_step5_bound.py",
+      "line": 719,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr19_legacy_step5_bound.py",
+      "line": 885,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr19_legacy_step5_bound.py",
+      "line": 1000,
+      "verb": "delete from",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr19_legacy_step5_bound.py",
+      "line": 1004,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr5_pipeline_wiring.py",
+      "line": 130,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_pr5_pipeline_wiring.py",
+      "line": 670,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
+      "path": "tests/test_v9_schema_bridge.py",
+      "line": 116,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    }
+  ],
+  "collectors": [
+    {
+      "name": "PolymarketPublicAdapter",
+      "path": "src/polycopy/adapters/polymarket.py",
+      "reads": true,
+      "writes_db": false,
+      "tables_touched": [],
+      "writes_source_trades_directly": false,
+      "fetcher_only_safe": true,
+      "notes": "Fetches market/trade/resolution data via Gamma+CLOB APIs. No DB writes anywhere in adapters/ (verified)."
+    },
+    {
+      "name": "PolymarketClobAdapter.fetch_book",
+      "path": "src/polycopy/adapters/polymarket_clob.py",
+      "reads": true,
+      "writes_db": false,
+      "tables_touched": [],
+      "writes_source_trades_directly": false,
+      "fetcher_only_safe": true,
+      "notes": "Fetches CLOB order book only. No DB writes."
+    },
+    {
+      "name": "BullpenReadOnlyAdapter",
+      "path": "src/polycopy/adapters/bullpen.py",
+      "reads": true,
+      "writes_db": false,
+      "tables_touched": [],
+      "writes_source_trades_directly": false,
+      "fetcher_only_safe": true,
+      "notes": "ReadOnly adapter implementing provider protocols. No writes."
+    },
+    {
+      "name": "RealSnapshotEvidenceCollector",
+      "path": "src/polycopy/engine/trade_copyability_real_snapshot_collection_bridge.py",
+      "reads": true,
+      "writes_db": false,
+      "tables_touched": [],
+      "writes_source_trades_directly": false,
+      "fetcher_only_safe": true,
+      "notes": "Live CLOB book collector used by PR24U bridge. Fetch-only."
+    },
+    {
+      "name": "run_scan.ScanPipeline",
+      "path": "scripts/run_scan.py",
+      "reads": true,
+      "writes_db": true,
+      "tables_touched": [
+        "source_trades",
+        "wallets",
+        "markets"
+      ],
+      "writes_source_trades_directly": true,
+      "fetcher_only_safe": false,
+      "notes": "PRODUCTION writer. Calls _persist_trade() (run_scan.py:1419) directly. Also persists wallets/markets. Must be refactored so ingestion delegates to the single shared writer."
+    },
+    {
+      "name": "collect_smart_money_data.run_collection",
+      "path": "scripts/collect_smart_money_data.py",
+      "reads": true,
+      "writes_db": true,
+      "tables_touched": [
+        "source_trades",
+        "wallets",
+        "markets"
+      ],
+      "writes_source_trades_directly": true,
+      "fetcher_only_safe": false,
+      "notes": "PRODUCTION writer. Calls _persist_trade() (collect_smart_money_data.py:703) directly. Duplicate of the run_scan writer. Must be refactored to the shared writer."
+    },
+    {
+      "name": "wallet_discovery",
+      "path": "src/polycopy/discovery/wallet_discovery.py",
+      "reads": true,
+      "writes_db": false,
+      "tables_touched": [],
+      "writes_source_trades_directly": false,
+      "fetcher_only_safe": true,
+      "notes": "Reads/normalizes wallet discovery inputs. No source_trades writes."
+    },
+    {
+      "name": "backfill_resolution_truth",
+      "path": "scripts/backfill_resolution_truth.py",
+      "reads": true,
+      "writes_db": true,
+      "tables_touched": [
+        "source_trades"
+      ],
+      "writes_source_trades_directly": true,
+      "fetcher_only_safe": false,
+      "notes": "UPDATEs source_trades resolution columns (line 449). Settlement-stage, not ingestion. Must remain a separate, explicit, single-owner writer."
+    }
+  ],
+  "architecture_roles": [
+    {
+      "role": "Fetcher(s)",
+      "may_write": false,
+      "responsibility": "Pull raw trade/wallet/activity data from APIs. No DB writes."
+    },
+    {
+      "role": "Normalizer",
+      "may_write": false,
+      "responsibility": "Map raw payloads to the source_trade contract. No DB writes."
+    },
+    {
+      "role": "Validator",
+      "may_write": false,
+      "responsibility": "Reject/flag rows failing contract. No DB writes."
+    },
+    {
+      "role": "Batch",
+      "may_write": false,
+      "responsibility": "Group valid normalized rows into bounded batches. No DB writes."
+    },
+    {
+      "role": "Single SourceTrade Writer",
+      "may_write": true,
+      "responsibility": "ONLY component allowed to INSERT source_trades. Uses Database.connect() so WAL/busy_timeout apply. Idempotent, one transaction per batch, explicit write flag, dry-run."
+    }
+  ],
+  "contract": {
+    "required_fields": [
+      "source",
+      "source_trade_id",
+      "trader_address",
+      "market_source_id",
+      "token_id",
+      "side",
+      "price",
+      "size",
+      "timestamp",
+      "outcome",
+      "is_sample"
+    ],
+    "dedupe_key_preferred": "source + source_trade_id",
+    "dedupe_key_fallback": "wallet + token/condition + side + price + size + timestamp",
+    "pr24u_ready": "token_id present",
+    "pr24v_ready": "conditionId-shaped market_source_id present OR read-only token->condition mapping available",
+    "both_ready": "PR24U-ready + PR24V-ready"
+  },
+  "dedupe_strategy": {
+    "unique_key_preferred": "UNIQUE(source, source_trade_id)",
+    "conflict_behavior": "INSERT OR IGNORE \u2014 collision is counted as dedup, never as an overwrite (avoids INSERT OR REPLACE provenance loss proven in run_scan/collect history).",
+    "repeat_scan_behavior": "Idempotent \u2014 re-running the same fetch inserts 0 new rows; existing rows are untouched.",
+    "fallback_key": "wallet_address + token_id/conditionId + side + price + size + timestamp",
+    "fallback_when": "Only when upstream source_trade_id is unavailable; must be made deterministic before use.",
+    "duplicate_prevention": "Single writer + UNIQUE index + INSERT OR IGNORE + bounded transaction scope."
+  },
+  "wal_safe_write_policy": {
+    "accept_normalized_rows_only": true,
+    "validate_every_row": true,
+    "skip_or_report_invalid_rows": true,
+    "bounded_batches": true,
+    "one_transaction_per_batch": true,
+    "commit_once_per_batch": true,
+    "never_concurrent_with_another_writer": true,
+    "expose_dry_run": true,
+    "require_explicit_write_flag": true,
+    "report_db_size_mtime_before_after": true,
+    "never_called_by_timers_until_proven": true
+  },
+  "future_sequence": [
+    {
+      "pr": "PR24Y",
+      "title": "Read-only real trade source probe / live-preview",
+      "writes_db": false,
+      "notes": "No DB writes; validate fetch feasibility."
+    },
+    {
+      "pr": "PR24Z",
+      "title": "Normalized source_trade candidate generation",
+      "writes_db": false,
+      "notes": "Produce candidate rows in-memory/report only."
+    },
+    {
+      "pr": "PR25A",
+      "title": "Guarded single-writer source_trade batch insert",
+      "writes_db": true,
+      "notes": "Explicit --write flag only; dry-run default."
+    },
+    {
+      "pr": "later",
+      "title": "Evidence attachment / scoring / decisions",
+      "writes_db": true,
+      "notes": "After ingestion is proven safe and single-owned."
+    }
+  ],
+  "centralized_writer_exists": false,
+  "centralized_writer_note": "No safe centralized source_trade writer exists today. persist_trade is duplicated across two collectors (run_scan.py and collect_smart_money_data.py). PR24X recommends building ONE shared writer role per the architecture below rather than a new parallel path.",
+  "guardrail_flags": {
+    "no_deploy": true,
+    "no_service_restart": true,
+    "no_timer_enablement": true,
+    "no_collect_scan_settle_update_restart": true,
+    "no_production_db_writes": true,
+    "no_source_trades_mutation": true,
+    "no_backfill": true,
+    "no_real_ingestion_implementation": true,
+    "no_live_fetch": true,
+    "no_persistence_writer": true,
+    "no_scoring": true,
+    "no_trade_copyability_decisions": true,
+    "no_copy_candidates": true,
+    "no_paper_signal_decisions": true,
+    "no_candidate_price_snapshots": true,
+    "no_candidate_price_snapshot_levels": true,
+    "no_orders": true,
+    "no_positions": true,
+    "no_automation": true,
+    "no_broker_order_placement": true,
+    "no_candidate_creation": true,
+    "no_signal_creation": true
+  }
+}

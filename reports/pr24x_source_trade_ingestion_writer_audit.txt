@@ -1,0 +1,111 @@
+PR24X — SOURCE-TRADE INGESTION WRITER AUDIT (human summary)
+============================================================
+
+STATUS: SAFE / PARKED / PAPER-ONLY / NON-AUTOMATED
+SCOPE: Step 1 / Step 2 architecture only. Report-only / design-only / audit-only.
+VERIFIED DB (read-only): source_trades=5, side buy=4 / BUY=1, all downstream
+tables empty (trade_copyability_decisions=0, copy_candidates=0,
+paper_signal_decisions=0, candidate_price_snapshots=0, orders=0, positions=0).
+
+1) DB SAFETY LAYER — VERIFIED
+   - Database.connect() (src/polycopy/db/database.py) enforces:
+       * foreign_keys = ON
+       * journal_mode = WAL
+       * busy_timeout = 30000 ms
+       * wal_autocheckpoint = 1000 frames
+   - No production path bypasses Database.connect() for writes. The only raw
+     sqlite3.connect() opens are read-only mode=ro report helpers; the lone
+     non-ro raw open is a standalone schema-loop debug script (not on the
+     ingestion path).
+   - WAL exists. busy_timeout exists.
+   - WAL IS NECESSARY BUT NOT SUFFICIENT. WAL lets readers proceed and
+     busy_timeout makes writers wait instead of raising SQLITE_BUSY, but
+     WAL does NOT make SQLite multi-writer. An application-level single-writer
+     rule is STILL REQUIRED.
+
+2) source_trades WRITE PATHS — CLASSIFIED
+   PRODUCTION WRITE PATHS (2 collector-owned INSERTs + 1 settlement UPDATE):
+     - scripts/run_scan.py:1419            INSERT OR IGNORE INTO source_trades
+     - scripts/collect_smart_money_data.py:703  INSERT OR IGNORE INTO source_trades
+     - scripts/backfill_resolution_truth.py:449 UPDATE source_trades (settlement)
+   SAMPLE/TEST SEED PATH:
+     - scripts/seed_demo_data.py:472       INSERT OR REPLACE (is_sample=1)
+   MIGRATION/SCHEMA PATH:
+     - src/polycopy/db/schema.py           CREATE TABLE source_trades + UNIQUE
+   TEST/TEMP DB ONLY (94 hits across tests/):
+     - tests/*.py INSERT INTO source_trades (isolated temp DBs, is_sample rows)
+   DEAD/UNKNOWN: none flagged.
+   KEY FINDING: persist_trade is DUPLICATED across run_scan and
+   collect_smart_money_data. There is NO safe centralized writer today.
+
+3) COLLECTORS / FETCHERS — FETCHER-ONLY WHERE SAFE
+   - Adapters (polymarket.py, polymarket_clob.py, bullpen.py): READ only,
+     NO DB writes (verified by grep). Safe fetcher-only components.
+   - engine/*_evidence_bridge.py collectors: fetch-only (CLOB book, Gamma
+     market state). Safe fetcher-only.
+   - run_scan.ScanPipeline + collect_smart_money_data.run_collection: READ +
+     WRITE source_trades directly. MUST be refactored to delegate to the
+     single shared writer.
+   - backfill_resolution_truth: UPDATEs source_trades (settlement stage, not
+     ingestion). Keep as a separate explicit single-owner writer.
+
+4) SAFE INGESTION ARCHITECTURE (proposed)
+   Fetcher(s) -> Normalizer -> Validator -> Batch -> Single SourceTrade Writer
+   RULES:
+     * fetchers must NOT write
+     * normalizers must NOT write
+     * validators must NOT write
+     * ONLY the Single SourceTrade Writer may write source_trades
+     * writer is manually invoked first (no timer)
+     * writer batches rows, one bounded transaction per batch, commit once
+     * writer is idempotent (INSERT OR IGNORE on UNIQUE(source, source_trade_id))
+     * writer uses Database.connect() so WAL/busy_timeout apply
+     * NO collector-owned DB writes, NO multiple writer timers, NO auto restart
+
+5) source_trade CONTRACT (real row, is_sample=0)
+   Required: source, source_trade_id, trader_address/wallet_address,
+   market_source_id/conditionId (if available), token_id (if available),
+   side, price, size/quantity, timestamp, outcome (if available), is_sample=0,
+   stable dedupe key.
+   Evidence readiness:
+     - PR24U-ready  = token_id present
+     - PR24V-ready  = conditionId-shaped market_source_id present OR read-only
+                     token->condition mapping available
+     - both-ready   = PR24U-ready + PR24V-ready
+
+6) DEDUPE / IDEMPOTENCY
+   - Preferred unique key: UNIQUE(source, source_trade_id)
+   - Conflict behavior: INSERT OR IGNORE — collision counted as dedup, never
+     overwrite (INSERT OR REPLACE proven to destroy provenance).
+   - Repeat scan: idempotent; rerun inserts 0 new rows, existing untouched.
+   - Fallback (only if source_trade_id unavailable):
+     wallet + token/condition + side + price + size + timestamp (must be
+     deterministic before use).
+   - Duplicate prevention: single writer + UNIQUE index + INSERT OR IGNORE +
+     bounded transaction scope.
+
+7) WAL-SAFE WRITE POLICY (future writer)
+   Accept normalized rows only; validate every row; skip/report invalid rows;
+   write in bounded batches; one transaction per batch; commit once per batch;
+   never run concurrently with another writer; expose dry-run; require explicit
+   write flag; report DB size+mtime before/after in tests/reports; never called
+   by timers until manual runs are proven.
+
+8) FUTURE MANUAL INGESTION SEQUENCE
+   - PR24Y: read-only real trade source probe / live-preview, no DB writes
+   - PR24Z: normalized source_trade candidate generation, no DB writes
+   - PR25A: guarded single-writer source_trade batch insert, explicit --write
+            flag only
+   - later: evidence attachment / scoring / decisions
+
+9) RECOMMENDATION
+   No safe centralized writer exists today. Build ONE shared
+   SourceTradeWriter role (per architecture in section 4) and refactor
+   run_scan + collect_smart_money_data to delegate to it, rather than adding a
+   new parallel write path. Do NOT implement ingestion in PR24X.
+
+HARD GUARDRAILS (all enforced this PR): no deploy, no service/timer restart,
+no collect/scan/settle/update restart, no production DB writes, no
+source_trades mutation, no backfill, no real ingestion, no live fetch, no
+persistence writer, no scoring/decisions/candidates/signals/snapshots/orders/
+positions, no automation/broker/order placement.
