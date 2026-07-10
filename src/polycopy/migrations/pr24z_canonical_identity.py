@@ -17,7 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-MIGRATION_VERSION = "pr24z_canonical_identity_v1"
+from polycopy.migrations.pr24z_marker import MARKER_VERSION as MIGRATION_VERSION
+
 SOURCE = "polymarket_data_api_trades_user"
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_REFERENCE_PATH = ROOT / "reports" / "pr24z_historical_production_reference.json"
