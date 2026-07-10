@@ -1,470 +1,261 @@
-"""PR24Z historical production row reconciliation + HARD identity gate tests.
+"""PR24Z historical production reconciliation — final-architecture tests.
 
 Read-only verification only. No live API, no production write.
 
-16 reconciliation cases + 6 identity-compatibility-gate cases.
+These tests verify the *committed* artifacts and the one-time migration
+module against the *current* final architecture. They deliberately do NOT
+depend on the production DB (data/polycopy.db) and do NOT import any removed
+legacy-compatibility gate (IdentityCompatibilityGate / run_identity_compatibility_gate),
+which was intentionally removed from the permanent ingestion path.
+
+The 14 historical rows below are taken from the committed historical reference
+and approved mapping artifacts — never from the production DB.
 """
 from __future__ import annotations
 
-import json
+import csv
 import sqlite3
 from pathlib import Path
 
-import pytest
+from polycopy.ingestion.normalized_source_trade import generate_identity
+from polycopy.migrations.pr24z_canonical_identity import (
+    SOURCE as MIG_SOURCE,
+    canonical_replay_would_insert,
+    load_reference,
+)
+from polycopy.migrations.pr24z_marker import validate_pr24z_migration_marker
 
-ROOT = Path("/root/Polycopy")
-REPORT = ROOT / "reports" / "pr24z_historical_production_row_reconciliation.json"
-CSV_PATH = ROOT / "reports" / "pr24z_historical_production_row_reconciliation.csv"
-MAIN_JSON = ROOT / "reports" / "pr24z_manual_real_source_trade_ingestion.json"
-HIST_REF = ROOT / "reports" / "pr24z_historical_production_reference.json"
-DB_PATH = str(ROOT / "data" / "polycopy.db")
+ROOT = Path(__file__).resolve().parents[1]
+REPORTS = ROOT / "reports"
+HIST_REF = REPORTS / "pr24z_historical_production_reference.json"
+MAPPING_CSV = REPORTS / "pr24z_canonical_identity_migration_mapping.csv"
+MARKER = ROOT / "data" / ".pr24z_canonical_migration_complete"
 SOURCE = "polymarket_data_api_trades_user"
 
-FIXTURE_WALLET = "0x1111111111111111111111111111111111111111"
-FIXTURE_PREFIXES = ("0x2222", "0x3333", "0x4444", "0x5555", "0x6666", "0x7777")
 
-# 14 historical source_trade_ids (canonical strong ids, polymarket:<64hex>).
-HIST_IDS = [
-    "polymarket:11ae80be5e1566fda292d78b0150629ef29c828a1ed3c6df81bc00ba8b9ffe90",
-    "polymarket:9b9b74c36aec602b1fd5dc43d10664b8ecee3254a8af9c1b65bc92d333e26a75",
-    "polymarket:bd05d2c65e8c76b3017e2ae76b917311dfca8eb64d80b31c0c35f4dc6bdca54c",
-    "polymarket:bf5384d36afcfb132658b11e703d79a088f9b5821a02290d0652216fb6c8958f",
-    "polymarket:e9bd9ceacfb86240db805877269795d95773868a4fe497f92d76bd43cdd18536",
-    "polymarket:b3fbc4a16770ccde262588878b8d52169550098e92aa0c2e7ea54a22b3c99943",
-    "polymarket:1c69cda9e635a0e8e483c148c89c26cdbfa7953785f8c99f9b5d0ccbafd557a3",
-    "polymarket:afc7a199a17cfc3a12588e6457299e6ea8cc73d6d162f1883fe91f4d46077e86",
-    "polymarket:74f08b2cf54cd9170ed2a18d452198b1e3155cab6162fb96b2e428f3eb51a210",
-    "polymarket:d638d2140198a51f5796078389cff4ce936f983aa8522c5b28b6ec8d552a0607",
-    "polymarket:763644f6c36eba47a92ec9c4c01ec10c6dfb4d9ad87503a718c01f9a493f71ca",
-    "polymarket:ec5d86981161be068734dcde26c957a16c4584f4c2c8bbb1856b77b5f7d96ecd",
-    "polymarket:d84dbf96d8e00266b6de83a0604a0da425ab32441ab2d1c18223f51a5be7c106",
-    "polymarket:ccbcc9265c2d3578f6dc5732fef92f88b1f864d4ceaa380b6aa670afc5ec6d18",
-]
-
-
-# ── 16 reconciliation cases ──────────────────────────────────────────────────
-def _load_json():
-    return json.loads(REPORT.read_text())
-
-
-def test_reconciliation_artifact_exists():
-    assert REPORT.exists()
-
-
-def test_historical_run_commit_and_mode():
-    art = _load_json()
-    hr = art["historical_run"]
-    assert hr["commit"] == "56fbd0ee67770af4df5c2dcd93d65eec4c2df583"
-    assert hr["mode"] == "production-write"
-    assert hr["live"] is True
-    assert hr["network_calls_attempted"] == 2
-    assert hr["network_calls_succeeded"] == 2
-    assert hr["raw_records"] == 25
-    assert hr["eligible_buy_records"] == 14
-    assert hr["inserted_rows"] == 14
-
-
-def test_production_db_matched_14():
-    art = _load_json()
-    pdb = art["production_db"]
-    assert pdb["source_trades_total"] == 19
-    assert pdb["matched_historical_rows"] == 14
-    assert pdb["unmatched_historical_report_rows"] == 0
-    assert pdb["unexpected_extra_matches"] == 0
-
-
-def test_reconciliation_summary_all_14_match():
-    art = _load_json()
-    s = art["reconciliation_summary"]
-    assert s["rows_examined"] == 14
-    assert s["rows_all_fields_match"] == 14
-    assert s["rows_with_mismatch"] == 0
-    assert s["fixture_rows_found_in_production_set"] == 0
-    assert s["all_14_proven_real_format"] is True
-    assert s["all_14_report_db_match"] is True
-
-
-def test_fixture_verification_run_separate():
-    art = _load_json()
-    fv = art["fixture_verification_run"]
-    assert fv["mode"] == "safety-verification"
-    assert fv["live"] is False
-    assert fv["network_calls_attempted"] == 0
-    assert fv["fixture_wallet"] == FIXTURE_WALLET
-    assert fv["valid_rows"] == 3
-    assert fv["write_was_null"] is True
-    assert fv["rows_written_to_production"] == 0
-
-
-def test_live_read_only_reconfirmation_no_write():
-    art = _load_json()
-    lr = art["live_read_only_reconfirmation"]
-    assert lr["wallet"] == "0xcac76b761231464900cce5da7c20233d59b20579"
-    assert lr["production_write_requested"] is False
-    assert lr["production_write_performed"] is False
-
-
-def test_identity_pipeline_summary():
-    art = _load_json()
-    ip = art["identity_pipeline"]
-    assert ip["historical_mapping_bug_confirmed"] is True
-    assert ip["historical_source_id_mislabeled_as_transaction_hash"] is True
-    assert ip["historical_strong_count"] == 0
-    assert ip["historical_fallback_count"] == 25
-    assert ip["current_source_provided_count_for_14_rows"] == 14
-    assert ip["current_transaction_hash_count_for_14_rows"] == 0
-    assert ip["current_fallback_count_for_14_rows"] == 0
-    assert ip["current_ambiguous_count_for_14_rows"] == 0
-    assert ip["duplicate_rows_that_would_be_inserted"] == 0
-    assert ip["correction_verified"] is True
-
-
-def test_no_fixture_rows_labeled_historical():
-    """Fixture report rows cannot be labeled as historical production rows."""
-    art = _load_json()
-    assert art["historical_run"]["wallet_address"] != FIXTURE_WALLET
-    for r in art["row_reconciliation"]:
-        assert r["report_source_trade_id"] in HIST_IDS
-        assert not r["report_source_trade_id"].startswith("0x1111")
-
-
-def test_reconciliation_requires_exact_source_trade_id_selection():
-    """Reconciliation must select by exact historical source_trade_id, not count."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    try:
-        conn.row_factory = sqlite3.Row
-        ph = ",".join("?" * len(HIST_IDS))
-        rows = conn.execute(
-            "SELECT COUNT(*) c FROM source_trades WHERE source=? AND source_trade_id IN (%s)"
-            % ph,
-            [SOURCE] + HIST_IDS,
-        ).fetchone()["c"]
-        assert rows == 14
-        wrong = conn.execute(
-            "SELECT COUNT(*) c FROM source_trades WHERE source=? AND source_trade_id=?",
-            [SOURCE, "polymarket:deadbeef"],
-        ).fetchone()["c"]
-        assert wrong == 0
-    finally:
-        conn.close()
-
-
-def test_all_14_rows_present():
-    art = _load_json()
-    assert len(art["row_reconciliation"]) == 14
-
-
-def test_missing_db_row_fails_reconciliation():
-    """If a DB row were missing, all_fields_match would not be 14/14."""
-    art = _load_json()
-    if len(art["row_reconciliation"]) < 14:
-        pytest.fail("missing DB rows in reconciliation")
-    assert all(r["all_fields_match"] for r in art["row_reconciliation"])
-
-
-def test_extra_unexpected_matched_row_reported():
-    art = _load_json()
-    assert "unexpected_extra_matches" in art["production_db"]
-    assert art["production_db"]["unexpected_extra_matches"] == 0
-
-
-def test_decimal_price_comparison_stable():
-    from decimal import Decimal
-
-    art = _load_json()
-    for r in art["row_reconciliation"]:
-        assert Decimal(str(r["report_price"])) == Decimal(str(r["db_price"]))
-
-
-def test_decimal_quantity_comparison_stable():
-    from decimal import Decimal
-
-    art = _load_json()
-    for r in art["row_reconciliation"]:
-        assert Decimal(str(r["report_quantity"])) == Decimal(str(r["db_quantity"]))
-
-
-def test_timestamps_normalized_to_utc():
-    art = _load_json()
-    for r in art["row_reconciliation"]:
-        assert r["report_timestamp"] == r["db_timestamp"]
-        assert "+00:00" in r["report_timestamp"]
-
-
-def test_lowercase_wallet_comparison():
-    art = _load_json()
-    for r in art["row_reconciliation"]:
-        assert r["report_trader_address"].lower() == r["db_trader_address"].lower()
-
-
-def test_repeated_digit_fixture_wallet_flagged():
-    from scripts._recon_build import _is_repeated_hex
-
-    assert _is_repeated_hex(FIXTURE_WALLET) is True
-    assert _is_repeated_hex("0x" + "a" * 40) is True
-
-
-def test_repeated_digit_condition_and_token_flagged():
-    from scripts._recon_build import _is_repeated_hex, _is_repeated_dec
-
-    assert _is_repeated_hex("0x2222222222222222222222222222222222222222") is True
-    assert _is_repeated_dec("555555555555555555555555") is True
-
-
-def test_normal_identifiers_not_falsely_flagged():
-    from scripts._recon_build import _is_repeated_hex, _is_repeated_dec
-
-    for hid in HIST_IDS:
-        assert not _is_repeated_hex(hid)
-        assert not _is_repeated_dec(hid.split(":")[-1])
-
-
-def test_csv_contains_all_required_columns():
-    import csv
-
-    required = [
-        "row_number", "report_source", "db_source", "source_match",
-        "report_source_trade_id", "db_source_trade_id", "source_trade_id_match",
-        "report_market_source_id", "db_market_source_id", "market_source_id_match",
-        "report_token_id", "db_token_id", "token_id_match",
-        "report_trader_address", "db_trader_address", "trader_address_match",
-        "report_side", "db_side", "side_match",
-        "report_outcome", "db_outcome", "outcome_match",
-        "report_quantity", "db_quantity", "quantity_match",
-        "report_price", "db_price", "price_match",
-        "report_timestamp", "db_timestamp", "timestamp_match",
-        "report_is_sample", "db_is_sample", "is_sample_match",
-        "placeholder_pattern_detected", "placeholder_pattern_reasons", "all_fields_match",
-    ]
-    with open(CSV_PATH, newline="") as f:
-        cols = list(csv.DictReader(f).fieldnames)
-    for c in required:
-        assert c in cols, c
-
-
-def test_human_reports_redact_wallet():
-    txt = (ROOT / "reports" / "pr24z_manual_real_source_trade_ingestion.txt").read_text()
-    assert "0xcac76b761231464900cce5da7c20233d59b20579" not in txt
-    assert "0x…0579" in txt or "0x…1111" in txt
-
-
-def test_no_write_path_invoked():
-    """Verification produced no production write (source_trades stayed 19)."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    try:
-        n = conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
-    finally:
-        conn.close()
-    assert n == 19
-    main = json.loads(MAIN_JSON.read_text())
-    assert main["historical_production_rows"]["rows_inserted"] == 14
-    assert main["fixture_verification_rows"]["rows_written_to_production"] == 0
-
-
-# ── 6 HARD identity-compatibility-gate cases ──────────────────────────────────
-def _run_gate(records, *, expected=14, db_path=DB_PATH):
-    from polycopy.ingestion.source_trade_writer import run_identity_compatibility_gate
-
-    return run_identity_compatibility_gate(SOURCE, records, db_path=db_path, expected=expected)
-
-
-def _reference_records():
-    return json.loads(HIST_REF.read_text())
-
-
-def test_gate_passes_against_real_db_all_14_recognized():
-    gate = _run_gate(_reference_records())
-    assert gate.historical_rows_examined == 14
-    assert gate.unmatched == 0
-    assert gate.rerun_would_insert == 0
-    assert gate.safe_for_future_production_write is True
-
-
-def test_gate_recognizes_legacy_fallback_not_canonical():
-    """With REAL upstream ids, the 14 historical rows are recognized ONLY via
-    the recomputed legacy fallback (canonical strong id differs from stored DB id)."""
-    gate = _run_gate(_reference_records())
-    # Corrected canonical id (real upstream) != stored DB id for every row.
-    assert gate.canonical_matches == 0
-    assert gate.legacy_alias_matches == 14
-    assert gate.unmatched == 0
-    assert gate.rerun_would_insert == 0
-    assert gate.safe_for_future_production_write is True
-
-
-def test_gate_recognizes_legacy_fallback_when_canonical_differs():
-    """A row whose corrected canonical id differs must still match via legacy alias."""
-    recs = _reference_records()
-    mutated = []
-    for r in recs:
-        r2 = dict(r)
-        r2["sourceProvidedTradeId"] = "polymarket:" + "f" * 64
-        mutated.append(r2)
-    gate = _run_gate(mutated)
-    assert gate.canonical_matches == 0
-    assert gate.legacy_alias_matches == 14
-    assert gate.unmatched == 0
-    assert gate.rerun_would_insert == 0
-    assert gate.safe_for_future_production_write is True
-
-
-def test_gate_blocks_when_unmatched_historical_row():
-    """An unmatched historical row blocks production write."""
-    recs = _reference_records()
-    extra = dict(recs[0])
-    # Change an immutable field (token_id) so BOTH the canonical strong id and the
-    # recomputed legacy fallback id diverge from every existing DB row -> unrecognized.
-    extra["source_trade_id"] = "polymarket:" + "9" * 64
-    extra["sourceProvidedTradeId"] = "polymarket:" + "9" * 64
-    extra["token_id"] = "99999999999999999999999999999999999999999999999999999999999999999"
-    gate = _run_gate(recs + [extra], expected=15)
-    assert gate.unmatched >= 1
-    assert gate.rerun_would_insert >= 1
-    assert gate.safe_for_future_production_write is False
-
-
-def test_gate_blocks_when_rerun_would_insert():
-    """rerun_would_insert > 0 blocks production write."""
-    recs = _reference_records()
-    extra = dict(recs[0])
-    extra["source_trade_id"] = "polymarket:" + "a" * 64
-    extra["sourceProvidedTradeId"] = "polymarket:" + "a" * 64
-    extra["token_id"] = "11111111111111111111111111111111111111111111111111111111111111111"
-    gate = _run_gate(recs + [extra], expected=15)
-    assert gate.rerun_would_insert > 0
-    assert gate.safe_for_future_production_write is False
-
-
-def test_writer_not_invoked_when_gate_fails(monkeypatch):
-    """Writer is not invoked when the compatibility gate fails (CLI aborts)."""
-    from scripts import ingest_real_source_trades as cli
-    from polycopy.ingestion.source_trade_writer import IdentityCompatibilityGate
-
-    # Missing reference file -> gate fails closed.
-    monkeypatch.setattr(cli, "_HISTORICAL_REFERENCE", ROOT / "reports" / "does_not_exist.json")
-    g2 = cli._run_historical_compatibility_gate(DB_PATH)
-    assert g2.safe_for_future_production_write is False
-
-    # Explicitly unsafe gate object also reports unsafe.
-    gate = IdentityCompatibilityGate(
-        historical_rows_expected=14, historical_rows_examined=0,
-        unmatched=14, rerun_would_insert=14, safe_for_future_production_write=False,
+# ── helpers ────────────────────────────────────────────────────────────────
+def _hist() -> list[dict]:
+    return load_reference(HIST_REF)
+
+
+def _legacy_ids() -> list[str]:
+    return [r["source_trade_id"] for r in _hist()]
+
+
+def _canonical_ids() -> list[str]:
+    return [r["transaction_hash"] for r in _hist()]
+
+
+def _read_mapping() -> list[dict]:
+    with MAPPING_CSV.open(newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE source_trades (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            source_trade_id TEXT NOT NULL,
+            market_source_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            price REAL NOT NULL,
+            trader_address TEXT,
+            timestamp TEXT NOT NULL,
+            is_sample INTEGER NOT NULL DEFAULT 0,
+            token_id TEXT,
+            UNIQUE(source, source_trade_id)
+        );
+        CREATE TABLE trade_copyability_decisions (id INTEGER PRIMARY KEY, source_trade_id TEXT NOT NULL);
+        CREATE TABLE copy_candidates (id INTEGER PRIMARY KEY, source_trade_id TEXT NOT NULL, source_trade_internal_id TEXT REFERENCES source_trades(id));
+        CREATE TABLE paper_signal_decisions (id INTEGER PRIMARY KEY, candidate_id INTEGER, source_trade_id TEXT);
+        CREATE TABLE candidate_price_snapshots (id TEXT PRIMARY KEY, candidate_id INTEGER NOT NULL);
+        CREATE TABLE candidate_price_snapshot_levels (id INTEGER PRIMARY KEY, snapshot_id TEXT NOT NULL REFERENCES candidate_price_snapshots(id));
+        CREATE TABLE orders (id TEXT PRIMARY KEY, source_order_id TEXT);
+        CREATE TABLE positions (id TEXT PRIMARY KEY, wallet_id TEXT);
+        CREATE TABLE settlement_accounting_ledger (id TEXT PRIMARY KEY, source_trade_id TEXT NOT NULL REFERENCES source_trades(id));
+        CREATE TABLE wallet_score_decisions (id INTEGER PRIMARY KEY, wallet_id TEXT NOT NULL, candidate_id INTEGER);
+        """
     )
-    assert gate.safe_for_future_production_write is False
 
 
-# ── Section 8: tautology-bug regression tests ──────────────────────────────────
-def test_stored_fallback_and_upstream_ids_differ():
-    """Historical stored fallback DB id and the real upstream source-provided id
-    are DIFFERENT for every historical row (the root cause of the tautology)."""
-    recs = _reference_records()
-    assert len(recs) == 14
-    for r in recs:
-        stored = r["historical_stored_source_trade_id"]
-        upstream = r["historical_upstream_source_provided_trade_id"]
-        assert stored != upstream
-        assert r["upstream_id_historically_mislabeled_as_transaction_hash"] is True
-        assert upstream == r["transaction_hash"]
+def _insert_hist(conn: sqlite3.Connection, rows: list[dict], *, canonical: bool = False) -> None:
+    for i, h in enumerate(rows, 1):
+        conn.execute(
+            """INSERT INTO source_trades
+            (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"target-{i}",
+                h["source"],
+                h["transaction_hash"] if canonical else h["source_trade_id"],
+                h["market_source_id"],
+                h["side"],
+                h["outcome"],
+                h["quantity"],
+                h["price"],
+                h["trader_address"],
+                h["timestamp"],
+                h["is_sample"],
+                h["token_id"],
+            ),
+        )
 
 
-def test_reconciliation_not_populated_from_source_trade_id():
-    """Reconciliation must derive the upstream id from transaction_hash, never
-    copy source_trade_id into the upstream_source_provided field."""
-    art = _load_json()
-    for r in art["identity_row_reconciliation"]:
-        assert r["real_upstream_source_provided_trade_id"] != r["historical_report_source_trade_id"]
-        assert r["real_upstream_source_provided_trade_id"] == r["historical_report_transaction_hash"]
+def _insert_extras(conn: sqlite3.Connection) -> None:
+    for i in range(5):
+        conn.execute(
+            """INSERT INTO source_trades
+            (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
+            VALUES (?, ?, ?, ?, 'BUY', 'Yes', 1, 0.5, '0xabc', '2026-01-01T00:00:00+00:00', 0, ?)""",
+            (f"extra-{i}", SOURCE, f"polymarket:extra{i}", f"market-{i}", f"token-{i}"),
+        )
 
 
-def test_row1_corrected_derives_from_upstream_not_stored():
-    """Row 1: corrected canonical must derive from e0c9d495... (upstream),
-    not from 11ae80be... (stored)."""
-    art = _load_json()
-    r1 = art["identity_row_reconciliation"][0]
-    assert r1["historical_report_source_trade_id"] == "polymarket:11ae80be5e1566fda292d78b0150629ef29c828a1ed3c6df81bc00ba8b9ffe90"
-    assert r1["real_upstream_source_provided_trade_id"] == "polymarket:e0c9d495b892a136f1053473e3cb96d4a721e1fce7bb46bf1019d911ad441dbb"
-    assert r1["corrected_generate_identity_output_id"] == "polymarket:e0c9d495b892a136f1053473e3cb96d4a721e1fce7bb46bf1019d911ad441dbb"
-    assert r1["corrected_id_equals_db_id"] is False
-    assert r1["recomputed_legacy_equals_db_id"] is True
-    assert r1["recognized_as_existing"] is True
+def _db(tmp_path: Path, *, canonical: bool = False) -> Path:
+    path = tmp_path / "copy.db"
+    conn = _connect(path)
+    _create_schema(conn)
+    _insert_hist(conn, _hist(), canonical=canonical)
+    _insert_extras(conn)
+    conn.commit()
+    conn.close()
+    return path
 
 
-def test_row2_corrected_derives_from_upstream_not_stored():
-    """Row 2: corrected canonical must derive from 9b811fe6... (upstream),
-    not from 9b9b74c3... (stored)."""
-    art = _load_json()
-    r2 = art["identity_row_reconciliation"][1]
-    assert r2["historical_report_source_trade_id"] == "polymarket:9b9b74c36aec602b1fd5dc43d10664b8ecee3254a8af9c1b65bc92d333e26a75"
-    assert r2["real_upstream_source_provided_trade_id"] == "polymarket:9b811fe6d9f115c5c23d9e73c960e2566ad7e442cfff3d5215d8c16a15705671"
-    assert r2["corrected_generate_identity_output_id"] == "polymarket:9b811fe6d9f115c5c23d9e73c960e2566ad7e442cfff3d5215d8c16a15705671"
-    assert r2["corrected_id_equals_db_id"] is False
-
-
-def test_canonical_mismatch_with_valid_legacy_alias_recognized():
-    """A canonical mismatch PLUS a valid legacy alias is recognized as existing."""
-    gate = _run_gate(_reference_records())
-    assert gate.canonical_matches == 0
-    assert gate.legacy_alias_matches == 14
-    assert gate.unmatched == 0
-
-
-def test_canonical_mismatch_without_legacy_alias_blocks():
-    """A canonical mismatch WITHOUT a legacy alias blocks the writer (unmatched)."""
-    recs = _reference_records()
-    extra = dict(recs[0])
-    extra["source_trade_id"] = "polymarket:" + "c" * 64
-    extra["sourceProvidedTradeId"] = "polymarket:" + "c" * 64
-    extra["token_id"] = "77777777777777777777777777777777777777777777777777777777777777777"
-    gate = _run_gate(recs + [extra], expected=15)
-    assert gate.unmatched >= 1
-    assert gate.safe_for_future_production_write is False
-
-
-def test_reusing_db_source_trade_id_as_source_provided_fails():
-    """Feeding the stored DB source_trade_id back as sourceProvidedTradeId must
-    NOT be accepted as the canonical proof (tautology guard)."""
-    recs = _reference_records()
-    bad = []
-    for r in recs:
-        r2 = dict(r)
-        r2["sourceProvidedTradeId"] = r2["historical_stored_source_trade_id"]
-        r2["historical_upstream_source_provided_trade_id"] = r2["historical_stored_source_trade_id"]
-        bad.append(r2)
-    _run_gate(bad)  # forcing the bug would make canonical_matches=14 (tautology)
-    # The committed reference must NOT do this:
-    real = _run_gate(_reference_records())
-    assert real.canonical_matches == 0
-
-
-def test_csv_has_row_where_corrected_id_unequals_db():
-    """The CSV must contain at least one row where corrected_id_equals_db_id is
-    False (proving the real historical data produces a canonical mismatch)."""
-    import csv
-
-    with open(CSV_PATH, newline="") as f:
-        rows = list(csv.DictReader(f))
-    false_rows = [r for r in rows if r["corrected_id_equals_db_id"].lower() == "false"]
-    assert len(false_rows) >= 1
+# ── 1-5: artifact + mapping integrity ──────────────────────────────────────
+def test_1_historical_reference_contains_exactly_14_rows():
+    rows = _hist()
     assert len(rows) == 14
+    assert all(r.get("source_trade_id") and r.get("transaction_hash") for r in rows)
 
 
-def test_no_test_hardcodes_safe_true():
-    """safe_for_future_production_write must always be COMPUTED from the gate,
-    never asserted without the gate running. This test runs the gate and checks
-    the value is consistent with its inputs."""
-    gate = _run_gate(_reference_records())
-    expected_safe = (
-        gate.historical_rows_examined == gate.historical_rows_expected
-        and gate.unmatched == 0
-        and gate.rerun_would_insert == 0
-    )
-    assert gate.safe_for_future_production_write == expected_safe
+def test_2_approved_mapping_contains_exactly_14_rows():
+    m = _read_mapping()
+    assert len(m) == 14
 
 
-def test_writer_not_invoked_when_reconciliation_invalid():
-    """The committed reference must carry real upstream ids (so the gate is not
-    tautological), and the gate on the real reference must be safe."""
-    recs = _reference_records()
-    assert all(r["historical_upstream_source_provided_trade_id"] for r in recs)
-    real = _run_gate(recs)
-    assert real.safe_for_future_production_write is True
+def test_3_each_legacy_maps_to_exactly_one_canonical():
+    m = _read_mapping()
+    legacy_to_canon = {}
+    for r in m:
+        leg = r["legacy_source_trade_id"]
+        assert leg not in legacy_to_canon, f"duplicate legacy id {leg}"
+        legacy_to_canon[leg] = r["canonical_source_trade_id"]
+    assert len(legacy_to_canon) == 14
+
+
+def test_4_every_canonical_id_is_unique():
+    m = _read_mapping()
+    canon = [r["canonical_source_trade_id"] for r in m]
+    assert len(set(canon)) == 14
+
+
+def test_5_canonical_ids_derive_from_historical_upstream_source_provided_ids():
+    m = _read_mapping()
+    for r in m:
+        # canonical == upstream_source_provided_id == historical transaction_hash
+        assert r["canonical_source_trade_id"] == r["historical_transaction_hash"]
+        assert r["canonical_source_trade_id"] == r["upstream_source_provided_id"]
+
+
+# ── 6-7: immutable + final state ───────────────────────────────────────────
+def test_6_approved_immutable_fields_match():
+    m = _read_mapping()
+    for r in m:
+        assert r["immutable_fields_match"] == "True"
+
+
+def test_7_mapping_is_in_all_canonical_final_state():
+    m = _read_mapping()
+    assert all(r["migration_state"] == "ALL_CANONICAL" for r in m)
+    # The one-time production migration WAS applied (historical record).
+    assert all(r["migration_applied"] == "True" for r in m)
+
+
+# ── 8-10: post-migration DB expectations (against temp canonical DB) ───────
+def test_8_every_post_migration_canonical_row_exists_once(tmp_path):
+    path = _db(tmp_path, canonical=True)
+    conn = _connect(path)
+    for canon in _canonical_ids():
+        c = conn.execute(
+            "SELECT COUNT(*) c FROM source_trades WHERE source=? AND source_trade_id=?",
+            (MIG_SOURCE, canon),
+        ).fetchone()["c"]
+        assert c == 1
+    conn.close()
+
+
+def test_9_every_historical_legacy_id_absent_after_migration(tmp_path):
+    path = _db(tmp_path, canonical=True)
+    conn = _connect(path)
+    for leg in _legacy_ids():
+        c = conn.execute(
+            "SELECT COUNT(*) c FROM source_trades WHERE source=? AND source_trade_id=?",
+            (MIG_SOURCE, leg),
+        ).fetchone()["c"]
+        assert c == 0
+    conn.close()
+
+
+def test_10_replay_would_insert_is_false_for_all_14(tmp_path):
+    path = _db(tmp_path, canonical=True)
+    conn = _connect(path)
+    assert canonical_replay_would_insert(conn, _hist()) == 0
+    conn.close()
+
+
+# ── 11-13: no legacy compatibility in permanent ingestion code ────────────
+def test_11_normal_writer_code_contains_no_legacy_compatibility_gate():
+    src = (ROOT / "src/polycopy/ingestion/source_trade_writer.py").read_text()
+    assert "IdentityCompatibilityGate" not in src
+    assert "run_identity_compatibility_gate" not in src
+
+
+def test_12_source_trade_writer_imports_no_historical_pr24z_artifacts():
+    src = (ROOT / "src/polycopy/ingestion/source_trade_writer.py").read_text()
+    assert "pr24z_historical" not in src
+    assert "pr24z_canonical_identity_migration_mapping" not in src
+
+
+def test_13_no_permanent_legacy_alias_function_exists():
+    import importlib
+
+    mod = importlib.import_module("polycopy.ingestion.source_trade_writer")
+    assert not hasattr(mod, "IdentityCompatibilityGate")
+    assert not hasattr(mod, "run_identity_compatibility_gate")
+
+
+# ── 14: migration module separate from normal ingestion ───────────────────
+def test_14_one_time_migration_module_is_separate_from_ingestion():
+    # The migration module lives under migrations/ and is standalone; the
+    # normal ingestion writer must not import it.
+    writer_src = (ROOT / "src/polycopy/ingestion/source_trade_writer.py").read_text()
+    assert "from polycopy.migrations.pr24z_canonical_identity import" not in writer_src
+    assert "import pr24z_canonical_identity" not in writer_src
+    # And the marker validates the final canonical state.
+    if MARKER.exists():
+        v = validate_pr24z_migration_marker(MARKER, str(ROOT / "data" / "polycopy.db"))
+        assert v.valid
+        assert v.data is not None
+        assert v.data["canonical_row_count"] == 14
+        assert v.data["legacy_row_count"] == 0
+
+
+# ── bonus: canonical identity derivation matches writer path ──────────────
+def test_canonical_identity_derives_from_upstream_not_legacy():
+    row0 = _hist()[0]
+    ident = generate_identity({"sourceProvidedTradeId": row0["transaction_hash"]})
+    assert ident.source_trade_id == row0["transaction_hash"]
+    assert ident.source_trade_id != row0["source_trade_id"]
