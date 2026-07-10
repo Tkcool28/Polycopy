@@ -135,10 +135,17 @@ async def run_ingestion(
             # counted once via count_rejection below to avoid double counting).
             if cand.source_trade_id:
                 counters.stable_ids_generated += 1
-            if cand.identity_strong:
-                counters.strong_identity_used_count += 1
+            if cand.identity_source_provided:
+                counters.source_provided_identity_used_count += 1
+            elif cand.identity_transaction_hash:
+                counters.transaction_identity_used_count += 1
             elif cand.identity_fallback:
                 counters.identity_fallback_used_count += 1
+            # Invariant: strong = source_provided + transaction.
+            counters.strong_identity_used_count = (
+                counters.source_provided_identity_used_count
+                + counters.transaction_identity_used_count
+            )
 
             # Readiness counters.
             if cand.pr24u_ready:

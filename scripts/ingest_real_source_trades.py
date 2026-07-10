@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""PR24Z — Manual real source-trade ingestion CLI.
+"""PR24Z — Manual real source-trade ingestion CLI (safety-corrected).
 
 This is the single manual entry point for the bounded, guarded real
 source-trade ingestion slice. It wires the pure pipeline
 (``polycopy.ingestion.ingest_pipeline``) to the one centralized writer
-(``polycopy.ingestion.source_trade_writer.SourceTradeWriter``).
+(``polycopy.ingestion.source_trade_writer.write_valid_rows``).
 
 Four modes
 ----------
@@ -30,6 +30,13 @@ Hard guardrails
   * No scoring / candidates / signals / snapshots / orders / positions /
     settlement mutation / timers / automation / deploy / service restart.
 
+This PR is a SAFETY-CORRECTION only. It must NOT perform a second production
+write. Allowed: fixture/temp-DB tests, production DB read-only inspection,
+bounded live dry-run, compatibility analysis, a verified SQLite online backup
+(no new trades), report regeneration. The first historical production write
+(attempted=14, inserted=14, deduplicated=0) is preserved in the report and is
+NEVER overwritten by verification-run counters.
+
 Reports (.md / .json / .txt) always REDACT full wallet addresses in the human
 (.md/.txt) reports; the JSON retains the full wallet address only for audit.
 """
@@ -40,7 +47,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -63,10 +72,16 @@ from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
     INGESTION_VERSION,
     IngestionCounters,
     SOURCE_NAME,
-    NormalizedSourceTrade,
 )
 from polycopy.engine.real_trade_source_probe import is_valid_wallet_address  # noqa: E402
-from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
+from polycopy.ingestion.source_trade_writer import (  # noqa: E402
+    write_valid_rows,
+    create_verified_backup,
+    assert_unique_dedupe_constraint,
+    BackupResult,
+    UniqueConstraintResult,
+    legacy_fallback_id_from_db_row,
+)
 from polycopy.db.database import Database  # noqa: E402
 
 # Tables that must remain UNCHANGED by a production write.
@@ -91,6 +106,14 @@ _INGESTION_TIMER_UNITS = (
     "polycopy-wc-fixture-refresh.timer",
 )
 
+# Known writer-capable processes to exclude before a production write.
+_WRITER_PROCESS_HINTS = (
+    "scripts/run_scan.py",
+    "scripts/collect_smart_money_data.py",
+    "scripts/ingest_real_source_trades.py",
+    "scripts/live_smoke_pr3_fixes.py",
+)
+
 
 # ── Built-in deterministic fixture dataset (no network) ───────────────────────
 def _fixture_records(wallet: str) -> list[dict[str, Any]]:
@@ -99,41 +122,41 @@ def _fixture_records(wallet: str) -> list[dict[str, Any]]:
     Covers: BUY eligible x3 (one with a duplicate tx hash pair to prove
     strong-id distinctness), SELL, missing side, invalid price, zero qty,
     invalid timestamp, wallet mismatch, and an ambiguous-identity row (no tx
-    hash, insufficient fields).
+    hash, insufficient fields). Includes both a source-provided id (strong)
+    and a real tx-hash row to exercise the new identity preference.
     """
     def tx(i: str) -> str:
         return "0x" + i * 64
 
     return [
-        {  # valid BUY, strong id
-            "transactionHash": tx("a"), "proxyWallet": wallet,
-            "asset": tx("2"), "conditionId": tx("3"), "side": "buy",
-            "price": "0.40", "size": "100", "timestamp": 1700000000,
+        {  # valid BUY, source-provided id (preferred strong)
+            "sourceProvidedTradeId": "polymarket:" + "a" * 64,
+            "proxyWallet": wallet, "asset": tx("2"), "conditionId": tx("3"),
+            "side": "buy", "price": "0.40", "size": "100", "timestamp": 1700000000,
             "outcome": "Yes", "title": "Market A", "slug": "market-a",
         },
-        {  # valid BUY, strong id (distinct tx)
+        {  # valid BUY, real transaction hash strong id
             "transactionHash": tx("b"), "proxyWallet": wallet,
             "asset": tx("4"), "conditionId": tx("5"), "side": "BUY",
             "price": "0.62", "size": "50", "timestamp": 1700000100,
             "outcome": "No", "title": "Market B", "slug": "market-b",
         },
-        {  # valid BUY, strong id (distinct tx) — used to test dup page collapse
-            "transactionHash": tx("c"), "proxyWallet": wallet,
-            "asset": tx("6"), "conditionId": tx("7"), "side": "BUY",
-            "price": "0.75", "size": "10", "timestamp": 1700000200,
+        {  # valid BUY, source-provided id (distinct) — dup page collapse
+            "sourceProvidedTradeId": "polymarket:" + "c" * 64,
+            "proxyWallet": wallet, "asset": tx("6"), "conditionId": tx("7"),
+            "side": "BUY", "price": "0.75", "size": "10", "timestamp": 1700000200,
             "outcome": "Up", "title": "Market C", "slug": "market-c",
         },
-        {  # duplicate of first (same tx hash) -> duplicate_in_fetch
-            "transactionHash": tx("a"), "proxyWallet": wallet,
-            "asset": tx("2"), "conditionId": tx("3"), "side": "BUY",
-            "price": "0.40", "size": "100", "timestamp": 1700000000,
+        {  # duplicate of first (same source-provided id) -> duplicate_in_fetch
+            "sourceProvidedTradeId": "polymarket:" + "a" * 64,
+            "proxyWallet": wallet, "asset": tx("2"), "conditionId": tx("3"),
+            "side": "BUY", "price": "0.40", "size": "100", "timestamp": 1700000000,
             "outcome": "Yes", "title": "Market A", "slug": "market-a",
         },
         {  # SELL -> unsupported_side
             "transactionHash": tx("d"), "proxyWallet": wallet,
             "asset": tx("8"), "conditionId": tx("9"), "side": "sell",
-            "price": "0.30", "size": "20", "timestamp": 1700000300,
-            "outcome": "Yes",
+            "price": "0.30", "size": "20", "timestamp": 1700000300, "outcome": "Yes",
         },
         {  # missing side -> missing_side
             "transactionHash": tx("e"), "proxyWallet": wallet,
@@ -142,25 +165,25 @@ def _fixture_records(wallet: str) -> list[dict[str, Any]]:
         },
         {  # invalid price -> invalid_price
             "transactionHash": tx("f"), "proxyWallet": wallet,
-            "asset": tx("c"), "conditionId": tx("d"),
-            "side": "BUY", "price": "1.5", "size": "5", "timestamp": 1700000500,
+            "asset": tx("c"), "conditionId": tx("d"), "side": "BUY",
+            "price": "1.5", "size": "5", "timestamp": 1700000500,
         },
         {  # zero quantity -> invalid_quantity
             "transactionHash": tx("1"), "proxyWallet": wallet,
-            "asset": tx("e"), "conditionId": tx("f"),
-            "side": "BUY", "price": "0.50", "size": "0", "timestamp": 1700000600,
+            "asset": tx("e"), "conditionId": tx("f"), "side": "BUY",
+            "price": "0.50", "size": "0", "timestamp": 1700000600,
         },
         {  # invalid timestamp -> invalid_timestamp
             "transactionHash": tx("2"), "proxyWallet": wallet,
-            "asset": tx("1"), "conditionId": tx("2"),
-            "side": "BUY", "price": "0.50", "size": "5", "timestamp": "not-a-time",
+            "asset": tx("1"), "conditionId": tx("2"), "side": "BUY",
+            "price": "0.50", "size": "5", "timestamp": "not-a-time",
         },
         {  # wallet mismatch -> wallet_mismatch
             "transactionHash": tx("3"), "proxyWallet": "0x" + "9" * 40,
-            "asset": tx("2"), "conditionId": tx("3"),
-            "side": "BUY", "price": "0.50", "size": "5", "timestamp": 1700000700,
+            "asset": tx("2"), "conditionId": tx("3"), "side": "BUY",
+            "price": "0.50", "size": "5", "timestamp": 1700000700,
         },
-        {  # ambiguous identity: no tx hash, missing price/size/timestamp
+        {  # ambiguous identity: no id source, no tx hash, missing fields
             "proxyWallet": wallet, "asset": "", "conditionId": "",
             "side": "BUY", "price": None, "size": None, "timestamp": None,
         },
@@ -176,7 +199,6 @@ class _FixtureProvider:
         self._pages = [_fixture_records(wallet)]
 
     async def fetch_trades(self, wallet: str, *, limit: int, page: int) -> list[dict[str, Any]]:
-        # Return the full fixture page (mirrors real data-api page contract).
         if page < len(self._pages):
             return self._pages[page][:limit]
         return []
@@ -197,9 +219,7 @@ class _RealDataApiProvider:
             data_api_base_url="https://data-api.polymarket.com",
             timeout=timeout,
         )
-        # Advertise that this provider MAKES real external HTTP calls. The
-        # pipeline counts a page as a network call whenever this flag is True
-        # (set at construction so even a single-page live fetch is counted).
+        # Advertise that this provider MAKES real external HTTP calls.
         self.made_network_call = True
 
     async def fetch_trades(self, wallet: str, *, limit: int, page: int) -> list[dict[str, Any]]:
@@ -216,10 +236,14 @@ class _RealDataApiProvider:
 
     @staticmethod
     def _to_raw(t: Any) -> dict[str, Any]:
+        # Preserve source-provided id and tx hash as SEPARATE fields.
         side = getattr(t, "side", None)
         ts = getattr(t, "timestamp", None)
         return {
-            "transactionHash": getattr(t, "source_trade_id", None),
+            # Source-provided stable id (v2 id) — kept separate from tx hash.
+            "sourceProvidedTradeId": getattr(t, "source_trade_id", None),
+            # Real on-chain tx hash (usually None from this adapter).
+            "transactionHash": None,
             "proxyWallet": getattr(t, "trader_address", None),
             "asset": getattr(t, "token_id", None),
             "conditionId": getattr(t, "market_source_id", None),
@@ -297,35 +321,141 @@ def _check_timers() -> dict[str, str]:
     return out
 
 
-def _make_backup(db_path: str) -> Optional[str]:
-    """Create a timestamped backup copy; return its path."""
+def _enumerate_processes() -> list[dict[str, Any]]:
+    """Return [(pid, cmdline_str)] for all processes via psutil or /proc."""
+    procs: list[dict[str, Any]] = []
+    try:
+        import psutil  # type: ignore
+
+        for p in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                cmd = " ".join(p.info.get("cmdline") or [])
+                procs.append({"pid": p.info.get("pid"), "cmdline": cmd})
+            except Exception:
+                pass
+        return procs
+    except Exception:
+        pass
+    # Fallback: parse /proc directly.
+    if sys.platform == "linux" and os.path.isdir("/proc"):
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    data = fh.read().decode("utf-8", "replace").replace("\x00", " ").strip()
+                procs.append({"pid": int(pid), "cmdline": data})
+            except OSError:
+                continue
+    return procs
+
+
+def _redact_wallet_in_text(text: str) -> str:
+    """Redact any 0x…40-hex wallet address that appears inside a string (cmdline)."""
+    if not text:
+        return text
+    return re.sub(r"0x[0-9a-fA-F]{40}", lambda m: "0x…" + m.group(0)[-4:], text)
+
+
+def _ancestor_pids(pid: int) -> set[int]:
+    """Return the set of ancestor pids for ``pid`` (inclusive of pid)."""
+    ancestors: set[int] = set()
+    cur = pid
+    seen: set[int] = set()
+    while cur and cur > 1 and cur not in seen:
+        seen.add(cur)
+        ancestors.add(cur)
+        try:
+            with open(f"/proc/{cur}/stat", "rb") as fh:
+                data = fh.read().decode("utf-8", "replace")
+            # ppid is the 4th field in /proc/<pid>/stat.
+            parts = data.split(")")
+            ppid = int(parts[1].split()[1]) if len(parts) > 1 else 1
+            cur = ppid
+        except (OSError, ValueError, IndexError):
+            break
+    return ancestors
+
+
+def _check_competing_writers(current_pid: int) -> tuple[bool, list[dict[str, Any]]]:
+    """Detect another writer-capable process (excluding this run's own tree).
+
+    Returns (found, details). ``details`` contains redacted PID/command info.
+
+    Exclusions:
+      * the current process (by pid);
+      * any ancestor of the current process (the launch shell of THIS run);
+      * shell-wrapping processes (bash/sh/dash/zsh) whose only match is the
+        wrapping command — a shell alone is not a writer; the python it spawns
+        is matched separately.
+    """
+    found: list[dict[str, Any]] = []
+    ancestors = _ancestor_pids(current_pid)
+    _SHELLS = ("/bin/bash", "/bin/sh", "/bin/dash", "/usr/bin/bash", "/usr/bin/zsh", "bash", "sh", "dash", "zsh")
+    for p in _enumerate_processes():
+        pid = p.get("pid")
+        if pid in ancestors:
+            continue
+        cmd = p.get("cmdline") or ""
+        if not any(h in cmd for h in _WRITER_PROCESS_HINTS):
+            continue
+        # Skip pure shell wrappers (the writer is the python child, matched on its own pid).
+        exe = (cmd.split()[:1] or [""])[0]
+        if any(exe.endswith(s) for s in _SHELLS) and "python" not in cmd:
+            continue
+        found.append({
+            "pid": pid,
+            "command": _redact_wallet_in_text(cmd),
+        })
+    return bool(found), found
+
+
+def _make_backup_legacy(db_path: str) -> Optional[str]:
+    """Legacy raw file-copy backup (kept for reference; NOT used for write gating)."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = f"{db_path}.pr24z_backup_{ts}"
+    backup = f"{db_path}.pr24z_legacy_raw_copy_backup_{ts}"
     try:
         shutil.copy2(db_path, backup)
-        # Also checkpoint WAL into the backup so it is self-contained.
         return backup
     except Exception as exc:
-        print(f"warning: backup failed: {exc}", file=sys.stderr)
+        print(f"warning: legacy raw backup failed: {exc}", file=sys.stderr)
         return None
 
 
 # ── Report rendering ───────────────────────────────────────────────────────────
+def _identity_block(c: IngestionCounters) -> dict[str, Any]:
+    return {
+        "stable_ids_generated": c.stable_ids_generated,
+        "source_provided_identity_used_count": c.source_provided_identity_used_count,
+        "transaction_identity_used_count": c.transaction_identity_used_count,
+        "strong_identity_used_count": c.strong_identity_used_count,
+        "identity_fallback_used_count": c.identity_fallback_used_count,
+        "identity_ambiguous_count": c.identity_ambiguous_count,
+        "duplicate_records_in_fetch": c.duplicate_records_in_fetch,
+        "duplicate_records_existing_db": c.duplicate_records_existing_db,
+        "collision_errors": c.collision_errors,
+    }
+
+
 def _build_report_payload(
     wallet: str,
     live: bool,
     result: pipeline.IngestionResult,
     *,
     write_result: Optional[Any] = None,
+    backup: Optional[BackupResult] = None,
+    unique_constraint: Optional[UniqueConstraintResult] = None,
+    process_gate: Optional[dict] = None,
+    compatibility: Optional[dict] = None,
     db_path: Optional[str] = None,
     db_before: Optional[dict] = None,
     db_after: Optional[dict] = None,
     timers_before: Optional[dict] = None,
     timers_after: Optional[dict] = None,
-    backup_path: Optional[str] = None,
     integrity: Optional[str] = None,
     fk: Optional[int] = None,
     mode: str = "dry-run",
+    historical_write: Optional[dict] = None,
 ) -> dict[str, Any]:
     c = result.counters
     payload: dict[str, Any] = {
@@ -352,17 +482,10 @@ def _build_report_payload(
             "rejected_invalid_quantity": c.rejected_invalid_quantity,
             "rejected_invalid_timestamp": c.rejected_invalid_timestamp,
             "rejected_wallet_mismatch": c.rejected_wallet_mismatch,
+            "rejected_invalid_fields": c.rejected_invalid_fields,
             "rows_rejected": c.rows_rejected,
         },
-        "identity": {
-            "stable_ids_generated": c.stable_ids_generated,
-            "strong_identity_used_count": c.strong_identity_used_count,
-            "identity_fallback_used_count": c.identity_fallback_used_count,
-            "identity_ambiguous_count": c.identity_ambiguous_count,
-            "duplicate_records_in_fetch": c.duplicate_records_in_fetch,
-            "duplicate_records_existing_db": c.duplicate_records_existing_db,
-            "collision_errors": c.collision_errors,
-        },
+        "identity": _identity_block(c),
         "readiness": {
             "pr24u_ready_count": c.pr24u_ready_count,
             "pr24v_ready_count": c.pr24v_ready_count,
@@ -381,10 +504,15 @@ def _build_report_payload(
         "db_after": db_after,
         "timers_before": timers_before,
         "timers_after": timers_after,
-        "backup_path": backup_path,
+        "backup": backup.as_dict() if backup is not None else None,
+        "unique_constraint": unique_constraint.as_dict() if unique_constraint is not None else None,
+        "process_gate": process_gate,
+        "compatibility": compatibility,
         "integrity_check": integrity,
         "foreign_key_check": fk,
     }
+    if historical_write is not None:
+        payload["historical_first_production_write"] = historical_write
     return payload
 
 
@@ -415,10 +543,12 @@ def _render_markdown(p: dict[str, Any]) -> str:
         f"- rejected_invalid_quantity: {c['rejected_invalid_quantity']}",
         f"- rejected_invalid_timestamp: {c['rejected_invalid_timestamp']}",
         f"- rejected_wallet_mismatch: {c['rejected_wallet_mismatch']}",
+        f"- rejected_invalid_fields: {c['rejected_invalid_fields']}",
         f"- rows_rejected: {c['rows_rejected']}",
         "",
         "## Identity strategy",
-        f"- stable_ids_generated: {ident['stable_ids_generated']}",
+        f"- source_provided_identity_used_count: {ident['source_provided_identity_used_count']}",
+        f"- transaction_identity_used_count: {ident['transaction_identity_used_count']}",
         f"- strong_identity_used_count: {ident['strong_identity_used_count']}",
         f"- identity_fallback_used_count: {ident['identity_fallback_used_count']}",
         f"- identity_ambiguous_count: {ident['identity_ambiguous_count']}",
@@ -433,6 +563,52 @@ def _render_markdown(p: dict[str, Any]) -> str:
         f"- ready_for_automation: {p['readiness']['ready_for_automation']}",
         "",
     ]
+    if p.get("unique_constraint") is not None:
+        uc = p["unique_constraint"]
+        lines += [
+            "## UNIQUE constraint preflight",
+            f"- present: {uc['present']}",
+            f"- index_name: {uc['index_name']}",
+            f"- columns: {uc['columns']}",
+            f"- error: {uc['error']}",
+            "",
+        ]
+    if p.get("process_gate") is not None:
+        pg = p["process_gate"]
+        lines += [
+            "## Process gate",
+            f"- checked: {pg['checked']}",
+            f"- competing_writers_found: {pg['competing_writers_found']}",
+            f"- safe_to_write: {pg['safe_to_write']}",
+            "",
+        ]
+    if p.get("compatibility") is not None:
+        comp = p["compatibility"]
+        lines += [
+            "## Compatibility (post-write idempotency)",
+            f"- existing_pr24z_rows_examined: {comp['existing_pr24z_rows_examined']}",
+            f"- existing_pr24z_rows_matched: {comp['existing_pr24z_rows_matched']}",
+            f"- existing_pr24z_rows_unmatched: {comp['existing_pr24z_rows_unmatched']}",
+            f"- legacy_identity_aliases_used: {comp['legacy_identity_aliases_used']}",
+            f"- rerun_would_insert: {comp['rerun_would_insert']}",
+            f"- reconciliation_error: {comp['reconciliation_error']}",
+            "",
+        ]
+    if p.get("backup") is not None:
+        b = p["backup"]
+        lines += [
+            "## Backup (SQLite online backup)",
+            f"- method: {b['method']}",
+            f"- path: {b['path']}",
+            f"- sha256: {b['sha256']}",
+            f"- size: {b['size']}",
+            f"- integrity_check: {b['integrity_check']}",
+            f"- foreign_key_violations: {b['foreign_key_violations']}",
+            f"- source_trades_count: {b['source_trades_count']}",
+            f"- success: {b['success']}",
+            f"- error: {b['error']}",
+            "",
+        ]
     if p.get("write") is not None:
         w = p["write"]
         lines += [
@@ -444,7 +620,18 @@ def _render_markdown(p: dict[str, Any]) -> str:
             f"- errors: {w['errors']}",
             f"- committed: {w['committed']}",
             f"- rolled_back: {w['rolled_back']}",
+            f"- existing_duplicates_recognized: {w['existing_duplicates_recognized']}",
+            f"- unique_constraint_present: {w['unique_constraint_present']}",
             f"- error_message: {w['error_message']}",
+            "",
+        ]
+    if p.get("historical_first_production_write") is not None:
+        hw = p["historical_first_production_write"]
+        lines += [
+            "## Historical FIRST production write (preserved; never overwritten)",
+            f"- attempted: {hw['attempted']}",
+            f"- inserted: {hw['inserted']}",
+            f"- deduplicated: {hw['deduplicated']}",
             "",
         ]
     if p.get("db_before") or p.get("db_after"):
@@ -455,14 +642,13 @@ def _render_markdown(p: dict[str, Any]) -> str:
             f"- mtime before/after: {db.get('mtime')} / {after.get('mtime')}",
             f"- integrity_check: {p.get('integrity_check')}",
             f"- foreign_key_check: {p.get('foreign_key_check')}",
-            f"- backup_path: {p.get('backup_path')}",
+            f"- backup_path: {p.get('backup', {}).get('path')}",
             "",
         ]
     return "\n".join(lines)
 
 
 def _render_txt(p: dict[str, Any]) -> str:
-    # Plain-text human report; redact wallet.
     c = p["counts"]
     ident = p["identity"]
     db = p.get("db_before") or {}
@@ -481,14 +667,15 @@ def _render_txt(p: dict[str, Any]) -> str:
         f"  eligible_buy={c['eligible_buy_records']} rows_rejected={c['rows_rejected']}",
         f"  rejected: side={c['rejected_unsupported_side']} missing={c['rejected_missing_fields']} "
         f"price={c['rejected_invalid_price']} qty={c['rejected_invalid_quantity']} "
-        f"ts={c['rejected_invalid_timestamp']} wallet={c['rejected_wallet_mismatch']}",
+        f"ts={c['rejected_invalid_timestamp']} wallet={c['rejected_wallet_mismatch']} "
+        f"fields={c['rejected_invalid_fields']}",
         "",
         "IDENTITY",
-        f"  strong={ident['strong_identity_used_count']} fallback={ident['identity_fallback_used_count']} "
-        f"ambiguous={ident['identity_ambiguous_count']}",
+        f"  source_provided={ident['source_provided_identity_used_count']} "
+        f"tx={ident['transaction_identity_used_count']} strong={ident['strong_identity_used_count']} "
+        f"fallback={ident['identity_fallback_used_count']} ambiguous={ident['identity_ambiguous_count']}",
         f"  dup_in_fetch={ident['duplicate_records_in_fetch']} "
-        f"dup_existing_db={ident['duplicate_records_existing_db']} "
-        f"collisions={ident['collision_errors']}",
+        f"dup_existing_db={ident['duplicate_records_existing_db']} collisions={ident['collision_errors']}",
         "",
         "SAFETY",
         f"  downstream_changed={p['safety']['downstream_tables_changed']} "
@@ -497,13 +684,34 @@ def _render_txt(p: dict[str, Any]) -> str:
         f"ready_for_automation={p['readiness']['ready_for_automation']}",
         "",
     ]
+    if p.get("backup") is not None:
+        b = p["backup"]
+        lines += [
+            "BACKUP (SQLite online)",
+            f"  method={b['method']} success={b['success']}",
+            f"  sha256={b['sha256']} size={b['size']}",
+            f"  integrity={b['integrity_check']} fk={b['foreign_key_violations']} "
+            f"count={b['source_trades_count']}",
+            f"  path={b['path']}",
+            "",
+        ]
     if p.get("write") is not None:
         w = p["write"]
         lines += [
             "PRODUCTION WRITE",
             f"  attempted={w['attempted']} inserted={w['inserted']} "
             f"deduplicated={w['deduplicated']} rejected={w['rejected']} errors={w['errors']}",
-            f"  committed={w['committed']} rolled_back={w['rolled_back']}",
+            f"  committed={w['committed']} rolled_back={w['rolled_back']} "
+            f"existing_dupes={w['existing_duplicates_recognized']} "
+            f"unique_ok={w['unique_constraint_present']}",
+            "",
+        ]
+    if p.get("historical_first_production_write") is not None:
+        hw = p["historical_first_production_write"]
+        lines += [
+            "HISTORICAL FIRST WRITE (preserved)",
+            f"  attempted={hw['attempted']} inserted={hw['inserted']} "
+            f"deduplicated={hw['deduplicated']}",
             "",
         ]
     if p.get("db_before") or p.get("db_after"):
@@ -513,7 +721,7 @@ def _render_txt(p: dict[str, Any]) -> str:
             f"  mtime before/after: {db.get('mtime')}/{after.get('mtime')}",
             f"  integrity_check={p.get('integrity_check')} "
             f"foreign_key_check={p.get('foreign_key_check')}",
-            f"  backup={p.get('backup_path')}",
+            f"  backup={p.get('backup', {}).get('path')}",
             "",
         ]
     return "\n".join(lines)
@@ -554,6 +762,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true",
                         help="Emit report as JSON (full wallet retained for audit).")
     parser.add_argument("--out", default=None, help="Write the report to this file.")
+    parser.add_argument("--no-write-compat-verify", dest="no_write_compat_verify",
+                        action="store_true", default=False,
+                        help="Skip the bounded live dry-run compatibility verification "
+                             "(still performs a verified SQLite online backup).")
     args = parser.parse_args(argv)
 
     # ── Resolve bounds ──
@@ -565,7 +777,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.allow_live and not wallet:
         print("error: --allow-live requires --wallet-address", file=sys.stderr)
         return 2
-    # Fixture / dry-run default wallet (deterministic synthetic for fixtures).
     if wallet is None:
         wallet = "0x" + "1" * 40
     if args.allow_live and not is_valid_wallet_address(wallet):
@@ -594,7 +805,6 @@ def main(argv: list[str] | None = None) -> int:
         provider = _FixtureProvider(wallet)
         live = False
     else:
-        # Default dry-run: fixture dataset, NO network.
         provider = _FixtureProvider(wallet)
         live = False
 
@@ -619,10 +829,19 @@ def main(argv: list[str] | None = None) -> int:
     db_after = None
     timers_before = None
     timers_after = None
-    backup_path = None
+    backup: Optional[BackupResult] = None
+    unique_constraint: Optional[UniqueConstraintResult] = None
+    process_gate: Optional[dict] = None
+    compatibility: Optional[dict] = None
     integrity = None
     fk = None
     mode = "dry-run"
+    # Preserved historical FIRST production write (never overwritten).
+    historical_write = {
+        "attempted": 14,
+        "inserted": 14,
+        "deduplicated": 0,
+    }
 
     # ── Mode C: temp-DB write test (isolated, never production) ──
     if args.temp_db_write_test:
@@ -643,12 +862,11 @@ def main(argv: list[str] | None = None) -> int:
             result.counters.production_db_opened = 0  # temp, not production
         finally:
             tdb.close()
-            try:
-                os.remove(tmp)
-                os.remove(tmp + "-wal") if os.path.exists(tmp + "-wal") else None
-                os.remove(tmp + "-shm") if os.path.exists(tmp + "-shm") else None
-            except OSError:
-                pass
+            for ext in ("", "-wal", "-shm"):
+                try:
+                    os.remove(tmp + ext)
+                except OSError:
+                    pass
 
     # ── Mode D: explicit production write ──
     elif production_write:
@@ -660,13 +878,38 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: ingestion timer(s) active: {active}; aborting production write.",
                   file=sys.stderr)
             return 2
-        # Pre-flight: DB size/mtime + counts + integrity + fk + backup.
-        size_b, mtime_b = _db_stat(db_path)
-        db_before = {"size": size_b, "mtime": mtime_b, "path": db_path}
-        backup_path = _make_backup(db_path)
+        # Pre-flight: competing process gate.
+        current_pid = os.getpid()
+        found, details = _check_competing_writers(current_pid)
+        process_gate = {
+            "checked": True,
+            "competing_writers_found": found,
+            "safe_to_write": not found,
+            "details": details,
+        }
+        if found:
+            print(f"error: competing writer process(es) detected: {details}; "
+                  f"aborting production write.", file=sys.stderr)
+            return 2
+        # Pre-flight: backup (hard gate).
+        pre_size, pre_mtime = _db_stat(db_path)
+        db_before = {"size": pre_size, "mtime": pre_mtime, "path": db_path,
+                     "counts": _table_counts_open(db_path)}
+        backup = create_verified_backup(db_path)
+        if not backup.success:
+            print(f"error: verified backup failed ({backup.error}); "
+                  f"aborting production write. source_trades unchanged.",
+                  file=sys.stderr)
+            return 2
         db = Database(Path(db_path))
         db.connect()
         try:
+            unique_constraint = assert_unique_dedupe_constraint(db)
+            if not unique_constraint.present:
+                print(f"error: UNIQUE dedupe constraint missing "
+                      f"({unique_constraint.error}); aborting production write.",
+                      file=sys.stderr)
+                return 2
             counts_before = _table_counts(db)
             integrity = _integrity(db)
             fk = _fk_check(db)
@@ -674,18 +917,30 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: pre-flight integrity={integrity} fk={fk}; aborting.",
                       file=sys.stderr)
                 return 2
-            # Detect duplicates already in the DB (INSERT OR IGNORE will skip).
-            existing_ids = {
-                r[0] for r in db.conn.execute(
-                    "SELECT source_trade_id FROM source_trades WHERE source = ?",
-                    (SOURCE_NAME,),
-                ).fetchall()
-            }
+            # Existing ids (canonical + legacy fallback) for dedupe recognition.
+            pre_ids = {r[0] for r in db.conn.execute(
+                "SELECT source_trade_id FROM source_trades WHERE source = ?",
+                (SOURCE_NAME,)).fetchall()}
+            pre_legacy = set()
+            # Use sqlite3.Row so rows behave like mappings for legacy-id recompute.
+            prev_row_factory = db.conn.row_factory
+            db.conn.row_factory = sqlite3.Row
+            try:
+                for row in db.conn.execute(
+                    "SELECT * FROM source_trades WHERE source = ?", (SOURCE_NAME,)
+                ).fetchall():
+                    lid = legacy_fallback_id_from_db_row(row)
+                    if lid is not None:
+                        pre_legacy.add(lid)
+            finally:
+                db.conn.row_factory = prev_row_factory
             for r in result.valid_rows:
-                if r.source_trade_id in existing_ids:
+                if r.source_trade_id in pre_ids:
                     result.counters.duplicate_records_existing_db += 1
-            # Write (one bounded transaction).
-            write_result = write_valid_rows(db, result.valid_rows, dry_run=False)
+            write_result = write_valid_rows(
+                db, result.valid_rows, dry_run=False,
+                pre_existing_ids=pre_ids, legacy_fallback_ids=pre_legacy,
+            )
             result.counters.rows_attempted = write_result.attempted
             result.counters.rows_inserted = write_result.inserted
             result.counters.rows_deduplicated = write_result.deduplicated
@@ -693,11 +948,9 @@ def main(argv: list[str] | None = None) -> int:
             result.counters.write_requested = 1
             result.counters.transaction_committed = int(write_result.committed)
             result.counters.transaction_rolled_back = int(write_result.rolled_back)
-            # Post-flight: counts + integrity + fk + size/mtime.
             counts_after = _table_counts(db)
             integrity = _integrity(db)
             fk = _fk_check(db)
-            # Guardrail: downstream tables must be UNCHANGED.
             for t in _GUARDED_TABLES:
                 if counts_before.get(t) != counts_after.get(t):
                     result.counters.downstream_tables_changed = 1
@@ -709,6 +962,62 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             db.close()
 
+    # ── No-write safety correction verification (Modes A/B + explicit verify) ──
+    else:
+        # Safety-corrected verification run: create a verified SQLite online
+        # backup (no new trades), run the process gate + UNIQUE preflight as a
+        # read-only check, and perform a bounded live dry-run compatibility
+        # analysis when allowed. Never writes source_trades.
+        mode = "safety-verification"
+        # Verified online backup (no trades written).
+        backup = create_verified_backup(db_path)
+        # Read-only UNIQUE preflight + process gate.
+        timers_before = _check_timers()
+        current_pid = os.getpid()
+        found, details = _check_competing_writers(current_pid)
+        process_gate = {
+            "checked": True,
+            "competing_writers_found": found,
+            "safe_to_write": not found,
+            "details": details,
+        }
+        db = Database(Path(db_path))
+        db.connect()
+        try:
+            unique_constraint = assert_unique_dedupe_constraint(db)
+            integrity = _integrity(db)
+            fk = _fk_check(db)
+            db_before = {"size": _db_stat(db_path)[0], "mtime": _db_stat(db_path)[1],
+                         "path": db_path, "counts": _table_counts(db)}
+            # Compatibility analysis when allowed-live (bounded dry-run).
+            if live and not args.no_write_compat_verify:
+                pre_ids = {r[0] for r in db.conn.execute(
+                    "SELECT source_trade_id FROM source_trades WHERE source = ?",
+                    (SOURCE_NAME,)).fetchall()}
+                matched = 0
+                unmatched = 0
+                for r in result.valid_rows:
+                    if r.source_trade_id in pre_ids:
+                        matched += 1
+                    else:
+                        unmatched += 1
+                compatibility = {
+                    "existing_pr24z_rows_examined": len(pre_ids),
+                    "existing_pr24z_rows_matched": matched,
+                    "existing_pr24z_rows_unmatched": unmatched,
+                    "legacy_identity_aliases_used": 0,
+                    "rerun_would_insert": unmatched,
+                    "reconciliation_error": None,
+                }
+                # Count existing-duplicate recognition for the report.
+                for r in result.valid_rows:
+                    if r.source_trade_id in pre_ids:
+                        result.counters.duplicate_records_existing_db += 1
+            db_after = db_before  # unchanged; no write
+        finally:
+            db.close()
+        timers_after = timers_before
+
     # Safety flags always False for this PR.
     result.counters.ready_for_scoring = 0
     result.counters.ready_for_automation = 0
@@ -716,15 +1025,19 @@ def main(argv: list[str] | None = None) -> int:
     payload = _build_report_payload(
         wallet, live, result,
         write_result=write_result,
-        db_path=db_path if production_write else None,
+        backup=backup,
+        unique_constraint=unique_constraint,
+        process_gate=process_gate,
+        compatibility=compatibility,
+        db_path=db_path if production_write else db_path,
         db_before=db_before,
         db_after=db_after,
         timers_before=timers_before,
         timers_after=timers_after,
-        backup_path=backup_path,
         integrity=integrity,
         fk=fk,
         mode=mode,
+        historical_write=historical_write,
     )
 
     if args.json:
@@ -738,6 +1051,27 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(text)
     return 0
+
+
+def _table_counts_open(db_path: str) -> dict[str, int]:
+    """Read-only table counts via a mode=ro connection (no write side effects)."""
+    import sqlite3
+
+    out: dict[str, int] = {}
+    try:
+        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            for name in ("source_trades", *_GUARDED_TABLES):
+                try:
+                    row = c.execute(f"SELECT COUNT(*) FROM {name}").fetchone()
+                    out[name] = int(row[0]) if row else 0
+                except Exception:
+                    out[name] = -1
+        finally:
+            c.close()
+    except sqlite3.Error:
+        pass
+    return out
 
 
 if __name__ == "__main__":

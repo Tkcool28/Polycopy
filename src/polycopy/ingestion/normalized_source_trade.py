@@ -60,6 +60,11 @@ IDENTITY_STRONG = "strong"          # upstream transactionHash (or stable fill i
 IDENTITY_FALLBACK = "fallback"      # deterministic composite key
 IDENTITY_AMBIGUOUS = "ambiguous"    # cannot be proven unique -> reject/report
 
+# Identity *source* kind codes (which strong source produced the id).
+IDENTITY_SOURCE_PROVIDED = "source_provided_trade_id"   # Polymarket v2 stable id
+IDENTITY_SOURCE_TX = "transaction_hash"                 # real on-chain tx hash
+IDENTITY_SOURCE_FALLBACK = "fallback"                   # deterministic composite
+
 # A real on-chain transaction hash: 0x + 8+ hex chars.
 _TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{8,}$")
 # A conditionId-shaped identifier: 0x + 64 hex chars (Keccak).
@@ -170,10 +175,18 @@ class NormalizedSourceTrade:
     is_sample: int = 0
 
     # Identity bookkeeping.
-    identity_source: str = ""       # "strong" | "fallback" | "ambiguous"
+    identity_source: str = ""       # IDENTITY_SOURCE_* code
     identity_strong: bool = False
     identity_fallback: bool = False
     identity_ambiguous: bool = False
+
+    # Distinct strong-identity counters.
+    identity_source_provided: bool = False   # Polymarket v2 stable id (canonical)
+    identity_transaction_hash: bool = False   # real on-chain tx hash + fill index
+
+    # Optional raw provenance (kept separate; never fed through fallback).
+    source_provided_trade_id: Optional[str] = None   # Polymarket v2 stable id
+    transaction_hash: Optional[str] = None           # real on-chain hash (sep)
 
     # Validation.
     validation_status: str = "pending"   # "valid" | "rejected"
@@ -206,24 +219,56 @@ class IdentityResult:
     notes: str = ""
 
 
-def _strong_identity(raw: dict[str, Any], *, record_index: int) -> Optional[str]:
-    """Strong identity from upstream transactionHash (+ record index if needed).
+def _namespace_v2_id(v2_id: str) -> str:
+    """Namespace a Polymarket v2 stable id consistently as ``polymarket:<id>``.
 
-    Returns a string only when a real transactionHash is present. The upstream
-    data-api emits one unique transactionHash per fill, so it is normally a
-    valid strong identity on its own. However, if the SAME transactionHash
-    legitimately carries multiple fills (rare but possible), we fold in the
-    deterministic ``record_index`` so distinct fills under one transaction stay
-    DISTINCT — matching PR24X v2 row-distinguishing semantics (two rows from
-    the same transaction but with different fills get different ids).
+    The adapter returns ``source_trade_id`` already prefixed with
+    ``polymarket:``. We accept either form and always emit exactly
+    ``polymarket:<id>`` so the identity is stable across adapter versions
+    and matches rows previously persisted (the 14 PR24Z rows used exactly
+    this form).
     """
+    s = str(v2_id).strip().lower()
+    if s.startswith("polymarket:"):
+        return s
+    return "polymarket:" + s
+
+
+def _strong_identity(raw: dict[str, Any], *, record_index: int) -> tuple[Optional[str], str, bool]:
+    """Strong identity resolution.
+
+    Returns ``(source_trade_id, identity_source_kind, is_source_provided)``.
+
+    Preference order (per PR24Z safety-correction):
+      1. Source-provided stable trade/fill ID (``sourceProvidedTradeId`` /
+         adapter ``source_trade_id`` / v2 id) -> canonical ``polymarket:<id>``.
+         This is the PREFERRED strong identity; it is NOT routed through the
+         fallback composite.
+      2. Real on-chain transaction hash (+ deterministic record index when a
+         single transaction legitimately carries multiple fills) ->
+         ``polymarket:<tx>[:<index>]``.
+      3. Not a strong identity -> ``(None, "", False)`` (caller falls back).
+
+    The two raw fields are preserved SEPARATELY on the candidate (never
+    relabeled into one another): ``source_provided_trade_id`` and
+    ``transaction_hash``.
+    """
+    # 1. Source-provided stable trade/fill ID.
+    sp = raw.get("sourceProvidedTradeId")
+    if sp is None:
+        sp = raw.get("source_trade_id")
+    if isinstance(sp, str) and sp.strip():
+        return _namespace_v2_id(sp), IDENTITY_SOURCE_PROVIDED, True
+
+    # 2. Real on-chain transaction hash.
     tx = raw.get("transactionHash")
-    if not isinstance(tx, str) or not _TX_HASH_RE.match(tx.strip()):
-        return None
-    tx = tx.strip().lower()
-    if record_index is not None and record_index >= 0:
-        return f"polymarket:{tx}:{record_index}"
-    return f"polymarket:{tx}"
+    if isinstance(tx, str) and _TX_HASH_RE.match(tx.strip()):
+        tx = tx.strip().lower()
+        if record_index is not None and record_index >= 0:
+            return f"polymarket:{tx}:{record_index}", IDENTITY_SOURCE_TX, False
+        return f"polymarket:{tx}", IDENTITY_SOURCE_TX, False
+
+    return None, "", False
 
 
 def _fallback_identity(raw: dict[str, Any]) -> Optional[str]:
@@ -269,17 +314,30 @@ def generate_identity(
     """Compute a stable identity for a raw trade dict.
 
     Resolution order:
-      1. strong (upstream transactionHash) -> IDENTITY_STRONG
-      2. fallback (deterministic composite) -> IDENTITY_FALLBACK
-      3. otherwise -> IDENTITY_AMBIGUOUS (caller must report/reject)
+      1. source-provided stable trade/fill ID -> IDENTITY_STRONG
+         (identity_source = source_provided_trade_id)
+      2. real transaction hash + stable fill index -> IDENTITY_STRONG
+         (identity_source = transaction_hash)
+      3. deterministic fallback composite -> IDENTITY_FALLBACK
+      4. otherwise -> IDENTITY_AMBIGUOUS (caller must report/reject)
+
+    ``strong_identity_used_count`` = source_provided_identity_used_count
+        + transaction_identity_used_count`` (enforced by the caller counter).
     """
-    strong = _strong_identity(raw, record_index=record_index)
-    if strong is not None:
+    sid, kind, is_sp = _strong_identity(raw, record_index=record_index)
+    if sid is not None:
+        if is_sp:
+            return IdentityResult(
+                source_trade_id=sid,
+                strategy=IDENTITY_STRONG,
+                strong=True,
+                notes="strong identity from source-provided stable trade/fill id",
+            )
         return IdentityResult(
-            source_trade_id=strong,
+            source_trade_id=sid,
             strategy=IDENTITY_STRONG,
             strong=True,
-            notes="strong identity from upstream transactionHash",
+            notes="strong identity from real transaction hash (+ fill index)",
         )
     fallback = _fallback_identity(raw)
     if fallback is not None:
@@ -287,15 +345,15 @@ def generate_identity(
             source_trade_id=fallback,
             strategy=IDENTITY_FALLBACK,
             fallback=True,
-            notes="fallback deterministic composite identity (no upstream tx hash)",
+            notes="fallback deterministic composite identity (no strong source)",
         )
     return IdentityResult(
         source_trade_id=None,
         strategy=IDENTITY_AMBIGUOUS,
         ambiguous=True,
         notes=(
-            "ambiguous identity: no upstream transactionHash and insufficient "
-            "fields for a trusted deterministic composite key; cannot be proven unique"
+            "ambiguous identity: no source-provided id and no transaction hash, "
+            "and insufficient fields for a trusted deterministic composite key"
         ),
     )
 
@@ -406,7 +464,14 @@ def normalize_source_trade(
     candidate.outcome = str(outcome).strip() if isinstance(outcome, str) and outcome.strip() else None
     candidate.market_title = raw.get("title") if isinstance(raw.get("title"), str) else None
     candidate.market_slug = raw.get("slug") if isinstance(raw.get("slug"), str) else None
-    candidate.transaction_hash = raw.get("transactionHash") if isinstance(raw.get("transactionHash"), str) else None
+
+    # ── raw provenance: keep source-provided id and tx hash SEPARATE ──
+    sp = raw.get("sourceProvidedTradeId")
+    if sp is None:
+        sp = raw.get("source_trade_id")
+    candidate.source_provided_trade_id = sp if isinstance(sp, str) and sp.strip() else None
+    tx = raw.get("transactionHash")
+    candidate.transaction_hash = tx if isinstance(tx, str) and tx.strip() else None
 
     # ── live rows: is_sample always 0 ──
     candidate.is_sample = 0
@@ -419,10 +484,15 @@ def normalize_source_trade(
     # ── identity ──
     ident = generate_identity(raw, record_index=record_index)
     candidate.source_trade_id = ident.source_trade_id
-    candidate.identity_source = ident.strategy
+    kind = IDENTITY_SOURCE_PROVIDED if ident.notes.startswith("strong identity from source-provided") else (
+        IDENTITY_SOURCE_TX if ident.strategy == IDENTITY_STRONG else (
+            IDENTITY_SOURCE_FALLBACK if ident.strategy == IDENTITY_FALLBACK else ""))
+    candidate.identity_source = kind
     candidate.identity_strong = ident.strong
     candidate.identity_fallback = ident.fallback
     candidate.identity_ambiguous = ident.ambiguous
+    candidate.identity_source_provided = bool(ident.strong and kind == IDENTITY_SOURCE_PROVIDED)
+    candidate.identity_transaction_hash = bool(ident.strong and kind == IDENTITY_SOURCE_TX)
 
     # Ambiguous identity -> reject (cannot be proven unique).
     if ident.ambiguous:
@@ -474,8 +544,11 @@ class IngestionCounters:
     rejected_invalid_quantity: int = 0
     rejected_invalid_timestamp: int = 0
     rejected_wallet_mismatch: int = 0
+    rejected_invalid_fields: int = 0
     # Identity
     stable_ids_generated: int = 0
+    source_provided_identity_used_count: int = 0
+    transaction_identity_used_count: int = 0
     strong_identity_used_count: int = 0
     identity_fallback_used_count: int = 0
     identity_ambiguous_count: int = 0
@@ -523,5 +596,7 @@ def count_rejection(counters: "IngestionCounters", candidate: "NormalizedSourceT
             counters.rejected_invalid_timestamp += 1
         elif base == REASON_WALLET_MISMATCH:
             counters.rejected_wallet_mismatch += 1
+        elif base == REASON_PLACEHOLDER:
+            counters.rejected_invalid_fields += 1
         elif base == "ambiguous_identity":
             counters.identity_ambiguous_count += 1
