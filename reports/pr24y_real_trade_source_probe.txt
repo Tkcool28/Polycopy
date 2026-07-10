@@ -1,0 +1,72 @@
+PR24Y — REAL WALLET TRADE SOURCE PROBE (human summary)
+=========================================================
+
+STATUS: SAFE / PARKED / PAPER-ONLY / NON-AUTOMATED
+SCOPE: Step 1/Step 2 source probe only. Read-only, no ingestion.
+PROBE VERSION: PR24Y-1
+
+SELECTED SOURCE: polymarket_data_api_trades_user
+  Endpoint : GET https://data-api.polymarket.com/trades?user=<addr>
+  Client   : PolymarketPublicAdapter.get_trades_by_address (EXISTING, reused)
+  Auth     : NONE (unauthenticated public endpoint)
+  Verdict  : SOURCE_PARTIAL until a live preview demonstrates real records;
+             structurally confirmed by repo audit as the right source.
+
+WHY THIS SOURCE:
+  - Unauthenticated wallet-attributed trade history.
+  - Wallet-filterable via user=<addr>.
+  - Paginated (offset+limit), bounded.
+  - Returns every field Polycopy needs:
+      * proxyWallet  (trader address)      YES
+      * side         (BUY/SELL)             YES
+      * asset        (CLOB token_id)        YES
+      * conditionId  (market identifier)    YES
+      * size         (quantity)             YES
+      * price        ([0,1] probability)    YES
+      * timestamp    (Unix seconds)         YES
+      * transactionHash (stable trade id)   YES
+      * title/slug   (market metadata)      YES
+  - Stable identity: transactionHash is unique per trade -> natural dedup key
+    (UNIQUE(source, source_trade_id)); row-distinguishing key available
+    (deterministic_source_trade_id_v2) if needed.
+
+SOURCES REJECTED / NOT USED:
+  - polymarket_clob_trades (CLOB /trades): REQUIRES AUTH (HTTP 401). Not used.
+  - polymarket_gamma_markets: market metadata only, no trade history.
+  - run_scan / collect_smart_money_data: duplicated collector-owned source_trades
+    WRITERS (PR24X). Excluded as probe sources; future ingestion must delegate
+    to ONE centralized writer, not these.
+
+BUY-ONLY V1 RULE:
+  - BUY records evaluated for eligibility (all required fields present).
+  - SELL records classified excluded_unsupported_side (observed, never eligible).
+  - Missing/unknown side -> excluded_missing_fields.
+
+READINESS (observational; no mapping performed here):
+  - PR24U-ready : token_id present and non-placeholder.
+  - PR24V-ready : conditionId present OR token->condition mapping available (PR24W).
+  - both-ready  : PR24U-ready AND PR24V-ready.
+
+NETWORK SAFETY (enforced in core + CLI):
+  - Default mode: NO network, NO DB, NO writes (fixture provider).
+  - Live mode requires --allow-live-preview AND explicit wallet.
+  - Default limit 25, hard max 100 records.
+  - PR24Y fetches at most 2 pages per wallet.
+  - Single wallet default; explicit hard max 5.
+  - No concurrent workers, no timers, no background process.
+  - No rate-limit hammering (provider throttles; bounded retries on 429).
+
+SAFETY FLAGS (always False in PR24Y):
+  - production_db_opened          = False
+  - production_db_written          = False
+  - ready_for_PR24Z                = True ONLY if real records confirm fields
+  - ready_to_persist_source_trades = False
+  - ready_to_wire_to_automation    = False
+
+NEXT STEP (PR24Z): generate in-memory normalized source_trade candidate rows
+from this source (no DB writes), proving field coverage on real fetched data.
+Do NOT implement ingestion in PR24Y.
+
+HARD GUARDRAILS HONORED: no deploy/service restart/timer; no production DB
+writes; no source_trades mutation; no backfill; no real ingestion; no scoring/
+decisions/candidates/signals/snapshots/orders/positions; no automation; BUY-only.
