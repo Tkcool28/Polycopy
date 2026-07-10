@@ -1,0 +1,243 @@
+{
+  "ingestion_version": "PR24Z-1",
+  "generated_at": "2026-07-10T16:26:35.829257+00:00",
+  "mode": "safety-verification",
+  "source": "polymarket_data_api_trades_user",
+  "wallet_address": "0x1111111111111111111111111111111111111111",
+  "wallet_address_redacted": "0x\u20261111",
+  "live": false,
+  "network_calls_attempted": 0,
+  "network_calls_succeeded": 0,
+  "error": null,
+  "counts": {
+    "raw_records": 11,
+    "raw_buy_records": 9,
+    "raw_sell_records": 1,
+    "unknown_side_records": 1,
+    "eligible_buy_records": 3,
+    "rejected_unsupported_side": 1,
+    "rejected_missing_fields": 1,
+    "rejected_invalid_price": 2,
+    "rejected_invalid_quantity": 2,
+    "rejected_invalid_timestamp": 2,
+    "rejected_wallet_mismatch": 1,
+    "rejected_invalid_fields": 1,
+    "rows_rejected": 8
+  },
+  "identity": {
+    "stable_ids_generated": 10,
+    "source_provided_identity_used_count": 3,
+    "transaction_identity_used_count": 7,
+    "strong_identity_used_count": 10,
+    "identity_fallback_used_count": 0,
+    "identity_ambiguous_count": 1,
+    "duplicate_records_in_fetch": 1,
+    "duplicate_records_existing_db": 0,
+    "collision_errors": 0
+  },
+  "readiness": {
+    "pr24u_ready_count": 10,
+    "pr24v_ready_count": 10,
+    "both_ready_count": 10,
+    "ready_for_scoring": false,
+    "ready_for_automation": false
+  },
+  "canonical_migration": {
+    "existing_production_rows_with_legacy_fallback_ids": 14,
+    "corrected_canonical_ids_differ": true,
+    "canonical_migration_required_before_next_production_write": true,
+    "migration_work_separated_into_stacked_pr": true,
+    "future_production_write_allowed_now": false,
+    "supersedes_prior_canonical_compatibility_claim": true,
+    "temporary_write_block": "missing canonical migration completion marker"
+  },
+  "backup_inventory_correction": {
+    "distinct_sha256_groups_listed_by_inspection": 4,
+    "do_not_assume_logical_identity_from_size_integrity_and_count": true,
+    "later_cleanup_requires_logical_table_counts_and_row_hashes_or_normalized_dumps": true,
+    "backup_files_deleted_in_this_task": false
+  },
+  "safety": {
+    "downstream_tables_changed": false,
+    "timers_changed": false
+  },
+  "valid_rows": [
+    {
+      "source": "polymarket_data_api_trades_user",
+      "source_trade_id": "polymarket:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "trader_address": "0x1111111111111111111111111111111111111111",
+      "market_source_id": "0x3333333333333333333333333333333333333333333333333333333333333333",
+      "token_id": "0x2222222222222222222222222222222222222222222222222222222222222222",
+      "side": "BUY",
+      "price": 0.4,
+      "quantity": 100.0,
+      "timestamp": "2023-11-14T22:13:20+00:00",
+      "outcome": "Yes",
+      "transaction_hash": null,
+      "market_title": "Market A",
+      "market_slug": "market-a",
+      "is_sample": 0,
+      "identity_source": "source_provided_trade_id",
+      "identity_strong": true,
+      "identity_fallback": false,
+      "identity_ambiguous": false,
+      "identity_source_provided": true,
+      "identity_transaction_hash": false,
+      "source_provided_trade_id": "polymarket:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "validation_status": "valid",
+      "validation_reasons": [
+        "buy_eligible"
+      ],
+      "pr24u_ready": true,
+      "pr24v_ready": true,
+      "both_ready": true,
+      "_fetch_index": 0
+    },
+    {
+      "source": "polymarket_data_api_trades_user",
+      "source_trade_id": "polymarket:0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:1",
+      "trader_address": "0x1111111111111111111111111111111111111111",
+      "market_source_id": "0x5555555555555555555555555555555555555555555555555555555555555555",
+      "token_id": "0x4444444444444444444444444444444444444444444444444444444444444444",
+      "side": "BUY",
+      "price": 0.62,
+      "quantity": 50.0,
+      "timestamp": "2023-11-14T22:15:00+00:00",
+      "outcome": "No",
+      "transaction_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "market_title": "Market B",
+      "market_slug": "market-b",
+      "is_sample": 0,
+      "identity_source": "transaction_hash",
+      "identity_strong": true,
+      "identity_fallback": false,
+      "identity_ambiguous": false,
+      "identity_source_provided": false,
+      "identity_transaction_hash": true,
+      "source_provided_trade_id": null,
+      "validation_status": "valid",
+      "validation_reasons": [
+        "buy_eligible"
+      ],
+      "pr24u_ready": true,
+      "pr24v_ready": true,
+      "both_ready": true,
+      "_fetch_index": 1
+    },
+    {
+      "source": "polymarket_data_api_trades_user",
+      "source_trade_id": "polymarket:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "trader_address": "0x1111111111111111111111111111111111111111",
+      "market_source_id": "0x7777777777777777777777777777777777777777777777777777777777777777",
+      "token_id": "0x6666666666666666666666666666666666666666666666666666666666666666",
+      "side": "BUY",
+      "price": 0.75,
+      "quantity": 10.0,
+      "timestamp": "2023-11-14T22:16:40+00:00",
+      "outcome": "Up",
+      "transaction_hash": null,
+      "market_title": "Market C",
+      "market_slug": "market-c",
+      "is_sample": 0,
+      "identity_source": "source_provided_trade_id",
+      "identity_strong": true,
+      "identity_fallback": false,
+      "identity_ambiguous": false,
+      "identity_source_provided": true,
+      "identity_transaction_hash": false,
+      "source_provided_trade_id": "polymarket:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "validation_status": "valid",
+      "validation_reasons": [
+        "buy_eligible"
+      ],
+      "pr24u_ready": true,
+      "pr24v_ready": true,
+      "both_ready": true,
+      "_fetch_index": 2
+    }
+  ],
+  "write": null,
+  "db_path": "/root/Polycopy/data/polycopy.db",
+  "db_before": {
+    "size": 528384,
+    "mtime": 1783658343,
+    "path": "/root/Polycopy/data/polycopy.db",
+    "counts": {
+      "source_trades": 19,
+      "trade_copyability_decisions": 0,
+      "copy_candidates": 0,
+      "paper_signal_decisions": 0,
+      "candidate_price_snapshots": 0,
+      "candidate_price_snapshot_levels": 0,
+      "orders": 0,
+      "positions": 0,
+      "wallet_score_decisions": 1,
+      "settlement_accounting_ledger": 0
+    }
+  },
+  "db_after": {
+    "size": 528384,
+    "mtime": 1783658343,
+    "path": "/root/Polycopy/data/polycopy.db",
+    "counts": {
+      "source_trades": 19,
+      "trade_copyability_decisions": 0,
+      "copy_candidates": 0,
+      "paper_signal_decisions": 0,
+      "candidate_price_snapshots": 0,
+      "candidate_price_snapshot_levels": 0,
+      "orders": 0,
+      "positions": 0,
+      "wallet_score_decisions": 1,
+      "settlement_accounting_ledger": 0
+    }
+  },
+  "timers_before": {
+    "polycopy-collect.timer": "inactive",
+    "polycopy-scan.timer": "inactive",
+    "polycopy-settle.timer": "inactive",
+    "polycopy-update.timer": "inactive",
+    "polycopy-wc-fixture-refresh.timer": "inactive"
+  },
+  "timers_after": {
+    "polycopy-collect.timer": "inactive",
+    "polycopy-scan.timer": "inactive",
+    "polycopy-settle.timer": "inactive",
+    "polycopy-update.timer": "inactive",
+    "polycopy-wc-fixture-refresh.timer": "inactive"
+  },
+  "backup": {
+    "success": true,
+    "path": "/root/Polycopy/data/polycopy.db.pr24z_online_backup_20260710T162635Z",
+    "method": "sqlite_online_backup",
+    "sha256": "b1c1df3d56ca78410c9d330de4a071b3fdf65d8e77a9565950d75870621d9a85",
+    "size": 528384,
+    "integrity_check": "ok",
+    "foreign_key_violations": 0,
+    "source_trades_count": 19,
+    "error": null
+  },
+  "unique_constraint": {
+    "present": true,
+    "index_name": "sqlite_autoindex_source_trades_2",
+    "columns": [
+      "source",
+      "source_trade_id"
+    ],
+    "error": null
+  },
+  "process_gate": {
+    "checked": true,
+    "competing_writers_found": false,
+    "safe_to_write": true,
+    "details": []
+  },
+  "compatibility": null,
+  "integrity_check": "ok",
+  "foreign_key_check": 0,
+  "historical_first_production_write": {
+    "attempted": 14,
+    "inserted": 14,
+    "deduplicated": 0
+  }
+}
