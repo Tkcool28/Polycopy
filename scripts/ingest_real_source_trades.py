@@ -82,6 +82,9 @@ from polycopy.ingestion.source_trade_writer import (  # noqa: E402
     UniqueConstraintResult,
 )
 from polycopy.db.database import Database  # noqa: E402
+from polycopy.migrations.pr24z_marker import (  # noqa: E402
+    validate_pr24z_migration_marker,
+)
 
 # Tables that must remain UNCHANGED by a production write.
 _GUARDED_TABLES = (
@@ -946,11 +949,15 @@ def main(argv: list[str] | None = None) -> int:
         # must not receive another ingestion write until the separate canonical
         # migration PR completes. This is fail-closed and does not implement
         # legacy alias matching or per-trade adaptation.
-        if not _CANONICAL_MIGRATION_COMPLETE_MARKER.exists():
+        marker_validation = validate_pr24z_migration_marker(
+            _CANONICAL_MIGRATION_COMPLETE_MARKER, db_path
+        )
+        if not marker_validation.valid:
             print(
                 "error: canonical source_trade_id migration is not complete; "
                 "refusing production ingestion write. "
-                f"Missing marker: {_CANONICAL_MIGRATION_COMPLETE_MARKER}",
+                f"Invalid marker: {_CANONICAL_MIGRATION_COMPLETE_MARKER}; "
+                f"reasons={marker_validation.reasons}",
                 file=sys.stderr,
             )
             return 2
