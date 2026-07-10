@@ -572,10 +572,23 @@ def build_source_trade_ingestion_writer_audit(
     for a source-only audit with empty inventory). This function never opens a
     DB for writing.
     """
-    root = Path(repo_root) if repo_root else Path("/root/Polycopy")
-    if detect_repo and not root.exists():
-        # Fall back to cwd.
-        root = Path.cwd()
+    # Default the repo root from this module's location (repo_root/src/polycopy/
+    # engine/...), mirroring the CLI's __file__-based resolution. Never hardcode
+    # an absolute root-owned path (e.g. /root/Polycopy): on CI the test user may
+    # lack traverse permission on /root, which would raise PermissionError before
+    # any fallback. Fall back to cwd if the derived path is absent.
+    if repo_root:
+        root = Path(repo_root)
+    else:
+        root = Path(__file__).resolve().parents[3]
+    if detect_repo:
+        try:
+            root_exists = root.exists()
+        except OSError:
+            root_exists = False
+        if not root_exists:
+            # Fall back to cwd (test isolation / CI layout).
+            root = Path.cwd()
 
     inventory = _inventory_from_conn(conn) if conn is not None else {}
 
