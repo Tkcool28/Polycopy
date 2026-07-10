@@ -1,0 +1,16 @@
+{
+  "marker_expected_by_pr50": "/root/Polycopy/data/.pr24z_canonical_migration_complete",
+  "marker_json_created_only_after_complete_verification": true,
+  "migration_version": "pr24z_canonical_identity_v1",
+  "normal_ingestion_logic_changed": false,
+  "production_execution_authorized": false,
+  "state_machine": [
+    "ALL_LEGACY",
+    "ALL_CANONICAL",
+    "MIXED",
+    "MISSING",
+    "DUPLICATE",
+    "COLLISION",
+    "UNKNOWN"
+  ]
+}
