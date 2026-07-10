@@ -59,7 +59,9 @@ _GUARDED_TABLES = (
 
 def _make_db(rows, *, add_guarded_tables=False) -> str:
     """Build an isolated temp SQLite DB with a source_trades table + rows."""
+    import os as _os
     fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24x_test_")
+    _os.close(fd)
     Path(path).unlink()  # mkstemp creates the file; recreate clean.
     con = sqlite3.connect(path)
     con.execute(
@@ -261,7 +263,6 @@ def test_safety_layer_reports_wal_insufficient_alone():
 # ── Classification of direct write paths ─────────────────────────────────────
 def test_direct_source_trade_write_paths_are_classified():
     audit = build_source_trade_ingestion_writer_audit(None)
-    paths = {(w.path, w.line): w for w in audit.write_paths}
     # Production writer locations present and classified.
     prod = [w for w in audit.write_paths
             if w.classification == "production_write_path"]

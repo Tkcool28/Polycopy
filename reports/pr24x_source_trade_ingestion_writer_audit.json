@@ -879,6 +879,16 @@
       "notes": "static inspection only; not executed"
     },
     {
+      "path": "tests/test_p24x_source_trade_ingestion_writer_audit.py",
+      "line": 93,
+      "verb": "insert into",
+      "classification": "test_temp_db_only",
+      "writes_db": true,
+      "uses_database_connect": false,
+      "is_sample_seed": false,
+      "notes": "static inspection only; not executed"
+    },
+    {
       "path": "tests/test_p30_wallet_identity_normalization.py",
       "line": 241,
       "verb": "insert into",

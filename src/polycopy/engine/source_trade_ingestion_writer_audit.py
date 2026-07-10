@@ -594,7 +594,7 @@ def build_source_trade_ingestion_writer_audit(
     bypasses = _scan_direct_connect_bypasses(root)
     audit.db_safety_layer.note = (
         audit.db_safety_layer.note
-        + f" | direct sqlite3.connect (non-ro) opens in src/: "
+        + " | direct sqlite3.connect (non-ro) opens in src/: "
         + (str(bypasses) if bypasses else "none")
     )
     return audit
@@ -604,7 +604,7 @@ def report_to_markdown(audit: IngestionWriterAudit) -> str:
     """Render the audit as a human-readable Markdown report."""
     d = audit.as_dict()
     lines: list[str] = []
-    lines.append(f"# PR24X — Source-Trade Ingestion Writer Audit")
+    lines.append("# PR24X — Source-Trade Ingestion Writer Audit")
     lines.append("")
     lines.append(f"**Audit version:** {d['audit_version']}  ")
     lines.append(f"**Repo root:** `{d['repo_root']}`  ")
@@ -621,7 +621,7 @@ def report_to_markdown(audit: IngestionWriterAudit) -> str:
     lines.append(f"- foreign_keys=ON: **{sl['foreign_keys_on']}**")
     lines.append(f"- WAL sufficient alone: **{sl['wal_sufficient_alone']}** "
                  f"(WAL helps, does NOT make SQLite multi-writer)")
-    lines.append(f"- Application-level single-writer rule still required: **YES**")
+    lines.append("- Application-level single-writer rule still required: **YES**")
     lines.append("")
 
     lines.append("## 2. source_trades Write Path Classification")

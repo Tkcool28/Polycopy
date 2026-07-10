@@ -26,7 +26,7 @@
 ### migration_schema_path (1)
 - `src/polycopy/db/schema.py:432` — `insert into` (uses Database.connect: True, sample seed: False)
 
-### test_temp_db_only (94)
+### test_temp_db_only (95)
 - `tests/test_p01_trade_outcome_identity.py:154` — `insert into` (uses Database.connect: False, sample seed: False)
 - `tests/test_p01_trade_outcome_identity.py:365` — `insert or ignore into` (uses Database.connect: False, sample seed: False)
 - `tests/test_p01_trade_outcome_identity.py:422` — `insert or ignore into` (uses Database.connect: False, sample seed: False)
@@ -106,6 +106,7 @@
 - `tests/test_p24v_trade_copyability_market_state_evidence_bridge.py:90` — `insert into` (uses Database.connect: False, sample seed: False)
 - `tests/test_p24v_trade_copyability_market_state_evidence_bridge.py:524` — `insert into` (uses Database.connect: False, sample seed: False)
 - `tests/test_p24w_source_trade_real_coverage_mapping_audit.py:90` — `insert into` (uses Database.connect: False, sample seed: False)
+- `tests/test_p24x_source_trade_ingestion_writer_audit.py:93` — `insert into` (uses Database.connect: False, sample seed: False)
 - `tests/test_p30_wallet_identity_normalization.py:241` — `insert into` (uses Database.connect: False, sample seed: False)
 - `tests/test_p30_wallet_identity_normalization.py:266` — `insert into` (uses Database.connect: False, sample seed: False)
 - `tests/test_p30_wallet_identity_normalization.py:300` — `insert into` (uses Database.connect: False, sample seed: False)
