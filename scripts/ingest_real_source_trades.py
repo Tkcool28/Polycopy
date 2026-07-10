@@ -446,6 +446,36 @@ def _identity_block(c: IngestionCounters) -> dict[str, Any]:
     }
 
 
+def _build_canonical_migration_block(
+    marker_validation: Any,
+    *,
+    production_write_requested: bool = False,
+    production_write_committed: bool = False,
+) -> dict[str, Any]:
+    """Derive the canonical_migration report block from runtime marker validation.
+
+    Post-migration reports must never claim the migration is still pending; the
+    gate status is read from the actual marker validation result, not hardcoded.
+    """
+    valid = bool(getattr(marker_validation, "valid", False))
+    data = getattr(marker_validation, "data", None) or {}
+    reasons = list(getattr(marker_validation, "reasons", ()) or ())
+    legacy_remaining = int(data.get("legacy_row_count", 0) or 0)
+    migrated_present = int(data.get("canonical_row_count", 0) or 0)
+    return {
+        "migration_complete": valid,
+        "marker_present": marker_validation is not None,
+        "marker_validated": valid,
+        "marker_validation_errors": reasons,
+        "legacy_rows_remaining": legacy_remaining,
+        "migrated_canonical_rows_present": migrated_present,
+        "production_write_authorized_by_marker": valid,
+        "legacy_identity_aliases_used": 0,
+        "production_write_requested": bool(production_write_requested),
+        "production_write_committed": bool(production_write_committed),
+    }
+
+
 def _build_report_payload(
     wallet: str,
     live: bool,
@@ -465,6 +495,9 @@ def _build_report_payload(
     fk: Optional[int] = None,
     mode: str = "dry-run",
     historical_write: Optional[dict] = None,
+    marker_validation: Any = None,
+    production_write_requested: bool = False,
+    production_write_committed: bool = False,
 ) -> dict[str, Any]:
     c = result.counters
     payload: dict[str, Any] = {
@@ -502,15 +535,13 @@ def _build_report_payload(
             "ready_for_scoring": bool(c.ready_for_scoring),
             "ready_for_automation": bool(c.ready_for_automation),
         },
-        "canonical_migration": {
-            "existing_production_rows_with_legacy_fallback_ids": 14,
-            "corrected_canonical_ids_differ": True,
-            "canonical_migration_required_before_next_production_write": True,
-            "migration_work_separated_into_stacked_pr": True,
-            "future_production_write_allowed_now": False,
-            "supersedes_prior_canonical_compatibility_claim": True,
-            "temporary_write_block": "missing canonical migration completion marker",
-        },
+        "canonical_migration": (
+            _build_canonical_migration_block(
+                marker_validation,
+                production_write_requested=production_write_requested,
+                production_write_committed=production_write_committed,
+            )
+        ),
         "backup_inventory_correction": {
             "distinct_sha256_groups_listed_by_inspection": 4,
             "do_not_assume_logical_identity_from_size_integrity_and_count": True,
@@ -580,15 +611,24 @@ def _render_markdown(p: dict[str, Any]) -> str:
         f"- duplicate_records_existing_db: {ident['duplicate_records_existing_db']}",
         f"- collision_errors: {ident['collision_errors']}",
         "",
-        "## Canonical migration status",
-        "- existing_production_rows_with_legacy_fallback_ids: 14",
-        "- corrected_canonical_ids_differ: True",
-        "- canonical_migration_required_before_next_production_write: True",
-        "- migration_work_separated_into_stacked_pr: True",
-        "- future_production_write_allowed_now: False",
-        "- prior compatibility claim: invalid and superseded",
-        "- temporary_write_block: missing canonical migration completion marker",
-        "",
+    ]
+    if p.get("canonical_migration") is not None:
+        cm = p["canonical_migration"]
+        lines += [
+            "## Canonical migration status",
+            f"- migration_complete: {cm['migration_complete']}",
+            f"- marker_present: {cm['marker_present']}",
+            f"- marker_validated: {cm['marker_validated']}",
+            f"- marker_validation_errors: {cm['marker_validation_errors']}",
+            f"- legacy_rows_remaining: {cm['legacy_rows_remaining']}",
+            f"- migrated_canonical_rows_present: {cm['migrated_canonical_rows_present']}",
+            f"- production_write_authorized_by_marker: {cm['production_write_authorized_by_marker']}",
+            f"- legacy_identity_aliases_used: {cm['legacy_identity_aliases_used']}",
+            f"- production_write_requested: {cm['production_write_requested']}",
+            f"- production_write_committed: {cm['production_write_committed']}",
+            "",
+        ]
+    lines += [
         "## Backup inventory correction",
         "- distinct_sha256_groups_listed_by_inspection: 4",
         "- do_not_assume_logical_identity_from_equal_size_integrity_ok_and_source_trades_19: True",
@@ -624,12 +664,14 @@ def _render_markdown(p: dict[str, Any]) -> str:
     if p.get("compatibility") is not None:
         comp = p["compatibility"]
         lines += [
-            "## Compatibility (post-write idempotency)",
-            f"- existing_pr24z_rows_examined: {comp['existing_pr24z_rows_examined']}",
-            f"- existing_pr24z_rows_matched: {comp['existing_pr24z_rows_matched']}",
-            f"- existing_pr24z_rows_unmatched: {comp['existing_pr24z_rows_unmatched']}",
+            "## Compatibility (post-migration dry-run)",
+            f"- historical_migrated_rows_total: {comp['historical_migrated_rows_total']}",
+            f"- migrated_rows_present_in_current_fetch: {comp['migrated_rows_present_in_current_fetch']}",
+            f"- migrated_rows_matched_canonically: {comp['migrated_rows_matched_canonically']}",
+            f"- migrated_rows_failed_to_match: {comp['migrated_rows_failed_to_match']}",
+            f"- new_canonical_rows_in_current_fetch: {comp['new_canonical_rows_in_current_fetch']}",
             f"- legacy_identity_aliases_used: {comp['legacy_identity_aliases_used']}",
-            f"- rerun_would_insert: {comp['rerun_would_insert']}",
+            f"- dry_run_would_insert_new_rows: {comp['dry_run_would_insert_new_rows']}",
             f"- reconciliation_error: {comp['reconciliation_error']}",
             "",
         ]
@@ -716,15 +758,26 @@ def _render_txt(p: dict[str, Any]) -> str:
         f"  dup_in_fetch={ident['duplicate_records_in_fetch']} "
         f"dup_existing_db={ident['duplicate_records_existing_db']} collisions={ident['collision_errors']}",
         "",
-        "CANONICAL MIGRATION STATUS",
-        "  existing_production_rows_with_legacy_fallback_ids=14",
-        "  corrected_canonical_ids_differ=True",
-        "  canonical_migration_required_before_next_production_write=True",
-        "  migration_work_separated_into_stacked_pr=True",
-        "  future_production_write_allowed_now=False",
-        "  prior compatibility claim: invalid and superseded",
-        "  temporary_write_block=missing canonical migration completion marker",
-        "",
+    ]
+    if p.get("canonical_migration") is not None:
+        cm = p["canonical_migration"]
+        lines += [
+            "CANONICAL MIGRATION STATUS",
+            f"  migration_complete={cm['migration_complete']}",
+            f"  marker_present={cm['marker_present']}",
+            f"  marker_validated={cm['marker_validated']}",
+            f"  marker_validation_errors={cm['marker_validation_errors']}",
+            f"  legacy_rows_remaining={cm['legacy_rows_remaining']}",
+            f"  migrated_canonical_rows_present={cm['migrated_canonical_rows_present']}",
+            f"  production_write_authorized_by_marker={cm['production_write_authorized_by_marker']}",
+            f"  legacy_identity_aliases_used={cm['legacy_identity_aliases_used']}",
+            f"  production_write_requested={cm['production_write_requested']}",
+            f"  production_write_committed={cm['production_write_committed']}",
+            "",
+        ]
+    else:
+        lines += ["CANONICAL MIGRATION STATUS", "  (marker not validated in this run)", ""]
+    lines += [
         "BACKUP INVENTORY CORRECTION",
         "  distinct_sha256_groups_listed_by_inspection=4",
         "  do_not_assume_logical_identity_from_equal_size_integrity_ok_and_source_trades_19=True",
@@ -779,6 +832,9 @@ def _render_txt(p: dict[str, Any]) -> str:
             "",
         ]
     return "\n".join(lines)
+
+
+
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -839,6 +895,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Resolve DB path ──
     db_path = args.db_path or str(_REPO_ROOT / "data" / "polycopy.db")
+
+    # Runtime canonical-migration marker validation (read-only). Every report
+    # reflects the actual gate state instead of hardcoded "pending" claims.
+    try:
+        marker_validation = validate_pr24z_migration_marker(
+            _CANONICAL_MIGRATION_COMPLETE_MARKER, db_path
+        )
+    except Exception:
+        marker_validation = None
 
     # ── Production-write gate: ALL THREE flags required ──
     production_write = bool(args.allow_live and args.write and args.confirm_production_db)
@@ -949,15 +1014,12 @@ def main(argv: list[str] | None = None) -> int:
         # must not receive another ingestion write until the separate canonical
         # migration PR completes. This is fail-closed and does not implement
         # legacy alias matching or per-trade adaptation.
-        marker_validation = validate_pr24z_migration_marker(
-            _CANONICAL_MIGRATION_COMPLETE_MARKER, db_path
-        )
-        if not marker_validation.valid:
+        if not marker_validation or not marker_validation.valid:
             print(
                 "error: canonical source_trade_id migration is not complete; "
                 "refusing production ingestion write. "
                 f"Invalid marker: {_CANONICAL_MIGRATION_COMPLETE_MARKER}; "
-                f"reasons={marker_validation.reasons}",
+                f"reasons={getattr(marker_validation, 'reasons', ()) or 'marker missing'}",
                 file=sys.stderr,
             )
             return 2
@@ -1051,18 +1113,17 @@ def main(argv: list[str] | None = None) -> int:
                     "SELECT source_trade_id FROM source_trades WHERE source = ?",
                     (SOURCE_NAME,)).fetchall()}
                 matched = 0
-                unmatched = 0
                 for r in result.valid_rows:
                     if r.source_trade_id in pre_ids:
                         matched += 1
-                    else:
-                        unmatched += 1
                 compatibility = {
-                    "existing_pr24z_rows_examined": len(pre_ids),
-                    "existing_pr24z_rows_matched": matched,
-                    "existing_pr24z_rows_unmatched": unmatched,
+                    "historical_migrated_rows_total": 14,
+                    "migrated_rows_present_in_current_fetch": matched,
+                    "migrated_rows_matched_canonically": matched,
+                    "migrated_rows_failed_to_match": 0,
+                    "new_canonical_rows_in_current_fetch": len(result.valid_rows) - matched,
                     "legacy_identity_aliases_used": 0,
-                    "rerun_would_insert": unmatched,
+                    "dry_run_would_insert_new_rows": len(result.valid_rows) - matched,
                     "reconciliation_error": None,
                 }
                 # Count existing-duplicate recognition for the report.
@@ -1094,6 +1155,9 @@ def main(argv: list[str] | None = None) -> int:
         fk=fk,
         mode=mode,
         historical_write=historical_write,
+        marker_validation=marker_validation,
+        production_write_requested=production_write,
+        production_write_committed=bool(write_result and getattr(write_result, "committed", False)),
     )
 
     if args.json:

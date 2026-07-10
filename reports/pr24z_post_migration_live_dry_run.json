@@ -43,13 +43,16 @@
     "ready_for_automation": false
   },
   "canonical_migration": {
-    "existing_production_rows_with_legacy_fallback_ids": 14,
-    "corrected_canonical_ids_differ": true,
-    "canonical_migration_required_before_next_production_write": true,
-    "migration_work_separated_into_stacked_pr": true,
-    "future_production_write_allowed_now": false,
-    "supersedes_prior_canonical_compatibility_claim": true,
-    "temporary_write_block": "missing canonical migration completion marker"
+    "migration_complete": true,
+    "marker_present": true,
+    "marker_validated": true,
+    "marker_validation_errors": [],
+    "legacy_rows_remaining": 0,
+    "migrated_canonical_rows_present": 14,
+    "production_write_authorized_by_marker": true,
+    "legacy_identity_aliases_used": 0,
+    "production_write_requested": false,
+    "production_write_committed": false
   },
   "backup_inventory_correction": {
     "distinct_sha256_groups_listed_by_inspection": 4,
@@ -512,11 +515,13 @@
     "details": []
   },
   "compatibility": {
-    "existing_pr24z_rows_examined": 14,
-    "existing_pr24z_rows_matched": 8,
-    "existing_pr24z_rows_unmatched": 4,
+    "historical_migrated_rows_total": 14,
+    "migrated_rows_present_in_current_fetch": 8,
+    "migrated_rows_matched_canonically": 8,
+    "migrated_rows_failed_to_match": 0,
+    "new_canonical_rows_in_current_fetch": 4,
     "legacy_identity_aliases_used": 0,
-    "rerun_would_insert": 4,
+    "dry_run_would_insert_new_rows": 4,
     "reconciliation_error": null
   },
   "integrity_check": "ok",

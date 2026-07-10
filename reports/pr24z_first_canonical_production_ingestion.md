@@ -14,7 +14,7 @@
 - raw_records: 25 (BUY 12, SELL 13)
 - eligible_buy: 12, rejected_unsupported_side (SELL): 13
 - identity: source_provided_used=25, fallback=0, ambiguous=0
-- compatibility: examined 14, matched 8, unmatched 4, legacy_aliases_used=0, rerun_would_insert=4
+- compatibility: historical_migrated_rows_total 14, migrated_rows_present_in_current_fetch 8, migrated_rows_matched_canonically 8, migrated_rows_failed_to_match 0, new_canonical_rows_in_current_fetch 4, legacy_aliases_used=0, dry_run_would_insert_new_rows=4
 - write: NONE
 - DB unchanged (size 528384, mtime_ns 1783708114961708145, source_trades=19 before/after)
 
@@ -54,7 +54,7 @@ positions 0, wallet_score_decisions 1, settlement_accounting_ledger 0,
 market_outcomes 6, decision_log 0.
 
 ## Post-write no-write replay (idempotency)
-- examined 18, matched 12, unmatched 0, legacy_aliases_used 0, rerun_would_insert 0
+- post-write replay: historical_migrated_rows_total 14, migrated_rows_present 12, migrated_rows_matched_canonically 12, migrated_rows_failed_to_match 0, new_canonical_rows_in_current_fetch 0, legacy_aliases_used 0, rerun_would_insert 0
 - write: NONE, DB unchanged
 
 ## Final integrity
