@@ -20,6 +20,7 @@ from polycopy.monitoring.approved_wallet_monitor import (
     Probe,
     SystemProbe,
     build_baseline,
+    count_collector_oom_events,
     evaluate,
     write_json_atomic,
 )
@@ -154,6 +155,41 @@ def test_api_transient_then_repeated_failure_and_memory_limits(config, tmp_path)
     assert evaluate(p, config, no_remediation=True)["status"] == "RED"
     p.api["healthy"] = True; p.memory_info["collector_max_process_rss_bytes"] = 513 * 1024**2
     assert evaluate(p, config, no_remediation=True)["status"] == "RED"
+
+
+def test_systemctl_show_uses_valid_property_arguments():
+    class ShowProbe(SystemProbe):
+        def __init__(self): self.args = None
+        def run(self, args, timeout=10):
+            self.args = args
+            return SimpleNamespace(returncode=0, stderr="", stdout="ActiveState=active\nUnitFileState=enabled\n")
+    probe = ShowProbe()
+    assert probe.collector_timer() == {"enabled": True, "active": True}
+    assert probe.args == ["systemctl", "show", "polycopy-approved-wallet-collect.timer", "-p", "ActiveState", "-p", "UnitFileState"]
+
+
+def test_collector_oom_attribution_is_bounded_strict_and_deduplicated():
+    same_line = "Out of memory: Killed process 1 (python3) polycopy-approved-wallet-collect.service"
+    adjacent = "\n".join((
+        "oom-kill: task_memcg=/system.slice/polycopy-approved-wallet-collect.service",
+        "Memory cgroup out of memory: Killed process 12345 (python3)",
+        "Out of memory: Killed process 12345 (python3)",
+    ))
+    unrelated_python = "Out of memory: Killed process 7 (python3)"
+    hermes = "Out of memory: Killed process 8 (python3) task_memcg=/hermes-gateway.service"
+    two_events = "\n".join((
+        "oom-kill: task_memcg=/system.slice/polycopy-approved-wallet-collect.service",
+        "Out of memory: Killed process 1 (python3)",
+        *["noise" for _ in range(9)],
+        "oom-kill: task_memcg=/system.slice/polycopy-approved-wallet-collect.service",
+        "Out of memory: Killed process 2 (python3)",
+    ))
+    assert count_collector_oom_events(same_line) == 1
+    assert count_collector_oom_events(adjacent) == 1
+    assert count_collector_oom_events(unrelated_python) == 0
+    assert count_collector_oom_events(hermes) == 0
+    assert count_collector_oom_events(two_events) == 2
+    assert count_collector_oom_events("") == 0
 
 
 def test_systemd_failure_pair_counts_as_one_invocation():
