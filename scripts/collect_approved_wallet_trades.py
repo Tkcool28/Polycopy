@@ -20,32 +20,12 @@ from polycopy.ingestion.approved_wallet_collector import (
     resolve_wallet,
     UnsafeCollectorConfiguration,
 )
+from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
 from polycopy.ingestion.source_trade_writer import write_valid_rows
 from polycopy.runtime.locks import operational_job_lock
 from polycopy.runtime.memory import MemoryLimitExceeded, check_rss_limit, get_max_rss_mb_from_env
 from polycopy.utils.concurrency import LockError
 from ingest_real_source_trades import _RealDataApiProvider
-
-
-def _existing_ids_read_only(path: str, rows: list) -> set[str]:
-    """Open SQLite URI read-only solely to classify canonical replay rows."""
-    import sqlite3
-
-    if not Path(path).exists() or not rows:
-        return set()
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        ids = [r.source_trade_id for r in rows]
-        marks = ",".join("?" for _ in ids)
-        return {
-            r[0]
-            for r in conn.execute(
-                f"SELECT source_trade_id FROM source_trades WHERE source=? AND source_trade_id IN ({marks})",
-                [rows[0].source, *ids],
-            )
-        }
-    finally:
-        conn.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -84,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
                 pre = {
                     r[0]
                     for r in db.conn.execute(
-                        "SELECT source_trade_id FROM source_trades WHERE source=?", ("polymarket",)
+                        "SELECT source_trade_id FROM source_trades WHERE source=?", (SOURCE_NAME,)
                     )
                 }
                 outcome = write_valid_rows(

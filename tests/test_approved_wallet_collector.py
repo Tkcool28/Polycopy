@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -110,3 +112,31 @@ def test_first_write_and_replay_use_single_canonical_writer(tmp_path):
             assert db.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     finally:
         db.close()
+
+
+def test_write_report_recognizes_existing_source_name_row(tmp_path, monkeypatch, capsys):
+    script_path = Path(__file__).parents[1] / "scripts/collect_approved_wallet_trades.py"
+    monkeypatch.syspath_prepend(str(script_path.parent))
+    spec = importlib.util.spec_from_file_location("approved_wallet_cli_test", script_path)
+    assert spec and spec.loader
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    result = asyncio.run(collect(FakeProvider([raw()]), WALLET))
+
+    class Provider:
+        async def aclose(self):
+            return None
+
+    monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
+    monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(tmp_path / "lock"))
+    monkeypatch.setattr(cli, "_RealDataApiProvider", lambda timeout: Provider())
+    monkeypatch.setattr(cli, "collect_sync", lambda provider, wallet: result)
+    db_path = tmp_path / "collector.db"
+    assert cli.main(["--write", "--db-path", str(db_path)]) == 0
+    capsys.readouterr()
+    assert cli.main(["--write", "--db-path", str(db_path)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["inserted"] == 0
+    assert report["deduplicated"] == 1
+    assert report["existing_canonical_records"] == 1
+    assert report["new_canonical_records"] == 0
