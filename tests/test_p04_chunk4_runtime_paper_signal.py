@@ -136,12 +136,13 @@ def _insert_candidate(
     source_trade_id: str,
     market_id: str,
     market_outcome_id: int,
+    source_trade_internal_id: str | None = None,
     side: str = "BUY",
     notional: float | None = 100.0,
     status: str = "PENDING_PRICE_CHECK",
     observed_at: str = "2026-07-03T00:00:00Z",
 ) -> int:
-    internal = source_trade_id
+    internal = source_trade_internal_id or source_trade_id
     db.conn.execute(
         "INSERT INTO copy_candidates (wallet_id, source, source_trade_id, "
         "source_trade_internal_id, market_id, market_outcome_id, "
@@ -754,6 +755,27 @@ class TestFutureSnapshotIgnored:
         )
         assert summary["verdict"] == "INCOMPLETE"
         assert summary["reason"] == "no_snapshot"
+
+
+
+def test_loader_uses_source_trade_internal_id_not_public_identity(tmp_path: Path):
+    db = _make_db(tmp_path)
+    wallet_id = _insert_wallet(db)
+    market_id, outcome_id = _insert_market(db)
+    internal_id = _insert_source_trade(db, trader_address=wallet_id.lower())
+    public_id = "polymarket:" + "a" * 64
+    db.conn.execute("UPDATE source_trades SET source_trade_id = ? WHERE id = ?", (public_id, internal_id))
+    db.conn.commit()
+    cid = _insert_candidate(
+        db, wallet_id=wallet_id, source_trade_id=public_id,
+        source_trade_internal_id=internal_id, market_id=market_id,
+        market_outcome_id=outcome_id,
+    )
+    from polycopy.scoring.paper_signal import load_persisted_paper_signal_inputs
+    inputs = load_persisted_paper_signal_inputs(db, cid)
+    assert inputs.source_trade is not None
+    assert inputs.source_trade["id"] == internal_id
+    assert inputs.source_trade["side"] == "BUY"
 
 
 # ──────────────────────────────────────────────────────────────────────
