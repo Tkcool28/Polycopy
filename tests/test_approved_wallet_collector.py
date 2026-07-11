@@ -93,6 +93,7 @@ def test_service_template_uses_safe_command_and_stays_timer_free():
     assert "collect_approved_wallet_trades.py --write" in text
     assert "POLYCOPY_MAX_RSS_MB=512" in text
     assert ".timer" not in text and "[Install]" not in text
+    assert "PrivateTmp=true" not in text
 
 
 def test_first_write_and_replay_use_single_canonical_writer(tmp_path):

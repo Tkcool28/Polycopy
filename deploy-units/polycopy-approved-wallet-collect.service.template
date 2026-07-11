@@ -13,7 +13,6 @@ ExecStart=/root/mlb-ev-model-lab/.venv/bin/python3 /root/Polycopy/scripts/collec
 TimeoutStartSec=300
 Restart=no
 NoNewPrivileges=true
-PrivateTmp=true
 StandardOutput=journal
 StandardError=journal
 
