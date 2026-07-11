@@ -1,0 +1,22 @@
+# Template only: review/install separately after merge. Runs as root because the
+# narrowly scoped, fail-closed remediation may disable one root-owned timer.
+[Unit]
+Description=Polycopy approved-wallet safety monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Polycopy
+EnvironmentFile=/root/Polycopy/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYCOPY_MAX_RSS_MB=256
+ExecStart=/root/mlb-ev-model-lab/.venv/bin/python3 /root/Polycopy/scripts/monitor_approved_wallet_collector.py --json
+TimeoutStartSec=60
+Restart=no
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+# No PrivateTmp: this monitor must inspect authoritative shared runtime paths.
+# It writes only monitor artifacts and may only disable the approved collector timer.

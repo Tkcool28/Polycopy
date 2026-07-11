@@ -1,0 +1,13 @@
+# Template only: review/install separately after merge.
+[Unit]
+Description=Run Polycopy approved-wallet safety monitor every 5 minutes
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+Unit=polycopy-approved-wallet-monitor.service
+
+[Install]
+WantedBy=timers.target
