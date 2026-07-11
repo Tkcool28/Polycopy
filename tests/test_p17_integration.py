@@ -13,7 +13,9 @@ from __future__ import annotations
 import subprocess
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import pytest
 from fastapi.testclient import TestClient
@@ -623,12 +625,28 @@ class TestConfiguredStalenessThreshold:
     """Data Health must use the configured staleness_seconds, not a hard-coded value."""
 
     def _client_with_staleness(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staleness: float
-    ) -> TestClient:
-        """Create a client with a custom staleness_seconds value."""
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staleness: float,
+        now: Optional["datetime"] = None,
+    ):
+        """Create a client with a custom staleness_seconds value.
+
+        The freshness clock is frozen to ``now`` so the staleness age is
+        computed against the exact same reference the caller uses to set
+        ``fetched_at``.  This isolates the test from wall-clock drift — the
+        real CI flake was a query-time ``datetime.now()`` read landing >1s
+        after the test's own read, which flipped a 119s-old snapshot to
+        ``stale`` under a heavily loaded 133s suite.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+
+        if now is None:
+            now = _dt.now(_tz.utc)
         db_path = tmp_path / "staleness.db"
         monkeypatch.setenv("POLYCOPY_DB_PATH", str(db_path))
+        # Isolate every env input that influences data-health / staleness.
         monkeypatch.delenv("POLYCOPY_ENABLE_DEMO_DATA", raising=False)
+        monkeypatch.delenv("POLYCOPY_STALENESS_SECONDS", raising=False)
+        monkeypatch.delenv("POLYCOPY_ORDER_KILL_SWITCH", raising=False)
 
         import polycopy.config.settings as settings_module
         import polycopy.db.database as db_module
@@ -643,6 +661,22 @@ class TestConfiguredStalenessThreshold:
         object.__setattr__(settings, "staleness_seconds", staleness)
 
         db = __import__("polycopy.db.database", fromlist=["get_database"]).get_database(reload=True)
+
+        # Freeze the freshness clock to the same reference used for fetched_at.
+        # repository.data_health() does a *local* `from polycopy.risk.freshness
+        # import seconds_since`, so we must patch the source module attribute.
+        import polycopy.risk.freshness as freshness_module
+
+        def _frozen_seconds_since(dt):
+            if dt is None:
+                return None
+            ref = now
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_tz.utc)
+            return (ref - dt).total_seconds()
+
+        monkeypatch.setattr(freshness_module, "seconds_since", _frozen_seconds_since)
+
         from polycopy.api.app import app as _app
         return db, TestClient(_app)
 
@@ -652,8 +686,8 @@ class TestConfiguredStalenessThreshold:
         """With staleness=120, a 121s-old snapshot must be stale."""
         from datetime import datetime, timezone
 
-        db, client = self._client_with_staleness(tmp_path, monkeypatch, 120.0)
         now = datetime.now(timezone.utc)
+        db, client = self._client_with_staleness(tmp_path, monkeypatch, 120.0, now=now)
         # Insert with fetched_at 121 seconds in the past
         old_ts_121 = (now.replace(microsecond=0) - __import__("datetime").timedelta(seconds=121)).isoformat()
         # Ensure table exists
@@ -674,8 +708,8 @@ class TestConfiguredStalenessThreshold:
     ) -> None:
         """With staleness=120, a 119s-old snapshot must be ok."""
         from datetime import datetime, timezone
-        db, client = self._client_with_staleness(tmp_path, monkeypatch, 120.0)
         now = datetime.now(timezone.utc)
+        db, client = self._client_with_staleness(tmp_path, monkeypatch, 120.0, now=now)
         old_ts_119 = (now.replace(microsecond=0) - __import__("datetime").timedelta(seconds=119)).isoformat()
         _seed_raw_snapshot(db, "src_b", old_ts_119)
 
@@ -693,8 +727,8 @@ class TestConfiguredStalenessThreshold:
     ) -> None:
         """When staleness is set to 60s, a 61s-old snapshot becomes stale."""
         from datetime import datetime, timezone
-        db, client = self._client_with_staleness(tmp_path, monkeypatch, 60.0)
         now = datetime.now(timezone.utc)
+        db, client = self._client_with_staleness(tmp_path, monkeypatch, 60.0, now=now)
         old_ts_61 = (now.replace(microsecond=0) - __import__("datetime").timedelta(seconds=61)).isoformat()
         _seed_raw_snapshot(db, "src_c", old_ts_61)
 
