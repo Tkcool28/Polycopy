@@ -10,9 +10,10 @@ import os
 import pathlib
 import sys
 
-# Tests must not inherit a local production .env kill switch. Individual tests
-# can still override this with monkeypatch.setenv when they exercise risk gates.
-os.environ.setdefault("POLYCOPY_ORDER_KILL_SWITCH", "false")
+# Tests must explicitly use the safe test default rather than inheriting a
+# production `.env` kill switch. Individual risk-gate tests override this with
+# monkeypatch and restore their own required value.
+os.environ["POLYCOPY_ORDER_KILL_SWITCH"] = "false"
 
 _SRC = str(pathlib.Path(__file__).resolve().parent.parent / "src")
 if _SRC not in sys.path:

@@ -124,6 +124,31 @@ class Probe:
     def disable_collector_timer(self) -> tuple[bool, str]: raise NotImplementedError
 
 
+def count_collector_oom_events(journal_text: str, *, context_lines: int = 8) -> int:
+    """Count bounded, collector-attributed kernel OOM events exactly once.
+
+    Kernel OOM diagnostics are multi-line.  A collector service cgroup can
+    appear shortly before a generic ``python3`` kill line, so attribution is
+    made over a small preceding window rather than from generic Python alone.
+    Consecutive OOM marker lines in the same block are deduplicated.
+    """
+    lines = journal_text.lower().splitlines()
+    collector_markers = ("polycopy-approved-wallet-collect.service", "collect_approved_wallet_trades.py")
+    count = 0
+    last_counted_marker = -context_lines - 1
+    for index, line in enumerate(lines):
+        if "out of memory" not in line:
+            continue
+        window = "\n".join(lines[max(0, index - context_lines) : min(len(lines), index + 3)])
+        if not any(marker in window for marker in collector_markers):
+            continue
+        if index - last_counted_marker <= context_lines:
+            continue
+        count += 1
+        last_counted_marker = index
+    return count
+
+
 class SystemProbe(Probe):
     def run(self, args: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
@@ -252,14 +277,7 @@ class SystemProbe(Probe):
             key, value = line.split(":", 1); mem[key] = int(value.split()[0]) * 1024
         available = mem.get("MemAvailable", 0); total = mem.get("MemTotal", 0)
         oom = self.run(["journalctl", "-k", "-n", "500", "--no-pager", "-o", "cat"], 8)
-        # Kernel OOM lines often say only ``python3``.  That is insufficient
-        # attribution: count an event only when it names Polycopy/collector.
-        oom_count = sum(
-            1
-            for line in oom.stdout.lower().splitlines()
-            if "out of memory" in line
-            and ("polycopy" in line or "collect_approved_wallet_trades.py" in line)
-        )
+        oom_count = count_collector_oom_events(oom.stdout)
         return {"collector_process_count": len(processes), "collector_total_rss_bytes": sum(p["rss_bytes"] for p in processes),
           "collector_max_process_rss_bytes": max((p["rss_bytes"] for p in processes), default=0), "collector_runtime_seconds": max((p["elapsed_seconds"] for p in processes), default=None),
           "service_memory_current_bytes": integer("MemoryCurrent"), "service_memory_peak_bytes": integer("MemoryPeak"), "service_tasks_current": integer("TasksCurrent"),
