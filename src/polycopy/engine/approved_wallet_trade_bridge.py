@@ -18,13 +18,20 @@ from polycopy.db.copy_candidate_persistence import persist_copy_candidate
 from polycopy.db.levels_persistence import persist_depth_levels
 from polycopy.db.price_snapshot_persistence import persist_price_snapshot
 from polycopy.db.wallet_identity import canonical_wallet_address
+from polycopy.scoring.depth_normalization import (
+    DEFAULT_MAX_LEVELS_PER_SIDE,
+    normalize_book_levels,
+)
 from polycopy.domain.copy_candidate import CandidateStatus, CopyCandidate
 from polycopy.domain.market import Market
 from polycopy.engine.price_snapshots import _now_iso, snapshot_one
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
-from polycopy.scoring.paper_signal import persist_bridge_incomplete_paper_signal
+from polycopy.scoring.paper_signal import persist_bridge_trade_copyability_v1
 
 MAX_LIMIT = 10
+# PR25A: bounded evidence capture; this is deliberately the existing frozen
+# depth-normalization limit rather than a bridge-specific widening.
+BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE = DEFAULT_MAX_LEVELS_PER_SIDE
 ALLOWED_WRITE_TABLES = frozenset(
     {
         "wallets",
@@ -331,6 +338,24 @@ def _snapshot_value(snapshot: Any, field: str) -> Any:
         return getattr(snapshot, field)
 
 
+def _bounded_book_levels(book: Any) -> tuple[list[tuple[Any, Any]], list[tuple[Any, Any]], int, int, str | None]:
+    """Validate, sort, and cap provider levels before persistence."""
+    raw_bids = [(level.price, level.size) for level in book.bids]
+    raw_asks = [(level.price, level.size) for level in book.asks]
+    bids, asks, error = normalize_book_levels(
+        raw_bids, raw_asks, max_levels=BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE,
+    )
+    if error:
+        return [], [], len(raw_bids), len(raw_asks), error
+    return (
+        [(level.price, level.size) for level in bids],
+        [(level.price, level.size) for level in asks],
+        len(raw_bids),
+        len(raw_asks),
+        None,
+    )
+
+
 class _CommitShield:
     """Facade that lets legacy persistence helpers join our savepoint."""
 
@@ -442,75 +467,93 @@ def process_approved_wallet_trades(
         if error:
             _record_skip(report, detail, error)
             continue
+        try:
+            bids, asks, raw_bid_n, raw_ask_n, level_error = _bounded_book_levels(book)
+        except (AttributeError, TypeError, ValueError) as exc:
+            bids, asks, raw_bid_n, raw_ask_n, level_error = [], [], 0, 0, f"depth_normalization_error:{type(exc).__name__}"
+        detail["raw_bid_level_count"] = raw_bid_n
+        detail["raw_ask_level_count"] = raw_ask_n
+        detail["persisted_bid_level_count"] = len(bids)
+        detail["persisted_ask_level_count"] = len(asks)
+        if level_error:
+            detail["stages"]["levels"] = level_error
+            _record_skip(report, detail, level_error)
+            continue
         if not write:
             detail["actions"].append("would_write_allowlisted_evidence_only")
             report.rows.append(detail)
             continue
-        wallet_id, error, wallet_new = _wallet(db, address)
-        detail["stages"]["wallet"] = (
-            "inserted" if wallet_new else "ok" if error is None else error
-        )
-        if error:
-            detail["skip_reason"] = error
-            report.rows.append(detail)
-            continue
-        assert wallet_id is not None
-        market_id, outcome_id, error, market_new = _safe_persist_market(db, market, outcome)
-        detail["stages"]["market_mapping"] = (
-            "inserted" if market_new else "ok" if error is None else error
-        )
-        if error:
-            detail["skip_reason"] = error
-            report.rows.append(detail)
-            continue
-        assert market_id is not None and outcome_id is not None
-        # Capture one shared ``now`` so the candidate's ``created_at`` is
-        # identical to the snapshot's ``fetched_at``; otherwise the
-        # deterministic paper-signal loader lookup
-        # (``fetched_at <= candidate.created_at``) would miss the just-
-        # inserted snapshot. Use ``_now_iso`` (seconds-precision) so the
-        # string is bit-identical to ``snapshot_one``'s ``fetched_at``.
-        now_iso = _now_iso(datetime.now(timezone.utc))
-        candidate_id, candidate_new = persist_copy_candidate(
-            db, _candidate(row, wallet_id, market_id, outcome_id, now_iso)
-        )
-        detail["stages"]["candidate"] = "inserted" if candidate_new else "replayed"
 
-        class FetchedBook:
-            async def fetch_book(self, token_id: str) -> Any:
-                return book
+        # Every allowlisted write for this source trade joins exactly one
+        # savepoint. Legacy owners see a commit-shield facade, so their
+        # local commits cannot escape this atomic boundary.
+        savepoint = "pr25a_trade"
+        db.conn.execute(f"SAVEPOINT {savepoint}")
+        tx_db = _CommitShield(db)
+        try:
+            wallet_id, error, wallet_new = _wallet(tx_db, address)
+            detail["stages"]["wallet"] = (
+                "inserted" if wallet_new else "ok" if error is None else error
+            )
+            if error:
+                raise RuntimeError(error)
+            assert wallet_id is not None
+            market_id, outcome_id, error, market_new = _safe_persist_market(tx_db, market, outcome)
+            detail["stages"]["market_mapping"] = (
+                "inserted" if market_new else "ok" if error is None else error
+            )
+            if error:
+                raise RuntimeError(error)
+            assert market_id is not None and outcome_id is not None
+            now_iso = _now_iso(datetime.now(timezone.utc))
+            candidate_id, candidate_new = persist_copy_candidate(
+                tx_db, _candidate(row, wallet_id, market_id, outcome_id, now_iso)
+            )
+            detail["stages"]["candidate"] = "inserted" if candidate_new else "replayed"
 
-        snapshot = snapshot_one(
-            db,
-            candidate_id=candidate_id,
-            snapshot_run_id=f"pr25a:{row['id']}",
-            book_provider=FetchedBook(),
-            now=datetime.fromisoformat(now_iso.replace("Z", "+00:00")),
-        )
-        snapshot_id, snapshot_new = persist_price_snapshot(db, snapshot)
-        persisted_snapshot = db.fetchone(
-            "SELECT best_bid, best_bid_size, best_ask, best_ask_size, spread, "
-            "trade_age_seconds, seconds_to_market_end, market_active_at_fetch, "
-            "market_closed_at_fetch, market_resolved_at_fetch, expected_fill_price, "
-            "fetched_at FROM candidate_price_snapshots WHERE id=?",
-            (snapshot_id,),
-        )
-        assert persisted_snapshot is not None
-        bids = [(level.price, level.size) for level in book.bids]
-        asks = [(level.price, level.size) for level in book.asks]
-        bid_n, ask_n, level_error = persist_depth_levels(db, snapshot_id, bids, asks)
-        detail["stages"]["snapshot"] = "inserted" if snapshot_new else "replayed"
-        detail["stages"]["levels"] = level_error or f"ok:{bid_n}/{ask_n}"
-        detail["snapshot_id"] = snapshot_id
-        detail["snapshot_token_id"] = snapshot.token_id
-        if level_error:
-            detail["skip_reason"] = level_error
-            report.rows.append(detail)
+            class FetchedBook:
+                async def fetch_book(self, token_id: str) -> Any:
+                    return book
+
+            snapshot = snapshot_one(
+                tx_db,
+                candidate_id=candidate_id,
+                snapshot_run_id=f"pr25a:{row['id']}",
+                book_provider=FetchedBook(),
+                now=datetime.fromisoformat(now_iso.replace("Z", "+00:00")),
+            )
+            snapshot_id, snapshot_new = persist_price_snapshot(tx_db, snapshot)
+            persisted_snapshot = tx_db.fetchone(
+                "SELECT id FROM candidate_price_snapshots WHERE id=?", (snapshot_id,)
+            )
+            if persisted_snapshot is None:
+                raise RuntimeError("snapshot_persistence_missing")
+            bid_n, ask_n, level_error = persist_depth_levels(
+                tx_db, snapshot_id, bids, asks,
+                max_levels=BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE,
+                manage_transaction=False,
+            )
+            detail["stages"]["snapshot"] = "inserted" if snapshot_new else "replayed"
+            detail["stages"]["levels"] = level_error or f"ok:{bid_n}/{ask_n}"
+            detail["snapshot_id"] = snapshot_id
+            detail["snapshot_token_id"] = snapshot.token_id
+            if level_error:
+                raise RuntimeError(level_error)
+            trade_decision_id, signal_id = persist_bridge_trade_copyability_v1(tx_db, candidate_id)
+            detail["stages"]["trade_copyability"] = "persisted"
+            detail["stages"]["paper"] = "persisted"
+            detail["actions"].extend([
+                "candidate", "snapshot", "depth_levels", "trade_copyability_v1", "canonical_paper",
+            ])
+            detail["trade_copyability_decision_id"] = trade_decision_id
+            detail["paper_signal_id"] = signal_id
+            db.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception as exc:
+            db.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            db.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            reason = str(exc) if isinstance(exc, RuntimeError) else f"persistence_error:{type(exc).__name__}"
+            _record_skip(report, detail, reason)
             continue
-        signal_id = persist_bridge_incomplete_paper_signal(db, candidate_id)
-        detail["stages"]["paper"] = "persisted"
-        detail["actions"].extend(["candidate", "snapshot", "depth_levels", "canonical_paper"])
-        detail["paper_signal_id"] = signal_id
         report.rows.append(detail)
     if write:
         after = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)

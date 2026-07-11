@@ -72,6 +72,7 @@ def persist_depth_levels(
     *,
     max_levels: int = DEFAULT_MAX_LEVELS_PER_SIDE,
     max_notional: Decimal = Decimal(str(DEFAULT_MAX_NOTIONAL_PER_SIDE)),
+    manage_transaction: bool = True,
 ) -> PersistResult:
     """Normalize and persist order-book depth levels atomically.
 
@@ -120,12 +121,12 @@ def persist_depth_levels(
     if parent is None:
         return 0, 0, DEPTH_LEVELS_MALFORMED
 
-    # 4. Begin explicit transaction.
-    #    Commit any implicit transaction opened by previous DML on
-    #    this connection first (e.g. by the fixture inserts), then
-    #    start our own.
-    db.conn.commit()
-    db.conn.execute("BEGIN")
+    # 4. Begin an explicit transaction unless the caller has supplied
+    #    an enclosing savepoint. The bridge uses the latter so a depth
+    #    failure rolls back the full per-trade chain, not just levels.
+    if manage_transaction:
+        db.conn.commit()
+        db.conn.execute("BEGIN")
 
     try:
         # 5. Load existing levels for this snapshot.
@@ -145,10 +146,12 @@ def persist_depth_levels(
                 _p_size = float(level.size)
                 _p_price = float(level.price)
                 if _p_size <= 0:
-                    db.conn.rollback()
+                    if manage_transaction:
+                        db.conn.rollback()
                     return 0, 0, DEPTH_LEVELS_MALFORMED
                 if _p_price < 0 or _p_price > 1:
-                    db.conn.rollback()
+                    if manage_transaction:
+                        db.conn.rollback()
                     return 0, 0, DEPTH_LEVELS_MALFORMED
 
             for idx, level in enumerate(bids):
@@ -196,10 +199,12 @@ def persist_depth_levels(
             # roll back.
             persisted = _load_existing_levels(db, snapshot_id)
             if not _persisted_matches_requested(persisted, bids, asks):
-                db.conn.rollback()
+                if manage_transaction:
+                    db.conn.rollback()
                 return 0, 0, DEPTH_LEVELS_MALFORMED
 
-            db.conn.commit()
+            if manage_transaction:
+                db.conn.commit()
             return len(bids), len(asks), None
 
         # CASE B — existing rows.
@@ -207,23 +212,26 @@ def persist_depth_levels(
             existing, expected_bid_count=len(bids), expected_ask_count=len(asks),
         )
         if not is_valid:
-            db.conn.rollback()
+            if manage_transaction:
+                db.conn.rollback()
             return 0, 0, malformed_reason
 
         stored_bids, stored_asks = _split_existing_levels(existing)
         stored_hash = compute_book_hash(stored_bids, stored_asks)
 
         if stored_hash == requested_hash:
-            db.conn.commit()
+            if manage_transaction:
+                db.conn.commit()
             return len(stored_bids), len(stored_asks), None
 
-        db.conn.rollback()
+        if manage_transaction:
+            db.conn.rollback()
         return 0, 0, DEPTH_SNAPSHOT_MISMATCH
 
     except Exception:
-        # Any failure during persistence rolls back the entire
-        # transaction. We do NOT swallow exceptions or continue.
-        db.conn.rollback()
+        # The enclosing bridge savepoint owns rollback when present.
+        if manage_transaction:
+            db.conn.rollback()
         raise
 
 

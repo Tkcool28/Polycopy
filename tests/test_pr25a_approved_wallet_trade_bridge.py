@@ -21,6 +21,7 @@ from polycopy.engine.approved_wallet_trade_bridge import (
     select_approved_source_trades, validate_limit,
 )
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
+from polycopy.scoring import paper_signal as paper_signal_mod
 
 WALLET = "0x" + "a" * 40
 
@@ -143,52 +144,65 @@ def test_read_only_facade_rejects_direct_write(tmp_path):
     conn.close()
 
 
-@pytest.mark.skip(reason="PR25A uses the narrow canonical paper persistence primitive")
-def test_write_uses_frozen_v1_scorer_and_serialization_owner_fail_closed(monkeypatch, tmp_path):
-    """Missing persisted score evidence must reach the frozen V1 scorer unchanged."""
-    db = _db(tmp_path)
-    _trade(db)
-    scorer_calls = []
-    persist_calls = []
-    real_scorer = bridge_mod.compute_trade_score_v1
-    real_persist = bridge_mod.persist_trade_score_v1
-
-    def score(*args, **kwargs):
-        scorer_calls.append((args, kwargs))
-        return real_scorer(*args, **kwargs)
-
-    def persist(*args, **kwargs):
-        persist_calls.append((args, kwargs))
-        return real_persist(*args, **kwargs)
-
-    monkeypatch.setattr(bridge_mod, "compute_trade_score_v1", score)
-    monkeypatch.setattr(bridge_mod, "persist_trade_score_v1", persist)
+def test_write_persists_frozen_trade_copyability_v1_once_and_replay_is_idempotent(tmp_path):
+    db = _db(tmp_path); _trade(db)
     deps = BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book()))
-    for _ in range(2):
-        process_approved_wallet_trades(
-            db,
-            wallet=WALLET,
-            limit=1,
-            dependencies=deps,
-            write=True,
-            write_authorization=_issue_write_capability(),
-        )
-
-    assert len(scorer_calls) == len(persist_calls) == 2
-    row = db.fetchone(
-        "SELECT formula_name, formula_version, verdict, final_score, "
-        "missing_essentials_json, rejection_reasons_json FROM trade_copyability_decisions"
-    )
-    assert dict(row) == {
-        "formula_name": "trade_copyability",
-        "formula_version": "1",
-        "verdict": "incomplete",
-        "final_score": 0.0,
-        "missing_essentials_json": '["executable_depth", "seconds_to_market_end"]',
-        "rejection_reasons_json": "[]",
-    }
+    first = process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
+    assert first.rows[0]["stages"]["trade_copyability"] == "persisted"
     assert db.fetchone("SELECT COUNT(*) AS n FROM trade_copyability_decisions")["n"] == 1
+    decision = db.fetchone("SELECT formula_name, formula_version, verdict FROM trade_copyability_decisions")
+    assert (decision["formula_name"], decision["formula_version"]) == ("trade_copyability", "1")
+    assert decision["verdict"] in {"copy_candidate", "watchlist", "skip", "incomplete"}
+    assert db.fetchone("SELECT signal_reason FROM paper_signal_decisions")["signal_reason"] != "bridge_score_evidence_unavailable"
+    second = process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
+    assert second.rows[0]["stages"]["trade_copyability"] == "persisted"
+    assert db.fetchone("SELECT COUNT(*) AS n FROM trade_copyability_decisions")["n"] == 1
+    assert db.fetchone("SELECT COUNT(*) AS n FROM paper_signal_decisions")["n"] == 1
     db.close()
+
+
+@pytest.mark.parametrize("stage", ["snapshot", "depth", "copyability", "paper"])
+def test_late_stage_failure_rolls_back_entire_trade(monkeypatch, tmp_path, stage):
+    db = _db(tmp_path); _trade(db)
+    before = _counts(db, ALLOWED_WRITE_TABLES)
+    if stage == "snapshot":
+        monkeypatch.setattr(bridge_mod, "persist_price_snapshot", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("snapshot boom")))
+    elif stage == "depth":
+        monkeypatch.setattr(bridge_mod, "persist_depth_levels", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("depth boom")))
+    elif stage == "copyability":
+        monkeypatch.setattr(paper_signal_mod, "persist_trade_score_v1", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("copyability boom")))
+    else:
+        monkeypatch.setattr(paper_signal_mod, "persist_paper_signal", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("paper boom")))
+    report = process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())), write=True, write_authorization=_issue_write_capability())
+    assert report.rows[0]["skip_reason"]
+    assert _counts(db, ALLOWED_WRITE_TABLES) == before
+    db.close()
+
+
+def test_oversized_depth_is_capped_before_persistence_and_malformed_fails_closed(monkeypatch, tmp_path):
+    db = _db(tmp_path); _trade(db)
+    bids = [ClobBookLevel(.49 - i / 1000, 1) for i in range(30)]
+    asks = [ClobBookLevel(.51 + i / 1000, 1) for i in range(30)]
+    seen = []
+    real = bridge_mod.persist_depth_levels
+    def bounded(*args, **kwargs):
+        seen.append((len(args[2]), len(args[3])))
+        return real(*args, **kwargs)
+    monkeypatch.setattr(bridge_mod, "persist_depth_levels", bounded)
+    deps = BridgeDependencies(gamma=_Gamma(), clob=_Book(ClobBook(token_id="tok1", bids=bids, asks=asks)))
+    process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
+    assert seen == [(bridge_mod.BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE, bridge_mod.BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE)]
+    assert db.fetchone("SELECT COUNT(*) AS n FROM candidate_price_snapshot_levels")["n"] == 2 * bridge_mod.BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE
+    process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
+    assert db.fetchone("SELECT COUNT(*) AS n FROM candidate_price_snapshot_levels")["n"] == 2 * bridge_mod.BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE
+    db.close()
+
+    malformed = _db(tmp_path / "malformed"); _trade(malformed)
+    bad = ClobBook(token_id="tok1", bids=[SimpleNamespace(price="NaN", size=1)], asks=[ClobBookLevel(.51, 1)])
+    report = process_approved_wallet_trades(malformed, wallet=WALLET, limit=1, dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(bad)), write=True, write_authorization=_issue_write_capability())
+    assert report.rows[0]["skip_reason"] == "DEPTH_LEVELS_MALFORMED"
+    assert _counts(malformed, ALLOWED_WRITE_TABLES)["copy_candidates"] == 0
+    malformed.close()
 
 
 def _load_cli_module():
@@ -267,7 +281,7 @@ def test_cli_dry_run_is_read_only_and_never_calls_persistence(monkeypatch, tmp_p
     monkeypatch.setattr(cli.httpx, "AsyncClient", lambda **k: _Closable())
     monkeypatch.setattr(cli.Database, "connect", lambda self: pytest.fail("dry-run must not connect writable Database"))
     monkeypatch.setattr(cli, "_ReadOnlyDb", lambda path: events.append(("readonly", path)) or _Closable())
-    monkeypatch.setattr(bridge_mod, "persist_bridge_incomplete_paper_signal", lambda *a, **k: pytest.fail("dry-run must not persist paper signals"))
+    monkeypatch.setattr(bridge_mod, "persist_bridge_trade_copyability_v1", lambda *a, **k: pytest.fail("dry-run must not persist paper signals"))
     monkeypatch.setattr(
         cli,
         "process_approved_wallet_trades",
