@@ -1,0 +1,19 @@
+# Review-only template. Do not install, start, or enable during this PR.
+[Unit]
+Description=Polycopy approved-wallet BUY-only canonical collector
+After=network-online.target polycopy-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Polycopy
+EnvironmentFile=/root/Polycopy/.env
+Environment=POLYCOPY_MAX_RSS_MB=512
+ExecStart=/root/mlb-ev-model-lab/.venv/bin/python3 /root/Polycopy/scripts/collect_approved_wallet_trades.py --write
+TimeoutStartSec=300
+Restart=no
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+# Installation and scheduling are separate approved operations.

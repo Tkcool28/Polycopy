@@ -42,6 +42,16 @@ coverage/
 *.db
 *.sqlite
 *.sqlite3
+# SQLite sidecars and PR24Z runtime backup snapshots (not source evidence)
+data/polycopy.db-wal
+data/polycopy.db-shm
+data/polycopy.db.pr24z_*
+# Local PR24Z marker and narrowly identified generated outputs
+data/.pr24z_canonical_migration_complete
+observations/24h_*
+observations/post-pr22-24h/
+reports/pr24z_backup_*
+reports/pr24z_deletion_*
 .env
 .mypy_cache/
 node_modules/
