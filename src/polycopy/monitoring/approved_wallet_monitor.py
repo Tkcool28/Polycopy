@@ -129,7 +129,7 @@ class SystemProbe(Probe):
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
 
     def show(self, unit: str, *properties: str) -> dict[str, str]:
-        result = self.run(["systemctl", "show", unit, *[f"-p={item}" for item in properties]], 8)
+        result = self.run(["systemctl", "show", unit, *[part for item in properties for part in ("-p", item)]], 8)
         values = {"_error": result.stderr.strip()[:300]} if result.returncode else {}
         for line in result.stdout.splitlines():
             if "=" in line:
@@ -252,7 +252,14 @@ class SystemProbe(Probe):
             key, value = line.split(":", 1); mem[key] = int(value.split()[0]) * 1024
         available = mem.get("MemAvailable", 0); total = mem.get("MemTotal", 0)
         oom = self.run(["journalctl", "-k", "-n", "500", "--no-pager", "-o", "cat"], 8)
-        oom_count = sum(1 for line in oom.stdout.lower().splitlines() if "out of memory" in line and ("polycopy" in line or "python" in line))
+        # Kernel OOM lines often say only ``python3``.  That is insufficient
+        # attribution: count an event only when it names Polycopy/collector.
+        oom_count = sum(
+            1
+            for line in oom.stdout.lower().splitlines()
+            if "out of memory" in line
+            and ("polycopy" in line or "collect_approved_wallet_trades.py" in line)
+        )
         return {"collector_process_count": len(processes), "collector_total_rss_bytes": sum(p["rss_bytes"] for p in processes),
           "collector_max_process_rss_bytes": max((p["rss_bytes"] for p in processes), default=0), "collector_runtime_seconds": max((p["elapsed_seconds"] for p in processes), default=None),
           "service_memory_current_bytes": integer("MemoryCurrent"), "service_memory_peak_bytes": integer("MemoryPeak"), "service_tasks_current": integer("TasksCurrent"),

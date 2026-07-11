@@ -156,6 +156,17 @@ def test_api_transient_then_repeated_failure_and_memory_limits(config, tmp_path)
     assert evaluate(p, config, no_remediation=True)["status"] == "RED"
 
 
+def test_systemctl_show_uses_valid_property_arguments():
+    class ShowProbe(SystemProbe):
+        def __init__(self): self.args = None
+        def run(self, args, timeout=10):
+            self.args = args
+            return SimpleNamespace(returncode=0, stderr="", stdout="ActiveState=active\nUnitFileState=enabled\n")
+    probe = ShowProbe()
+    assert probe.collector_timer() == {"enabled": True, "active": True}
+    assert probe.args == ["systemctl", "show", "polycopy-approved-wallet-collect.timer", "-p", "ActiveState", "-p", "UnitFileState"]
+
+
 def test_systemd_failure_pair_counts_as_one_invocation():
     class JournalProbe(SystemProbe):
         def run(self, args, timeout=10):
