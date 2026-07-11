@@ -48,6 +48,13 @@ data/polycopy.db-shm
 data/polycopy.db.pr24z_*
 # Local PR24Z marker and narrowly identified generated outputs
 data/.pr24z_canonical_migration_complete
+# Deterministic approved-wallet monitor runtime state (created only after deployment)
+data/approved_wallet_monitor_baseline.json
+data/approved_wallet_monitor_state.json
+data/approved_wallet_monitor_latest.json
+data/approved_wallet_monitor_latest.txt
+data/approved_wallet_monitor_events.jsonl
+data/approved_wallet_monitor_events.jsonl.1
 observations/24h_*
 observations/post-pr22-24h/
 reports/pr24z_backup_*
