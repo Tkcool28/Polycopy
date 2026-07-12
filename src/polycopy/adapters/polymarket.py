@@ -650,15 +650,87 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
 
     # ── MarketDataProvider ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_condition_id(value: str) -> bool:
+        """True iff ``value`` is a canonical hex Polymarket condition ID.
+
+        Condition IDs are ``0x`` followed by exactly 64 hex characters.
+        This is the ONLY heuristic used to route the lookup; numeric Gamma
+        market IDs are detected separately so we never guess from a broad
+        substring/shape rule.
+        """
+        return bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", value or ""))
+
+    @staticmethod
+    def _is_numeric_market_id(value: str) -> bool:
+        """True iff ``value`` is a plain decimal Gamma market ``id``."""
+        return bool(re.fullmatch(r"[0-9]+", value or ""))
+
     async def get_market(self, market_id: str) -> Optional[Market]:
-        """Fetch a single market from Gamma API by condition_id."""
+        """Fetch a single market from Gamma by condition ID or numeric market ID.
+
+        Gamma's ``GET /markets/{id}`` path treats ``{id}`` as a numeric
+        market ``id``; a hexadecimal condition ID in the path returns
+        HTTP 422 ``{"type":"validation error","error":"invalid integer"}``.
+        The correct condition-ID lookup is ``GET /markets?condition_ids=<hex>``
+        (plural query param), which returns a JSON **list**.
+
+        Routing is explicit, not heuristic-by-shape:
+          * hex ``0x`` + 64 hex chars  -> condition-ID query-param lookup
+          * all-digits                  -> numeric market-ID path lookup
+          * anything else               -> rejected with ``ValueError``
+
+        For condition-ID lookups the top-level response MUST be a list; we
+        select exactly one entry whose ``conditionId`` equals the requested
+        value (identity preserved through parsing). Zero matches is the
+        existing not-found behavior (``None``); more than one exact match
+        fails closed with a clear ambiguity error.
+        """
+        if market_id is None or not str(market_id).strip():
+            raise ValueError("get_market requires a non-empty identifier")
+        market_id = market_id.strip()
+
         client = await self._get_gamma_client()
-        resp = await client.get(f"/markets/{market_id}")
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        data = resp.json()
-        return self._parse_gamma_market(data)
+
+        if self._is_condition_id(market_id):
+            resp = await client.get(
+                "/markets", params={"condition_ids": market_id}
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, list):
+                raise ValueError(
+                    f"Gamma condition_ids lookup returned non-list top-level "
+                    f"type {type(payload).__name__}; cannot select by identity"
+                )
+            exact = [
+                m
+                for m in payload
+                if isinstance(m, dict) and str(m.get("conditionId", "")) == market_id
+            ]
+            if len(exact) == 0:
+                return None
+            if len(exact) > 1:
+                raise ValueError(
+                    f"Gamma condition_ids lookup returned {len(exact)} exact "
+                    f"matches for {market_id}; refusing ambiguous selection"
+                )
+            return self._parse_gamma_market(exact[0])
+
+        if self._is_numeric_market_id(market_id):
+            resp = await client.get(f"/markets/{market_id}")
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            return self._parse_gamma_market(data)
+
+        raise ValueError(
+            f"get_market identifier {market_id!r} is neither a hex "
+            f"condition ID (0x + 64 hex) nor a numeric market ID"
+        )
 
     async def list_active_markets(self, limit: int = 100, offset: int = 0) -> list[Market]:
         """List active markets from Gamma API."""
