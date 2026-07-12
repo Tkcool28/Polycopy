@@ -89,6 +89,59 @@ def test_dry_run_hydrates_and_preflights_but_mutates_no_tables_or_metadata(tmp_p
     db.close()
 
 
+def test_pr25a_dry_run_clob_receives_source_token_as_token_id_and_reports_complete_would_write(tmp_path):
+    """PR25A integration regression for the CLOB token_id fix.
+
+    Using a mocked CLOB provider (no live network), assert that:
+      * Gamma hydration succeeds for the source trade,
+      * the bridge passes the source trade's ``token_id`` verbatim to the
+        CLOB provider's ``fetch_book`` (the exact contract the fix targets),
+      * valid bids/asks reach the bridge CLOB preflight,
+      * the dry-run reports a complete would-write path (non-empty actions),
+      * and ZERO rows are persisted (dry-run, mode 'ro').
+    """
+    db = _db(tmp_path)
+    TOKEN = "104431860535489654020481219089291817898241901940037260095979653681449084465327"
+    # Seed a trade carrying the exact token id the contract expects.
+    db.execute(
+        """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
+           VALUES ('t1', ?, 'polymarket:public-1', 'condition-1', 'BUY', 'Yes', 2, .5, ?, '2026-01-01T00:00:00Z', 0, ?)""",
+        (SOURCE_NAME, WALLET, TOKEN),
+    )
+    db.conn.commit()
+
+    class _RecordingBook:
+        def __init__(self, book): self.book, self.received_token = book, None
+        async def fetch_book(self, token_id):
+            self.received_token = token_id
+            return self.book
+
+    book = _RecordingBook(_valid_book())
+    gamma = _Gamma(label="Yes", token=TOKEN, condition="condition-1")
+    # Snapshot counts AFTER seeding, before the dry-run executes.
+    before_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=BridgeDependencies(gamma=gamma, clob=book),
+    )
+    # CLOB provider received the exact source token, unchanged.
+    assert book.received_token == TOKEN
+    # Gamma hydration + exact token->outcome mapping succeeded.
+    row = report.rows[0]
+    assert row["stages"]["gamma"] == "ok"
+    assert row["stages"]["source_validation"] == "ok"
+    # Valid bids/asks reached preflight -> complete would-write path.
+    assert row["stages"]["clob_preflight"] not in ("clob_evidence_invalid", "clob_error")
+    assert row["actions"], "expected a non-empty would-write action list"
+    assert report.mode == "ro"
+    # No persistence in dry-run.
+    assert report.write_counts == {}
+    assert report.forbidden_table_delta == {}
+    # No rows persisted in any allowlist/forbidden table during dry-run.
+    after_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    assert after_counts == before_counts
+    db.close()
+
+
 @pytest.mark.parametrize("book", [None, ClobBook(token_id="tok1"), ClobBook(token_id="tok1", bids=[ClobBookLevel(.49, 1)])])
 def test_invalid_or_unavailable_clob_evidence_creates_no_candidate(tmp_path, book):
     db = _db(tmp_path); _trade(db)

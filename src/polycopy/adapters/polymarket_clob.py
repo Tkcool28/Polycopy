@@ -319,7 +319,7 @@ class PolymarketClobClient:
             try:
                 response = await self._http.get(
                     "/book",
-                    params={"token": token_id},
+                    params={"token_id": token_id},
                     timeout=self._timeout,
                 )
             except httpx.TimeoutException as exc:
