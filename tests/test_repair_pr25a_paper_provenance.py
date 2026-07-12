@@ -401,11 +401,16 @@ def test_report_json_survives_failure(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 # 13. Real production DB hard guard (autouse fixture handles it).
 # --------------------------------------------------------------------------
-def test_real_production_db_never_opened(tmp_path):
-    # Even a dry-run against the real path must be blocked by the guard;
-    # we do not actually call it, but assert the path constant is the guard key.
-    assert repair_mod._is_production_db(PROD_PATH) is True
-    assert PROD_PATH not in _CONNECT_CALLS
+def test_real_production_db_never_opened(tmp_path, monkeypatch):
+    # The canonical production path is an exact resolved-path equality.
+    # Make the repo-local data/polycopy.db the "production" target so the test
+    # is location-independent (the VPS path /root/Polycopy does not exist on
+    # clean runners). Assert the guard key resolves to production and that no
+    # connection to it is ever opened by this test.
+    canonical = Path(__file__).resolve().parents[1] / "data" / "polycopy.db"
+    monkeypatch.setattr(repair_mod, "CANONICAL_PRODUCTION_DB", canonical.resolve())
+    assert repair_mod._is_production_db(str(canonical)) is True
+    assert str(canonical.resolve()) not in _CONNECT_CALLS
 
 
 # ==========================================================================
@@ -413,28 +418,38 @@ def test_real_production_db_never_opened(tmp_path):
 # ==========================================================================
 
 # --- Section 3: exact resolved-path production detection -------------------
-def test_production_path_detection_exact_equality():
-    # Real function, no connect.
-    assert repair_mod._is_production_db("/root/Polycopy/data/polycopy.db") is True
-    # Relative path resolving to canonical.
+def test_production_path_detection_exact_equality(monkeypatch):
+    # Location-independent: point CANONICAL_PRODUCTION_DB at a temp file and
+    # verify exact resolved-path equality (no substring/suffix heuristic) for
+    # the canonical path, a relative path resolving to it, and a symlink to it.
+    # Look-alike paths must NOT be classified as production.
     import os
-    cwd = os.getcwd()
-    try:
-        os.chdir("/root/Polycopy")
-        assert repair_mod._is_production_db("data/polycopy.db") is True
-    finally:
-        os.chdir(cwd)
-    # Symlink resolving to canonical.
     import tempfile
     with tempfile.TemporaryDirectory() as td:
+        canon = Path(td) / "data" / "polycopy.db"
+        canon.parent.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(
+            repair_mod, "CANONICAL_PRODUCTION_DB", canon.resolve())
+        # Exact canonical path -> production.
+        assert repair_mod._is_production_db(str(canon)) is True
+        # Relative path resolving to canonical (chdir into the temp dir).
+        cwd = os.getcwd()
+        try:
+            os.chdir(str(canon.parent))
+            assert repair_mod._is_production_db("polycopy.db") is True
+        finally:
+            os.chdir(cwd)
+        # Symlink resolving to canonical.
         link = Path(td) / "polycopy_link.db"
-        link.symlink_to("/root/Polycopy/data/polycopy.db")
+        link.symlink_to(canon)
         assert repair_mod._is_production_db(str(link)) is True
-    # Look-alikes must NOT be classified as production.
-    assert repair_mod._is_production_db("/tmp/Polycopy/data/polycopy.db") is False
-    assert repair_mod._is_production_db("/root/OtherPolycopy/data/polycopy.db") is False
-    assert repair_mod._is_production_db("/root/Polycopy/data/polycopy.db.bak") is False
-    assert repair_mod._is_production_db("/root/Polycopy/other/polycopy.db") is False
+        # Look-alikes must NOT be classified as production.
+        assert repair_mod._is_production_db(
+            str(Path(td) / "other" / "polycopy.db")) is False
+        assert repair_mod._is_production_db(
+            str(Path(td) / "data" / "polycopy.db.bak")) is False
+        assert repair_mod._is_production_db(
+            str(Path(td) / "otherdir" / "polycopy.db")) is False
 
 
 # --- Section 4: limit bounds ----------------------------------------------
