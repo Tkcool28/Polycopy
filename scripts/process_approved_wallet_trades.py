@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 for path in (ROOT / "src", ROOT):
@@ -52,6 +52,38 @@ class _ReadOnlyDb:
 
     def close(self) -> None:
         self.conn.close()
+
+
+class _Closable:
+    """Wraps async adapters + the shared httpx client so the bridge can aclose
+    them on ITS OWN event loop (via ``client_close_hooks``), never on a fresh
+    loop in the CLI's ``finally``. Aclose runs on the same loop that ran the
+    Gamma/CLOB requests, so no transport is re-bound to a closed loop.
+
+    The bridge calls each hook as ``hook(loop)``; we return the ``aclose``
+    coroutine so the bridge awaits it on that same loop.
+    """
+
+    def __init__(self, *clients: Any) -> None:
+        self._clients = list(clients)
+
+    def __call__(self, loop: Any) -> Any:
+        return self.aclose()
+
+    async def aclose(self) -> None:
+        for client in self._clients:
+            if client is None:
+                continue
+            aclose = getattr(client, "aclose", None)
+            if aclose is None:
+                continue
+            coro = aclose()
+            if coro is not None:
+                await coro
+
+
+def _make_closable(adapter: Any, http: Any) -> _Closable:
+    return _Closable(adapter, http)
 
 
 def _summary(report: dict) -> str:
@@ -99,13 +131,19 @@ def main(argv: list[str] | None = None) -> int:
         requests_per_minute=settings.clob_rpm,
     )
     deps = BridgeDependencies(gamma=adapter, clob=clob)
+    # One _Closable wraps the shared async clients; the bridge acloses it on the
+    # SAME loop that runs the Gamma/CLOB requests (see process_approved_wallet_trades).
+    closable = _make_closable(adapter, http)
+    client_close_hooks = [closable]
     db = None
+    report: dict | None = None
+    cleanup_errors: list[dict[str, str]] = []
     try:
         if args.write:
             with operational_job_lock("scan", timeout=args.lock_timeout):
                 check_rss_limit("pr25a:before-write", get_max_rss_mb_from_env())
                 db = Database(Path(args.db_path)).connect()
-                report = process_approved_wallet_trades(
+                report_obj = process_approved_wallet_trades(
                     db,
                     wallet=wallet,
                     limit=args.limit,
@@ -113,18 +151,24 @@ def main(argv: list[str] | None = None) -> int:
                     write=True,
                     write_authorization=_issue_write_capability(),
                     source_trade_id=args.source_trade_id,
-                ).as_dict()
+                    client_close_hooks=client_close_hooks,
+                )
+                cleanup_errors = list(getattr(report_obj, "cleanup_errors", []))
+                report = report_obj.as_dict()
                 check_rss_limit("pr25a:after-write", get_max_rss_mb_from_env())
         else:
             db = _ReadOnlyDb(Path(args.db_path))
-            report = process_approved_wallet_trades(
+            report_obj = process_approved_wallet_trades(
                 db,
                 wallet=wallet,
                 limit=args.limit,
                 dependencies=deps,
                 write=False,
                 source_trade_id=args.source_trade_id,
-            ).as_dict()
+                client_close_hooks=client_close_hooks,
+            )
+            cleanup_errors = list(getattr(report_obj, "cleanup_errors", []))
+            report = report_obj.as_dict()
     except LockError as exc:
         print(f"error: global operational lock unavailable: {exc}", file=sys.stderr)
         return 3
@@ -135,13 +179,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
-        if db is not None:
-            db.close()
-        asyncio.run(adapter.aclose())
-        asyncio.run(http.aclose())
-    print(json.dumps(report, sort_keys=True))
-    if not args.json:
-        print(_summary(report))
+        # Print the completed report BEFORE any cleanup, so a client aclose
+        # failure can never erase an already-generated report. The async client
+        # cleanup already ran inside the bridge (on its own loop) and is recorded
+        # in ``cleanup_errors``; here we only close the DB.
+        if report is not None:
+            print(json.dumps(report, sort_keys=True))
+            if not args.json:
+                print(_summary(report))
+        # Report DB close failures loudly (no silent suppression).
+        try:
+            if db is not None:
+                db.close()
+        except Exception as exc:  # noqa: BLE001 - report, do not swallow
+            cleanup_errors.append({"type": type(exc).__name__, "error": str(exc)})
+        # http/adapter are closed by the bridge's client_close_hooks on its loop.
+        # Drop our references so nothing else can aclose them on a fresh loop.
+        http = None
+        adapter = None
+    # Cleanup errors force exit code 1 and are reported to stderr, but they do
+    # NOT erase the JSON already printed above.
+    if cleanup_errors:
+        for err in cleanup_errors:
+            print(f"error: cleanup failed: {err['type']}: {err['error']}", file=sys.stderr)
+        return 1
+    if report is None:
+        return 1
     return 0 if not report["failures"] else 1
 
 

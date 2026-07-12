@@ -8,6 +8,7 @@ import importlib.util
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -30,6 +31,22 @@ TOKENS = [
     "1970496541508335019913900195809032484597886384784144327835472760880523550630",
     "462547474504332232595082342285851716602015351553019365447058575920118967359469",
 ]
+
+
+def _sqlite_readonly(path: str):
+    """Read-only sqlite facade matching the CLI's real _ReadOnlyDb interface
+    (fetchall/fetchone/close), so tests never touch Database().connect()."""
+    class _Facade:
+        def __init__(self, p: str) -> None:
+            self.conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            self.conn.row_factory = sqlite3.Row
+        def fetchall(self, sql: str, params: tuple = ()) -> list:
+            return list(self.conn.execute(sql, params).fetchall())
+        def fetchone(self, sql: str, params: tuple = ()) -> "object":
+            return self.conn.execute(sql, params).fetchone()
+        def close(self) -> None:
+            self.conn.close()
+    return _Facade(path)
 
 
 def _db(tmp_path: Path) -> Database:
@@ -652,3 +669,301 @@ def test_write_path_guarded_ordering_one_failure_does_not_abort_batch(tmp_path):
     assert gamma.calls == 2, gamma.calls
     assert book.calls == 2, book.calls
     db.close()
+
+
+# ── PR25A CLI async client lifecycle fix ────────────────────────────────────
+
+class _LoopRecordingGamma:
+    """Gamma mock that records the running loop on each async request."""
+
+    def __init__(self):
+        self.loops: list = []
+        self.calls = 0
+
+    async def get_market(self, condition_id: str) -> "Any":
+        import asyncio as _asyncio
+        self.loops.append(_asyncio.get_running_loop())
+        self.calls += 1
+        return _make_gamma_market(condition_id)
+
+
+class _LoopRecordingBook:
+    """CLOB mock that records the running loop on each async fetch."""
+
+    def __init__(self):
+        self.loops: list = []
+        self.calls = 0
+
+    async def fetch_book(self, token_id: str) -> "Any":
+        import asyncio as _asyncio
+        self.loops.append(_asyncio.get_running_loop())
+        self.calls += 1
+        return _valid_book()
+
+
+class _LoopRecordingClosable:
+    """Async closable that records the loop its aclose ran on."""
+
+    def __init__(self):
+        self.aclose_loops: list = []
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        import asyncio as _asyncio
+        self.aclose_loops.append(_asyncio.get_running_loop())
+        self.aclose_calls += 1
+
+    def __call__(self, loop: "Any") -> "Any":
+        return self.aclose()
+
+
+def _make_gamma_market(condition_id: str = "condition-0") -> "Any":
+    """Return a real Market whose clob_token_id matches the seeded token for the
+    requested condition, so the exact token->outcome mapping succeeds."""
+    from polycopy.domain.market import Market, MarketOutcome
+
+    idx = 0
+    if condition_id.startswith("condition-"):
+        try:
+            idx = int(condition_id.split("-", 1)[1])
+        except ValueError:
+            idx = 0
+    tok = TOKENS[idx] if 0 <= idx < len(TOKENS) else (TOKENS[0] if TOKENS else "tok")
+    return Market(
+        source_id=condition_id, source="polymarket", question="Q",
+        outcomes=[MarketOutcome(label="Yes", price=0.5, clob_token_id=tok)],
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+def test_bridge_closes_client_hooks_on_same_loop_as_requests(tmp_path):
+    """REQUIRED #1-3: the same single event loop drives Gamma/CLOB requests AND
+    client aclose. Proves no second-loop aclose, so asyncio.run(aclose) on a
+    fresh loop is never needed."""
+    import asyncio as _asyncio
+    db = _db(tmp_path)
+    _seed_three(db)
+    gamma = _LoopRecordingGamma()
+    book = _LoopRecordingBook()
+    closable = _LoopRecordingClosable()
+    before_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+        client_close_hooks=[closable],
+    )
+    assert report.failures == [], report.failures
+    # Aclose ran exactly once, on a captured loop.
+    assert closable.aclose_calls == 1, closable.aclose_calls
+    assert len(closable.aclose_loops) == 1
+    # Request loop identity == cleanup loop identity (the bridge's batch loop).
+    request_loop = gamma.loops[0]
+    cleanup_loop = closable.aclose_loops[0]
+    assert isinstance(request_loop, _asyncio.AbstractEventLoop)
+    assert request_loop is cleanup_loop, "request loop must be the SAME object as cleanup loop"
+    # CLOB ran on the same loop too.
+    assert book.loops[0] is request_loop
+    # Successful path records no cleanup errors and writes nothing.
+    assert report.cleanup_errors == []
+    assert _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES) == before_counts
+    db.close()
+
+
+def test_bridge_records_cleanup_error_without_raising_report(tmp_path):
+    """Required design: a failing client hook is recorded on the report's
+    cleanup_errors and the BridgeReport is STILL returned (not erased)."""
+    db = _db(tmp_path)
+    _seed_three(db)
+    gamma = _CallCountingGamma()
+    book = _CallCountingBook(_valid_book())
+
+    def _boom(loop):
+        raise RuntimeError("simulated aclose failure")
+
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+        client_close_hooks=[_boom],
+    )
+    # Report is returned with rows produced; cleanup error recorded separately.
+    assert report.selected == 3
+    assert report.cleanup_errors, "cleanup error must be recorded, not raised"
+    assert report.cleanup_errors[0]["type"] == "RuntimeError"
+    assert "simulated aclose failure" in report.cleanup_errors[0]["error"]
+    db.close()
+
+
+def test_cli_dry_run_cleanup_failure_still_prints_json(tmp_path, capsys, monkeypatch):
+    """REQUIRED #4: cleanup hook raises -> valid JSON STILL on stdout, report has
+    selected rows/stages, stderr reports cleanup failure, exit code = 1."""
+    cli = _load_cli_module()
+    monkeypatch.setattr(cli, "resolve_wallet", lambda value: WALLET)
+    monkeypatch.setattr(
+        cli, "Settings",
+        lambda: SimpleNamespace(
+            gamma_base_url="https://example.invalid", clob_base_url="https://example.invalid",
+            clob_max_retries=1, clob_rpm=1,
+        ),
+    )
+    monkeypatch.setattr(cli, "PolymarketPublicAdapter", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli, "PolymarketClobClient", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli.httpx, "AsyncClient", lambda **k: SimpleNamespace())
+    from polycopy.db.database import Database as _DB
+    real_db = _DB(tmp_path / "cli.db").connect()
+    _trade(real_db)
+    real_db.close()
+    monkeypatch.setattr(cli.Database, "connect", lambda self: pytest.fail("dry-run must not connect writable Database"))
+    monkeypatch.setattr(cli, "_ReadOnlyDb", lambda path: _sqlite_readonly(str(path)))
+    # Stub returns a completed report WITH a recorded cleanup error (the bridge's
+    # cleanup_errors transport) so we exercise the CLI's print-then-stderr path.
+    def _stub_bridge(*a, **k):
+        return type(
+            "Report", (),
+            {"cleanup_errors": [{"type": "RuntimeError", "error": "simulated aclose failure"}],
+             "as_dict": lambda self: {
+                 "mode": "ro", "wallet": WALLET, "limit": 1, "selected": 1,
+                 "rows": [{"source_trade_id_prefix": "pm:x", "stages": {"source_validation": "ok"}, "actions": []}],
+                 "failures": [], "write_counts": {}, "forbidden_table_delta": {},
+                 "cleanup_errors": [{"type": "RuntimeError", "error": "simulated aclose failure"}],
+             }},
+        )()
+    monkeypatch.setattr(cli, "process_approved_wallet_trades", _stub_bridge)
+
+    rc = cli.main(["--wallet", WALLET, "--limit", "1", "--db-path", str(tmp_path / "cli.db"), "--json"])
+    captured = capsys.readouterr()
+    import json as _json
+    payload = _json.loads(captured.out)  # valid JSON on stdout
+    assert payload["selected"] == 1
+    assert payload["rows"][0]["stages"]["source_validation"] == "ok"
+    assert payload["cleanup_errors"], "cleanup error must appear in the JSON"
+    assert "Event loop is closed" not in captured.err, captured.err
+    assert "cleanup failed" in captured.err, captured.err  # stderr reported it
+    assert rc == 1, captured.err  # exit 1 because cleanup failed
+    assert payload["write_counts"] == {}
+
+
+def test_cli_dry_run_row_failure_still_prints_json(tmp_path, capsys, monkeypatch):
+    """REQUIRED #5: a row-level failure still prints JSON and exits 1."""
+    cli = _load_cli_module()
+    monkeypatch.setattr(cli, "resolve_wallet", lambda value: WALLET)
+    monkeypatch.setattr(
+        cli, "Settings",
+        lambda: SimpleNamespace(
+            gamma_base_url="https://example.invalid", clob_base_url="https://example.invalid",
+            clob_max_retries=1, clob_rpm=1,
+        ),
+    )
+    monkeypatch.setattr(cli, "PolymarketPublicAdapter", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli, "PolymarketClobClient", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli.httpx, "AsyncClient", lambda **k: SimpleNamespace())
+    from polycopy.db.database import Database as _DB
+    real_db = _DB(tmp_path / "cli.db").connect()
+    _trade(real_db)
+    real_db.close()
+    monkeypatch.setattr(cli.Database, "connect", lambda self: pytest.fail("dry-run must not connect writable Database"))
+    monkeypatch.setattr(cli, "_ReadOnlyDb", lambda path: _sqlite_readonly(str(path)))
+    monkeypatch.setattr(
+        cli, "process_approved_wallet_trades",
+        lambda *a, **k: type(
+            "Report", (),
+            {"cleanup_errors": [],
+             "as_dict": lambda self: {
+                 "mode": "ro", "wallet": WALLET, "limit": 1, "selected": 1,
+                 "rows": [{"source_trade_id_prefix": "pm:x", "stages": {}, "actions": []}],
+                 "failures": [{"source_trade_id": "pm:x", "reason": "clob_evidence_invalid"}],
+                 "write_counts": {}, "forbidden_table_delta": {}, "cleanup_errors": [],
+             }},
+        )(),
+    )
+    rc = cli.main(["--wallet", WALLET, "--limit", "1", "--db-path", str(tmp_path / "cli.db"), "--json"])
+    captured = capsys.readouterr()
+    import json as _json
+    payload = _json.loads(captured.out)
+    assert payload["failures"], "row-level failure should remain visible"
+    assert "Event loop is closed" not in captured.err, captured.err
+    assert rc == 1, captured.err
+    assert payload["write_counts"] == {}
+
+
+def test_cli_dry_run_success_prints_json_no_event_loop_closed(tmp_path, capsys, monkeypatch):
+    """REQUIRED #6: successful dry-run prints JSON, no Event loop is closed, exit
+    follows report failures (0 here)."""
+    cli = _load_cli_module()
+    monkeypatch.setattr(cli, "resolve_wallet", lambda value: WALLET)
+    monkeypatch.setattr(
+        cli, "Settings",
+        lambda: SimpleNamespace(
+            gamma_base_url="https://example.invalid", clob_base_url="https://example.invalid",
+            clob_max_retries=1, clob_rpm=1,
+        ),
+    )
+    monkeypatch.setattr(cli, "PolymarketPublicAdapter", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli, "PolymarketClobClient", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli.httpx, "AsyncClient", lambda **k: SimpleNamespace())
+    from polycopy.db.database import Database as _DB
+    real_db = _DB(tmp_path / "cli.db").connect()
+    _trade(real_db)
+    real_db.close()
+    monkeypatch.setattr(cli.Database, "connect", lambda self: pytest.fail("dry-run must not connect writable Database"))
+    monkeypatch.setattr(cli, "_ReadOnlyDb", lambda path: _sqlite_readonly(str(path)))
+    monkeypatch.setattr(
+        cli, "process_approved_wallet_trades",
+        lambda *a, **k: type(
+            "Report", (),
+            {"cleanup_errors": [],
+             "as_dict": lambda self: {
+                 "mode": "ro", "wallet": WALLET, "limit": 1, "selected": 1, "rows": [],
+                 "failures": [], "write_counts": {}, "forbidden_table_delta": {}, "cleanup_errors": [],
+             }},
+        )(),
+    )
+    rc = cli.main(["--wallet", WALLET, "--limit", "1", "--db-path", str(tmp_path / "cli.db"), "--json"])
+    captured = capsys.readouterr()
+    import json as _json
+    payload = _json.loads(captured.out)
+    assert payload["mode"] == "ro"
+    assert "Event loop is closed" not in captured.err, captured.err
+    assert rc == 0, captured.err
+    assert payload["write_counts"] == {}
+
+
+def test_cli_dry_run_zero_db_writes_and_stdout_report(tmp_path, capsys, monkeypatch):
+    """REQUIRED #7 + #8: write_counts stays {} and the DB is untouched."""
+    cli = _load_cli_module()
+    monkeypatch.setattr(cli, "resolve_wallet", lambda value: WALLET)
+    monkeypatch.setattr(
+        cli, "Settings",
+        lambda: SimpleNamespace(
+            gamma_base_url="https://example.invalid", clob_base_url="https://example.invalid",
+            clob_max_retries=1, clob_rpm=1,
+        ),
+    )
+    monkeypatch.setattr(cli, "PolymarketPublicAdapter", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli, "PolymarketClobClient", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(cli.httpx, "AsyncClient", lambda **k: SimpleNamespace())
+    # Seed the readable DB BEFORE monkeypatching Database.connect (which would
+    # refuse any connect, including our own seed).
+    from polycopy.db.database import Database as _DB
+    real_db = _DB(tmp_path / "cli.db").connect()
+    _trade(real_db)
+    real_db.close()
+    before = (tmp_path / "cli.db").stat()
+    monkeypatch.setattr(cli.Database, "connect", lambda self: pytest.fail("dry-run must not connect writable Database"))
+    monkeypatch.setattr(cli, "_ReadOnlyDb", lambda path: _sqlite_readonly(str(path)))
+    monkeypatch.setattr(
+        cli, "process_approved_wallet_trades",
+        lambda *a, **k: type(
+            "Report", (),
+            {"cleanup_errors": [],
+             "as_dict": lambda self: {
+                 "mode": "ro", "wallet": WALLET, "limit": 1, "selected": 1, "rows": [],
+                 "failures": [], "write_counts": {}, "forbidden_table_delta": {}, "cleanup_errors": [],
+             }},
+        )(),
+    )
+    rc = cli.main(["--wallet", WALLET, "--limit", "1", "--db-path", str(tmp_path / "cli.db"), "--json"])
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    after = (tmp_path / "cli.db").stat()
+    assert (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+    assert "Event loop is closed" not in captured.err, captured.err
