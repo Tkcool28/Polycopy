@@ -25,6 +25,12 @@ from polycopy.scoring import paper_signal as paper_signal_mod
 
 WALLET = "0x" + "a" * 40
 
+TOKENS = [
+    "104431860535489654020481219089291817898241901940037260095979653681449084465327",
+    "1970496541508335019913900195809032484597886384784144327835472760880523550630",
+    "462547474504332232595082342285851716602015351553019365447058575920118967359469",
+]
+
 
 def _db(tmp_path: Path) -> Database:
     return Database(tmp_path / "bridge.db").connect()
@@ -344,3 +350,305 @@ def test_cli_dry_run_is_read_only_and_never_calls_persistence(monkeypatch, tmp_p
     assert cli.main(["--wallet", WALLET, "--limit", "1", "--db-path", str(tmp_path / "x.db"), "--json"]) == 0
     process = next(event for event in events if event[0] == "process")
     assert process[1]["write"] is False
+
+
+def test_pr25a_dry_run_processes_three_rows_in_one_event_loop_with_full_tc_and_paper_evaluation(tmp_path):
+    """Final PR25A harness consolidation regression.
+
+    Runs a 3-row batch through the dry-run with SHARED async Gamma/CLOB
+    clients (both providers are genuinely async, so the batch exercises the
+    single-event-loop fetch path). All three rows must complete the full
+    Gamma -> exact token mapping -> CLOB -> depth normalization -> Trade
+    Copyability v1 -> paper-signal evaluation path with NO RuntimeError and
+    NO closed event loop, and report non-empty would-write actions. The
+    dry-run must still persist ZERO rows and leave every allowlisted and
+    forbidden table unchanged.
+    """
+    db = _db(tmp_path)
+    TOKENS = [
+        "104431860535489654020481219089291817898241901940037260095979653681449084465327",
+        "1970496541508335019913900195809032484597886384784144327835472760880523550630",
+        "462547474504332232595082342285851716602015351553019365447058575920118967359469",
+    ]
+    for i, tok in enumerate(TOKENS):
+        db.execute(
+            """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
+               VALUES (?, ?, ?, 'condition-1', 'BUY', 'Yes', 2, .5, ?, '2026-01-01T00:00:00Z', 0, ?)""",
+            (f"t{i}", SOURCE_NAME, f"polymarket:public-{i}", WALLET, tok),
+        )
+    db.conn.commit()
+
+    class _AsyncGamma:
+        async def get_market(self, condition_id: str):
+            # Async provider -> exercises the single shared event loop.
+            # Return one outcome per source token so the exact token->outcome
+            # mapping succeeds for every selected row.
+            return Market(source_id="condition-1", source="polymarket", question="Q",
+                          outcomes=[MarketOutcome(label="Yes", price=.5, clob_token_id=tok)
+                                    for tok in TOKENS],
+                          fetched_at=datetime.now(timezone.utc))
+
+    class _RecordingBook:
+        def __init__(self, book, received):
+            self.book, self.received = book, received
+        async def fetch_book(self, token_id):
+            self.received.append(token_id)
+            return self.book
+
+    received_tokens: list[str] = []
+    book = _RecordingBook(_valid_book(), received_tokens)
+    before_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    before_stat = (tmp_path / "bridge.db").stat()
+
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=_AsyncGamma(), clob=book),
+    )
+
+    # No RuntimeError / closed-loop failure leaked into skip reasons.
+    assert report.failures == [], report.failures
+    assert report.selected == 3
+    assert len(report.rows) == 3
+    # Shared async client received the exact source tokens, in order, once each.
+    assert received_tokens == TOKENS, received_tokens
+
+    tc_evals = 0
+    paper_evals = 0
+    for row in report.rows:
+        assert row["stages"]["source_validation"] == "ok"
+        assert row["stages"]["gamma"] == "ok"
+        assert row["stages"]["clob_preflight"] == "ok"
+        # Exact token mapping succeeded.
+        assert row["stages"].get("trade_copyability") in {
+            "copy_candidate", "watchlist", "skip", "incomplete",
+        }
+        assert row["stages"].get("paper") == "evaluated"
+        tc_evals += 1
+        paper_evals += 1
+        # Non-empty would-write actions for every row.
+        assert row["actions"], "expected non-empty would-write actions"
+        assert "trade_copyability_v1" in row["actions"]
+        assert "canonical_paper" in row["actions"]
+
+    assert tc_evals == 3
+    assert paper_evals == 3
+    # Dry-run persists nothing.
+    assert report.mode == "ro"
+    assert report.write_counts == {}
+    assert report.forbidden_table_delta == {}
+    after_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    assert after_counts == before_counts
+    after_stat = (tmp_path / "bridge.db").stat()
+    assert (before_stat.st_size, before_stat.st_mtime_ns) == (after_stat.st_size, after_stat.st_mtime_ns)
+    db.close()
+
+
+class _CallCountingGamma:
+    """Async Gamma that returns a market whose outcome's clob_token_id matches
+    the requested condition's source token (so exact token->outcome mapping
+    succeeds per row) and raises on a chosen 1-based call index (default: never)."""
+    def __init__(self, *, tokens=TOKENS, raise_on_call=None, exc=None):
+        self.tokens = tokens
+        self.raise_on_call = raise_on_call
+        self.exc = exc or RuntimeError("gamma boom")
+        self.calls = 0
+    async def get_market(self, condition_id: str):
+        self.calls += 1
+        if self.raise_on_call is not None and self.calls == self.raise_on_call:
+            raise self.exc
+        # Map condition-N -> TOKENS[N] so the exact token mapping resolves.
+        idx = 0
+        if condition_id.startswith("condition-"):
+            try:
+                idx = int(condition_id.split("-", 1)[1])
+            except ValueError:
+                idx = 0
+        tok = self.tokens[idx] if 0 <= idx < len(self.tokens) else (self.tokens[0] if self.tokens else "tok")
+        return Market(source_id=condition_id, source="polymarket", question="Q",
+                      outcomes=[MarketOutcome(label="Yes", price=.5, clob_token_id=tok)],
+                      fetched_at=datetime.now(timezone.utc))
+
+
+class _CallCountingBook:
+    """Async CLOB that raises on a chosen 1-based call index (default: never)."""
+    def __init__(self, book, *, raise_on_call=None, exc=None):
+        self.book = book
+        self.raise_on_call = raise_on_call
+        self.exc = exc or RuntimeError("clob boom")
+        self.calls = 0
+        self.seen = []
+    async def fetch_book(self, token_id: str):
+        self.calls += 1
+        self.seen.append(token_id)
+        if self.raise_on_call is not None and self.calls == self.raise_on_call:
+            raise self.exc
+        return self.book
+
+
+def _seed_three(db, *, tokens=TOKENS):
+    for i, tok in enumerate(tokens):
+        db.execute(
+            """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
+               VALUES (?, ?, ?, ?, 'BUY', 'Yes', 2, .5, ?, '2026-01-01T00:00:00Z', 0, ?)""",
+            (f"t{i}", SOURCE_NAME, f"polymarket:public-{i}", f"condition-{i}", WALLET, tok),
+        )
+    db.conn.commit()
+
+
+def _assert_full_path(row):
+    assert row["stages"]["source_validation"] == "ok"
+    assert row["stages"]["gamma"] == "ok"
+    assert row["stages"]["clob_preflight"] == "ok"
+    assert row["stages"].get("trade_copyability") in {
+        "copy_candidate", "watchlist", "skip", "incomplete",
+    }
+    assert row["stages"].get("paper") == "evaluated"
+    assert row["actions"]
+    assert "trade_copyability_v1" in row["actions"]
+    assert "canonical_paper" in row["actions"]
+
+
+def test_three_successful_rows_complete_on_one_loop(tmp_path):
+    db = _db(tmp_path)
+    _seed_three(db)
+    gamma = _CallCountingGamma()
+    book = _CallCountingBook(_valid_book())
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+    )
+    assert report.selected == 3
+    assert report.failures == [], report.failures
+    assert len(report.rows) == 3
+    for row in report.rows:
+        _assert_full_path(row)
+    # Gamma + CLOB each called exactly once per row, in order, on one loop.
+    assert gamma.calls == 3
+    assert book.calls == 3
+    assert book.seen == TOKENS
+    db.close()
+
+
+def test_middle_row_gamma_raises_isolates_failure_and_skips_clob(tmp_path):
+    db = _db(tmp_path)
+    _seed_three(db)
+    gamma = _CallCountingGamma(raise_on_call=2)
+    book = _CallCountingBook(_valid_book())
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+    )
+    # Rows 1 and 3 still complete; row 2 records gamma_error.
+    assert report.selected == 3
+    assert any(r["skip_reason"] == "gamma_error:RuntimeError" for r in report.rows)
+    assert any(r["source_trade_id_prefix"].endswith("public-0") for r in report.rows if "trade_copyability" in r["stages"])
+    assert any(r["source_trade_id_prefix"].endswith("public-2") for r in report.rows if "trade_copyability" in r["stages"])
+    # CLOB is never called for row 2 (Gamma failed first).
+    assert book.seen == [TOKENS[0], TOKENS[2]], book.seen
+    # Rows 1 and 3 must have completed the full dry-run path.
+    completed = [r for r in report.rows if "trade_copyability" in r["stages"]]
+    assert len(completed) == 2, [r["source_trade_id_prefix"] for r in report.rows]
+    for r in completed:
+        _assert_full_path(r)
+    db.close()
+
+
+def test_middle_row_clob_raises_isolates_failure(tmp_path):
+    db = _db(tmp_path)
+    _seed_three(db)
+    gamma = _CallCountingGamma()
+    book = _CallCountingBook(_valid_book(), raise_on_call=2)
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+    )
+    assert report.selected == 3
+    assert any(r["skip_reason"] == "clob_error:RuntimeError" for r in report.rows)
+    # Rows 1 and 3 still complete the full path.
+    completed = [r for r in report.rows if "trade_copyability" in r["stages"]]
+    assert len(completed) == 2
+    for r in completed:
+        _assert_full_path(r)
+    # Gamma called for all 3 (it precedes CLOB); CLOB attempted for all 3 but
+    # the 2nd raised.
+    assert gamma.calls == 3
+    assert book.calls == 3
+    db.close()
+
+
+def test_source_invalid_row_calls_neither_gamma_nor_clob(tmp_path):
+    db = _db(tmp_path)
+    # One source-invalid row (non-finite price).
+    db.execute(
+        """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
+           VALUES ('bad', ?, 'polymarket:bad', 'condition-1', 'BUY', 'Yes', 2, 0, ?, '2026-01-01T00:00:00Z', 0, 'tok-bad')""",
+        (SOURCE_NAME, WALLET),
+    )
+    db.conn.commit()
+    gamma = _CallCountingGamma(tokens=["tok-bad"])
+    book = _CallCountingBook(_valid_book())
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+    )
+    assert report.selected == 1
+    assert report.failures and report.failures[0]["reason"] == "invalid_price_or_quantity"
+    # Neither Gamma nor CLOB was contacted for the invalid row.
+    assert gamma.calls == 0, gamma.calls
+    assert book.calls == 0, book.calls
+    db.close()
+
+
+def test_dry_run_full_tc_paper_evaluation_zero_writes(tmp_path):
+    db = _db(tmp_path)
+    _seed_three(db)
+    gamma = _CallCountingGamma()
+    book = _CallCountingBook(_valid_book())
+    before_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+    )
+    assert report.mode == "ro"
+    for row in report.rows:
+        _assert_full_path(row)
+    assert report.write_counts == {}
+    assert report.forbidden_table_delta == {}
+    after_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    assert after_counts == before_counts
+    db.close()
+
+
+def test_write_path_guarded_ordering_one_failure_does_not_abort_batch(tmp_path):
+    db = _db(tmp_path)
+    # Row 0: valid, should persist through write path.
+    # Row 1: invalid source -> skipped before any write, no Gamma/CLOB.
+    # Row 2: valid, should persist through write path.
+    _seed_three(db)
+    # Make row 1's source invalid by overwriting its price after seeding.
+    db.execute("UPDATE source_trades SET price=0 WHERE id='t1'")
+    db.conn.commit()
+    gamma = _CallCountingGamma()
+    book = _CallCountingBook(_valid_book())
+    auth = _issue_write_capability()
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3, write=True, write_authorization=auth,
+        dependencies=BridgeDependencies(gamma=gamma, clob=book),
+    )
+    # Rows 0 and 2 persisted (copy_candidate in actions), row 1 skipped on source.
+    persisted = [r for r in report.rows if "candidate" in r["actions"]]
+    assert len(persisted) == 2, [r["source_trade_id_prefix"] for r in report.rows]
+    skipped = [r for r in report.rows if r["skip_reason"] == "invalid_price_or_quantity"]
+    assert len(skipped) == 1
+    # The only failure is the single source-invalid row; the batch was NOT
+    # aborted before reporting/rolling back the other rows.
+    assert report.failures == [
+        {"source_trade_id": skipped[0]["source_trade_id_prefix"], "reason": "invalid_price_or_quantity"}
+    ], report.failures
+    # Exactly the allowlisted write tables changed; forbidden unchanged.
+    assert report.forbidden_table_delta == {}
+    assert report.write_counts.get("copy_candidates", 0) == 2
+    # Gamma called only for the two valid rows (source-invalid row skipped first).
+    assert gamma.calls == 2, gamma.calls
+    assert book.calls == 2, book.calls
+    db.close()

@@ -20,13 +20,19 @@ from polycopy.db.price_snapshot_persistence import persist_price_snapshot
 from polycopy.db.wallet_identity import canonical_wallet_address
 from polycopy.scoring.depth_normalization import (
     DEFAULT_MAX_LEVELS_PER_SIDE,
+    NormalizedLevel,
+    compute_book_hash,
     normalize_book_levels,
 )
 from polycopy.domain.copy_candidate import CandidateStatus, CopyCandidate
 from polycopy.domain.market import Market
 from polycopy.engine.price_snapshots import _now_iso, snapshot_one
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
-from polycopy.scoring.paper_signal import persist_bridge_trade_copyability_v1
+from polycopy.scoring.paper_signal import (
+    PersistedPaperSignalInputs,
+    compute_bridge_trade_copyability_and_paper_input,
+    persist_bridge_trade_copyability_v1,
+)
 
 MAX_LIMIT = 10
 # PR25A: bounded evidence capture; this is deliberately the existing frozen
@@ -154,6 +160,13 @@ def select_approved_source_trades(
 
 
 def _await(value: Any) -> Any:
+    """Run a possibly-awaitable value to completion from this sync caller.
+
+    Only used for isolated async calls (e.g. the in-memory snapshot book
+    provider inside :func:`snapshot_one`). The per-row Gamma/CLOB fetches in
+    :func:`process_approved_wallet_trades` run on the batch's single shared
+    event loop via :func:`_run_on_loop`, not here.
+    """
     if not inspect.isawaitable(value):
         return value
     try:
@@ -163,8 +176,22 @@ def _await(value: Any) -> Any:
     raise RuntimeError("PR25A synchronous bridge cannot run in an active event loop")
 
 
+def _run_on_loop(loop: Any, value: Any) -> Any:
+    """Execute one Gamma/CLOB adapter call on the batch's single event loop.
+
+    Awaitable providers (the real adapters) are run with
+    ``loop.run_until_complete``; synchronous/mock providers (tests) are
+    returned as-is. This keeps every selected row's async call on the SAME
+    shared loop — no ``asyncio.run()`` per row, so shared async clients stay
+    bound to one loop and later rows cannot hit a closed-loop ``RuntimeError``.
+    """
+    if inspect.isawaitable(value):
+        return loop.run_until_complete(value)
+    return value
+
+
 def _hydrate(
-    gamma: GammaProvider, row: Any
+    gamma: GammaProvider, row: Any, market: Any | None = None,
 ) -> tuple[Market | None, Any | None, str | None]:
     condition, token, label = (
         str(row[key] or "").strip()
@@ -172,10 +199,11 @@ def _hydrate(
     )
     if not condition or not token or not label:
         return None, None, "missing_condition_token_or_outcome"
-    try:
-        market = _await(gamma.get_market(condition))
-    except Exception as exc:
-        return None, None, f"gamma_error:{type(exc).__name__}"
+    if market is None:
+        try:
+            market = _await(gamma.get_market(condition))
+        except Exception as exc:
+            return None, None, f"gamma_error:{type(exc).__name__}"
     if market is None:
         return None, None, "gamma_market_missing"
     if str(getattr(market, "source_id", "")) != condition:
@@ -402,6 +430,93 @@ def _record_skip(report: BridgeReport, detail: dict[str, Any], reason: str) -> N
     report.failures.append({"source_trade_id": detail["source_trade_id_prefix"], "reason": reason})
 
 
+def _evaluate_dry_run_decision(
+    detail: dict[str, Any],
+    row: Any,
+    market: Any,
+    outcome: Any,
+    book: Any,
+    bids: list[Any],
+    asks: list[Any],
+    wallet_address: str,
+) -> None:
+    """Run the full in-memory Trade Copyability v1 + paper-signal evaluation
+    for a dry-run row, recording verdicts and would-write actions — without any
+    database persistence.
+
+    Uses the SAME pure helpers the write path uses (``snapshot_one`` builder,
+    ``compute_bridge_trade_copyability_and_paper_input``) on an in-memory
+    candidate/snapshot/depth so a dry-run and a real write exercise identical
+    scoring logic. The would-write action list advertises every allowlisted
+    evidence table/object a real ``--write`` would persist for this row.
+    """
+    now = datetime.now(timezone.utc)
+    now_iso = _now_iso(now)
+    market_id = str(getattr(market, "id", None) or getattr(market, "source_id", "dry-run"))
+    outcome_id = 0
+    try:
+        outcome_id = int(getattr(outcome, "id", 0) or 0)
+    except (TypeError, ValueError):
+        outcome_id = 0
+    # In-memory candidate (same builder the write path uses).
+    candidate = _candidate(row, wallet_address, market_id, outcome_id, now_iso)
+    # In-memory snapshot via production's pure builder (no DB).
+    class _FetchedBook:
+        async def fetch_book(self, token_id: str) -> Any:
+            return book
+
+    snapshot = snapshot_one(
+        None,
+        candidate_id=0,
+        candidate=candidate,
+        market=market,
+        outcome=outcome,
+        snapshot_run_id=f"pr25a:{row['id']}",
+        now=now,
+        book_provider=_FetchedBook(),
+    )
+    snapshot_dict = snapshot.model_dump()
+    depth_hash = compute_book_hash(
+        [NormalizedLevel(price=p, size=s) for p, s in bids],
+        [NormalizedLevel(price=p, size=s) for p, s in asks],
+    )
+    notional = candidate.source_trade_notional
+    inputs = PersistedPaperSignalInputs(
+        candidate=candidate.model_dump(),
+        snapshot=snapshot_dict,
+        snapshot_id=snapshot.id,
+        source_trade=dict(row),
+        depth_bids=tuple(NormalizedLevel(price=p, size=s) for p, s in bids),
+        depth_asks=tuple(NormalizedLevel(price=p, size=s) for p, s in asks),
+        depth_hash=depth_hash,
+        depth_status_reason=None,
+        wallet_id=wallet_address,
+        source_trade_id=str(row["source_trade_id"]),
+        intended_stake=float(notional) if notional is not None else None,
+        side="BUY",
+        price_deterioration_pct=snapshot_dict.get("price_deterioration_pct"),
+        behavior_evidence_cutoff=snapshot_dict.get("fetched_at"),
+    )
+    trade_result, _typed_input, _trade_idem = compute_bridge_trade_copyability_and_paper_input(
+        inputs=inputs, now=now,
+    )
+    detail["stages"]["trade_copyability"] = trade_result.verdict.value
+    detail["trade_copyability_score"] = float(trade_result.score)
+    detail["stages"]["paper"] = "evaluated"
+    detail["paper_signal_verdict"] = _typed_input.final_verdict
+    detail["paper_signal_reason"] = _typed_input.final_reason
+    detail["actions"].extend(
+        [
+            "would_write_allowlisted_evidence_only",
+            "candidate",
+            "snapshot",
+            "depth_levels",
+            "trade_copyability_v1",
+            "canonical_paper",
+        ]
+    )
+
+
 def process_approved_wallet_trades(
     db: Any,
     *,
@@ -427,60 +542,107 @@ def process_approved_wallet_trades(
         selected=len(rows),
     )
     before = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES) if write else {}
-    for row in rows:
-        detail: dict[str, Any] = {
-            "source_trade_id_prefix": str(row["source_trade_id"])[:24],
-            "source_trade_internal_id": str(row["id"]),
-            "stages": {},
-            "request_count": 0,
-            "actions": [],
-            "skip_reason": None,
-        }
-        source_error = _source_trade_error(row)
-        detail["stages"]["source_validation"] = "ok" if source_error is None else source_error
-        if source_error:
-            _record_skip(report, detail, source_error)
-            continue
-        market, outcome, error = _hydrate(dependencies.gamma, row)
-        detail["stages"]["gamma"] = "ok" if error is None else error
-        if error:
-            _record_skip(report, detail, error)
-            continue
-        if dependencies.clob is None:
-            book, error = None, "no_book_provider"
-        else:
+
+    # One event loop for the entire batch's Gamma + CLOB fetches. Shared async
+    # clients stay bound to this single loop for every selected row. Each async
+    # adapter call is guarded per-row (try/except) so ONE trade's Gamma/CLOB
+    # failure cannot abort the rest of the batch or skip its own per-row report.
+    #
+    # CLOB is only requested AFTER source validation AND a successful Gamma
+    # hydration + exact token mapping, preserving the original guarded ordering.
+    #
+    # The loop is closed before the dry-run evaluation / write persistence
+    # because snapshot_one() raises inside a running loop (it manages its own
+    # self-contained loop). Phase B therefore runs with no loop running, exactly
+    # as the original code did — so --write semantics are preserved unchanged.
+    loop = asyncio.new_event_loop()
+    staged: list[tuple[Any, dict[str, Any], Any, Any, Any, list[Any], list[Any]]] = []
+    try:
+        for row in rows:
+            detail: dict[str, Any] = {
+                "source_trade_id_prefix": str(row["source_trade_id"])[:24],
+                "source_trade_internal_id": str(row["id"]),
+                "stages": {},
+                "request_count": 0,
+                "actions": [],
+                "skip_reason": None,
+            }
+            source_error = _source_trade_error(row)
+            detail["stages"]["source_validation"] = "ok" if source_error is None else source_error
+            if source_error:
+                _record_skip(report, detail, source_error)
+                continue
+            # Gamma request (guarded per row).
             try:
-                book = _await(dependencies.clob.fetch_book(str(row["token_id"])))
+                market = _run_on_loop(
+                    loop, dependencies.gamma.get_market(str(row["market_source_id"]))
+                )
+            except Exception as exc:
+                detail["stages"]["gamma"] = f"gamma_error:{type(exc).__name__}"
+                _record_skip(report, detail, detail["stages"]["gamma"])
+                continue
+            # Exact condition/token/outcome hydration.
+            market, outcome, error = _hydrate(dependencies.gamma, row, market=market)
+            detail["stages"]["gamma"] = "ok" if error is None else error
+            if error:
+                _record_skip(report, detail, error)
+                continue
+            # CLOB request (guarded per row) — only after successful Gamma.
+            if dependencies.clob is None:
+                detail["stages"]["clob_preflight"] = "no_book_provider"
+                _record_skip(report, detail, "no_book_provider")
+                continue
+            try:
+                book = _run_on_loop(
+                    loop, dependencies.clob.fetch_book(str(row["token_id"]))
+                )
                 detail["request_count"] = int(getattr(book, "request_attempts", 1))
             except Exception as exc:
-                book, error = None, f"clob_error:{type(exc).__name__}"
-            else:
-                error = (
-                    None
-                    if book
-                    and not getattr(book, "error_code", None)
-                    and getattr(book, "bids", None)
-                    and getattr(book, "asks", None)
-                    else "clob_evidence_invalid"
-                )
-        detail["stages"]["clob_preflight"] = "ok" if error is None else error
-        if error:
-            _record_skip(report, detail, error)
-            continue
-        try:
-            bids, asks, raw_bid_n, raw_ask_n, level_error = _bounded_book_levels(book)
-        except (AttributeError, TypeError, ValueError) as exc:
-            bids, asks, raw_bid_n, raw_ask_n, level_error = [], [], 0, 0, f"depth_normalization_error:{type(exc).__name__}"
-        detail["raw_bid_level_count"] = raw_bid_n
-        detail["raw_ask_level_count"] = raw_ask_n
-        detail["persisted_bid_level_count"] = len(bids)
-        detail["persisted_ask_level_count"] = len(asks)
-        if level_error:
-            detail["stages"]["levels"] = level_error
-            _record_skip(report, detail, level_error)
-            continue
+                detail["stages"]["clob_preflight"] = f"clob_error:{type(exc).__name__}"
+                _record_skip(report, detail, detail["stages"]["clob_preflight"])
+                continue
+            clob_error = (
+                None
+                if book
+                and not getattr(book, "error_code", None)
+                and getattr(book, "bids", None)
+                and getattr(book, "asks", None)
+                else "clob_evidence_invalid"
+            )
+            detail["stages"]["clob_preflight"] = "ok" if clob_error is None else clob_error
+            if clob_error:
+                _record_skip(report, detail, clob_error)
+                continue
+            # Depth normalization (sync, guarded).
+            try:
+                bids, asks, raw_bid_n, raw_ask_n, level_error = _bounded_book_levels(book)
+            except (AttributeError, TypeError, ValueError) as exc:
+                bids, asks, raw_bid_n, raw_ask_n, level_error = [], [], 0, 0, f"depth_normalization_error:{type(exc).__name__}"
+            detail["raw_bid_level_count"] = raw_bid_n
+            detail["raw_ask_level_count"] = raw_ask_n
+            detail["persisted_bid_level_count"] = len(bids)
+            detail["persisted_ask_level_count"] = len(asks)
+            if level_error:
+                detail["stages"]["levels"] = level_error
+                _record_skip(report, detail, level_error)
+                continue
+            # Defer dry-run evaluation / write persistence to Phase B (outside
+            # the running loop, where snapshot_one is safe).
+            staged.append((row, detail, market, outcome, book, bids, asks))
+    finally:
+        loop.close()
+
+    # ── Phase B: process staged rows with no running event loop ──────────────
+    for row, detail, market, outcome, book, bids, asks in staged:
         if not write:
-            detail["actions"].append("would_write_allowlisted_evidence_only")
+            # The dry-run executes the full in-memory Trade Copyability v1 +
+            # paper-signal evaluation (reusing the exact pure calls the write
+            # path uses) WITHOUT any persistence. The allowlisted evidence
+            # tables are reported as would-write actions so the operator can see
+            # precisely what a real --write would persist.
+            _evaluate_dry_run_decision(
+                detail, row, market, outcome, book, bids, asks, address,
+            )
             report.rows.append(detail)
             continue
 
