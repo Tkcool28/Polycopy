@@ -163,9 +163,9 @@ def _await(value: Any) -> Any:
     """Run a possibly-awaitable value to completion from this sync caller.
 
     Only used for isolated async calls (e.g. the in-memory snapshot book
-    provider). The per-row Gamma/CLOB fetches in
-    :func:`process_approved_wallet_trades` run inside ONE event loop for the
-    whole batch via :func:`_fetch_batch`, so they never call this.
+    provider inside :func:`snapshot_one`). The per-row Gamma/CLOB fetches in
+    :func:`process_approved_wallet_trades` run on the batch's single shared
+    event loop via :func:`_run_on_loop`, not here.
     """
     if not inspect.isawaitable(value):
         return value
@@ -176,28 +176,18 @@ def _await(value: Any) -> Any:
     raise RuntimeError("PR25A synchronous bridge cannot run in an active event loop")
 
 
-async def _fetch_batch(
-    deps: BridgeDependencies, rows: list[Any],
-) -> list[tuple[Any, Any]]:
-    """Fetch Gamma + CLOB evidence for every selected row inside a SINGLE
-    event loop for the entire batch.
+def _run_on_loop(loop: Any, value: Any) -> Any:
+    """Execute one Gamma/CLOB adapter call on the batch's single event loop.
 
-    The shared async clients (Gamma adapter, CLOB client) stay bound to this
-    one loop for all rows — no ``asyncio.run()`` is opened or closed per row,
-    so later rows can no longer hit a closed-loop ``RuntimeError``. Awaitable
-    providers (the real adapters) are awaited; synchronous/mock providers
-    (tests) are returned as-is.
+    Awaitable providers (the real adapters) are run with
+    ``loop.run_until_complete``; synchronous/mock providers (tests) are
+    returned as-is. This keeps every selected row's async call on the SAME
+    shared loop — no ``asyncio.run()`` per row, so shared async clients stay
+    bound to one loop and later rows cannot hit a closed-loop ``RuntimeError``.
     """
-    async def _one(condition_id: str, token_id: str) -> tuple[Any, Any]:
-        market = deps.gamma.get_market(condition_id)
-        if inspect.isawaitable(market):
-            market = await market
-        book = deps.clob.fetch_book(token_id) if deps.clob is not None else None
-        if inspect.isawaitable(book):
-            book = await book
-        return market, book
-
-    return [await _one(str(r["market_source_id"]), str(r["token_id"])) for r in rows]
+    if inspect.isawaitable(value):
+        return loop.run_until_complete(value)
+    return value
 
 
 def _hydrate(
@@ -553,35 +543,65 @@ def process_approved_wallet_trades(
     )
     before = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES) if write else {}
 
-    # Defect fix #1: fetch every row's Gamma + CLOB evidence inside ONE event
-    # loop for the whole batch. The shared async clients stay bound to that
-    # loop, so no row can hit a closed-loop RuntimeError.
-    fetched = asyncio.run(_fetch_batch(dependencies, rows))
-
-    for row, (market, book) in zip(rows, fetched):
-        detail: dict[str, Any] = {
-            "source_trade_id_prefix": str(row["source_trade_id"])[:24],
-            "source_trade_internal_id": str(row["id"]),
-            "stages": {},
-            "request_count": 0,
-            "actions": [],
-            "skip_reason": None,
-        }
-        source_error = _source_trade_error(row)
-        detail["stages"]["source_validation"] = "ok" if source_error is None else source_error
-        if source_error:
-            _record_skip(report, detail, source_error)
-            continue
-        market, outcome, error = _hydrate(dependencies.gamma, row, market=market)
-        detail["stages"]["gamma"] = "ok" if error is None else error
-        if error:
-            _record_skip(report, detail, error)
-            continue
-        if book is None:
-            error = "no_book_provider"
-        else:
-            detail["request_count"] = int(getattr(book, "request_attempts", 1))
-            error = (
+    # One event loop for the entire batch's Gamma + CLOB fetches. Shared async
+    # clients stay bound to this single loop for every selected row. Each async
+    # adapter call is guarded per-row (try/except) so ONE trade's Gamma/CLOB
+    # failure cannot abort the rest of the batch or skip its own per-row report.
+    #
+    # CLOB is only requested AFTER source validation AND a successful Gamma
+    # hydration + exact token mapping, preserving the original guarded ordering.
+    #
+    # The loop is closed before the dry-run evaluation / write persistence
+    # because snapshot_one() raises inside a running loop (it manages its own
+    # self-contained loop). Phase B therefore runs with no loop running, exactly
+    # as the original code did — so --write semantics are preserved unchanged.
+    loop = asyncio.new_event_loop()
+    staged: list[tuple[Any, dict[str, Any], Any, Any, Any, list[Any], list[Any]]] = []
+    try:
+        for row in rows:
+            detail: dict[str, Any] = {
+                "source_trade_id_prefix": str(row["source_trade_id"])[:24],
+                "source_trade_internal_id": str(row["id"]),
+                "stages": {},
+                "request_count": 0,
+                "actions": [],
+                "skip_reason": None,
+            }
+            source_error = _source_trade_error(row)
+            detail["stages"]["source_validation"] = "ok" if source_error is None else source_error
+            if source_error:
+                _record_skip(report, detail, source_error)
+                continue
+            # Gamma request (guarded per row).
+            try:
+                market = _run_on_loop(
+                    loop, dependencies.gamma.get_market(str(row["market_source_id"]))
+                )
+            except Exception as exc:
+                detail["stages"]["gamma"] = f"gamma_error:{type(exc).__name__}"
+                _record_skip(report, detail, detail["stages"]["gamma"])
+                continue
+            # Exact condition/token/outcome hydration.
+            market, outcome, error = _hydrate(dependencies.gamma, row, market=market)
+            detail["stages"]["gamma"] = "ok" if error is None else error
+            if error:
+                _record_skip(report, detail, error)
+                continue
+            # CLOB request (guarded per row) — only after successful Gamma.
+            if dependencies.clob is None:
+                detail["stages"]["clob_preflight"] = "no_book_provider"
+                _record_skip(report, detail, "no_book_provider")
+                continue
+            try:
+                book = _run_on_loop(
+                    loop, dependencies.clob.fetch_book(str(row["token_id"]))
+                )
+                detail["request_count"] = int(getattr(book, "request_attempts", 1))
+            except Exception as exc:
+                detail["stages"]["clob_preflight"] = f"clob_error:{type(exc).__name__}"
+                _record_skip(report, detail, detail["stages"]["clob_preflight"])
+                continue
+            clob_error = (
                 None
                 if book
                 and not getattr(book, "error_code", None)
@@ -589,28 +609,37 @@ def process_approved_wallet_trades(
                 and getattr(book, "asks", None)
                 else "clob_evidence_invalid"
             )
-        detail["stages"]["clob_preflight"] = "ok" if error is None else error
-        if error:
-            _record_skip(report, detail, error)
-            continue
-        try:
-            bids, asks, raw_bid_n, raw_ask_n, level_error = _bounded_book_levels(book)
-        except (AttributeError, TypeError, ValueError) as exc:
-            bids, asks, raw_bid_n, raw_ask_n, level_error = [], [], 0, 0, f"depth_normalization_error:{type(exc).__name__}"
-        detail["raw_bid_level_count"] = raw_bid_n
-        detail["raw_ask_level_count"] = raw_ask_n
-        detail["persisted_bid_level_count"] = len(bids)
-        detail["persisted_ask_level_count"] = len(asks)
-        if level_error:
-            detail["stages"]["levels"] = level_error
-            _record_skip(report, detail, level_error)
-            continue
+            detail["stages"]["clob_preflight"] = "ok" if clob_error is None else clob_error
+            if clob_error:
+                _record_skip(report, detail, clob_error)
+                continue
+            # Depth normalization (sync, guarded).
+            try:
+                bids, asks, raw_bid_n, raw_ask_n, level_error = _bounded_book_levels(book)
+            except (AttributeError, TypeError, ValueError) as exc:
+                bids, asks, raw_bid_n, raw_ask_n, level_error = [], [], 0, 0, f"depth_normalization_error:{type(exc).__name__}"
+            detail["raw_bid_level_count"] = raw_bid_n
+            detail["raw_ask_level_count"] = raw_ask_n
+            detail["persisted_bid_level_count"] = len(bids)
+            detail["persisted_ask_level_count"] = len(asks)
+            if level_error:
+                detail["stages"]["levels"] = level_error
+                _record_skip(report, detail, level_error)
+                continue
+            # Defer dry-run evaluation / write persistence to Phase B (outside
+            # the running loop, where snapshot_one is safe).
+            staged.append((row, detail, market, outcome, book, bids, asks))
+    finally:
+        loop.close()
+
+    # ── Phase B: process staged rows with no running event loop ──────────────
+    for row, detail, market, outcome, book, bids, asks in staged:
         if not write:
-            # Defect fix #2: the dry-run now executes the full in-memory
-            # Trade Copyability v1 + paper-signal evaluation (reusing the exact
-            # pure calls the write path uses) WITHOUT any persistence. The
-            # allowlisted evidence tables are reported as would-write actions so
-            # the operator can see precisely what a real --write would persist.
+            # The dry-run executes the full in-memory Trade Copyability v1 +
+            # paper-signal evaluation (reusing the exact pure calls the write
+            # path uses) WITHOUT any persistence. The allowlisted evidence
+            # tables are reported as would-write actions so the operator can see
+            # precisely what a real --write would persist.
             _evaluate_dry_run_decision(
                 detail, row, market, outcome, book, bids, asks, address,
             )
