@@ -85,8 +85,13 @@ def _book_response(
 # A. Request construction
 # ─────────────────────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_request_uses_get_book_path_and_token_param() -> None:
-    """Correct HTTP method, correct /book path, correct token param."""
+async def test_request_uses_get_book_path_and_token_id_param() -> None:
+    """Correct HTTP method, correct /book path, correct token_id param.
+
+    Regression guard for the CLOB /book request parameter. The CLOB API
+    requires ``?token_id=<token>``; the obsolete ``?token=<token>`` form
+    returns HTTP 400 ``Invalid token id``. See fix/clob-book-token-id-param.
+    """
     captured: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -105,8 +110,120 @@ async def test_request_uses_get_book_path_and_token_param() -> None:
     req = captured[0]
     assert req.method == "GET"
     assert req.url.path == "/book"
-    # The ``token`` query parameter is preserved verbatim.
-    assert req.url.params.get("token") == "TOKEN123"
+    # The ``token_id`` query parameter is preserved verbatim.
+    assert req.url.params.get("token_id") == "TOKEN123"
+    # The obsolete ``token`` parameter must NOT be used.
+    assert req.url.params.get("token") is None
+
+
+@pytest.mark.asyncio
+async def test_request_preserves_exact_full_token_string() -> None:
+    """The exact source token string must be passed through verbatim.
+
+    Real CLOB token ids are large decimal integers; a transform (e.g.
+    stripping or reformatting) would break the lookup. We assert the
+    full decimal value reaches the wire unchanged.
+    """
+    TOKEN = "104431860535489654020481219089291817898241901940037260095979653681449084465327"
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json=_book_response(
+            bids=[["0.45", "100"]], asks=[["0.55", "100"]],
+        ))
+
+    client = _make_client(handler)
+    try:
+        await client.fetch_book(TOKEN)
+    finally:
+        await client._http.aclose()
+
+    assert len(captured) == 1
+    assert captured[0].url.params.get("token_id") == TOKEN
+
+
+@pytest.mark.asyncio
+async def test_obsolete_token_param_is_not_used() -> None:
+    """The obsolete ``?token=`` parameter must never appear on the wire."""
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json=_book_response(
+            bids=[["0.45", "100"]], asks=[["0.55", "100"]],
+        ))
+
+    client = _make_client(handler)
+    try:
+        await client.fetch_book("ANYTOKEN")
+    finally:
+        await client._http.aclose()
+
+    assert len(captured) == 1
+    assert "token" not in captured[0].url.params
+    assert captured[0].url.params.get("token_id") == "ANYTOKEN"
+
+
+@pytest.mark.asyncio
+async def test_http_400_invalid_token_id_surfaced_with_token_id_param() -> None:
+    """A malformed/unknown token returns HTTP 400, which the adapter must
+    surface as HTTP_4XX (no retry) with the real status + body message.
+
+    This reproduces the production symptom that motivated the fix: the
+    CLOB /book endpoint answers ``?token_id=<token>`` with HTTP 400
+    ``Invalid token id`` for bad inputs. The adapter preserves the bounded
+    error code, status, and message rather than crashing.
+    """
+    call_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        # Confirm the request used the correct parameter.
+        assert request.url.params.get("token_id") == "BADTOKEN"
+        assert request.url.params.get("token") is None
+        return httpx.Response(400, text='{"error":"Invalid token id"}')
+
+    client = _make_client(handler, max_retries=5)
+    try:
+        book = await client.fetch_book("BADTOKEN")
+    finally:
+        await client._http.aclose()
+    assert call_count == 1  # 4xx is not retried
+    assert book.error_code == "HTTP_4XX"
+    assert book.http_status == 400
+    assert book.request_attempts == 1
+    assert "Invalid token id" in (book.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_valid_response_with_token_id_param_normalizes_bids_asks() -> None:
+    """A valid two-sided book fetched via token_id produces normalized
+    best bid/ask and correct request-attempt count.
+    """
+    captured: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json=_book_response(
+            bids=[["0.49", "10"]], asks=[["0.51", "20"]],
+        ))
+
+    client = _make_client(handler)
+    try:
+        book = await client.fetch_book("TOKEN_XYZ")
+    finally:
+        await client._http.aclose()
+
+    assert len(captured) == 1
+    assert captured[0].url.params.get("token_id") == "TOKEN_XYZ"
+    assert book.error_code is None
+    assert book.request_attempts == 1
+    assert book.best_bid == 0.49
+    assert book.best_ask == 0.51
+    assert book.bid_level_count == 1
+    assert book.ask_level_count == 1
 
 
 @pytest.mark.asyncio
