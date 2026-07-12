@@ -284,44 +284,30 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 http = httpx.AsyncClient(base_url=settings.clob_base_url, timeout=10.0)
                 closable = _make_closable(adapter, http)
-                try:
-                    clob = PolymarketClobClient(
-                        http_client=http,
-                        base_url=settings.clob_base_url,
-                        timeout_seconds=10.0,
-                        max_retries=min(3, settings.clob_max_retries),
-                        requests_per_minute=settings.clob_rpm,
-                    )
-                    deps = BridgeDependencies(gamma=adapter, clob=clob)
-                    client_close_hooks = [closable]
-                    report_obj = process_approved_wallet_trades(
-                        db,
-                        wallet=wallet,
-                        limit=args.limit,
-                        dependencies=deps,
-                        write=True,
-                        write_authorization=_issue_write_capability(),
-                        source_trade_id=args.source_trade_id,
-                        client_close_hooks=client_close_hooks,
-                    )
-                    cleanup_errors = list(getattr(report_obj, "cleanup_errors", []))
-                    report = report_obj.as_dict()
-                    if backup_meta is not None:
-                        report["backup"] = backup_meta
-                    check_rss_limit("pr25a:after-write", get_max_rss_mb_from_env())
-                finally:
-                    # Same-loop-safe cleanup: close the adapters/http on a
-                    # fresh loop even on early failure paths.
-                    try:
-                        import asyncio
-
-                        loop = asyncio.new_event_loop()
-                        try:
-                            loop.run_until_complete(closable.aclose())
-                        finally:
-                            loop.close()
-                    except Exception:  # noqa: BLE001 - best-effort pre-report close
-                        pass
+                clob = PolymarketClobClient(
+                    http_client=http,
+                    base_url=settings.clob_base_url,
+                    timeout_seconds=10.0,
+                    max_retries=min(3, settings.clob_max_retries),
+                    requests_per_minute=settings.clob_rpm,
+                )
+                deps = BridgeDependencies(gamma=adapter, clob=clob)
+                client_close_hooks = [closable]
+                report_obj = process_approved_wallet_trades(
+                    db,
+                    wallet=wallet,
+                    limit=args.limit,
+                    dependencies=deps,
+                    write=True,
+                    write_authorization=_issue_write_capability(),
+                    source_trade_id=args.source_trade_id,
+                    client_close_hooks=client_close_hooks,
+                )
+                cleanup_errors = list(getattr(report_obj, "cleanup_errors", []))
+                report = report_obj.as_dict()
+                if backup_meta is not None:
+                    report["backup"] = backup_meta
+                check_rss_limit("pr25a:after-write", get_max_rss_mb_from_env())
         else:
             # Dry run: read-only DB, no backup, no network clients needed by the
             # gate logic. Adapters are still constructed (matched by the dry-run
@@ -332,37 +318,25 @@ def main(argv: list[str] | None = None) -> int:
             )
             http = httpx.AsyncClient(base_url=settings.clob_base_url, timeout=10.0)
             closable = _make_closable(adapter, http)
-            try:
-                clob = PolymarketClobClient(
-                    http_client=http,
-                    base_url=settings.clob_base_url,
-                    timeout_seconds=10.0,
-                    max_retries=min(3, settings.clob_max_retries),
-                    requests_per_minute=settings.clob_rpm,
-                )
-                deps = BridgeDependencies(gamma=adapter, clob=clob)
-                report_obj = process_approved_wallet_trades(
-                    db,
-                    wallet=wallet,
-                    limit=args.limit,
-                    dependencies=deps,
-                    write=False,
-                    source_trade_id=args.source_trade_id,
-                    client_close_hooks=[closable],
-                )
-                cleanup_errors = list(getattr(report_obj, "cleanup_errors", []))
-                report = report_obj.as_dict()
-            finally:
-                try:
-                    import asyncio
-
-                    loop = asyncio.new_event_loop()
-                    try:
-                        loop.run_until_complete(closable.aclose())
-                    finally:
-                        loop.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            clob = PolymarketClobClient(
+                http_client=http,
+                base_url=settings.clob_base_url,
+                timeout_seconds=10.0,
+                max_retries=min(3, settings.clob_max_retries),
+                requests_per_minute=settings.clob_rpm,
+            )
+            deps = BridgeDependencies(gamma=adapter, clob=clob)
+            report_obj = process_approved_wallet_trades(
+                db,
+                wallet=wallet,
+                limit=args.limit,
+                dependencies=deps,
+                write=False,
+                source_trade_id=args.source_trade_id,
+                client_close_hooks=[closable],
+            )
+            cleanup_errors = list(getattr(report_obj, "cleanup_errors", []))
+            report = report_obj.as_dict()
     except LockError as exc:
         print(f"error: global operational lock unavailable: {exc}", file=sys.stderr)
         return 3
