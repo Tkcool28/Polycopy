@@ -11,7 +11,7 @@ import inspect
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, Sequence
 from uuid import uuid4
 
 from polycopy.db.copy_candidate_persistence import persist_copy_candidate
@@ -101,6 +101,11 @@ class BridgeReport:
     write_counts: dict[str, int] = field(default_factory=dict)
     forbidden_table_delta: dict[str, int] = field(default_factory=dict)
     failures: list[dict[str, str]] = field(default_factory=list)
+    # Async-client cleanup (e.g. shared httpx client / adapters) runs on the
+    # bridge's single batch loop. If a hook raises, the error is recorded here
+    # and the report is STILL returned so the caller can always print it. The
+    # bridge never raises cleanup errors before returning the report.
+    cleanup_errors: list[dict[str, str]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +118,7 @@ class BridgeReport:
             "write_counts": self.write_counts,
             "forbidden_table_delta": self.forbidden_table_delta,
             "failures": self.failures,
+            "cleanup_errors": self.cleanup_errors,
             "allowed_write_tables": sorted(ALLOWED_WRITE_TABLES),
             "forbidden_write_tables": sorted(FORBIDDEN_WRITE_TABLES),
         }
@@ -526,6 +532,7 @@ def process_approved_wallet_trades(
     write: bool = False,
     write_authorization: object | None = None,
     source_trade_id: str | None = None,
+    client_close_hooks: "Sequence[Callable[[asyncio.AbstractEventLoop], Any]]" = (),
 ) -> BridgeReport:
     address = canonical_wallet_address(wallet)
     if address is None:
@@ -555,6 +562,12 @@ def process_approved_wallet_trades(
     # because snapshot_one() raises inside a running loop (it manages its own
     # self-contained loop). Phase B therefore runs with no loop running, exactly
     # as the original code did — so --write semantics are preserved unchanged.
+    #
+    # Any injected ``client_close_hooks`` (e.g. the CLI's shared httpx client +
+    # adapters) are aclosed on THIS loop, before ``loop.close()`` — so the
+    # caller must never call ``asyncio.run(client.aclose())`` on a fresh loop
+    # afterward (that re-binds a transport to an already-closed loop and raises
+    # ``RuntimeError: Event loop is closed``).
     loop = asyncio.new_event_loop()
     staged: list[tuple[Any, dict[str, Any], Any, Any, Any, list[Any], list[Any]]] = []
     try:
@@ -630,6 +643,26 @@ def process_approved_wallet_trades(
             # the running loop, where snapshot_one is safe).
             staged.append((row, detail, market, outcome, book, bids, asks))
     finally:
+        # Aclose every injected async client on the SAME loop that ran the
+        # Gamma/CLOB requests, so their transports are released cleanly. This
+        # must happen before loop.close(); the caller must NOT re-close them on
+        # a fresh loop (see module docstring / PR25A CLI lifecycle fix).
+        #
+        # A hook failure is recorded on ``report.cleanup_errors`` and the report
+        # is STILL returned; we never raise cleanup errors before returning the
+        # report (that would erase an already-generated report in the caller).
+        close_errors: list[Exception] = []
+        for hook in client_close_hooks:
+            try:
+                result = hook(loop)
+                if inspect.isawaitable(result):
+                    loop.run_until_complete(result)
+            except Exception as exc:  # report, don't silently swallow
+                close_errors.append(exc)
+        for exc in close_errors:
+            report.cleanup_errors.append(
+                {"type": type(exc).__name__, "error": str(exc)}
+            )
         loop.close()
 
     # ── Phase B: process staged rows with no running event loop ──────────────
