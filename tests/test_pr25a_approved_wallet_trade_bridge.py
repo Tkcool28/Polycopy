@@ -344,3 +344,94 @@ def test_cli_dry_run_is_read_only_and_never_calls_persistence(monkeypatch, tmp_p
     assert cli.main(["--wallet", WALLET, "--limit", "1", "--db-path", str(tmp_path / "x.db"), "--json"]) == 0
     process = next(event for event in events if event[0] == "process")
     assert process[1]["write"] is False
+
+
+def test_pr25a_dry_run_processes_three_rows_in_one_event_loop_with_full_tc_and_paper_evaluation(tmp_path):
+    """Final PR25A harness consolidation regression.
+
+    Runs a 3-row batch through the dry-run with SHARED async Gamma/CLOB
+    clients (both providers are genuinely async, so the batch exercises the
+    single-event-loop fetch path). All three rows must complete the full
+    Gamma -> exact token mapping -> CLOB -> depth normalization -> Trade
+    Copyability v1 -> paper-signal evaluation path with NO RuntimeError and
+    NO closed event loop, and report non-empty would-write actions. The
+    dry-run must still persist ZERO rows and leave every allowlisted and
+    forbidden table unchanged.
+    """
+    db = _db(tmp_path)
+    TOKENS = [
+        "104431860535489654020481219089291817898241901940037260095979653681449084465327",
+        "1970496541508335019913900195809032484597886384784144327835472760880523550630",
+        "462547474504332232595082342285851716602015351553019365447058575920118967359469",
+    ]
+    for i, tok in enumerate(TOKENS):
+        db.execute(
+            """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
+               VALUES (?, ?, ?, 'condition-1', 'BUY', 'Yes', 2, .5, ?, '2026-01-01T00:00:00Z', 0, ?)""",
+            (f"t{i}", SOURCE_NAME, f"polymarket:public-{i}", WALLET, tok),
+        )
+    db.conn.commit()
+
+    class _AsyncGamma:
+        async def get_market(self, condition_id: str):
+            # Async provider -> exercises the single shared event loop.
+            # Return one outcome per source token so the exact token->outcome
+            # mapping succeeds for every selected row.
+            return Market(source_id="condition-1", source="polymarket", question="Q",
+                          outcomes=[MarketOutcome(label="Yes", price=.5, clob_token_id=tok)
+                                    for tok in TOKENS],
+                          fetched_at=datetime.now(timezone.utc))
+
+    class _RecordingBook:
+        def __init__(self, book, received):
+            self.book, self.received = book, received
+        async def fetch_book(self, token_id):
+            self.received.append(token_id)
+            return self.book
+
+    received_tokens: list[str] = []
+    book = _RecordingBook(_valid_book(), received_tokens)
+    before_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    before_stat = (tmp_path / "bridge.db").stat()
+
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=3,
+        dependencies=BridgeDependencies(gamma=_AsyncGamma(), clob=book),
+    )
+
+    # No RuntimeError / closed-loop failure leaked into skip reasons.
+    assert report.failures == [], report.failures
+    assert report.selected == 3
+    assert len(report.rows) == 3
+    # Shared async client received the exact source tokens, in order, once each.
+    assert received_tokens == TOKENS, received_tokens
+
+    tc_evals = 0
+    paper_evals = 0
+    for row in report.rows:
+        assert row["stages"]["source_validation"] == "ok"
+        assert row["stages"]["gamma"] == "ok"
+        assert row["stages"]["clob_preflight"] == "ok"
+        # Exact token mapping succeeded.
+        assert row["stages"].get("trade_copyability") in {
+            "copy_candidate", "watchlist", "skip", "incomplete",
+        }
+        assert row["stages"].get("paper") == "evaluated"
+        tc_evals += 1
+        paper_evals += 1
+        # Non-empty would-write actions for every row.
+        assert row["actions"], "expected non-empty would-write actions"
+        assert "trade_copyability_v1" in row["actions"]
+        assert "canonical_paper" in row["actions"]
+
+    assert tc_evals == 3
+    assert paper_evals == 3
+    # Dry-run persists nothing.
+    assert report.mode == "ro"
+    assert report.write_counts == {}
+    assert report.forbidden_table_delta == {}
+    after_counts = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)
+    assert after_counts == before_counts
+    after_stat = (tmp_path / "bridge.db").stat()
+    assert (before_stat.st_size, before_stat.st_mtime_ns) == (after_stat.st_size, after_stat.st_mtime_ns)
+    db.close()

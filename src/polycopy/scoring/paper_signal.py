@@ -1370,22 +1370,31 @@ def _persist_incomplete_signal(
     )
 
 
-def persist_bridge_trade_copyability_v1(db: Database, candidate_id: int) -> tuple[int, int]:
-    """Persist frozen Trade Copyability v1 and its bounded paper input.
+def compute_bridge_trade_copyability_and_paper_input(
+    *,
+    inputs: PersistedPaperSignalInputs,
+    now: datetime,
+) -> tuple[TradeScoreResult, PaperSignalDecisionInput, str]:
+    """Pure frozen-Trade-Copyability-v1 + paper-signal-input computation.
 
-    This bridge intentionally does not synthesize or invoke wallet/category,
-    shadow, exit, approval, or execution paths.  It scores only persisted
-    candidate/snapshot/depth evidence, persists the v1 decision through its
-    normal owner, then records that exact decision id in the paper-signal
-    input.  Missing independent paper evidence remains an honest INCOMPLETE.
+    Shared by the bridge write path (which persists the result) and the
+    PR25A dry-run (which records it without any persistence).  This function
+    performs NO I/O and NO database access — ``inputs`` is already materialized
+    (loaded from the DB in the write path, or built in-memory for the dry-run).
+
+    Returns ``(trade_result, typed_input, trade_idempotency_key)``.  The
+    idempotency key is the canonical key the write path must pass to
+    :func:`persist_trade_score_v1`; the dry-run ignores it.
+
+    The Trade Copyability v1 evaluation and the bounded paper-signal input are
+    produced by the exact same pure calls the persisted path uses, so a dry-run
+    and a real write can never diverge in the scoring logic.
     """
-    inputs = load_persisted_paper_signal_inputs(db, candidate_id)
     if inputs.candidate is None or inputs.snapshot is None:
-        raise ValueError("bridge paper persistence requires persisted candidate and snapshot")
+        raise ValueError("bridge paper evaluation requires candidate and snapshot")
     if inputs.wallet_id is None or inputs.source_trade_id is None:
-        raise ValueError("bridge paper persistence requires candidate identity")
+        raise ValueError("bridge paper evaluation requires candidate identity")
 
-    now = datetime.now(timezone.utc)
     walk = walk_persisted_depth(inputs)
     trade_input = build_trade_copyability_input(inputs, walk=walk)
     trade_result = compute_trade_score_v1(
@@ -1414,18 +1423,17 @@ def persist_bridge_trade_copyability_v1(db: Database, candidate_id: int) -> tupl
             "category_label": category_label or "missing",
         },
     )
-    trade_id = persist_trade_score_v1(
-        db, inputs.wallet_id, inputs.source_trade_id, trade_result,
-        idempotency_key=trade_idem, candidate_id=candidate_id,
-        price_snapshot_id=inputs.snapshot_id, source_data_timestamp=snap_ts,
-    )
     typed_input = PaperSignalDecisionInput(
-        candidate_id=candidate_id,
-        source_trade_id=inputs.source_trade_id,
-        wallet_id=inputs.wallet_id,
+        candidate_id=(
+            int(inputs.candidate["id"])
+            if inputs.candidate and inputs.candidate.get("id") is not None
+            else 0
+        ),
+        source_trade_id=inputs.source_trade_id or "",
+        wallet_id=inputs.wallet_id or "",
         wallet_score_decision_id=None,
         category_score_decision_id=None,
-        trade_score_decision_id=int(trade_id),
+        trade_score_decision_id=None,
         price_snapshot_id=inputs.snapshot_id,
         intended_stake=inputs.intended_stake,
         category_label=category_label,
@@ -1440,6 +1448,34 @@ def persist_bridge_trade_copyability_v1(db: Database, candidate_id: int) -> tupl
         final_verdict="incomplete",
         final_reason="bridge_required_paper_evidence_incomplete",
         is_approved=0,
+    )
+    return trade_result, typed_input, trade_idem
+
+
+def persist_bridge_trade_copyability_v1(db: Database, candidate_id: int) -> tuple[int, int]:
+    """Persist frozen Trade Copyability v1 and its bounded paper input.
+
+    This bridge intentionally does not synthesize or invoke wallet/category,
+    shadow, exit, approval, or execution paths.  It scores only persisted
+    candidate/snapshot/depth evidence, persists the v1 decision through its
+    normal owner, then records that exact decision id in the paper-signal
+    input.  Missing independent paper evidence remains an honest INCOMPLETE.
+    """
+    inputs = load_persisted_paper_signal_inputs(db, candidate_id)
+    if inputs.candidate is None or inputs.snapshot is None:
+        raise ValueError("bridge paper persistence requires persisted candidate and snapshot")
+    if inputs.wallet_id is None or inputs.source_trade_id is None:
+        raise ValueError("bridge paper persistence requires candidate identity")
+
+    now = datetime.now(timezone.utc)
+    trade_result, typed_input, trade_idem = compute_bridge_trade_copyability_and_paper_input(
+        inputs=inputs, now=now,
+    )
+    snap_ts = inputs.snapshot.get("fetched_at")
+    trade_id = persist_trade_score_v1(
+        db, inputs.wallet_id, inputs.source_trade_id, trade_result,
+        idempotency_key=trade_idem, candidate_id=candidate_id,
+        price_snapshot_id=inputs.snapshot_id, source_data_timestamp=snap_ts,
     )
     paper_idem = generate_idempotency_key(
         formula_name="paper_signal",
