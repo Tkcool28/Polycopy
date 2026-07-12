@@ -57,6 +57,7 @@ class BackupResult:
     integrity_check: Optional[str] = None
     foreign_key_violations: Optional[int] = None
     source_trades_count: Optional[int] = None
+    schema_version: Optional[int] = None
     error: Optional[str] = None
 
     def as_dict(self) -> dict:
@@ -69,6 +70,7 @@ class BackupResult:
             "integrity_check": self.integrity_check,
             "foreign_key_violations": self.foreign_key_violations,
             "source_trades_count": self.source_trades_count,
+            "schema_version": self.schema_version,
             "error": self.error,
         }
 
@@ -166,6 +168,16 @@ def create_verified_backup(db_path: str, *, backup_path: Optional[str] = None) -
                 )
             except sqlite3.Error:
                 res.source_trades_count = None
+            # Canonical schema version lives in _meta.schema_version (NOT
+            # PRAGMA schema_version, which is a connection schema cookie). Read
+            # it directly from the completed backup during independent verify.
+            try:
+                _sv = bk.execute(
+                    "SELECT value FROM _meta WHERE key='schema_version'"
+                ).fetchone()
+                res.schema_version = int(_sv[0]) if _sv else None
+            except sqlite3.Error:
+                res.schema_version = None
         finally:
             bk.close()
     except sqlite3.Error as exc:
