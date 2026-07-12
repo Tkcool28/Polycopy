@@ -46,7 +46,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Optional
@@ -1477,6 +1477,14 @@ def persist_bridge_trade_copyability_v1(db: Database, candidate_id: int) -> tupl
         idempotency_key=trade_idem, candidate_id=candidate_id,
         price_snapshot_id=inputs.snapshot_id, source_data_timestamp=snap_ts,
     )
+    # Provenance fix (PR25A paper-signal → Trade Copyability link). The paper
+    # idempotency key below MUST embed the same ``trade_id`` so a rerun that
+    # re-persists trade scoring produces a new paper row rather than silently
+    # reusing the previous audit row. ``typed_input`` is a frozen dataclass, so
+    # rebuild it with the canonical persisted TC decision id before persisting
+    # the paper signal. This is the exact id the paper row must reference.
+    trade_id_int = int(trade_id)
+    typed_input = replace(typed_input, trade_score_decision_id=trade_id_int)
     paper_idem = generate_idempotency_key(
         formula_name="paper_signal",
         formula_version=PAPER_SIGNAL_FORMULA_VERSION,
