@@ -384,8 +384,11 @@ def load_persisted_paper_signal_inputs(
     )
 
     # ---- 3. Source trade --------------------------------------------------
+    # Candidates retain both identities: ``source_trade_id`` is the canonical
+    # public source identity, while ``source_trade_internal_id`` is the UUID
+    # that references ``source_trades.id``.  The loader must use the latter.
     source_trade_id = (
-        candidate.get("source_trade_id") if candidate else None
+        candidate.get("source_trade_internal_id") if candidate else None
     )
     wallet_id = (
         candidate.get("wallet_id") if candidate else None
@@ -1337,22 +1340,129 @@ def _persist_incomplete_signal(
             "reason": reason,
         },
     )
-    return persist_paper_signal(
-        db,
-        candidate_id,
-        inputs.wallet_id or "",
-        "incomplete",  # canonical lowercase V1 verdict (SignalVerdict.INCOMPLETE.value)
-        reason,
-        float(wallet_score.score) if wallet_score is not None else 0.0,
-        0.0,
-        0.0,
-        None,
-        "incomplete",  # canonical lowercase V1 verdict
-        snap_ts,
-        inputs.source_trade_id,
-        inputs.snapshot_id,
-        idempotency_key=ps_idem,
+    typed_input = PaperSignalDecisionInput(
+        candidate_id=candidate_id,
+        source_trade_id=inputs.source_trade_id or "",
+        wallet_id=inputs.wallet_id or "",
+        wallet_score_decision_id=None,
+        category_score_decision_id=None,
+        trade_score_decision_id=None,
+        price_snapshot_id=inputs.snapshot_id,
+        intended_stake=inputs.intended_stake,
+        category_label=_resolve_category_label_safe(candidate=inputs.candidate, snapshot=inputs.snapshot),
+        behavior_classification=(behavior_result.classification.value if behavior_result else "unknown"),
+        wallet_formula_name="wallet_score",
+        wallet_formula_version=WALLET_FORMULA_VERSION,
+        category_formula_name="category_wallet_score",
+        category_formula_version=CATEGORY_FORMULA_VERSION,
+        trade_formula_name="trade_copyability",
+        trade_formula_version=TRADE_FORMULA_VERSION,
+        evaluation_timestamp=datetime.now(timezone.utc),
+        final_verdict="incomplete",
+        final_reason=reason,
+        is_approved=0,
     )
+    return persist_paper_signal(
+        db, candidate_id, inputs.wallet_id or "", "incomplete", reason,
+        float(wallet_score.score) if wallet_score is not None else 0.0,
+        0.0, 0.0, None, "incomplete", snap_ts, inputs.source_trade_id,
+        inputs.snapshot_id, idempotency_key=ps_idem, typed_input=typed_input,
+    )
+
+
+def persist_bridge_trade_copyability_v1(db: Database, candidate_id: int) -> tuple[int, int]:
+    """Persist frozen Trade Copyability v1 and its bounded paper input.
+
+    This bridge intentionally does not synthesize or invoke wallet/category,
+    shadow, exit, approval, or execution paths.  It scores only persisted
+    candidate/snapshot/depth evidence, persists the v1 decision through its
+    normal owner, then records that exact decision id in the paper-signal
+    input.  Missing independent paper evidence remains an honest INCOMPLETE.
+    """
+    inputs = load_persisted_paper_signal_inputs(db, candidate_id)
+    if inputs.candidate is None or inputs.snapshot is None:
+        raise ValueError("bridge paper persistence requires persisted candidate and snapshot")
+    if inputs.wallet_id is None or inputs.source_trade_id is None:
+        raise ValueError("bridge paper persistence requires candidate identity")
+
+    now = datetime.now(timezone.utc)
+    walk = walk_persisted_depth(inputs)
+    trade_input = build_trade_copyability_input(inputs, walk=walk)
+    trade_result = compute_trade_score_v1(
+        wallet_id=inputs.wallet_id,
+        source_trade_id=inputs.source_trade_id,
+        input=trade_input,
+        now=now,
+    )
+    snap_ts = inputs.snapshot.get("fetched_at")
+    category_label = _resolve_category_label_safe(
+        candidate=inputs.candidate, snapshot=inputs.snapshot,
+    )
+    trade_idem = generate_idempotency_key(
+        formula_name="trade_copyability",
+        formula_version=trade_result.formula_version,
+        wallet_id=inputs.wallet_id,
+        source_trade_id=inputs.source_trade_id,
+        source_data_timestamp=snap_ts,
+        extra_params={
+            "snapshot_id": inputs.snapshot_id,
+            "depth_hash": inputs.depth_hash,
+            "intended_stake": (
+                f"{float(inputs.intended_stake):.2f}"
+                if inputs.intended_stake is not None else "missing"
+            ),
+            "category_label": category_label or "missing",
+        },
+    )
+    trade_id = persist_trade_score_v1(
+        db, inputs.wallet_id, inputs.source_trade_id, trade_result,
+        idempotency_key=trade_idem, candidate_id=candidate_id,
+        price_snapshot_id=inputs.snapshot_id, source_data_timestamp=snap_ts,
+    )
+    typed_input = PaperSignalDecisionInput(
+        candidate_id=candidate_id,
+        source_trade_id=inputs.source_trade_id,
+        wallet_id=inputs.wallet_id,
+        wallet_score_decision_id=None,
+        category_score_decision_id=None,
+        trade_score_decision_id=int(trade_id),
+        price_snapshot_id=inputs.snapshot_id,
+        intended_stake=inputs.intended_stake,
+        category_label=category_label,
+        behavior_classification="unknown",
+        wallet_formula_name="wallet_score",
+        wallet_formula_version=WALLET_FORMULA_VERSION,
+        category_formula_name="category_wallet_score",
+        category_formula_version=CATEGORY_FORMULA_VERSION,
+        trade_formula_name="trade_copyability",
+        trade_formula_version=trade_result.formula_version,
+        evaluation_timestamp=now,
+        final_verdict="incomplete",
+        final_reason="bridge_required_paper_evidence_incomplete",
+        is_approved=0,
+    )
+    paper_idem = generate_idempotency_key(
+        formula_name="paper_signal",
+        formula_version=PAPER_SIGNAL_FORMULA_VERSION,
+        wallet_id=inputs.wallet_id,
+        source_trade_id=inputs.source_trade_id,
+        source_data_timestamp=snap_ts,
+        extra_params={
+            "candidate_id": candidate_id,
+            "snapshot_id": inputs.snapshot_id,
+            "depth_hash": inputs.depth_hash,
+            "trade_score_decision_id": int(trade_id),
+            "trade_score_verdict": trade_result.verdict.value,
+        },
+    )
+    paper_id = persist_paper_signal(
+        db, candidate_id, inputs.wallet_id, "incomplete",
+        "bridge_required_paper_evidence_incomplete", 0.0,
+        float(trade_result.score), 0.0, None, "incomplete", snap_ts,
+        inputs.source_trade_id, inputs.snapshot_id, idempotency_key=paper_idem,
+        typed_input=typed_input,
+    )
+    return int(trade_id), int(paper_id)
 
 
 def _compute_and_persist_shadow_v2(
