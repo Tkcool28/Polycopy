@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from polycopy.db.database import Database
@@ -128,7 +129,7 @@ def test_write_without_allow_live_rejected(tmp_path: Path) -> None:
     db_path = tmp_path / "auth.db"
     Database(db_path).connect().close()
     completed = subprocess.run(
-        [str(ROOT / ".venv/bin/python"), "scripts/ingest_wallet_evidence_history.py",
+        [sys.executable, "scripts/ingest_wallet_evidence_history.py",
          "--write", "--db-path", str(db_path)],
         cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT / "src"),
                        "POLYCOPY_APPROVED_SOURCE_WALLET": WALLET},
@@ -140,7 +141,7 @@ def test_write_without_allow_live_rejected(tmp_path: Path) -> None:
 
 def test_write_without_confirm_production_db_rejected_for_prod_db(tmp_path: Path) -> None:
     completed = subprocess.run(
-        [str(ROOT / ".venv/bin/python"), "scripts/ingest_wallet_evidence_history.py",
+        [sys.executable, "scripts/ingest_wallet_evidence_history.py",
          "--mock-live", "--write", "--db-path", str(tmp_path / "x.db")],
         cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT / "src"),
                        "POLYCOPY_APPROVED_SOURCE_WALLET": WALLET},
@@ -153,7 +154,7 @@ def test_write_without_confirm_production_db_rejected_for_prod_db(tmp_path: Path
 def test_offline_cli_makes_no_network_call(tmp_path: Path) -> None:
     """No --allow-live => process completes offline (live_read_performed false)."""
     completed = subprocess.run(
-        [str(ROOT / ".venv/bin/python"), "scripts/ingest_wallet_evidence_history.py", "--json"],
+        [sys.executable, "scripts/ingest_wallet_evidence_history.py", "--json"],
         cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT / "src"),
                        "POLYCOPY_APPROVED_SOURCE_WALLET": WALLET},
         text=True, capture_output=True, check=True,
@@ -466,7 +467,7 @@ def test_authorized_write_end_to_end_changes_only_source_trades(tmp_path: Path) 
     db_path = tmp_path / "hist_write.db"
     Database(db_path).connect().close()
     completed = subprocess.run(
-        [str(ROOT / ".venv/bin/python"), "scripts/ingest_wallet_evidence_history.py",
+        [sys.executable, "scripts/ingest_wallet_evidence_history.py",
          "--mock-live", "--write", "--confirm-production-db",
          "--input-file", str(tmp_path / "fixture.json"),
          "--db-path", str(db_path), "--json"],
