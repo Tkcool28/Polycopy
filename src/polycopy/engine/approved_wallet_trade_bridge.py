@@ -155,12 +155,24 @@ def select_approved_source_trades(
             raise ValueError("--source-trade-id must be non-empty")
         where.append("source_trade_id = ?")
         params.append(source_trade_id)
+    else:
+        # Anti-replay exclusion: in the DEFAULT scan path (no explicit
+        # --source-trade-id), skip source trades already represented by a
+        # bridge copy_candidate so a plain --limit N advances to fresh trades.
+        # The bridge writes copy_candidates.source_trade_internal_id from
+        # source_trades.id, so excluding it deterministically advances the
+        # cursor without changing the canonical ORDER BY. An explicit
+        # --source-trade-id always bypasses this (targeted re-run / repair).
+        where.append(
+            "st.id NOT IN (SELECT source_trade_internal_id FROM copy_candidates)"
+        )
     params.append(limit)
     return db.fetchall(
-        "SELECT id, source, source_trade_id, market_source_id, side, outcome, "
-        "quantity, price, trader_address, timestamp, token_id FROM source_trades "
+        "SELECT st.id, st.source, st.source_trade_id, st.market_source_id, "
+        "st.side, st.outcome, st.quantity, st.price, st.trader_address, "
+        "st.timestamp, st.token_id FROM source_trades st "
         f"WHERE {' AND '.join(where)} "
-        "ORDER BY timestamp ASC, source_trade_id ASC, id ASC LIMIT ?",
+        "ORDER BY st.timestamp ASC, st.source_trade_id ASC, st.id ASC LIMIT ?",
         tuple(params),
     )
 
