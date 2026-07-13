@@ -1172,7 +1172,7 @@ def test_bridge_replay_reuses_rows_and_preserves_corrected_reason(tmp_path):
     tc_id = first.rows[0]["trade_copyability_decision_id"]
     assert db.fetchone("SELECT COUNT(*) AS n FROM paper_signal_decisions")["n"] == 1
     assert db.fetchone("SELECT trade_score_decision_id FROM paper_signal_decisions")["trade_score_decision_id"] == tc_id
-    second = process_approved_wallet_trades(
+    process_approved_wallet_trades(
         db, wallet=WALLET, limit=1, dependencies=deps,
         write=True, write_authorization=_issue_write_capability(),
         source_trade_id="polymarket:public-1",
