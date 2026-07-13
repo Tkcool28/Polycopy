@@ -31,9 +31,17 @@ from uuid import uuid4
 
 from polycopy.db.database import Database
 from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
 
 # Columns inserted by the writer (matches schema v1 source_trades DDL).
 _INSERT_SQL = """
+INSERT OR IGNORE INTO source_trades
+   (id, source, source_trade_id, market_source_id, side, outcome,
+    quantity, price, trader_address, timestamp, is_sample, token_id, metadata_json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_INSERT_SQL_LEGACY = """
 INSERT OR IGNORE INTO source_trades
    (id, source, source_trade_id, market_source_id, side, outcome,
     quantity, price, trader_address, timestamp, is_sample, token_id)
@@ -275,8 +283,8 @@ class WriteResult:
         }
 
 
-def _row_tuple(c: NormalizedSourceTrade) -> tuple:
-    return (
+def _row_tuple(c: NormalizedSourceTrade, *, include_metadata: bool = True) -> tuple:
+    values = (
         str(uuid4()),
         c.source,
         c.source_trade_id,
@@ -290,6 +298,30 @@ def _row_tuple(c: NormalizedSourceTrade) -> tuple:
         int(c.is_sample),
         c.token_id,
     )
+    if include_metadata:
+        values += (serialize_source_trade_metadata(c.metadata),)
+    return values
+
+
+def _metadata_column_available(conn: sqlite3.Connection) -> bool:
+    """Require metadata on latest schemas; tolerate legacy isolated fixtures."""
+    has_column = any(
+        row[1] == "metadata_json" for row in conn.execute("PRAGMA table_info(source_trades)")
+    )
+    if has_column:
+        return True
+    try:
+        row = conn.execute(
+            "SELECT value FROM _meta WHERE key='schema_version'"
+        ).fetchone()
+        if row is not None and int(row[0]) >= 17:
+            raise RuntimeError(
+                "latest source_trades schema is missing required metadata_json column"
+            )
+    except sqlite3.OperationalError:
+        # Narrow support for old, hand-built test fixtures without _meta.
+        pass
+    return False
 
 
 def write_valid_rows(
@@ -361,9 +393,14 @@ def write_valid_rows(
     conn = db.conn
     try:
         # One bounded transaction for the whole batch.
+        # Legacy support is deliberately narrow: latest-schema databases must
+        # expose metadata_json; only pre-v17/hand-built isolated fixtures use
+        # the legacy insert shape.
+        include_metadata = _metadata_column_available(conn)
+        insert_sql = _INSERT_SQL if include_metadata else _INSERT_SQL_LEGACY
         inserted = 0
         for c in eligible:
-            cur = conn.execute(_INSERT_SQL, _row_tuple(c))
+            cur = conn.execute(insert_sql, _row_tuple(c, include_metadata=include_metadata))
             # INSERT OR IGNORE: rowcount == 1 fresh, 0 duplicate (UNIQUE hit).
             if getattr(cur, "rowcount", 0) == 1:
                 inserted += 1
