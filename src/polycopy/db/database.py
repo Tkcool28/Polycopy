@@ -258,6 +258,15 @@ class Database:
         ("trade_copyability_decisions", "evaluation_timestamp"),
     )
 
+    # PR66: v17 source-trade metadata evidence column and wallet-history index
+    # must exist before schema-metadata reconciliation can claim target shape.
+    _REQUIRED_V17_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("source_trades", "metadata_json"),
+    )
+    _REQUIRED_V17_OBJECTS: tuple[str, ...] = (
+        "idx_source_trades_wallet_timestamp",
+    )
+
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
     # already present but these specific indexes are missing.
@@ -266,7 +275,7 @@ class Database:
     )
 
     def _physical_schema_at_target(self) -> bool:
-        """Return True if the live DB already has every required v13/v14 object.
+        """Return True only when the physical schema has every target object.
 
         Used by the migration runner to detect "schema metadata lag":
         a database whose ``_meta.schema_version`` is behind the code's
@@ -290,6 +299,12 @@ class Database:
                 return False
         for table, column in self._REQUIRED_V16_COLUMNS:
             if not self._column_exists(table, column):
+                return False
+        for table, column in self._REQUIRED_V17_COLUMNS:
+            if not self._column_exists(table, column):
+                return False
+        for obj in self._REQUIRED_V17_OBJECTS:
+            if not self._index_exists(obj):
                 return False
         return True
 

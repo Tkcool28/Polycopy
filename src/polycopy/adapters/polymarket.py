@@ -1128,30 +1128,55 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
         trader_address: str,
         since: datetime,
         limit: int = 100,
+        offset: int = 0,
+        return_raw: bool = False,
     ) -> list[SourceTrade]:
         """Fetch trades by a specific trader address from data-api.
 
         The data-api `/trades?user=<addr>` filter is verified (2026-06-28):
         it returns the most-recent trades for that wallet across all markets.
         Pagination via offset+limit works. This is the wallet-discovery path.
+
+        Args:
+            trader_address: Polymarket proxy wallet address.
+            since: only trades at or after this timestamp are kept (applied
+                locally; the data-api does NOT server-side filter by time).
+            limit: page size requested from the data-api. Bounded to
+                ``data_api_window_size``.
+            offset: zero-based offset forwarded to the data-api so OLDER records
+                are fetched upstream on later pages (true offset pagination —
+                no local re-slice of page 0).
+            return_raw: when True, return the original data-api dicts verbatim
+                so downstream consumers can preserve upstream event/taxonomy/
+                series metadata that the typed ``SourceTrade`` discards. The
+                local ``since`` filter is still applied.
         """
         if not trader_address or not str(trader_address).strip():
             return []
         await self._throttle()
         client = await self._get_data_client()
         since_ts = since.timestamp() if isinstance(since, datetime) else 0.0
-        out: list[SourceTrade] = []
+        page_limit = max(1, min(int(limit), self.data_api_window_size))
+        real_offset = max(0, int(offset))
         try:
             resp = await client.get(
                 "/trades",
-                params={"user": trader_address, "limit": min(limit, self.data_api_window_size)},
+                params={
+                    "user": trader_address,
+                    "limit": page_limit,
+                    "offset": real_offset,
+                },
             )
             if resp.status_code == 429:
                 logger.warning("data-api returned 429 on /trades?user; sleeping 2s")
                 await _asyncio_sleep(2.0)
                 resp = await client.get(
                     "/trades",
-                    params={"user": trader_address, "limit": min(limit, self.data_api_window_size)},
+                    params={
+                        "user": trader_address,
+                        "limit": page_limit,
+                        "offset": real_offset,
+                    },
                 )
             resp.raise_for_status()
             data = resp.json()
@@ -1164,6 +1189,9 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
 
         if not isinstance(data, list):
             return []
+
+        out: list[Any] = []
+        seen: set[str] = set()
         for raw in data:
             if not isinstance(raw, dict):
                 continue
@@ -1175,10 +1203,19 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
                     continue
             except (TypeError, ValueError):
                 continue
+            if return_raw:
+                out.append(raw)
+                if len(out) >= page_limit:
+                    break
+                continue
+            sid = deterministic_source_trade_id_v2(raw)
+            if sid in seen:
+                continue
+            seen.add(sid)
             parsed = self._parse_data_api_trade(raw)
             if parsed is not None:
                 out.append(parsed)
-            if len(out) >= limit:
+            if len(out) >= page_limit:
                 break
         return out
 

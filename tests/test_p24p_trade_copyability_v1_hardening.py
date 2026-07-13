@@ -583,7 +583,7 @@ def test_fresh_db_at_schema_v16(tmp_path):
     db = _fresh_db(tmp_path)
     row = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
     assert int(row["value"]) == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 16
+    assert SCHEMA_VERSION >= 16
     db.close()
 
 
@@ -611,7 +611,7 @@ def test_v16_upgrade_from_v15_adds_trace_columns(tmp_path):
     db2 = Database(db_path=tmp_path / "fresh_p24p.db")
     db2.connect()
     assert int(db2.fetchone(
-        "SELECT value FROM _meta WHERE key='schema_version'")["value"]) == 16
+        "SELECT value FROM _meta WHERE key='schema_version'")["value"]) == SCHEMA_VERSION
     cols = {r["name"] for r in db2.fetchall(
         "PRAGMA table_info(trade_copyability_decisions)")}
     needed = {

@@ -35,6 +35,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from polycopy.ingestion.source_trade_metadata import normalize_source_trade_metadata
+
 # ── Constants ────────────────────────────────────────────────────────────────
 INGESTION_VERSION = "PR24Z-1"
 SOURCE_NAME = "polymarket_data_api_trades_user"
@@ -170,6 +172,8 @@ class NormalizedSourceTrade:
     transaction_hash: Optional[str] = None
     market_title: Optional[str] = None
     market_slug: Optional[str] = None
+    # Versioned source evidence; event.slug is identity/provenance, never a category.
+    metadata: Optional[dict[str, Any]] = None
 
     # Provenance flags (always 0 for live records).
     is_sample: int = 0
@@ -376,10 +380,14 @@ def normalize_source_trade(
     *,
     requested_wallet: Optional[str] = None,
     record_index: int = -1,
+    allow_sell: bool = False,
 ) -> "NormalizedSourceTrade":
-    """Normalize + validate + assign identity to one raw data-api trade dict.
+    """Normalize one record; ``allow_sell`` is opt-in for bounded history.
 
-    BUY-only V1 rules enforced:
+    The recurring collector leaves ``allow_sell=False`` and therefore remains
+    BUY-only. Historical evidence explicitly passes True.
+
+    BUY-only V1 rules enforced by the default:
       * side canonicalized to UPPERCASE; SELL -> rejected unsupported_side;
         missing/unknown -> rejected missing_side.
       * price parseable within [0, 1]; quantity > 0; timestamp parseable.
@@ -396,7 +404,7 @@ def normalize_source_trade(
     if side is None:
         candidate.validation_status = "rejected"
         candidate.validation_reasons.append(REASON_MISSING_SIDE)
-    elif side == "SELL":
+    elif side == "SELL" and not allow_sell:
         candidate.validation_status = "rejected"
         candidate.validation_reasons.append(REASON_UNSUPPORTED_SIDE)
 
@@ -471,6 +479,7 @@ def normalize_source_trade(
     candidate.outcome = str(outcome).strip() if isinstance(outcome, str) and outcome.strip() else None
     candidate.market_title = raw.get("title") if isinstance(raw.get("title"), str) else None
     candidate.market_slug = raw.get("slug") if isinstance(raw.get("slug"), str) else None
+    candidate.metadata = normalize_source_trade_metadata(raw)
 
     # ── raw provenance: keep source-provided id and tx hash SEPARATE ──
     sp = raw.get("sourceProvidedTradeId")
