@@ -78,7 +78,7 @@ def test_new_paper_row_has_non_null_trade_score_decision_id(tmp_path):
     row = db.fetchone("SELECT trade_score_decision_id, final_verdict, signal_reason FROM paper_signal_decisions")
     assert row["trade_score_decision_id"] is not None, "provenance link must be non-null"
     assert row["final_verdict"] == "incomplete"
-    assert row["signal_reason"] == "bridge_required_paper_evidence_incomplete"
+    assert row["signal_reason"] == "full_paper_evaluation_not_run"
     db.close()
 
 

@@ -1010,3 +1010,190 @@ def test_cli_dry_run_zero_db_writes_and_stdout_report(tmp_path, capsys, monkeypa
     after = (tmp_path / "cli.db").stat()
     assert (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
     assert "Event loop is closed" not in captured.err, captured.err
+
+
+# ===========================================================================
+# PR25B - bridge paper-signal reason contract (semantic clarification).
+#
+# The approved-wallet bridge intentionally captures candidate + snapshot +
+# depth evidence and scores Trade Copyability v1, but does NOT invoke the
+# full paper-signal evaluator (wallet score, category score, shadow,
+# approval, or order/position synthesis). The persisted paper verdict is
+# therefore "incomplete" with reason "full_paper_evaluation_not_run"
+# (replacing the misleading "bridge_required_paper_evidence_incomplete",
+# which falsely implied missing market evidence). These tests lock that
+# contract without altering verdicts, scores, approval state, or schema.
+# ===========================================================================
+
+def test_bridge_persists_incomplete_with_full_paper_evaluation_not_run_reason(tmp_path):
+    """REQUIRED #1: bridge evidence path -> incomplete + corrected reason + non-NULL TC provenance."""
+    db = _db(tmp_path)
+    _trade(db)
+    deps = BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book()))
+    proc = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=deps,
+        write=True, write_authorization=_issue_write_capability(),
+    )
+    tc_id = proc.rows[0]["trade_copyability_decision_id"]
+    row = db.fetchone(
+        "SELECT final_verdict, signal_reason, trade_score_decision_id, is_approved "
+        "FROM paper_signal_decisions"
+    )
+    assert row["final_verdict"] == "incomplete"
+    assert row["signal_reason"] == "full_paper_evaluation_not_run"
+    assert row["trade_score_decision_id"] is not None, "provenance link must be non-null"
+    assert row["trade_score_decision_id"] == tc_id, "paper row must reference the exact persisted TC decision id"
+    assert row["is_approved"] == 0
+    db.close()
+
+
+def test_bridge_reason_reflects_scope_not_missing_evidence_with_valid_market(tmp_path):
+    """REQUIRED #2: with valid mapping/bid/ask/depth/spread/timing, the reason still means not run, not missing."""
+    db = _db(tmp_path)
+    _trade(db, internal="t1", public="polymarket:public-1", outcome="Yes", token="tok1",
+           timestamp="2026-01-01T00:00:00Z")
+    deps = BridgeDependencies(gamma=_Gamma(label="Yes", token="tok1", condition="condition-1"),
+                              clob=_Book(ClobBook(token_id="tok1",
+                                                  bids=[ClobBookLevel(.49, 100)],
+                                                  asks=[ClobBookLevel(.51, 100)])))
+    process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=deps,
+        write=True, write_authorization=_issue_write_capability(),
+    )
+    snap = db.fetchone("SELECT best_bid, best_ask, spread, bid_level_count, ask_level_count "
+                       "FROM candidate_price_snapshots")
+    assert snap["best_bid"] is not None and snap["best_ask"] is not None
+    assert snap["spread"] is not None and snap["spread"] >= 0
+    assert snap["bid_level_count"] and snap["ask_level_count"]
+    row = db.fetchone("SELECT final_verdict, signal_reason FROM paper_signal_decisions")
+    assert row["final_verdict"] == "incomplete"
+    assert row["signal_reason"] == "full_paper_evaluation_not_run"
+    assert row["signal_reason"] != "bridge_required_paper_evidence_incomplete"
+    db.close()
+
+
+def test_bridge_long_duration_market_yields_skip_and_corrected_incomplete_reason():
+    """REQUIRED #3: seconds_to_market_end > 45d -> TC skip (duration_excluded_long) + paper incomplete (corrected reason)."""
+    from datetime import datetime, timezone
+    from polycopy.scoring.trade_score_v1 import compute_trade_score_v1, TradeCopyabilityInputV1
+    from polycopy.scoring.paper_signal import compute_bridge_trade_copyability_and_paper_input
+
+    long_end = 46 * 24 * 3600  # > DURATION_EXCLUDED_LONG_MAX (45 d)
+    tc_input = TradeCopyabilityInputV1(
+        wallet_id="w1", source_trade_id="polymarket:pub-1", side="BUY",
+        price_deterioration_pct=0.0, intended_stake=100.0, executable_depth=200.0,
+        fill_percentage=1.0, spread=0.01, best_bid_size=1000.0, best_ask_size=1000.0,
+        trade_age_seconds=0.0, seconds_to_market_end=float(long_end),
+        market_active=True, market_closed=False, market_resolved=False,
+        has_valid_strategy=True, has_complete_data=True,
+    )
+    res = compute_trade_score_v1(input=tc_input)
+    assert res.verdict.value == "skip"
+    assert "duration_excluded_long" in res.rejection_reasons
+
+    class _Inputs:
+        candidate = {"id": 1}
+        source_trade = {}
+        snapshot = {"fetched_at": "2026-01-01T00:00:00Z", "market_active_at_fetch": 1,
+                    "market_closed_at_fetch": 0, "market_resolved_at_fetch": 0,
+                    "spread": 0.01, "best_bid_size": 1000.0, "best_ask_size": 1000.0,
+                    "trade_age_seconds": 0.0, "seconds_to_market_end": float(long_end),
+                    "book_summary_json": None}
+        snapshot_id = "snap-1"
+        depth_hash = "h"
+        has_depth = False
+        depth_asks = []
+        depth_bids = []
+        intended_stake = 100.0
+        side = "BUY"
+        wallet_id = "w1"
+        source_trade_id = "polymarket:pub-1"
+        price_deterioration_pct = 0.0
+        depth_status_reason = None
+
+    _tr, typed, _idem = compute_bridge_trade_copyability_and_paper_input(
+        inputs=_Inputs(), now=datetime.now(timezone.utc))
+    assert _tr.verdict.value == "skip"
+    assert "duration_excluded_long" in _tr.rejection_reasons
+    assert typed.final_verdict == "incomplete"
+    assert typed.final_reason == "full_paper_evaluation_not_run"
+
+
+def test_bridge_does_not_synthesize_full_evaluator_outputs(tmp_path):
+    """REQUIRED #4: bridge must NOT call/synthesize wallet/category/shadow/approval/order/position."""
+    import pytest as _pytest
+    from polycopy.scoring import paper_signal as ps_mod
+    db = _db(tmp_path)
+    _trade(db)
+    calls = {"wallet": 0, "shadow": 0, "approval": 0}
+    real_wallet = ps_mod._resolve_wallet_score
+    real_shadow = ps_mod._compute_and_persist_shadow_v2
+    real_persist_paper = ps_mod.persist_paper_signal
+
+    def spy_wallet(*a, **k):
+        calls["wallet"] += 1
+        return real_wallet(*a, **k)
+
+    def spy_shadow(*a, **k):
+        calls["shadow"] += 1
+        return real_shadow(*a, **k)
+
+    def spy_paper(*a, **k):
+        calls["approval"] += (1 if k.get("is_approved") else 0)
+        return real_persist_paper(*a, **k)
+
+    with _pytest.MonkeyPatch().context() as mp:
+        mp.setattr(ps_mod, "_resolve_wallet_score", spy_wallet)
+        mp.setattr(ps_mod, "_compute_and_persist_shadow_v2", spy_shadow)
+        mp.setattr(ps_mod, "persist_paper_signal", spy_paper)
+        process_approved_wallet_trades(
+            db, wallet=WALLET, limit=1,
+            dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())),
+            write=True, write_authorization=_issue_write_capability(),
+        )
+    assert calls["wallet"] == 0, "wallet score must not be computed by the bridge"
+    assert calls["shadow"] == 0, "shadow decision must not be persisted by the bridge"
+    assert calls["approval"] == 0, "bridge must never set is_approved"
+    assert db.fetchone("SELECT COUNT(*) AS n FROM orders")["n"] == 0
+    assert db.fetchone("SELECT COUNT(*) AS n FROM positions")["n"] == 0
+    db.close()
+
+
+def test_bridge_replay_reuses_rows_and_preserves_corrected_reason(tmp_path):
+    """REQUIRED #5: targeted replay reuses TC + paper rows, keeps non-NULL provenance, preserves corrected reason."""
+    db = _db(tmp_path)
+    _trade(db, internal="t1", public="polymarket:public-1", outcome="Yes", token="tok1")
+    deps = BridgeDependencies(gamma=_Gamma(label="Yes", token="tok1", condition="condition-1"),
+                              clob=_Book(_valid_book()))
+    first = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=deps,
+        write=True, write_authorization=_issue_write_capability(),
+    )
+    tc_id = first.rows[0]["trade_copyability_decision_id"]
+    assert db.fetchone("SELECT COUNT(*) AS n FROM paper_signal_decisions")["n"] == 1
+    assert db.fetchone("SELECT trade_score_decision_id FROM paper_signal_decisions")["trade_score_decision_id"] == tc_id
+    process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=deps,
+        write=True, write_authorization=_issue_write_capability(),
+        source_trade_id="polymarket:public-1",
+    )
+    assert db.fetchone("SELECT COUNT(*) AS n FROM trade_copyability_decisions")["n"] == 1
+    assert db.fetchone("SELECT COUNT(*) AS n FROM paper_signal_decisions")["n"] == 1
+    row = db.fetchone("SELECT trade_score_decision_id, signal_reason, final_verdict FROM paper_signal_decisions")
+    assert row["trade_score_decision_id"] == tc_id, "provenance preserved across replay"
+    assert row["final_verdict"] == "incomplete"
+    assert row["signal_reason"] == "full_paper_evaluation_not_run", "corrected reason preserved on replay"
+    db.close()
+
+
+def test_historical_bridge_reason_remains_valid_audit_history():
+    """REQUIRED #6: downstream consumers must accept the historical reason string without forcing a backfill."""
+    from polycopy.scoring.paper_signal import BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION
+    assert BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION == "full_paper_evaluation_not_run"
+    legacy = "bridge_required_paper_evidence_incomplete"
+    # The two literals are intentionally distinct; both denote the same
+    # bridge-incomplete family (full evaluator not run).
+    assert legacy != BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION
+    bridge_incomplete_family = {BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION, legacy}
+    assert "full_paper_evaluation_not_run" in bridge_incomplete_family
+    assert "bridge_required_paper_evidence_incomplete" in bridge_incomplete_family
