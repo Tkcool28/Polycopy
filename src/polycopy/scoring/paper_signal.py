@@ -1370,6 +1370,23 @@ def _persist_incomplete_signal(
     )
 
 
+# Canonical reason for the approved-wallet bridge paper signal.
+#
+# The PR25A bounded bridge intentionally captures candidate + snapshot +
+# depth evidence and scores Trade Copyability v1, but does NOT invoke the
+# full paper-signal evaluator (wallet score, category score, shadow,
+# approval, or order/position synthesis). The ``incomplete`` verdict here
+# reflects that evaluation *scope*, NOT missing market evidence — the
+# CLOB book, bid/ask, spread, depth, market timing, outcome/token mapping,
+# and TC provenance are all captured and present.
+#
+# Historical note: this reason replaced the misleading
+# ``bridge_required_paper_evidence_incomplete`` (which implied missing
+# evidence). Existing production rows retaining the old reason remain
+# valid audit history and are NOT backfilled. See PR25B.
+BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION = "full_paper_evaluation_not_run"
+
+
 def compute_bridge_trade_copyability_and_paper_input(
     *,
     inputs: PersistedPaperSignalInputs,
@@ -1446,7 +1463,7 @@ def compute_bridge_trade_copyability_and_paper_input(
         trade_formula_version=trade_result.formula_version,
         evaluation_timestamp=now,
         final_verdict="incomplete",
-        final_reason="bridge_required_paper_evidence_incomplete",
+        final_reason=BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION,
         is_approved=0,
     )
     return trade_result, typed_input, trade_idem
@@ -1501,7 +1518,7 @@ def persist_bridge_trade_copyability_v1(db: Database, candidate_id: int) -> tupl
     )
     paper_id = persist_paper_signal(
         db, candidate_id, inputs.wallet_id, "incomplete",
-        "bridge_required_paper_evidence_incomplete", 0.0,
+        BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION, 0.0,
         float(trade_result.score), 0.0, None, "incomplete", snap_ts,
         inputs.source_trade_id, inputs.snapshot_id, idempotency_key=paper_idem,
         typed_input=typed_input,
