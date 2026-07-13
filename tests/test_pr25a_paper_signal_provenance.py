@@ -143,7 +143,13 @@ def test_second_identical_write_creates_no_duplicates(tmp_path):
     db = _db(tmp_path); _trade(db)
     deps = BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book()))
     process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
-    process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
+    # Re-target the already-bridged trade explicitly (anti-replay skips it in a
+    # default scan, so idempotency must be exercised via --source-trade-id).
+    process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=deps, write=True,
+        write_authorization=_issue_write_capability(),
+        source_trade_id="polymarket:public-1",
+    )
     assert db.fetchone("SELECT COUNT(*) AS n FROM trade_copyability_decisions")["n"] == 1
     assert db.fetchone("SELECT COUNT(*) AS n FROM paper_signal_decisions")["n"] == 1
     db.close()
@@ -153,7 +159,13 @@ def test_second_run_resolves_same_tc_id_and_paper_provenance_unchanged(tmp_path)
     db = _db(tmp_path); _trade(db)
     deps = BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book()))
     first = process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
-    second = process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
+    # Re-target the already-bridged trade explicitly so the idempotent path
+    # re-resolves the same TC decision instead of being skipped by anti-replay.
+    second = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=deps, write=True,
+        write_authorization=_issue_write_capability(),
+        source_trade_id="polymarket:public-1",
+    )
     first_tc = first.rows[0]["trade_copyability_decision_id"]
     second_tc = second.rows[0]["trade_copyability_decision_id"]
     assert first_tc == second_tc, "second run must reuse the same TC decision id"

@@ -53,9 +53,9 @@ def _db(tmp_path: Path) -> Database:
     return Database(tmp_path / "bridge.db").connect()
 
 
-def _trade(db: Database, *, internal="t1", public="polymarket:public-1", source=SOURCE_NAME, side="BUY", sample=0, outcome="Yes", token="tok1"):
+def _trade(db: Database, *, internal="t1", public="polymarket:public-1", source=SOURCE_NAME, side="BUY", sample=0, outcome="Yes", token="tok1", timestamp="2026-01-01T00:00:00Z"):
     db.execute("""INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
-    VALUES (?, ?, ?, 'condition-1', ?, ?, 2, .5, ?, '2026-01-01T00:00:00Z', ?, ?)""", (internal, source, public, side, outcome, WALLET, sample, token))
+    VALUES (?, ?, ?, 'condition-1', ?, ?, 2, .5, ?, ?, ?, ?)""", (internal, source, public, side, outcome, WALLET, timestamp, sample, token))
     db.conn.commit()
 
 
@@ -98,6 +98,45 @@ def test_selection_is_source_qualified_buy_only_non_sample_deterministic_and_pub
         assert [r["id"] for r in select_approved_source_trades(db, WALLET, limit=2, source_trade_id="public-2")] == ["t2"]
         assert not select_approved_source_trades(db, WALLET, limit=2, source_trade_id="t2")
     finally: db.close()
+
+
+def test_selection_skips_already_bridged_trades_anti_replay(tmp_path):
+    """PR25A anti-replay: a plain --limit N must advance past bridged trades.
+
+    The bridge persists ``copy_candidates.source_trade_internal_id`` from
+    ``source_trades.id``. Selection must exclude any source trade already
+    represented by a copy_candidate, without altering the canonical
+    ``timestamp ASC, source_trade_id ASC, id ASC`` ordering.
+
+    Uses the real production write path to create the copy_candidate so the
+    anti-replay exclusion is exercised against the exact row shape the bridge
+    emits (no hand-built INSERT that could drift from schema NOT NULLs).
+    """
+    db = _db(tmp_path)
+    try:
+        _trade(db, internal="t1", public="polymarket:public-1",
+               timestamp="2026-01-01T00:00:00Z")
+        _trade(db, internal="t2", public="polymarket:public-2",
+               timestamp="2026-01-02T00:00:00Z")
+        _trade(db, internal="t3", public="polymarket:public-3",
+               timestamp="2026-01-03T00:00:00Z")
+        # Bridge t1 for real (write mode) so a genuine copy_candidate exists.
+        deps = BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book()))
+        first = process_approved_wallet_trades(
+            db, wallet=WALLET, limit=1, dependencies=deps,
+            write=True, write_authorization=_issue_write_capability(),
+        )
+        assert first.rows and first.rows[0]["stages"]["trade_copyability"] == "persisted"
+        assert db.fetchone("SELECT COUNT(*) AS n FROM copy_candidates")["n"] == 1
+        # limit=2 must now skip t1 and return the two fresh trades in order.
+        selected = [r["id"] for r in select_approved_source_trades(db, WALLET, limit=2)]
+        assert selected == ["t2", "t3"], selected
+        # Explicit --source-trade-id still bypasses the exclusion (targeted re-run).
+        targeted = [r["id"] for r in select_approved_source_trades(
+            db, WALLET, limit=2, source_trade_id="polymarket:public-1")]
+        assert targeted == ["t1"], targeted
+    finally:
+        db.close()
 
 
 def test_dry_run_hydrates_and_preflights_but_mutates_no_tables_or_metadata(tmp_path):
@@ -230,7 +269,11 @@ def test_write_persists_frozen_trade_copyability_v1_once_and_replay_is_idempoten
     assert (decision["formula_name"], decision["formula_version"]) == ("trade_copyability", "1")
     assert decision["verdict"] in {"copy_candidate", "watchlist", "skip", "incomplete"}
     assert db.fetchone("SELECT signal_reason FROM paper_signal_decisions")["signal_reason"] != "bridge_score_evidence_unavailable"
-    second = process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=deps, write=True, write_authorization=_issue_write_capability())
+    second = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1, dependencies=deps, write=True,
+        write_authorization=_issue_write_capability(),
+        source_trade_id="polymarket:public-1",
+    )
     assert second.rows[0]["stages"]["trade_copyability"] == "persisted"
     assert db.fetchone("SELECT COUNT(*) AS n FROM trade_copyability_decisions")["n"] == 1
     assert db.fetchone("SELECT COUNT(*) AS n FROM paper_signal_decisions")["n"] == 1
