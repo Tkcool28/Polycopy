@@ -35,15 +35,9 @@ if str(REPO / "scripts") not in sys.path:
 
 import scripts.repair_pr25a_paper_provenance as repair_mod
 
-PROD_PATH = str((REPO / "data" / "polycopy.db").resolve())
+_PROD_PATH = str((REPO / "data" / "polycopy.db").resolve())
 
 _CONNECT_CALLS: list[str] = []
-
-_PAPER_COLS = [
-    "id", "candidate_id", "price_snapshot_id", "verdict", "signal_reason",
-    "score", "score_inputs", "idempotency_key", "created_at", "updated_at",
-    "metadata", "payload", "notes", "trade_score_decision_id",
-]
 
 
 @pytest.fixture(autouse=True)
@@ -58,78 +52,155 @@ def _guard(monkeypatch):
             if str(path).startswith("file:") else str(Path(path).resolve())
         )
         _CONNECT_CALLS.append(resolved)
-        if resolved == PROD_PATH:
+        if resolved == _PROD_PATH:
             raise AssertionError(f"TEST LEAK: opened real production DB: {resolved}")
         return real_connect(path, *a, **k)
 
     monkeypatch.setattr(sqlite3, "connect", _guarded)
     yield
-    assert PROD_PATH not in _CONNECT_CALLS, "production DB was opened during test"
+    assert _PROD_PATH not in _CONNECT_CALLS, "production DB was opened during test"
+
+
+# Real production paper_signal_decisions columns are discovered dynamically by
+# the repair utility (PRAGMA table_info). We build the test DB through the
+# canonical Database migration path so the fixture schema is IDENTICAL to
+# production -- no synthetic/simplified table that could drift again.
 
 
 def _mk_db(path: Path, *, rows):
-    """Build a tmp DB. ``rows`` is a list of dicts:
-        {"paper": {paper fields}, "tc": [(candidate_id, snapshot_id), ...]}
-    All PAPER_COLUMNS are seeded so the before/after proof is meaningful.
+    """Build a tmp DB using the canonical production migrations, then seed rows.
+
+    ``rows`` is a list of dicts:
+        {"paper": {real paper columns}, "tc": [(candidate_id, snapshot_id), ...]}
+    Only ``candidate_id`` + ``price_snapshot_id`` are required in each paper dict;
+    the remaining real columns default to safe bridge-incomplete values.
+
+    Parent rows (wallets, copy_candidates, candidate_price_snapshots,
+    trade_copyability_decisions) are seeded so foreign-key constraints hold. To
+    stay drift-proof, required NOT NULL columns are discovered from the live
+    schema via PRAGMA table_info and filled with safe dummy values -- the
+    fixture schema is IDENTICAL to production (built via Database migrations).
     """
+    from polycopy.db.database import Database
+
+    # Create the real, migrated schema (identical to production).
+    db = Database(path)
+    db.connect()
+    db.close()
+
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS trade_copyability_decisions ("
-        "id INTEGER PRIMARY KEY, candidate_id INTEGER, price_snapshot_id TEXT, "
-        "verdict TEXT)"
-    )
-    cols = ", ".join(c for c in _PAPER_COLS if c != "id")
-    conn.execute(
-        f"CREATE TABLE IF NOT EXISTS paper_signal_decisions ("
-        f"id INTEGER PRIMARY KEY, "
-        f"{', '.join(c + ' ' + _col_type(c) for c in _PAPER_COLS if c != 'id')})"
-    )
-    for t in repair_mod.FORBIDDEN_FINGERPRINT_TABLES:
-        conn.execute(f"CREATE TABLE IF NOT EXISTS {t} (id INTEGER PRIMARY KEY)")
+
+    def _dummy_for(col_type: str):
+        t = (col_type or "TEXT").upper()
+        if "INT" in t:
+            return 0
+        if "REAL" in t or "FLOA" in t or "DOUB" in t:
+            return 0.0
+        return "x"
+
+    def _seed(table: str, provided: dict):
+        """Insert a row into ``table`` supplying required NOT NULL columns."""
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        cols, vals = [], []
+        for (_, name, ctype, notnull, default, _) in info:
+            if name == "id" and name not in provided:
+                continue  # caller supplies id separately if needed
+            if name in provided:
+                cols.append(name); vals.append(provided[name]); continue
+            if notnull and default is None:
+                cols.append(name); vals.append(_dummy_for(ctype))
+        placeholders = ", ".join("?" for _ in cols)
+        col_list = ", ".join(cols)
+        conn.execute(
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})", vals)
+
+    def _ensure_candidate(cid, wid):
+        key = ("cand", cid, wid)
+        if key in seen:
+            return
+        _seed("copy_candidates",
+              {"id": cid, "wallet_id": wid, "source_trade_id": f"st-{cid}",
+               "created_at": T, "updated_at": T})
+        seen[key] = True
+
+    def _ensure_snapshot(snap, cid):
+        key = ("snap", snap, cid)
+        if key in seen:
+            return
+        _seed("candidate_price_snapshots",
+              {"id": snap, "candidate_id": cid, "snapshot_run_id": snap,
+               "source_trade_timestamp": T, "fetched_at": T, "created_at": T})
+        seen[key] = True
+
     tc_id = 0
     paper_id = 0
+    seen = {}
+    T = "2026-01-01T00:00:00Z"
     for item in rows:
-        for (cid, snap) in item["tc"]:
+        cid = item["paper"].get("candidate_id")
+        snap = item["paper"].get("price_snapshot_id")
+        wid = item["paper"].get("wallet_id", "w")
+        key = ("wallet", wid)
+        if key not in seen:
+            _seed("wallets", {"id": wid}); seen[key] = True
+        key = ("cand", cid, wid)
+        if key not in seen:
+            _seed("copy_candidates",
+                  {"id": cid, "wallet_id": wid,
+                   "source_trade_id": f"st-{cid}", "created_at": T,
+                   "updated_at": T}); seen[key] = True
+        key = ("snap", snap, cid)
+        if key not in seen:
+            _seed("candidate_price_snapshots",
+                  {"id": snap, "candidate_id": cid, "snapshot_run_id": snap,
+                   "source_trade_timestamp": T, "fetched_at": T,
+                   "created_at": T}); seen[key] = True
+        for (tc_cid, tc_snap) in item["tc"]:
             tc_id += 1
-            conn.execute(
-                "INSERT INTO trade_copyability_decisions "
-                "(id, candidate_id, price_snapshot_id, verdict) VALUES (?,?,?,?)",
-                (tc_id, cid, snap, "skip"),
-            )
+            _ensure_candidate(tc_cid, wid)
+            _ensure_snapshot(tc_snap, tc_cid)
+            _seed("trade_copyability_decisions",
+                  {"id": tc_id, "candidate_id": tc_cid, "wallet_id": wid,
+                   "price_snapshot_id": tc_snap, "verdict": "skip",
+                   "source_trade_id": f"tcst-{tc_id}"})
         paper_id += 1
         p = item["paper"]
         conn.execute(
-            f"INSERT INTO paper_signal_decisions ({cols}) VALUES ("
-            f"{', '.join('?' for _ in _PAPER_COLS if _ != 'id')})",
-            [
+            """
+            INSERT INTO paper_signal_decisions (
+                id, candidate_id, wallet_id, signal_family, signal_reason,
+                wallet_score, trade_score, shadow_score, shadow_verdict,
+                final_verdict, is_approved, source_data_timestamp,
+                source_trade_id, price_snapshot_id, idempotency_key,
+                decision_input_json, computed_at, created_at,
+                trade_score_decision_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                paper_id,
                 p.get("candidate_id"),
-                p.get("price_snapshot_id"),
-                p.get("verdict", "incomplete"),
+                wid,
+                p.get("signal_family", "incomplete"),
                 repair_mod.PR25A_PAPER_REASON,
-                p.get("score"),
-                p.get("score_inputs"),
+                p.get("wallet_score", 0.0),
+                p.get("trade_score", 0.0),
+                p.get("shadow_score", 0.0),
+                p.get("shadow_verdict"),
+                p.get("final_verdict", "incomplete"),
+                p.get("is_approved", 0),
+                p.get("source_data_timestamp", T),
+                p.get("source_trade_id", f"st-{paper_id}"),
+                p.get("price_snapshot_id"),
                 p.get("idempotency_key", f"idem-{paper_id}"),
-                p.get("created_at", "2026-01-01T00:00:00Z"),
-                p.get("updated_at", "2026-01-01T00:00:00Z"),
-                p.get("metadata"),
-                p.get("payload"),
-                p.get("notes"),
+                p.get("decision_input_json"),
+                p.get("computed_at", T),
+                p.get("created_at", T),
                 p.get("trade_score_decision_id"),
-            ],
+            ),
         )
     conn.commit()
     conn.close()
-
-
-def _col_type(col: str) -> str:
-    if col in ("candidate_id",):
-        return "INTEGER"
-    if col == "trade_score_decision_id":
-        return "INTEGER"
-    if col == "score":
-        return "REAL"
-    return "TEXT"
 
 
 class _FakeBackup:
@@ -218,7 +289,7 @@ def test_write_with_incomplete_gates_exits_nonzero(tmp_path, monkeypatch, kw):
     assert rep.backup is None, "no backup must be created on incomplete gates"
     assert len(rep.updated) == 0
     # No writable connection opened for a tmp (non-prod) path when gates missing.
-    assert PROD_PATH not in _CONNECT_CALLS
+    assert _PROD_PATH not in _CONNECT_CALLS
 
 
 def test_backup_occurs_before_writable_open(tmp_path, monkeypatch):
@@ -325,8 +396,8 @@ def test_only_trade_score_column_changes_and_forbidden_identical(tmp_path, monke
     dbp = tmp_path / "repair.db"
     _mk_db(dbp, rows=[
         {"paper": {"candidate_id": 1, "price_snapshot_id": "S1",
-                   "verdict": "incomplete", "score": 0.5,
-                   "idempotency_key": "idem-1", "notes": "orig"},
+                   "final_verdict": "incomplete", "trade_score": 0.5,
+                   "idempotency_key": "idem-1", "decision_input_json": "orig"},
          "tc": [(1, "S1")]},
     ])
     rep, code = repair_mod.repair(
@@ -337,11 +408,11 @@ def test_only_trade_score_column_changes_and_forbidden_identical(tmp_path, monke
     assert rep.proofs[0]["changed_columns"] == ["trade_score_decision_id"]
     assert rep.changed_columns_valid is True
     assert rep.forbidden_identical is True
-    # Other columns untouched in the live DB.
+    # Other real columns untouched in the live DB.
     live = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
     row = live.execute(
-        "SELECT verdict, signal_reason, score, notes FROM paper_signal_decisions "
-        "WHERE id=1").fetchone()
+        "SELECT final_verdict, signal_reason, trade_score, decision_input_json "
+        "FROM paper_signal_decisions WHERE id=1").fetchone()
     live.close()
     assert row == ("incomplete", repair_mod.PR25A_PAPER_REASON, 0.5, "orig")
 
@@ -562,12 +633,12 @@ def test_mid_transaction_exception_rolls_back(tmp_path, monkeypatch):
     orig_read = repair_mod._read_paper_row
     calls = {"n": 0}
 
-    def _corrupt_after(conn, paper_id):
-        row = orig_read(conn, paper_id)
+    def _corrupt_after(conn, paper_id, cols):
+        row = orig_read(conn, paper_id, cols)
         calls["n"] += 1
         if calls["n"] >= 4:  # 2nd row's AFTER read
             row = dict(row)
-            row["verdict"] = "TAMPERED"
+            row["final_verdict"] = "TAMPERED"
         return row
 
     monkeypatch.setattr(repair_mod, "_read_paper_row", _corrupt_after)
@@ -600,8 +671,8 @@ def test_rowcount_mismatch_rolls_back(tmp_path, monkeypatch):
     orig_read = repair_mod._read_paper_row
     state = {"before": True}
 
-    def _tamper(conn, paper_id):
-        row = orig_read(conn, paper_id)
+    def _tamper(conn, paper_id, cols):
+        row = orig_read(conn, paper_id, cols)
         if state["before"]:
             state["before"] = False
             row = dict(row)
@@ -626,12 +697,12 @@ def test_second_paper_column_change_fails_proof(tmp_path, monkeypatch):
     orig_read = repair_mod._read_paper_row
     calls = {"n": 0}
 
-    def _tamper_after(conn, paper_id):
-        row = orig_read(conn, paper_id)
+    def _tamper_after(conn, paper_id, cols):
+        row = orig_read(conn, paper_id, cols)
         calls["n"] += 1
         if calls["n"] >= 2:  # AFTER read
             row = dict(row)
-            row["notes"] = "CHANGED"
+            row["decision_input_json"] = "CHANGED"
         return row
 
     monkeypatch.setattr(repair_mod, "_read_paper_row", _tamper_after)
@@ -721,3 +792,101 @@ def test_post_repair_fk_failure_returns_nonzero(tmp_path, monkeypatch):
         confirm_production_db=True, json_out=False, backup_helper=_FakeBackup())
     assert code == 1
     assert rep.foreign_key_check_count != 0
+
+
+# ==========================================================================
+# SCHEMA-CONTRACT TESTS (close the real-schema drift class of defect)
+# ==========================================================================
+def test_discovers_real_paper_columns(tmp_path):
+    dbp = tmp_path / "repair.db"
+    _mk_db(dbp, rows=[
+        {"paper": {"candidate_id": 1, "price_snapshot_id": "S1"}, "tc": [(1, "S1")]},
+    ])
+    conn = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+    cols = repair_mod._discover_paper_columns(conn)
+    conn.close()
+    real = {
+        "id", "candidate_id", "wallet_id", "signal_family", "signal_reason",
+        "wallet_score", "trade_score", "shadow_score", "shadow_verdict",
+        "final_verdict", "is_approved", "source_data_timestamp",
+        "source_trade_id", "price_snapshot_id", "idempotency_key",
+        "computed_at", "created_at", "decision_input_json",
+        "wallet_score_decision_id", "category_score_decision_id",
+        "trade_score_decision_id",
+    }
+    assert set(cols) == real
+    for bad in ("verdict", "score", "score_inputs", "metadata", "payload", "notes"):
+        assert bad not in cols
+    for req in ("id", "candidate_id", "price_snapshot_id", "trade_score_decision_id"):
+        assert req in cols
+
+
+def test_missing_required_column_fails_closed(tmp_path):
+    dbp = tmp_path / "repair.db"
+    conn = sqlite3.connect(str(dbp))
+    conn.execute(
+        "CREATE TABLE paper_signal_decisions ("
+        "id INTEGER PRIMARY KEY, candidate_id INTEGER)")
+    conn.commit(); conn.close()
+    c2 = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.Error):
+            repair_mod._discover_paper_columns(c2)
+    finally:
+        c2.close()
+
+
+def test_full_row_proof_detects_any_extra_change(tmp_path, monkeypatch):
+    monkeypatch.setattr(repair_mod, "_is_production_db", lambda p: True)
+    dbp = tmp_path / "repair.db"
+    _mk_db(dbp, rows=[
+        {"paper": {"candidate_id": 1, "price_snapshot_id": "S1"}, "tc": [(1, "S1")]},
+    ])
+    orig_read = repair_mod._read_paper_row
+    calls = {"n": 0}
+
+    def _flip(conn, paper_id, cols):
+        row = orig_read(conn, paper_id, cols)
+        calls["n"] += 1
+        if calls["n"] >= 2:  # AFTER read
+            row = dict(row)
+            row["wallet_score"] = 99.0  # an unrelated real column changed
+        return row
+
+    monkeypatch.setattr(repair_mod, "_read_paper_row", _flip)
+    rep, code = repair_mod.repair(
+        str(dbp), limit=3, allow_live=True, write=True,
+        confirm_production_db=True, json_out=False, backup_helper=_FakeBackup())
+    assert code == 1
+    assert rep.rolled_back is True
+    assert len(rep.updated) == 0
+
+
+def test_real_schema_end_to_end_update(tmp_path, monkeypatch):
+    monkeypatch.setattr(repair_mod, "_is_production_db", lambda p: True)
+    dbp = tmp_path / "repair.db"
+    _mk_three(dbp, third="valid")
+    rep, code = repair_mod.repair(
+        str(dbp), limit=3, allow_live=True, write=True,
+        confirm_production_db=True, json_out=False, backup_helper=_FakeBackup())
+    assert code == 0
+    assert rep.selected_count == 3
+    assert rep.validated_count == 3
+    assert rep.updated_count == 3
+    assert rep.committed is True
+    assert rep.changed_columns_valid is True
+    for p in rep.proofs:
+        assert p["changed_columns"] == ["trade_score_decision_id"]
+    live = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+    rows = live.execute(
+        "SELECT id, trade_score_decision_id, final_verdict, trade_score, "
+        "decision_input_json FROM paper_signal_decisions ORDER BY id").fetchall()
+    live.close()
+    assert rows[0] == (1, 1, "incomplete", 0.0, None)
+    assert rows[1] == (2, 2, "incomplete", 0.0, None)
+    assert rows[2] == (3, 3, "incomplete", 0.0, None)
+    r2, code2 = repair_mod.repair(
+        str(dbp), limit=3, allow_live=True, write=True,
+        confirm_production_db=True, json_out=False, backup_helper=_FakeBackup())
+    assert code2 == 0
+    assert len(r2.updated) == 0

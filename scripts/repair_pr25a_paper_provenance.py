@@ -69,14 +69,40 @@ CANONICAL_PRODUCTION_DB = Path("/root/Polycopy/data/polycopy.db").resolve()
 # The exact discriminator for PR25A bridge paper rows (bridge_required path).
 PR25A_PAPER_REASON = "bridge_required_paper_evidence_incomplete"
 
-# Columns of paper_signal_decisions that are compared in the before/after
-# proof. ``trade_score_decision_id`` is included so the proof can confirm it
-# transitions NULL -> matched TC id and that NO other column changed.
-PAPER_COLUMNS = [
-    "id", "candidate_id", "price_snapshot_id", "verdict", "signal_reason",
-    "score", "score_inputs", "idempotency_key", "created_at", "updated_at",
-    "metadata", "payload", "notes", "trade_score_decision_id",
-]
+# Required columns that MUST exist on paper_signal_decisions for the repair
+# to be safe. The full column set is discovered dynamically at runtime via
+# PRAGMA table_info so the utility tracks the canonical schema instead of a
+# frozen (and previously drifted) hardcoded list. Fail closed if any of these
+# are absent.
+REQUIRED_PAPER_COLUMNS = (
+    "id", "candidate_id", "price_snapshot_id", "trade_score_decision_id",
+)
+
+
+def _discover_paper_columns(conn: sqlite3.Connection) -> list[str]:
+    """Return the real, schema-ordered column names of paper_signal_decisions.
+
+    This is the single source of truth for the before/after proof and avoids
+    the prior defect where a hardcoded column list drifted from the canonical
+    production schema (e.g. referencing nonexistent ``verdict``/``score``
+    columns). The columns are discovered from the live table so the utility
+    automatically adapts when the canonical schema evolves.
+    """
+    rows = conn.execute("PRAGMA table_info(paper_signal_decisions)").fetchall()
+    if not rows:
+        raise sqlite3.OperationalError(
+            "paper_signal_decisions has no columns (table missing or empty)")
+    cols = [r[1] for r in rows]
+    missing = [c for c in REQUIRED_PAPER_COLUMNS if c not in cols]
+    if missing:
+        raise sqlite3.OperationalError(
+            "paper_signal_decisions missing required column(s): "
+            + ", ".join(missing))
+    if "trade_score_decision_id" not in cols:
+        # guarded by the check above; kept explicit for clarity
+        raise sqlite3.OperationalError(
+            "paper_signal_decisions missing trade_score_decision_id")
+    return cols
 
 # Tables whose content must remain byte-for-byte identical across the repair.
 # (The repair may ONLY touch paper_signal_decisions.trade_score_decision_id;
@@ -244,19 +270,20 @@ def _find_matching_tc(conn: sqlite3.Connection, candidate_id: Optional[int],
     return [t["id"] for t in tcs], ""
 
 
-def _read_paper_row(conn: sqlite3.Connection, paper_id: int) -> dict:
-    cols = ", ".join(PAPER_COLUMNS)
+def _read_paper_row(conn: sqlite3.Connection, paper_id: int,
+                    cols: list[str]) -> dict:
+    sel = ", ".join(cols)
     row = conn.execute(
-        f"SELECT {cols} FROM paper_signal_decisions WHERE id = ?", (paper_id,)
+        f"SELECT {sel} FROM paper_signal_decisions WHERE id = ?", (paper_id,)
     ).fetchone()
     if row is None:
         return {}
-    return dict(zip(PAPER_COLUMNS, row))
+    return dict(zip(cols, row))
 
 
-def _proof_changed_columns(before: dict, after: dict) -> list[str]:
+def _proof_changed_columns(before: dict, after: dict, cols: list[str]) -> list[str]:
     changed = []
-    for c in PAPER_COLUMNS:
+    for c in cols:
         b = before.get(c)
         a = after.get(c)
         # Coerce None vs empty-string variance only for the untouched columns;
@@ -317,11 +344,12 @@ def repair(
             report.finished_at = _now_iso()
             return report, 2
         report.dry_run = False
-
     # --- Read-only first pass: forbidden fingerprint + candidates ----------
     ro = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     ro.row_factory = sqlite3.Row
     try:
+        # Discover the real paper_signal_decisions columns once (fail-closed).
+        paper_cols = _discover_paper_columns(ro)
         report.forbidden_before = {
             t: _fp(ro, t) for t in FORBIDDEN_FINGERPRINT_TABLES
         }
@@ -420,7 +448,7 @@ def repair(
         writable.execute("PRAGMA foreign_keys = ON")
         cur = writable.cursor()
         for v in valid_rows:
-            before = _read_paper_row(writable, v.paper_id)
+            before = _read_paper_row(writable, v.paper_id, paper_cols)
             cur.execute(
                 """
                 UPDATE paper_signal_decisions
@@ -438,8 +466,8 @@ def repair(
                     f"rowcount {cur.rowcount} for paper_id {v.paper_id} "
                     "(expected 1; stale/non-NULL row or mismatch)"
                 )
-            after = _read_paper_row(writable, v.paper_id)
-            changed = _proof_changed_columns(before, after)
+            after = _read_paper_row(writable, v.paper_id, paper_cols)
+            changed = _proof_changed_columns(before, after, paper_cols)
             if changed != ["trade_score_decision_id"]:
                 raise sqlite3.IntegrityError(
                     f"unexpected column changes for paper_id {v.paper_id}: "
