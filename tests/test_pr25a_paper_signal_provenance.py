@@ -14,6 +14,8 @@ production DB). They use the same fixtures as the PR25A bridge test file.
 # ruff: noqa: E402, E701, E702
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from polycopy.adapters.polymarket_clob import ClobBook, ClobBookLevel
@@ -35,7 +37,7 @@ def _db(tmp_path):
 def _trade(db, *, internal="t1", public="polymarket:public-1", source=SOURCE_NAME, side="BUY", sample=0, outcome="Yes", token="tok1"):
     db.execute(
         "INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id) "
-        "VALUES (?, ?, ?, 'condition-1', ?, ?, 2, .5, ?, '2026-01-01T00:00:00Z', ?, ?)",
+        "VALUES (?, ?, ?, 'condition-1', ?, ?, 2, .5, ?, '2026-07-14T11:30:00+00:00', ?, ?)",
         (internal, source, public, side, outcome, WALLET, sample, token),
     )
     db.conn.commit()
@@ -46,7 +48,8 @@ class _Gamma:
         return Market(
             source_id="condition-1", source="polymarket", question="Q",
             outcomes=[MarketOutcome(label="Yes", price=.5, clob_token_id="tok1")],
-            fetched_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            end_date=datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc),
+            fetched_at=datetime.now(timezone.utc),
         )
 
 

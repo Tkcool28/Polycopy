@@ -24,6 +24,11 @@ from polycopy.engine.approved_wallet_trade_bridge import (
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
 from polycopy.scoring import paper_signal as paper_signal_mod
 
+UTC = timezone.utc
+TEST_AS_OF = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
+TEST_SOURCE_TRADE_TIMESTAMP = "2026-07-14T11:30:00+00:00"
+TEST_MARKET_END = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+
 WALLET = "0x" + "a" * 40
 
 TOKENS = [
@@ -31,6 +36,16 @@ TOKENS = [
     "1970496541508335019913900195809032484597886384784144327835472760880523550630",
     "462547474504332232595082342285851716602015351553019365447058575920118967359469",
 ]
+
+
+@pytest.fixture(autouse=True)
+def _fixed_bridge_clock(monkeypatch):
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return TEST_AS_OF if tz is not None else TEST_AS_OF.replace(tzinfo=None)
+
+    monkeypatch.setattr(bridge_mod, "datetime", _FixedDatetime)
 
 
 def _sqlite_readonly(path: str):
@@ -53,17 +68,38 @@ def _db(tmp_path: Path) -> Database:
     return Database(tmp_path / "bridge.db").connect()
 
 
-def _trade(db: Database, *, internal="t1", public="polymarket:public-1", source=SOURCE_NAME, side="BUY", sample=0, outcome="Yes", token="tok1", timestamp="2026-01-01T00:00:00Z"):
+def _trade(db: Database, *, internal="t1", public="polymarket:public-1", source=SOURCE_NAME, side="BUY", sample=0, outcome="Yes", token="tok1", timestamp="2026-07-14T11:30:00+00:00"):
     db.execute("""INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
     VALUES (?, ?, ?, 'condition-1', ?, ?, 2, .5, ?, ?, ?, ?)""", (internal, source, public, side, outcome, WALLET, timestamp, sample, token))
     db.conn.commit()
 
 
+def test_successful_short_horizon_fixture_is_time_coherent() -> None:
+    from polycopy.policy.short_horizon import HORIZON_PREFERRED, evaluate_short_horizon
+
+    source_trade_timestamp = datetime.fromisoformat(TEST_SOURCE_TRADE_TIMESTAMP)
+    assert source_trade_timestamp <= TEST_AS_OF < TEST_MARKET_END
+    assessment = evaluate_short_horizon(source_trade_timestamp, TEST_MARKET_END)
+    assert assessment.status == HORIZON_PREFERRED
+    assert assessment.preferred and assessment.eligible
+    assert (TEST_MARKET_END - TEST_AS_OF).total_seconds() >= 0
+
+
 class _Gamma:
-    def __init__(self, *, label="Yes", token="tok1", condition="condition-1"):
-        self.label, self.token, self.condition = label, token, condition
+    def __init__(
+        self, *, label="Yes", token="tok1", condition="condition-1",
+        end_date=TEST_MARKET_END,
+    ):
+        self.label, self.token, self.condition, self.end_date = (
+            label, token, condition, end_date,
+        )
     def get_market(self, condition_id: str) -> Market:
-        return Market(source_id=self.condition, source="polymarket", question="Q", outcomes=[MarketOutcome(label=self.label, price=.5, clob_token_id=self.token)], fetched_at=datetime.now(timezone.utc))
+        return Market(
+            source_id=self.condition, source="polymarket", question="Q",
+            outcomes=[MarketOutcome(label=self.label, price=.5, clob_token_id=self.token)],
+            end_date=self.end_date,
+            fetched_at=datetime.now(timezone.utc),
+        )
 
 
 class _Book:
@@ -115,11 +151,11 @@ def test_selection_skips_already_bridged_trades_anti_replay(tmp_path):
     db = _db(tmp_path)
     try:
         _trade(db, internal="t1", public="polymarket:public-1",
-               timestamp="2026-01-01T00:00:00Z")
+               timestamp="2026-07-14T11:30:00+00:00")
         _trade(db, internal="t2", public="polymarket:public-2",
-               timestamp="2026-01-02T00:00:00Z")
+               timestamp="2026-07-14T11:31:00+00:00")
         _trade(db, internal="t3", public="polymarket:public-3",
-               timestamp="2026-01-03T00:00:00Z")
+               timestamp="2026-07-14T11:32:00+00:00")
         # Bridge t1 for real (write mode) so a genuine copy_candidate exists.
         deps = BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book()))
         first = process_approved_wallet_trades(
@@ -167,7 +203,7 @@ def test_pr25a_dry_run_clob_receives_source_token_as_token_id_and_reports_comple
     # Seed a trade carrying the exact token id the contract expects.
     db.execute(
         """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
-           VALUES ('t1', ?, 'polymarket:public-1', 'condition-1', 'BUY', 'Yes', 2, .5, ?, '2026-01-01T00:00:00Z', 0, ?)""",
+           VALUES ('t1', ?, 'polymarket:public-1', 'condition-1', 'BUY', 'Yes', 2, .5, ?, '2026-07-14T11:30:00+00:00', 0, ?)""",
         (SOURCE_NAME, WALLET, TOKEN),
     )
     db.conn.commit()
@@ -222,6 +258,57 @@ def test_gamma_mapping_conflicts_fail_closed_before_candidate(tmp_path, gamma):
     db.close()
 
 
+def test_long_and_missing_horizons_stop_before_clob_or_downstream_writes(tmp_path):
+    """PR69: the policy is a pre-score, pre-CLOB product gate."""
+    for end_date, expected_status in (
+        (TEST_AS_OF + __import__("datetime").timedelta(days=24, seconds=1), "HORIZON_TOO_LONG"),
+        (None, "HORIZON_UNAVAILABLE"),
+    ):
+        db = _db(tmp_path / expected_status)
+        try:
+            _trade(db)
+            book = _Book(_valid_book())
+            protected = {
+                "copy_candidates", "candidate_price_snapshots", "wallet_score_decisions",
+                "category_wallet_score_decisions", "trade_copyability_decisions",
+                "paper_signal_decisions", "orders", "positions",
+            }
+            before = _counts(db, protected)
+            report = process_approved_wallet_trades(
+                db, wallet=WALLET, limit=1,
+                dependencies=BridgeDependencies(gamma=_Gamma(end_date=end_date), clob=book),
+                write=True, write_authorization=_issue_write_capability(),
+            )
+            row = report.rows[0]
+            assert row["stages"]["horizon"] == expected_status
+            assert row["skip_reason"] == f"short_horizon:{expected_status}"
+            assert book.calls == 0
+            assert _counts(db, protected) == before
+        finally:
+            db.close()
+
+
+def test_2028_nominee_style_trade_is_long_horizon_rejected_before_candidate(tmp_path):
+    db = _db(tmp_path)
+    try:
+        _trade(db, public="polymarket:democratic-presidential-nominee-2028")
+        book = _Book(_valid_book())
+        report = process_approved_wallet_trades(
+            db, wallet=WALLET, limit=1,
+            dependencies=BridgeDependencies(
+                gamma=_Gamma(end_date=datetime(2028, 11, 1, tzinfo=UTC)), clob=book,
+            ),
+            write=True, write_authorization=_issue_write_capability(),
+        )
+        assert report.rows[0]["skip_reason"] == "short_horizon:HORIZON_TOO_LONG"
+        assert book.calls == 0
+        assert _counts(db, {"copy_candidates", "candidate_price_snapshots", "paper_signal_decisions"}) == {
+            "copy_candidates": 0, "candidate_price_snapshots": 0, "paper_signal_decisions": 0,
+        }
+    finally:
+        db.close()
+
+
 def test_write_authorization_wallet_preservation_allowlist_levels_and_replay(tmp_path):
     db = _db(tmp_path); _trade(db)
     with pytest.raises(PermissionError):
@@ -243,7 +330,7 @@ def test_write_authorization_wallet_preservation_allowlist_levels_and_replay(tmp
 
 def test_persisted_outcome_conflict_is_rejected_without_destructive_refresh(tmp_path):
     db = _db(tmp_path); _trade(db)
-    db.execute("INSERT INTO markets (id, source_id, source, question, fetched_at) VALUES ('m', 'condition-1', 'polymarket', 'old', '2026-01-01T00:00:00Z')")
+    db.execute("INSERT INTO markets (id, source_id, source, question, fetched_at) VALUES ('m', 'condition-1', 'polymarket', 'old', '2026-07-14T11:30:00+00:00')")
     db.execute("INSERT INTO market_outcomes (market_id, label, price, volume, clob_token_id) VALUES ('m', 'No', .5, 0, 'tok1')"); db.conn.commit()
     report = process_approved_wallet_trades(db, wallet=WALLET, limit=1, dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())), write=True, write_authorization=_issue_write_capability())
     assert report.rows[0]["skip_reason"] == "persisted_mapping_conflict"
@@ -435,7 +522,7 @@ def test_pr25a_dry_run_processes_three_rows_in_one_event_loop_with_full_tc_and_p
     for i, tok in enumerate(TOKENS):
         db.execute(
             """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
-               VALUES (?, ?, ?, 'condition-1', 'BUY', 'Yes', 2, .5, ?, '2026-01-01T00:00:00Z', 0, ?)""",
+               VALUES (?, ?, ?, 'condition-1', 'BUY', 'Yes', 2, .5, ?, '2026-07-14T11:30:00+00:00', 0, ?)""",
             (f"t{i}", SOURCE_NAME, f"polymarket:public-{i}", WALLET, tok),
         )
     db.conn.commit()
@@ -448,6 +535,7 @@ def test_pr25a_dry_run_processes_three_rows_in_one_event_loop_with_full_tc_and_p
             return Market(source_id="condition-1", source="polymarket", question="Q",
                           outcomes=[MarketOutcome(label="Yes", price=.5, clob_token_id=tok)
                                     for tok in TOKENS],
+                          end_date=TEST_MARKET_END,
                           fetched_at=datetime.now(timezone.utc))
 
     class _RecordingBook:
@@ -528,6 +616,7 @@ class _CallCountingGamma:
         tok = self.tokens[idx] if 0 <= idx < len(self.tokens) else (self.tokens[0] if self.tokens else "tok")
         return Market(source_id=condition_id, source="polymarket", question="Q",
                       outcomes=[MarketOutcome(label="Yes", price=.5, clob_token_id=tok)],
+                      end_date=TEST_MARKET_END,
                       fetched_at=datetime.now(timezone.utc))
 
 
@@ -551,7 +640,7 @@ def _seed_three(db, *, tokens=TOKENS):
     for i, tok in enumerate(tokens):
         db.execute(
             """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
-               VALUES (?, ?, ?, ?, 'BUY', 'Yes', 2, .5, ?, '2026-01-01T00:00:00Z', 0, ?)""",
+               VALUES (?, ?, ?, ?, 'BUY', 'Yes', 2, .5, ?, '2026-07-14T11:30:00+00:00', 0, ?)""",
             (f"t{i}", SOURCE_NAME, f"polymarket:public-{i}", f"condition-{i}", WALLET, tok),
         )
     db.conn.commit()
@@ -643,7 +732,7 @@ def test_source_invalid_row_calls_neither_gamma_nor_clob(tmp_path):
     # One source-invalid row (non-finite price).
     db.execute(
         """INSERT INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id)
-           VALUES ('bad', ?, 'polymarket:bad', 'condition-1', 'BUY', 'Yes', 2, 0, ?, '2026-01-01T00:00:00Z', 0, 'tok-bad')""",
+           VALUES ('bad', ?, 'polymarket:bad', 'condition-1', 'BUY', 'Yes', 2, 0, ?, '2026-07-14T11:30:00+00:00', 0, 'tok-bad')""",
         (SOURCE_NAME, WALLET),
     )
     db.conn.commit()
@@ -777,6 +866,7 @@ def _make_gamma_market(condition_id: str = "condition-0") -> "Any":
     return Market(
         source_id=condition_id, source="polymarket", question="Q",
         outcomes=[MarketOutcome(label="Yes", price=0.5, clob_token_id=tok)],
+        end_date=TEST_MARKET_END,
         fetched_at=datetime.now(timezone.utc),
     )
 
@@ -1053,7 +1143,7 @@ def test_bridge_reason_reflects_scope_not_missing_evidence_with_valid_market(tmp
     """REQUIRED #2: with valid mapping/bid/ask/depth/spread/timing, the reason still means not run, not missing."""
     db = _db(tmp_path)
     _trade(db, internal="t1", public="polymarket:public-1", outcome="Yes", token="tok1",
-           timestamp="2026-01-01T00:00:00Z")
+           timestamp="2026-07-14T11:30:00+00:00")
     deps = BridgeDependencies(gamma=_Gamma(label="Yes", token="tok1", condition="condition-1"),
                               clob=_Book(ClobBook(token_id="tok1",
                                                   bids=[ClobBookLevel(.49, 100)],
@@ -1096,7 +1186,7 @@ def test_bridge_long_duration_market_yields_skip_and_corrected_incomplete_reason
     class _Inputs:
         candidate = {"id": 1}
         source_trade = {}
-        snapshot = {"fetched_at": "2026-01-01T00:00:00Z", "market_active_at_fetch": 1,
+        snapshot = {"fetched_at": "2026-07-14T11:30:00+00:00", "market_active_at_fetch": 1,
                     "market_closed_at_fetch": 0, "market_resolved_at_fetch": 0,
                     "spread": 0.01, "best_bid_size": 1000.0, "best_ask_size": 1000.0,
                     "trade_age_seconds": 0.0, "seconds_to_market_end": float(long_end),

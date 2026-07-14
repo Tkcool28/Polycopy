@@ -28,6 +28,7 @@ from polycopy.domain.copy_candidate import CandidateStatus, CopyCandidate
 from polycopy.domain.market import Market
 from polycopy.engine.price_snapshots import _now_iso, snapshot_one
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
+from polycopy.policy.short_horizon import evaluate_short_horizon
 from polycopy.scoring.paper_signal import (
     PersistedPaperSignalInputs,
     compute_bridge_trade_copyability_and_paper_input,
@@ -615,6 +616,26 @@ def process_approved_wallet_trades(
             detail["stages"]["gamma"] = "ok" if error is None else error
             if error:
                 _record_skip(report, detail, error)
+                continue
+            # Product policy is an exact source-trade-time gate, before CLOB or
+            # any candidate/snapshot/decision persistence.  A historical actual
+            # redemption is unavailable in this live bridge path and therefore
+            # cannot relax the scheduled hard cap.
+            horizon = evaluate_short_horizon(
+                str(row["timestamp"]), getattr(market, "end_date", None)
+            )
+            detail["stages"]["horizon"] = horizon.status
+            detail["horizon"] = {
+                "policy_version": horizon.policy_version,
+                "status": horizon.status,
+                "reason_codes": list(horizon.reason_codes),
+                "scheduled_end_seconds": horizon.scheduled_end_seconds,
+                "expected_lock_seconds": horizon.expected_lock_seconds,
+                "preferred": horizon.preferred,
+                "eligible": horizon.eligible,
+            }
+            if not horizon.eligible:
+                _record_skip(report, detail, f"short_horizon:{horizon.status}")
                 continue
             # CLOB request (guarded per row) — only after successful Gamma.
             if dependencies.clob is None:
