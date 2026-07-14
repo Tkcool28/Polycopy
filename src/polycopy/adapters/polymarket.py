@@ -746,6 +746,45 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
         q_lower = query.lower()
         return [m for m in all_markets if q_lower in m.question.lower()][:limit]
 
+    async def get_market_raw(self, market_id: str) -> Optional[dict[str, Any]]:
+        """Fetch a single market's RAW Gamma JSON by condition ID.
+
+        PR68: returns the unparsed Gamma dict (which carries ``events``,
+        ``series``, ``category`` / ``groupItemTitle`` — the trusted taxonomy
+        source). Routing mirrors :meth:`get_market` exactly (condition-ID
+        query-param lookup, identity-preserving exact match, fail-closed on
+        ambiguity). Returns ``None`` when the market is not found.
+        """
+        if market_id is None or not str(market_id).strip():
+            raise ValueError("get_market_raw requires a non-empty identifier")
+        market_id = market_id.strip()
+        if not self._is_condition_id(market_id):
+            # Only condition-ID lookups are used for approved-wallet ingestion.
+            return None
+        client = await self._get_gamma_client()
+        resp = await client.get("/markets", params={"condition_ids": market_id})
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list):
+            raise ValueError(
+                "Gamma condition_ids lookup returned non-list top-level "
+                f"type {type(payload).__name__}; cannot select by identity"
+            )
+        exact = [
+            m for m in payload
+            if isinstance(m, dict) and str(m.get("conditionId", "")) == market_id
+        ]
+        if len(exact) == 0:
+            return None
+        if len(exact) > 1:
+            raise ValueError(
+                f"Gamma condition_ids lookup returned {len(exact)} exact "
+                f"matches for {market_id}; refusing ambiguous selection"
+            )
+        return exact[0]
+
     async def get_markets_by_volume(self, limit: int = 20, min_volume_24h: float = 0) -> list[Market]:
         """Top markets by 24h volume."""
         client = await self._get_gamma_client()

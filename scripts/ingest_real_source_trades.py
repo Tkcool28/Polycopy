@@ -260,6 +260,11 @@ class _RealDataApiProvider:
             "size": getattr(t, "quantity", None),
             "price": getattr(t, "price", None),
             "timestamp": ts.timestamp() if ts is not None else None,
+            # PR68: preserve denormalized market identity (NOT taxonomy). These
+            # feed the normalizer's market_title/market_slug only; taxonomy
+            # is sourced separately from the trusted Gamma market lookup.
+            "title": getattr(t, "title", None),
+            "slug": getattr(t, "slug", None),
         }
 
     async def aclose(self) -> None:

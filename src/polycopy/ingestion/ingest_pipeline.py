@@ -81,6 +81,7 @@ async def run_ingestion(
     record_limit: int = DEFAULT_RECORD_LIMIT,
     max_pages: int = HARD_MAX_PAGES,
     requested_wallet: Optional[str] = None,
+    gamma_resolver: Optional[Any] = None,
 ) -> IngestionResult:
     """Bounded fetch → normalize → validate → dedupe.
 
@@ -90,6 +91,15 @@ async def run_ingestion(
 
     Network counting follows PR24Y: only real external HTTP calls (where the
     provider sets ``made_network_call``) are counted; fixture calls are not.
+
+    ``gamma_resolver`` (PR68): an OPTIONAL async callable
+    ``async def gamma_resolver(condition_id) -> Optional[dict]`` returning the
+    trusted Gamma raw market dict for a trade's ``conditionId``. When supplied,
+    each normalized row carries canonical PR66 metadata sourced from that
+    Gamma market (event/series/category/tags). When ``None``, metadata stays
+    the honest all-null (UNAVAILABLE) shape. The resolver is never used for
+    scoring, mapping, or any downstream write — only to populate
+    ``source_trades.metadata_json``.
     """
     record_limit = max(1, min(int(record_limit), HARD_MAX_RECORD_LIMIT))
     max_pages = max(1, min(int(max_pages), HARD_MAX_PAGES))
@@ -121,7 +131,21 @@ async def run_ingestion(
             if not isinstance(raw, dict):
                 continue
             counters.raw_records += 1
-            cand = normalize_source_trade(raw, requested_wallet=req, record_index=counters.raw_records - 1)
+            # PR68: resolve trusted Gamma market for taxonomy enrichment.
+            gamma_market = None
+            if gamma_resolver is not None:
+                cond_id = raw.get("conditionId") or raw.get("market_source_id")
+                if isinstance(cond_id, str) and cond_id.strip():
+                    try:
+                        gamma_market = await gamma_resolver(cond_id.strip())
+                    except Exception:
+                        gamma_market = None
+            cand = normalize_source_trade(
+                raw,
+                requested_wallet=req,
+                record_index=counters.raw_records - 1,
+                gamma_market=gamma_market,
+            )
 
             # Classification counters.
             if cand.side == "BUY":
