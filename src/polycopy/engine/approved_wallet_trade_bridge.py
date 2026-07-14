@@ -31,8 +31,9 @@ from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
 from polycopy.scoring.paper_signal import (
     PersistedPaperSignalInputs,
     compute_bridge_trade_copyability_and_paper_input,
-    persist_bridge_trade_copyability_v1,
+    evaluate_paper_signals_for_candidate,
 )
+from polycopy.scoring.evaluation_policy import DECISION_ONLY_EVALUATION_POLICY
 
 MAX_LIMIT = 10
 # PR25A: bounded evidence capture; this is deliberately the existing frozen
@@ -46,6 +47,8 @@ ALLOWED_WRITE_TABLES = frozenset(
         "copy_candidates",
         "candidate_price_snapshots",
         "candidate_price_snapshot_levels",
+        "wallet_score_decisions",
+        "category_wallet_score_decisions",
         "trade_copyability_decisions",
         "paper_signal_decisions",
     }
@@ -58,11 +61,11 @@ FORBIDDEN_WRITE_TABLES = frozenset(
         "approvals",
         "fills",
         "settlement",
+        "settlement_accounting_ledger",
         "config",
         "decision_log",
-        "wallet_score_decisions",
-        "category_wallet_score_decisions",
         "shadow_score_decisions",
+        "shadow_decisions",
         "exit_experiment_registrations",
     }
 )
@@ -544,6 +547,7 @@ def process_approved_wallet_trades(
     write: bool = False,
     write_authorization: object | None = None,
     source_trade_id: str | None = None,
+    evaluate_canonical_decisions: bool = True,
     client_close_hooks: "Sequence[Callable[[asyncio.AbstractEventLoop], Any]]" = (),
 ) -> BridgeReport:
     address = canonical_wallet_address(wallet)
@@ -691,10 +695,16 @@ def process_approved_wallet_trades(
             report.rows.append(detail)
             continue
 
-        # Every allowlisted write for this source trade joins exactly one
-        # savepoint. Legacy owners see a commit-shield facade, so their
-        # local commits cannot escape this atomic boundary.
-        savepoint = "pr25a_trade"
+        # Phase A owns a real top-level transaction.  A savepoint alone is not
+        # a durability boundary: if another caller owns an outer transaction,
+        # releasing our savepoint leaves these inputs rollbackable.  Refuse that
+        # ambiguous state rather than committing unrelated caller work.
+        detail["phase_a_transaction_state_before"] = bool(db.conn.in_transaction)
+        if db.conn.in_transaction:
+            _record_skip(report, detail, "phase_a_outer_transaction_active")
+            continue
+        db.conn.execute("BEGIN IMMEDIATE")
+        savepoint = "pr67_phase_a_inputs"
         db.conn.execute(f"SAVEPOINT {savepoint}")
         tx_db = _CommitShield(db)
         try:
@@ -746,21 +756,105 @@ def process_approved_wallet_trades(
             detail["snapshot_token_id"] = snapshot.token_id
             if level_error:
                 raise RuntimeError(level_error)
-            trade_decision_id, signal_id = persist_bridge_trade_copyability_v1(tx_db, candidate_id)
-            detail["stages"]["trade_copyability"] = "persisted"
-            detail["stages"]["paper"] = "persisted"
-            detail["actions"].extend([
-                "candidate", "snapshot", "depth_levels", "trade_copyability_v1", "canonical_paper",
-            ])
-            detail["trade_copyability_decision_id"] = trade_decision_id
-            detail["paper_signal_id"] = signal_id
+            # Releasing this nested savepoint only completes the inner Phase A
+            # scope.  The explicit BEGIN above remains active until the exact
+            # top-level commit below; record both states for an auditable report.
             db.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            detail["phase_a_transaction_state_after_savepoint_release"] = bool(
+                db.conn.in_transaction
+            )
+            if not db.conn.in_transaction:
+                raise RuntimeError("phase_a_transaction_lost_before_commit")
+            db.conn.commit()
+            detail["phase_a_transaction_state_after_commit"] = bool(db.conn.in_transaction)
+            if db.conn.in_transaction:
+                raise RuntimeError("phase_a_commit_not_durable")
         except Exception as exc:
-            db.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            db.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if db.conn.in_transaction:
+                try:
+                    db.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    db.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except Exception:
+                    # The savepoint may already have been released before a
+                    # failed explicit commit; the top-level rollback below is
+                    # still the authoritative cleanup.
+                    pass
+                db.conn.rollback()
             reason = str(exc) if isinstance(exc, RuntimeError) else f"persistence_error:{type(exc).__name__}"
             _record_skip(report, detail, reason)
             continue
+
+        detail["candidate_id"] = candidate_id
+        detail["input_phase_status"] = "input_phase_committed"
+        # Retained additive alias for existing callers; status is not a Phase B
+        # success claim.
+        detail["input_creation_status"] = "input_creation_success"
+        detail["canonical_evaluation_requested"] = evaluate_canonical_decisions
+        if not evaluate_canonical_decisions:
+            detail["canonical_evaluation_status"] = "canonical_evaluation_deferred"
+            detail["stages"]["canonical_evaluation"] = "deferred"
+            detail["actions"].extend(["candidate", "snapshot", "depth_levels"])
+            report.rows.append(detail)
+            continue
+
+        # Phase B is deliberately outside the bridge input savepoint.  It uses
+        # the same connected DB and only the explicit decision-only policy.
+        # Evaluation failures must not roll back canonical bridge inputs.
+        try:
+            evaluation = evaluate_paper_signals_for_candidate(
+                db,
+                candidate_id,
+                policy=DECISION_ONLY_EVALUATION_POLICY,
+            )
+        except Exception as exc:  # defensive boundary for patched/foreign callers
+            evaluation = {
+                "outcome_kind": "failed",
+                "reason": f"exception:{type(exc).__name__}",
+                "is_approved": 0,
+            }
+        details = evaluation.get("decision_details") or {}
+        detail.update(
+            {
+                "wallet_score_decision_id": details.get("wallet_decision_id"),
+                "category_wallet_score_decision_id": details.get("category_decision_id"),
+                # Backward-compatible report alias, not a second decision.
+                "category_score_decision_id": details.get("category_decision_id"),
+                "trade_copyability_decision_id": details.get("tc_decision_id"),
+                "paper_signal_decision_id": evaluation.get("paper_signal_id"),
+                "wallet_status": details.get("wallet_score_status"),
+                "taxonomy_status": details.get("taxonomy_status"),
+                "category_status": details.get("category_score_status"),
+                "trade_copyability_verdict": details.get("tc_verdict"),
+                "paper_signal_verdict": evaluation.get("verdict"),
+                "paper_signal_reason": evaluation.get("reason"),
+                "is_approved": int(evaluation.get("is_approved", 0)),
+                "reused_decisions": {
+                    key: bool(details.get(key))
+                    for key in ("wallet_reused", "category_reused")
+                },
+                "created_decisions": {
+                    key: bool(details.get(key))
+                    for key in ("wallet_created", "category_created")
+                },
+            }
+        )
+        detail["stages"]["trade_copyability"] = (
+            "persisted" if details.get("tc_decision_id") is not None else "would_create"
+        )
+        detail["stages"]["paper"] = (
+            "persisted" if evaluation.get("paper_signal_id") is not None else "would_create"
+        )
+        if evaluation.get("outcome_kind") == "failed":
+            detail["canonical_evaluation_status"] = "canonical_evaluation_failed"
+            detail["canonical_evaluation_error"] = str(evaluation.get("reason", "failed"))[:240]
+            detail["stages"]["canonical_evaluation"] = "failed"
+        elif evaluation.get("verdict") in {"incomplete", "skip", "INCOMPLETE", "SKIP"}:
+            detail["canonical_evaluation_status"] = "canonical_evaluation_incomplete"
+            detail["stages"]["canonical_evaluation"] = "incomplete"
+        else:
+            detail["canonical_evaluation_status"] = "canonical_evaluation_success"
+            detail["stages"]["canonical_evaluation"] = "success"
+        detail["actions"].extend(["candidate", "snapshot", "depth_levels", "canonical_decision_evaluation"])
         report.rows.append(detail)
     if write:
         after = _counts(db, ALLOWED_WRITE_TABLES | FORBIDDEN_WRITE_TABLES)

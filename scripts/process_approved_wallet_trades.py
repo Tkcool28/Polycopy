@@ -300,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
                     dependencies=deps,
                     write=True,
                     write_authorization=_issue_write_capability(),
+                    evaluate_canonical_decisions=True,
                     source_trade_id=args.source_trade_id,
                     client_close_hooks=client_close_hooks,
                 )

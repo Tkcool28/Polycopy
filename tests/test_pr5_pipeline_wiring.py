@@ -709,10 +709,21 @@ def test_pr5_item12_missing_side_does_not_default_to_buy(tmp_path: Path):
     db.conn.commit()
 
     summary = evaluate_paper_signal_for_candidate(db, candidate_id=cid, now=now)
-    # The verdict must reflect INCOMPLETE — never COPY_CANDIDATE or WATCHLIST.
-    assert summary.get("verdict") in {"INCOMPLETE", None}, (
+    # Verdict contract (PR67 canonical): an unknown/missing trade side is a
+    # *computed* INCOMPLETE. PR67 removed the legacy early-return guard for
+    # missing-side/wallet-incomplete so the evidence pipeline (taxonomy,
+    # category, trade-copyability) still runs honestly and returns the
+    # canonical lowercase machine verdict "incomplete". It must never be a BUY
+    # default and never COPY_CANDIDATE/WATCHLIST. The historical uppercase
+    # "INCOMPLETE" label is retained only by the legacy early-return guards
+    # (no candidate / no snapshot / no source trade / no wallet id); the
+    # persistent/storage verdict is always lowercase. See PR67 docs §verdict.
+    verdict = summary.get("verdict")
+    assert verdict in {"incomplete", "INCOMPLETE"}, (
         f"unknown side must produce INCOMPLETE, got {summary}"
     )
+    assert verdict != "copy_candidate"
+    assert verdict != "watchlist"
     # The persisted row's side must NOT be coerced to BUY. The runner either
     # leaves 'UNKNOWN' or sets it to NULL — both are acceptable. The only
     # unacceptable outcome is a silent flip to 'BUY'.

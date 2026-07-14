@@ -63,10 +63,18 @@ from polycopy.scoring.behavior_classification import (
     load_behavior_evidence,
     load_behavior_evidence_from_rows,
 )
-from polycopy.scoring.wallet_score_v1 import (
-    WalletScoreResult,
-    WalletVerdict,
-    compute_wallet_score_v1,
+from polycopy.scoring.wallet_score_v1 import WalletScoreResult
+from polycopy.scoring.wallet_evidence import (
+    CATEGORY_TAXONOMY_UNAVAILABLE,
+    TaxonomyClassification,
+    classify_category_taxonomy,
+    resolve_category_score_v1,
+    resolve_wallet_score_v1,
+)
+from polycopy.scoring.evaluation_policy import (
+    DECISION_ONLY_EVALUATION_POLICY,
+    DEFAULT_EVALUATION_POLICY,
+    EvaluationExecutionPolicy,
 )
 from polycopy.scoring.trade_score_v1 import (
     TradeScoreResult,
@@ -100,7 +108,6 @@ from polycopy.scoring.verdict_generation import (
 )
 from polycopy.scoring.score_serialization import (
     PersistenceError,
-    persist_wallet_score_v1,
     persist_trade_score_v1,
     persist_shadow_score_v2,
     persist_paper_signal,
@@ -402,7 +409,7 @@ def load_persisted_paper_signal_inputs(
         try:
             trade_row = db.fetchone(
                 "SELECT id, trader_address, market_source_id, outcome, "
-                "side, price, quantity, timestamp FROM source_trades "
+                "side, price, quantity, timestamp, metadata_json FROM source_trades "
                 "WHERE id = ?",
                 (source_trade_id,),
             )
@@ -552,6 +559,46 @@ def load_persisted_paper_signal_inputs(
     )
 
 
+def resolve_candidate_taxonomy(
+    inputs: PersistedPaperSignalInputs,
+) -> TaxonomyClassification:
+    """Read canonical PR66 taxonomy from the candidate's source-trade row.
+
+    The candidate relationship is ``source_trade_internal_id -> source_trades.id``.
+    Only ``source_trades.metadata_json.taxonomy`` is authoritative; snapshots,
+    markets, event slugs, and titles are intentionally unreachable here.
+    """
+    source = inputs.source_trade
+    if source is None:
+        return TaxonomyClassification(
+            CATEGORY_TAXONOMY_UNAVAILABLE,
+            None,
+            "candidate_source_trade_unavailable",
+        )
+    raw_metadata = source.get("metadata_json")
+    if not isinstance(raw_metadata, str) or not raw_metadata.strip():
+        return TaxonomyClassification(
+            CATEGORY_TAXONOMY_UNAVAILABLE,
+            None,
+            "source_trade_metadata_json_missing",
+        )
+    try:
+        metadata = json.loads(raw_metadata)
+    except (TypeError, ValueError):
+        return TaxonomyClassification(
+            CATEGORY_TAXONOMY_UNAVAILABLE,
+            None,
+            "source_trade_metadata_json_malformed",
+        )
+    if not isinstance(metadata, dict):
+        return TaxonomyClassification(
+            CATEGORY_TAXONOMY_UNAVAILABLE,
+            None,
+            "source_trade_metadata_json_not_object",
+        )
+    return classify_category_taxonomy(metadata)
+
+
 def resolve_category_label_for_inputs(
     db: Database,
     candidate: Optional[dict],
@@ -691,6 +738,7 @@ def build_trade_copyability_input(
     inputs: PersistedPaperSignalInputs,
     *,
     walk: Optional[DepthWalkResult] = None,
+    market_category: Optional[str] = None,
 ) -> TradeCopyabilityInputV1:
     """Build :class:`TradeCopyabilityInputV1` strictly from persisted
     truth — no ``None -> 0`` silent conversions on numeric fields.
@@ -746,10 +794,12 @@ def build_trade_copyability_input(
         if walk.insufficient_reason is not None:
             depth_status_reason = walk.insufficient_reason
 
-    # Resolve market_category from snapshot/candidate. We use the
-    # existing helpers — but feed a noop db because we already
-    # have the candidate row in hand.
-    market_category = _resolve_category_label_safe(candidate=inputs.candidate, snapshot=inputs.snapshot)
+    # PR67 evaluator passes the canonical source-trade taxonomy. Legacy callers
+    # retain their snapshot-only behavior when no explicit value is supplied.
+    if market_category is None:
+        market_category = _resolve_category_label_safe(
+            candidate=inputs.candidate, snapshot=inputs.snapshot
+        )
 
     return TradeCopyabilityInputV1(
         wallet_id=inputs.wallet_id or "",
@@ -934,6 +984,7 @@ def evaluate_paper_signals_for_candidate(
     *,
     candidate_id_kw: Optional[int] = None,
     now: Optional[datetime] = None,
+    policy: EvaluationExecutionPolicy = DEFAULT_EVALUATION_POLICY,
 ) -> dict:
     """Evaluate a single candidate end-to-end and return a summary
     dict.
@@ -984,7 +1035,7 @@ def evaluate_paper_signals_for_candidate(
 
     try:
         return _evaluate_paper_signals_for_candidate_inner(
-            db, int(candidate_id), now=now,
+            db, int(candidate_id), now=now, policy=policy,
         )
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception(
@@ -1011,6 +1062,7 @@ def _evaluate_paper_signals_for_candidate_inner(
     candidate_id: int,
     *,
     now: datetime,
+    policy: EvaluationExecutionPolicy,
 ) -> dict:
     inputs = load_persisted_paper_signal_inputs(db, candidate_id)
 
@@ -1030,22 +1082,35 @@ def _evaluate_paper_signals_for_candidate_inner(
 
     if not inputs.has_snapshot:
         summary["reason"] = "no_snapshot"
-        ps_id = _persist_incomplete_signal(db, inputs, reason="no_snapshot")
-        summary["paper_signal_id"] = ps_id
+        if policy.persist_paper_signal:
+            summary["paper_signal_id"] = _persist_incomplete_signal(
+                db, inputs, reason="no_snapshot"
+            )
+        else:
+            summary["outcome_kind"] = "would_create"
+            summary["paper_signal_would_create"] = True
         return summary
 
     if inputs.source_trade_id is None:
         summary["reason"] = "no_source_trade"
-        ps_id = _persist_incomplete_signal(
-            db, inputs, reason="no_source_trade"
-        )
-        summary["paper_signal_id"] = ps_id
+        if policy.persist_paper_signal:
+            summary["paper_signal_id"] = _persist_incomplete_signal(
+                db, inputs, reason="no_source_trade"
+            )
+        else:
+            summary["outcome_kind"] = "would_create"
+            summary["paper_signal_would_create"] = True
         return summary
 
     if inputs.wallet_id is None:
         summary["reason"] = "no_wallet_id"
-        ps_id = _persist_incomplete_signal(db, inputs, reason="no_wallet_id")
-        summary["paper_signal_id"] = ps_id
+        if policy.persist_paper_signal:
+            summary["paper_signal_id"] = _persist_incomplete_signal(
+                db, inputs, reason="no_wallet_id"
+            )
+        else:
+            summary["outcome_kind"] = "would_create"
+            summary["paper_signal_would_create"] = True
         return summary
 
     # Behavior evidence — point-in-time safe.
@@ -1055,23 +1120,37 @@ def _evaluate_paper_signals_for_candidate_inner(
     )
     behavior_result = classify_wallet_behavior(behavior_evidence)
 
-    # Wallet score decision — re-use the persisted one when present,
-    # otherwise compute + persist.
-    wallet_score_result = _resolve_wallet_score(db, inputs, now=now)
-    if wallet_score_result.verdict == WalletVerdict.INCOMPLETE:
-        summary["reason"] = "wallet_incomplete"
-        ps_id = _persist_incomplete_signal(
-            db, inputs,
-            wallet_score=wallet_score_result,
-            behavior_result=behavior_result,
-            reason="wallet_incomplete",
-        )
-        summary["paper_signal_id"] = ps_id
-        return summary
+    # Canonical PR67 evidence resolvers: wallet first, then taxonomy and
+    # category, all at the exact snapshot point-in-time cutoff. A wallet
+    # INCOMPLETE blocks the verdict but never evidence orchestration.
+    cutoff = inputs.behavior_evidence_cutoff
+    wallet_resolution = resolve_wallet_score_v1(
+        db,
+        inputs.wallet_id,
+        cutoff_timestamp=cutoff,
+        persist=policy.persist_wallet_score,
+        now=now,
+    )
+    wallet_score_result = wallet_resolution.result
+    assert isinstance(wallet_score_result, WalletScoreResult)
+    taxonomy = resolve_candidate_taxonomy(inputs)
+    category_resolution = resolve_category_score_v1(
+        db,
+        inputs.wallet_id,
+        taxonomy,
+        cutoff_timestamp=cutoff,
+        persist=policy.persist_category_score,
+        now=now,
+    )
 
-    # Trade copyability — depth walk + score.
+    # Trade copyability still runs honestly with all independent reasons even
+    # when wallet/category evidence is incomplete or not applicable.
     walk = walk_persisted_depth(inputs)
-    trade_input = build_trade_copyability_input(inputs, walk=walk)
+    trade_input = build_trade_copyability_input(
+        inputs,
+        walk=walk,
+        market_category=taxonomy.category_label,
+    )
     trade_score_result = compute_trade_score_v1(
         wallet_id=inputs.wallet_id,
         source_trade_id=inputs.source_trade_id,
@@ -1086,12 +1165,7 @@ def _evaluate_paper_signals_for_candidate_inner(
     # intended stake (rounded to cents as a string) and the
     # category label, otherwise a changed stake or category would
     # silently collide on the same UNIQUE row. See Chunk 4 §A2.
-    cat_label_for_idem = (
-        _resolve_category_label_safe(
-            candidate=inputs.candidate, snapshot=inputs.snapshot,
-        )
-        or "missing"
-    )
+    cat_label_for_idem = taxonomy.category_label or "missing"
     stake_for_idem = (
         f"{float(inputs.intended_stake):.2f}"
         if inputs.intended_stake is not None else "missing"
@@ -1109,29 +1183,27 @@ def _evaluate_paper_signals_for_candidate_inner(
             "category_label": cat_label_for_idem,
         },
     )
-    # Capture the persisted trade-decision id (Chunk 5 contract +
-    # Repair 1 audit). The runtime MUST surface this id into the
-    # downstream ``PaperSignalDecisionInput`` so the audit row can
-    # record the trade-decision provenance rather than silently
-    # leaving it None.
-    trade_score_decision_id = persist_trade_score_v1(
-        db,
-        inputs.wallet_id,
-        inputs.source_trade_id,
-        trade_score_result,
-        idempotency_key=trade_idem,
-        candidate_id=candidate_id,
-        price_snapshot_id=inputs.snapshot_id,
-        source_data_timestamp=snap_ts,
-    )
-    # ``persist_trade_score_v1`` always returns an int (the inserted
-    # or pre-existing row's id). We coerce defensively in case a
-    # future migration ever returns a falsy non-int; the typed
-    # contract still gets a usable int.
-    try:
-        trade_score_decision_id = int(trade_score_decision_id)
-    except (TypeError, ValueError):
-        trade_score_decision_id = None
+    # Persist/reuse only when policy allows it. The pure frozen score is still
+    # computed above in decision-only mode; no TC row is inserted there.
+    trade_score_decision_id: Optional[int] = None
+    trade_score_would_create = False
+    if policy.persist_trade_copyability:
+        persisted_trade_id = persist_trade_score_v1(
+            db,
+            inputs.wallet_id,
+            inputs.source_trade_id,
+            trade_score_result,
+            idempotency_key=trade_idem,
+            candidate_id=candidate_id,
+            price_snapshot_id=inputs.snapshot_id,
+            source_data_timestamp=snap_ts,
+        )
+        try:
+            trade_score_decision_id = int(persisted_trade_id)
+        except (TypeError, ValueError):
+            trade_score_decision_id = None
+    else:
+        trade_score_would_create = True
 
     # Shadow v2 — parallel-only, never affects v1 verdict. We persist
     # a SEPARATE immutable research row per delay scenario (six
@@ -1139,11 +1211,15 @@ def _evaluate_paper_signals_for_candidate_inner(
     # DELAY_30_SECONDS, DELAY_2_MINUTES, DELAY_5_MINUTES,
     # DELAY_15_MINUTES, ACTUAL_MEASURED_DELAY). The shadow's first
     # scenario row is what the paper-signal summary reports.
-    shadow_results = _compute_and_persist_shadow_v2(
-        db,
-        inputs=inputs,
-        now=now,
-    )
+    # Shadow is optional execution-policy behavior. Decision-only callers make
+    # this branch unreachable, so they cannot write shadow_decisions.
+    shadow_results: dict[str, ShadowScoreResultV2] = {}
+    if policy.persist_shadow:
+        shadow_results = _compute_and_persist_shadow_v2(
+            db,
+            inputs=inputs,
+            now=now,
+        )
     # Primary shadow result for the paper-signal summary is the
     # THEORETICAL_IMMEDIATE scenario (no delay penalty). When it
     # cannot be computed (e.g. missing source/delayed prices), the
@@ -1160,14 +1236,15 @@ def _evaluate_paper_signals_for_candidate_inner(
         else:
             primary_shadow = next(iter(shadow_results.values()), None)
 
-    # Category inputs.
+    # Category resolver result is canonical. PARTIAL/UNAVAILABLE taxonomy
+    # deliberately yields a typed not_applicable resolution and no decision.
     cat_score: Optional[float] = None
     cat_verdict: Optional[str] = None
-    if inputs.category_decision is not None:
+    if category_resolution.result is not None:
         try:
-            cat_score = float(inputs.category_decision.get("final_score"))
-            cat_verdict = str(inputs.category_decision.get("verdict"))
-        except (TypeError, ValueError):
+            cat_score = float(category_resolution.result.score)
+            cat_verdict = str(category_resolution.result.verdict.value)
+        except (AttributeError, TypeError, ValueError):
             cat_score = None
             cat_verdict = None
 
@@ -1187,22 +1264,8 @@ def _evaluate_paper_signals_for_candidate_inner(
     # depth hash, and the trade score+verdict. The verdict text
     # alone is NOT enough to distinguish materially different
     # inputs. See Chunk 4 §A2.
-    wallet_decision_id = None
-    if inputs.wallet_decision is not None:
-        try:
-            wallet_decision_id = int(
-                inputs.wallet_decision.get("id") or 0
-            ) or None
-        except (TypeError, ValueError):
-            wallet_decision_id = None
-    category_decision_id = None
-    if inputs.category_decision is not None:
-        try:
-            category_decision_id = int(
-                inputs.category_decision.get("id") or 0
-            ) or None
-        except (TypeError, ValueError):
-            category_decision_id = None
+    wallet_decision_id = wallet_resolution.decision_id
+    category_decision_id = category_resolution.decision_id
 
     # ---- Chunk 5 typed paper-signal input ---------------------------------
     # Build the frozen typed input contract from the persisted
@@ -1231,9 +1294,29 @@ def _evaluate_paper_signals_for_candidate_inner(
         trade_formula_version=trade_score_result.formula_version,
         evaluation_timestamp=now,
         final_verdict=final_verdict.value,
-        final_reason=_signal_reason(final_verdict),
+        final_reason=(
+            "wallet_incomplete;" + _signal_reason(final_verdict)
+            if wallet_resolution.status == "incomplete"
+            else _signal_reason(final_verdict)
+        ),
         is_approved=0,  # PR 4 paper signals are NEVER approved.
         auto_approve_requested=False,
+        wallet_evidence_fingerprint=wallet_resolution.evidence_fingerprint,
+        wallet_score_complete=wallet_resolution.status == "complete",
+        wallet_score_missing_reasons=wallet_resolution.missing_reasons,
+        taxonomy_status=taxonomy.status,
+        taxonomy_source=taxonomy.source,
+        category_evidence_fingerprint=category_resolution.evidence_fingerprint,
+        category_score_status=category_resolution.status,
+        category_score_missing_reasons=category_resolution.missing_reasons,
+        category_not_applicable_reason=(
+            category_resolution.missing_reasons[0]
+            if category_resolution.status == "not_applicable"
+            and category_resolution.missing_reasons
+            else None
+        ),
+        evaluation_policy_name=_evaluation_policy_name(policy),
+        trade_copyability_decision_id=trade_score_decision_id,
     )
 
     ps_idem = generate_idempotency_key(
@@ -1262,31 +1345,88 @@ def _evaluate_paper_signals_for_candidate_inner(
             "trade_score": f"{float(trade_score_result.score):.2f}",
         },
     )
-    paper_signal_id = persist_paper_signal(
-        db,
-        candidate_id,
-        inputs.wallet_id,
-        final_verdict.value,
-        _signal_reason(final_verdict),
-        wallet_score_result.score,
-        trade_score_result.score,
-        float(primary_shadow.score) if primary_shadow is not None else 0.0,
-        primary_shadow.verdict if primary_shadow is not None else None,
-        final_verdict.value,
-        snap_ts,
-        inputs.source_trade_id,
-        inputs.snapshot_id,
-        idempotency_key=ps_idem,
-        typed_input=paper_signal_typed_input,
-    )
+    paper_signal_id: Optional[int] = None
+    paper_signal_would_create = False
+    if policy.persist_paper_signal:
+        paper_signal_id = persist_paper_signal(
+            db,
+            candidate_id,
+            inputs.wallet_id,
+            final_verdict.value,
+            _signal_reason(final_verdict),
+            wallet_score_result.score,
+            trade_score_result.score,
+            float(primary_shadow.score) if primary_shadow is not None else 0.0,
+            primary_shadow.verdict if primary_shadow is not None else None,
+            final_verdict.value,
+            snap_ts,
+            inputs.source_trade_id,
+            inputs.snapshot_id,
+            idempotency_key=ps_idem,
+            typed_input=paper_signal_typed_input,
+        )
+    else:
+        paper_signal_would_create = True
 
     summary["verdict"] = final_verdict.value
-    summary["reason"] = "ok"
+    summary["reason"] = (
+        "wallet_incomplete" if wallet_resolution.status == "incomplete" else "ok"
+    )
     summary["is_approved"] = 0
     summary["paper_signal_id"] = paper_signal_id
+    summary["trade_copyability_would_create"] = trade_score_would_create
+    summary["paper_signal_would_create"] = paper_signal_would_create
+    # Bounded caller-facing audit envelope.  It exposes values already produced
+    # by this canonical evaluation; it neither recomputes formulas nor reads
+    # any additional mutable evidence.
+    summary["decision_details"] = {
+        "snapshot_id": inputs.snapshot_id,
+        "snapshot_timestamp": snap_ts,
+        "taxonomy_status": taxonomy.status,
+        "taxonomy_source": taxonomy.source,
+        "taxonomy_reason": taxonomy.reason,
+        "category_label": taxonomy.category_label,
+        "wallet_score_status": wallet_resolution.status,
+        "wallet_score": wallet_score_result.score,
+        "wallet_verdict": wallet_score_result.verdict.value,
+        "wallet_missing_reasons": list(wallet_resolution.missing_reasons),
+        "wallet_fingerprint": wallet_resolution.evidence_fingerprint,
+        "wallet_decision_id": wallet_resolution.decision_id,
+        "wallet_reused": wallet_resolution.reused,
+        "wallet_created": wallet_resolution.created,
+        "wallet_would_create": wallet_resolution.would_create,
+        "wallet_persisted": wallet_resolution.persisted,
+        "category_score_status": category_resolution.status,
+        "category_score": (
+            category_resolution.result.score
+            if category_resolution.result is not None else None
+        ),
+        "category_verdict": (
+            category_resolution.result.verdict.value
+            if category_resolution.result is not None else None
+        ),
+        "category_missing_reasons": list(category_resolution.missing_reasons),
+        "category_fingerprint": category_resolution.evidence_fingerprint,
+        "category_decision_id": category_resolution.decision_id,
+        "category_reused": category_resolution.reused,
+        "category_created": category_resolution.created,
+        "category_would_create": category_resolution.would_create,
+        "category_persisted": category_resolution.persisted,
+        "tc_score": trade_score_result.score,
+        "tc_verdict": trade_score_result.verdict.value,
+        "tc_reason_codes": list(trade_score_result.rejection_reasons),
+        "tc_decision_id": trade_score_decision_id,
+        "tc_would_create": trade_score_would_create,
+        "tc_persisted": trade_score_decision_id is not None,
+    }
 
-    if final_verdict == SignalVerdict.COPY_CANDIDATE:
-        # Register 7 exit experiments (research only). The schedule
+    if (
+        final_verdict == SignalVerdict.COPY_CANDIDATE
+        and policy.persist_exit_experiments
+        and paper_signal_id is not None
+    ):
+        # Register 7 exit experiments only when the caller explicitly permits
+        # them. Decision-only evaluation leaves this write path unreachable.
         # is derived from the immutable signal evaluation timestamp,
         # NOT from wall-clock now(). Chunk 5 §5.3.
         n = record_exit_experiments_for_signal(
@@ -1298,6 +1438,15 @@ def _evaluate_paper_signals_for_candidate_inner(
         summary["exit_experiments_registered"] = n
 
     return summary
+
+
+def _evaluation_policy_name(policy: EvaluationExecutionPolicy) -> str:
+    """Stable, non-secret provenance label for evaluator execution mode."""
+    if policy == DECISION_ONLY_EVALUATION_POLICY:
+        return "decision_only"
+    if policy == DEFAULT_EVALUATION_POLICY:
+        return "default"
+    return "custom"
 
 
 def _signal_reason(verdict: SignalVerdict) -> str:
@@ -2164,61 +2313,21 @@ def _resolve_wallet_score(
     *,
     now: datetime,
 ) -> WalletScoreResult:
-    """Reuse the persisted wallet-score decision if present,
-    otherwise compute + persist.
+    """Legacy compatibility shim using the aggregate-backed PR67 resolver.
 
-    The persisted decision is keyed on the snapshot's point-in-time
-    timestamp, so re-running the pipeline with the same snapshot
-    yields the same score.
+    The canonical evaluator calls ``resolve_wallet_score_v1`` directly. This
+    retained private name has no evidence-free formula fallback.
     """
-    if inputs.wallet_decision is not None:
-        try:
-            score = float(inputs.wallet_decision.get("final_score"))
-            verdict_str = str(inputs.wallet_decision.get("verdict"))
-            try:
-                verdict = WalletVerdict(verdict_str)
-            except ValueError:
-                verdict = WalletVerdict.INCOMPLETE
-        except (TypeError, ValueError):
-            score = 0.0
-            verdict = WalletVerdict.INCOMPLETE
-        return WalletScoreResult(
-            wallet_id=inputs.wallet_id or "",
-            score=score,
-            verdict=verdict,
-        )
-
-    # Fall back to a re-computation. In a healthy runtime the
-    # wallet score is computed and persisted in Chunk 2 / 3 before
-    # the paper-signal pipeline runs. We compute it again here so
-    # the runtime remains self-contained.
-    result = compute_wallet_score_v1(
-        wallet_id=inputs.wallet_id or "",
+    resolution = resolve_wallet_score_v1(
+        db,
+        inputs.wallet_id or "",
+        cutoff_timestamp=inputs.behavior_evidence_cutoff,
+        persist=True,
         now=now,
     )
-    snap_ts = (
-        inputs.snapshot.get("fetched_at") if inputs.snapshot else None
-    )
-    idem = generate_idempotency_key(
-        formula_name="wallet_score",
-        formula_version=WALLET_FORMULA_VERSION,
-        wallet_id=inputs.wallet_id or "",
-        source_data_timestamp=snap_ts,
-    )
-    try:
-        persist_wallet_score_v1(
-            db, inputs.wallet_id or "", result,
-            idempotency_key=idem,
-            source_data_timestamp=snap_ts,
-            candidate_id=(
-                int(inputs.candidate.get("id"))
-                if inputs.candidate and "id" in inputs.candidate
-                else None
-            ),
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("persist_wallet_score_v1 failed: %s", exc)
-    return result
+    if not isinstance(resolution.result, WalletScoreResult):
+        raise RuntimeError("aggregate wallet resolver returned no WalletScoreResult")
+    return resolution.result
 
 
 def record_exit_experiments_for_signal(

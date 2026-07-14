@@ -88,6 +88,20 @@ class PaperSignalDecisionInput:
     # explicit safety reason. Default False (no request).
     auto_approve_requested: bool = False
 
+    # PR67 additive evidence-resolver provenance.  These optional fields keep
+    # historical decision_input_json payloads readable without a migration.
+    wallet_evidence_fingerprint: Optional[str] = None
+    wallet_score_complete: Optional[bool] = None
+    wallet_score_missing_reasons: tuple[str, ...] = ()
+    taxonomy_status: Optional[str] = None
+    taxonomy_source: Optional[str] = None
+    category_evidence_fingerprint: Optional[str] = None
+    category_score_status: Optional[str] = None
+    category_score_missing_reasons: tuple[str, ...] = ()
+    category_not_applicable_reason: Optional[str] = None
+    evaluation_policy_name: Optional[str] = None
+    trade_copyability_decision_id: Optional[int] = None
+
 
 @dataclass(frozen=True)
 class PaperSignalDecisionResult:
@@ -245,6 +259,29 @@ def serialize_paper_signal_input(
         "auto_approve_requested": _canonicalize(
             input.auto_approve_requested
         ),
+        "wallet_evidence_fingerprint": _canonicalize(
+            input.wallet_evidence_fingerprint
+        ),
+        "wallet_score_complete": _canonicalize(input.wallet_score_complete),
+        "wallet_score_missing_reasons": _canonicalize(
+            input.wallet_score_missing_reasons
+        ),
+        "taxonomy_status": _canonicalize(input.taxonomy_status),
+        "taxonomy_source": _canonicalize(input.taxonomy_source),
+        "category_evidence_fingerprint": _canonicalize(
+            input.category_evidence_fingerprint
+        ),
+        "category_score_status": _canonicalize(input.category_score_status),
+        "category_score_missing_reasons": _canonicalize(
+            input.category_score_missing_reasons
+        ),
+        "category_not_applicable_reason": _canonicalize(
+            input.category_not_applicable_reason
+        ),
+        "evaluation_policy_name": _canonicalize(input.evaluation_policy_name),
+        "trade_copyability_decision_id": _canonicalize(
+            input.trade_copyability_decision_id
+        ),
     }
     return json.dumps(
         payload,
@@ -336,4 +373,46 @@ def deserialize_paper_signal_input(
         final_reason=str(obj["final_reason"]),
         is_approved=int(obj["is_approved"]),
         auto_approve_requested=bool(obj.get("auto_approve_requested", False)),
+        wallet_evidence_fingerprint=(
+            str(obj["wallet_evidence_fingerprint"])
+            if obj.get("wallet_evidence_fingerprint") is not None else None
+        ),
+        wallet_score_complete=(
+            bool(obj["wallet_score_complete"])
+            if obj.get("wallet_score_complete") is not None else None
+        ),
+        wallet_score_missing_reasons=tuple(
+            str(value) for value in obj.get("wallet_score_missing_reasons", ())
+        ),
+        taxonomy_status=(
+            str(obj["taxonomy_status"])
+            if obj.get("taxonomy_status") is not None else None
+        ),
+        taxonomy_source=(
+            str(obj["taxonomy_source"])
+            if obj.get("taxonomy_source") is not None else None
+        ),
+        category_evidence_fingerprint=(
+            str(obj["category_evidence_fingerprint"])
+            if obj.get("category_evidence_fingerprint") is not None else None
+        ),
+        category_score_status=(
+            str(obj["category_score_status"])
+            if obj.get("category_score_status") is not None else None
+        ),
+        category_score_missing_reasons=tuple(
+            str(value) for value in obj.get("category_score_missing_reasons", ())
+        ),
+        category_not_applicable_reason=(
+            str(obj["category_not_applicable_reason"])
+            if obj.get("category_not_applicable_reason") is not None else None
+        ),
+        evaluation_policy_name=(
+            str(obj["evaluation_policy_name"])
+            if obj.get("evaluation_policy_name") is not None else None
+        ),
+        trade_copyability_decision_id=(
+            int(obj["trade_copyability_decision_id"])
+            if obj.get("trade_copyability_decision_id") is not None else None
+        ),
     )
