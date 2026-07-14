@@ -79,6 +79,68 @@ def normalize_source_trade_metadata(raw: Mapping[str, Any] | None) -> dict[str, 
     }
 
 
+def build_metadata_from_gamma_market(
+    trade: Mapping[str, Any] | None,
+    gamma_market: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the canonical PR66 metadata contract from a trusted Gamma market.
+
+    Used by PR68 bounded approved-wallet ingestion. The approved-wallet trade
+    data-api endpoint does NOT return event/taxonomy/series fields, so the
+    trusted taxonomy/event/series evidence is sourced from the Gamma market
+    that the trade's ``conditionId`` resolves to (the same trusted source
+    PR67's ``resolve_category_label_for_inputs`` already uses).
+
+    Gamma raw-market shape: ``events`` is a LIST of event objects, ``series``
+    is likewise a LIST (or a single object). We take the first element of each
+    (Gamma markets resolve to exactly one event/series) and feed it to the
+    canonical normalizer.
+
+    Trusted taxonomy source — EXACTLY the PR66 contract, no more:
+      * ``raw_category`` comes ONLY from Gamma ``category``. This matches the
+        trusted source already used by PR67's
+        ``resolve_category_label_for_inputs`` (``category`` / ``category_label``).
+      * ``groupItemTitle`` is NOT a trusted taxonomy field. There is NO
+        repository or upstream-schema evidence that ``groupItemTitle`` is a
+        category; it is a display grouping only and is intentionally NOT read.
+      * ``tags`` comes ONLY from an explicit Gamma ``tags`` list.
+      * ``event`` / ``series`` come ONLY from Gamma ``events`` / ``series``
+        objects (id/slug/title). ``event.slug`` is identity, never a category.
+      * If Gamma provides nothing, the result is the canonical all-null shape
+        (taxonomy stays UNAVAILABLE honestly).
+
+    Strict no-inference rules (mirrors ``normalize_source_trade_metadata``):
+      * ``raw_category`` is never derived from title, ``groupItemTitle``,
+        event/slug, token, or outcome text.
+
+    Args:
+        trade: the upstream-like trade dict (may carry nothing useful for
+            taxonomy; kept for forward-compat only).
+        gamma_market: the parsed Gamma market object/dict. May be None when
+            the market cannot be resolved (taxonomy then stays UNAVAILABLE).
+
+    Returns:
+        The exact same canonical dict shape as :func:`normalize_source_trade_metadata`.
+    """
+    trade_map = _mapping(trade)
+    market = _mapping(gamma_market)
+    # Prefer explicit trade-level taxonomy when the upstream trade actually
+    # carries it (future-proofing); otherwise fall back to Gamma.
+    if any(trade_map.get(k) for k in ("event", "taxonomy", "series", "category", "tags")):
+        source = trade_map
+    else:
+        # Adapt Gamma's plural events/series lists to the canonical singular
+        # event/series shape before normalizing.
+        source = dict(market)
+        events = market.get("events")
+        if isinstance(events, list) and events:
+            source["event"] = events[0]
+        series = market.get("series")
+        if isinstance(series, list) and series:
+            source["series"] = series[0]
+    return normalize_source_trade_metadata(source)
+
+
 def serialize_source_trade_metadata(raw: Mapping[str, Any] | None) -> str:
     """Serialize canonical source-trade evidence deterministically."""
     return json.dumps(
@@ -88,8 +150,22 @@ def serialize_source_trade_metadata(raw: Mapping[str, Any] | None) -> str:
     )
 
 
+def serialize_gamma_market_metadata(
+    trade: Mapping[str, Any] | None,
+    gamma_market: Mapping[str, Any] | None,
+) -> str:
+    """Serialize the canonical Gamma-derived metadata deterministically."""
+    return json.dumps(
+        build_metadata_from_gamma_market(trade, gamma_market),
+        sort_keys=True,
+        separators=_CANONICAL_SEPARATORS,
+    )
+
+
 __all__ = [
     "METADATA_VERSION",
+    "build_metadata_from_gamma_market",
     "normalize_source_trade_metadata",
+    "serialize_gamma_market_metadata",
     "serialize_source_trade_metadata",
 ]

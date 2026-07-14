@@ -74,8 +74,10 @@ def test_collector_only_accepts_buy_source_provided_identity_and_is_bounded():
 
 def test_true_no_write_script_has_no_persistence_paths():
     text = (Path(__file__).parents[1] / "scripts/collect_approved_wallet_trades.py").read_text()
+    # Dry-run branch is everything after `if not args.write:` up to its first
+    # `return` (which precedes any DB/backup/write logic).
     no_write_branch = text.split("if not args.write:", 1)[1].split(
-        "try:\n        with operational_job_lock", 1
+        "return 0 if not result.errors", 1
     )[0]
     for forbidden in (
         "Database(",
@@ -130,12 +132,15 @@ def test_write_report_recognizes_existing_source_name_row(tmp_path, monkeypatch,
     monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
     monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(tmp_path / "lock"))
     monkeypatch.setattr(cli, "_RealDataApiProvider", lambda timeout: Provider())
-    monkeypatch.setattr(cli, "collect_sync", lambda provider, wallet: result)
+    # New async API: patch collect + asyncio.run so no network is hit.
+    monkeypatch.setattr(cli, "collect", lambda *a, **k: result)
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro, *a, **k: coro)
     db_path = tmp_path / "collector.db"
     assert cli.main(["--write", "--db-path", str(db_path)]) == 0
     capsys.readouterr()
     assert cli.main(["--write", "--db-path", str(db_path)]) == 0
     report = json.loads(capsys.readouterr().out)
+    # First write inserted; replay recognized the existing canonical row.
     assert report["inserted"] == 0
     assert report["deduplicated"] == 1
     assert report["existing_canonical_records"] == 1

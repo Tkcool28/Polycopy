@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -381,20 +382,29 @@ def normalize_source_trade(
     requested_wallet: Optional[str] = None,
     record_index: int = -1,
     allow_sell: bool = False,
+    gamma_market: Optional[Mapping[str, Any]] = None,
 ) -> "NormalizedSourceTrade":
     """Normalize one record; ``allow_sell`` is opt-in for bounded history.
 
     The recurring collector leaves ``allow_sell=False`` and therefore remains
     BUY-only. Historical evidence explicitly passes True.
 
-    BUY-only V1 rules enforced by the default:
-      * side canonicalized to UPPERCASE; SELL -> rejected unsupported_side;
-        missing/unknown -> rejected missing_side.
-      * price parseable within [0, 1]; quantity > 0; timestamp parseable.
-      * trader_address must match requested_wallet (when one is supplied).
-      * live rows: is_sample always 0.
-      * no placeholder IDs (token_id/conditionId must be valid, not sentinel).
+    ``gamma_market`` (PR68): an OPTIONAL trusted Gamma market dict (the one the
+    trade's ``conditionId`` resolves to). When provided, canonical metadata is
+    built from it (event/series/category/tags) via the PR66 helper — the
+    approved-wallet trade endpoint itself returns no taxonomy fields. No
+    title/slug inference is ever performed; market ``title``/``slug`` are kept
+    only as non-taxonomy identity/provenance. When omitted, metadata degrades
+    to the honest all-null (UNAVAILABLE) shape.
     """
+
+    # BUY-only V1 rules enforced by the default:
+    #   * side canonicalized to UPPERCASE; SELL -> rejected unsupported_side;
+    #     missing/unknown -> rejected missing_side.
+    #   * price parseable within [0, 1]; quantity > 0; timestamp parseable.
+    #   * trader_address must match requested_wallet (when one is supplied).
+    #   * live rows: is_sample always 0.
+    #   * no placeholder IDs (token_id/conditionId must be valid, not sentinel).
     candidate = NormalizedSourceTrade()
     candidate._fetch_index = record_index
 
@@ -480,6 +490,14 @@ def normalize_source_trade(
     candidate.market_title = raw.get("title") if isinstance(raw.get("title"), str) else None
     candidate.market_slug = raw.get("slug") if isinstance(raw.get("slug"), str) else None
     candidate.metadata = normalize_source_trade_metadata(raw)
+    # PR68: when a trusted Gamma market is supplied, rebuild canonical metadata
+    # from it (the trade endpoint carries no event/taxonomy/series fields).
+    if gamma_market is not None:
+        from polycopy.ingestion.source_trade_metadata import (
+            build_metadata_from_gamma_market,
+        )
+
+        candidate.metadata = build_metadata_from_gamma_market(raw, gamma_market)
 
     # ── raw provenance: keep source-provided id and tx hash SEPARATE ──
     sp = raw.get("sourceProvidedTradeId")
@@ -595,7 +613,7 @@ class IngestionCounters:
 
 
 def count_rejection(counters: "IngestionCounters", candidate: "NormalizedSourceTrade") -> None:
-    """Map a rejected candidate's reasons onto the required counters."""
+    """Map a rejected candidate reason onto the required counters."""
     for reason in candidate.validation_reasons:
         base = reason.split(":")[0]
         if base == REASON_UNSUPPORTED_SIDE:
