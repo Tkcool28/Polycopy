@@ -11,15 +11,11 @@ import asyncio
 import json
 from pathlib import Path
 
-import pytest
-
 from polycopy.db.database import Database
 from polycopy.ingestion.approved_wallet_collector import (
     APPROVED_WALLET_ENV,
     _classify_taxonomy,
-    _raw_gamma_resolver_adapter,
     collect,
-    resolve_wallet,
 )
 from polycopy.ingestion.normalized_source_trade import normalize_source_trade
 from polycopy.ingestion.source_trade_metadata import (
@@ -170,8 +166,6 @@ def test_sell_exact_match_rejected():
 
 # ── Checkpoint C: limit ─────────────────────────────────────────────────────
 def test_limit_1_writes_at_most_one_row(tmp_path):
-    import scripts.collect_approved_wallet_trades as cli  # type: ignore
-
     rows = [
         _raw(sourceProvidedTradeId="a"),
         _raw(sourceProvidedTradeId="b"),
@@ -252,6 +246,289 @@ def test_production_write_requires_allow_live_and_confirm(monkeypatch, capsys):
          "--db-path", str(cli.PRODUCTION_DB_PATH), "--json"]
     )
     assert rc == 2  # missing --allow-live and --confirm-production-db
+
+
+# ── Checkpoint F (corrected): production requires EXACTLY --limit 1 ───────
+def test_production_write_requires_limit_1(monkeypatch, capsys):
+    import scripts.collect_approved_wallet_trades as cli  # type: ignore
+
+    monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
+    monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(Path("/tmp") / "lock"))
+    # All gates present EXCEPT --limit 1 (default MAX_RECORDS=25).
+    rc = cli.main(
+        ["--wallet", WALLET, "--source-trade-id", "polymarket:x", "--write",
+         "--allow-live", "--confirm-production-db",
+         "--db-path", str(cli.PRODUCTION_DB_PATH), "--json"]
+    )
+    assert rc == 2
+    assert "--limit 1" in capsys.readouterr().err
+
+
+def test_production_write_limit_2_rejected(monkeypatch, capsys):
+    import scripts.collect_approved_wallet_trades as cli  # type: ignore
+
+    monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
+    monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(Path("/tmp") / "lock"))
+    # --limit 2 must fail for production, before network/backup/connect.
+    rc = cli.main(
+        ["--wallet", WALLET, "--source-trade-id", "polymarket:x", "--write",
+         "--allow-live", "--confirm-production-db", "--limit", "2",
+         "--db-path", str(cli.PRODUCTION_DB_PATH), "--json"]
+    )
+    assert rc == 2
+    assert "--limit 1" in capsys.readouterr().err
+
+
+def test_production_write_limit_1_passes_gate(monkeypatch, capsys):
+    # is_prod gate accepts --limit 1; failure (if any) would come from a
+    # later stage (backup/connect), proven separately below.
+    import scripts.collect_approved_wallet_trades as cli  # type: ignore
+
+    monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
+    monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(Path("/tmp") / "lock"))
+    # Force the production gate path to succeed by treating a temp DB as prod.
+    monkeypatch.setattr(cli, "_is_production_db", lambda p: True)
+    calls: list[str] = []
+
+    class _Backup:
+        success = True
+        path = "/tmp/backup.db"
+        sha256 = "abc"
+        size = 123
+        integrity_check = "ok"
+        foreign_key_violations = 0
+        schema_version = 1
+
+    def _backup(_p):
+        calls.append("backup")
+        return _Backup()
+
+    class _DB:
+        def __init__(self, _p):
+            calls.append("db_open")
+            self.conn = _FakeConn()
+        def connect(self):
+            calls.append("db_connect")
+        def close(self):
+            calls.append("db_close")
+            self.conn = None
+
+    class _FakeConn:
+        def execute(self, *a, **k):
+            return []
+
+    class _Provider:
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(cli, "create_verified_backup", _backup)
+    monkeypatch.setattr(cli, "Database", _DB)
+    monkeypatch.setattr(cli, "_RealDataApiProvider", lambda timeout: _Provider())
+    monkeypatch.setattr(cli, "collect", lambda *a, **k: _sentinel_result())
+    monkeypatch.setattr(cli, "write_valid_rows", lambda *a, **k: _sentinel_outcome())
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro, *a, **k: coro)
+    monkeypatch.setattr(cli, "_read_canonical_schema_version", lambda p: 1)
+    db_path = str(Path("/tmp") / "prod_limit1.db")
+    cli.main(
+        ["--wallet", WALLET, "--source-trade-id", "polymarket:x", "--write",
+         "--allow-live", "--confirm-production-db", "--limit", "1",
+         "--db-path", db_path, "--json"]
+    )
+    # No assertion on rc (write internals may vary); the gate MUST have accepted
+    # --limit 1 (i.e. not returned 2 for missing --limit 1).
+    assert "--limit 1" not in capsys.readouterr().err
+
+
+def _sentinel_result():
+    from polycopy.ingestion.approved_wallet_collector import CollectionResult
+
+    r = CollectionResult(
+        wallet=WALLET,
+        raw_records=1,
+        buy_records=1,
+        sell_records_excluded=0,
+        accepted_rows=[],
+        rejected_records=0,
+        fallback_identities=0,
+        ambiguous_identities=0,
+        selected_count=0,
+    )
+    return r
+
+
+def _sentinel_outcome():
+    from polycopy.ingestion.source_trade_writer import WriteResult
+
+    return WriteResult(
+        inserted=1,
+        deduplicated=0,
+        existing_duplicates_recognized=0,
+        committed=True,
+        rolled_back=False,
+        errors=0,
+        unique_constraint_present=True,
+    )
+
+
+# ── Checkpoint F (corrected): backup BEFORE writable open (call order) ──────
+def test_backup_before_writable_open_call_order(monkeypatch, capsys):
+    import scripts.collect_approved_wallet_trades as cli  # type: ignore
+
+    monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
+    monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(Path("/tmp") / "lock"))
+    monkeypatch.setattr(cli, "_is_production_db", lambda p: True)
+    order: list[str] = []
+
+    class _Backup:
+        success = True
+        path = "/tmp/backup.db"
+        sha256 = "abc"
+        size = 123
+        integrity_check = "ok"
+        foreign_key_violations = 0
+        schema_version = 1
+
+    def _backup(_p):
+        order.append("backup")
+        return _Backup()
+
+    class _DB:
+        def __init__(self, _p):
+            order.append("db_open")
+            self.conn = _FakeConn()
+        def connect(self):
+            order.append("db_connect")
+        def close(self):
+            order.append("db_close")
+            self.conn = None
+
+    class _FakeConn:
+        def execute(self, *a, **k):
+            return []
+
+    class _Provider:
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(cli, "create_verified_backup", _backup)
+    monkeypatch.setattr(cli, "Database", _DB)
+    monkeypatch.setattr(cli, "_RealDataApiProvider", lambda timeout: _Provider())
+    monkeypatch.setattr(cli, "collect", lambda *a, **k: _sentinel_result())
+    monkeypatch.setattr(cli, "write_valid_rows", lambda *a, **k: _sentinel_outcome())
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro, *a, **k: coro)
+    monkeypatch.setattr(cli, "_read_canonical_schema_version", lambda p: 1)
+    db_path = str(Path("/tmp") / "prod_order.db")
+    rc = cli.main(
+        ["--wallet", WALLET, "--source-trade-id", "polymarket:x", "--write",
+         "--allow-live", "--confirm-production-db", "--limit", "1",
+         "--db-path", db_path, "--json"]
+    )
+    assert rc == 0, capsys.readouterr().err
+    # Backup verification must precede any writable DB open/connect.
+    assert "backup" in order and "db_open" in order
+    assert order.index("backup") < order.index("db_open")
+    assert order.index("backup") < order.index("db_connect")
+
+
+def test_backup_failure_blocks_writable_open(monkeypatch, capsys):
+    import scripts.collect_approved_wallet_trades as cli  # type: ignore
+
+    monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
+    monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(Path("/tmp") / "lock"))
+    monkeypatch.setattr(cli, "_is_production_db", lambda p: True)
+
+    class _BackupFail:
+        success = False
+        path = None
+        sha256 = None
+        size = None
+        integrity_check = "not_ok"
+        foreign_key_violations = 1
+        schema_version = None
+        error = "boom"
+
+    def _backup(_p):
+        return _BackupFail()
+
+    opened = []
+
+    class _DB:
+        def __init__(self, _p):
+            opened.append("db_open")
+        def connect(self):
+            opened.append("db_connect")
+        def close(self):
+            pass
+        conn = None
+
+    class _Provider:
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(cli, "create_verified_backup", _backup)
+    monkeypatch.setattr(cli, "Database", _DB)
+    monkeypatch.setattr(cli, "_RealDataApiProvider", lambda timeout: _Provider())
+    monkeypatch.setattr(cli, "collect", lambda *a, **k: _sentinel_result())
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro, *a, **k: coro)
+    monkeypatch.setattr(cli, "_read_canonical_schema_version", lambda p: 1)
+    db_path = str(Path("/tmp") / "prod_backupfail.db")
+    rc = cli.main(
+        ["--wallet", WALLET, "--source-trade-id", "polymarket:x", "--write",
+         "--allow-live", "--confirm-production-db", "--limit", "1",
+         "--db-path", db_path, "--json"]
+    )
+    assert rc == 1  # backup failure -> no write
+    assert opened == []  # Database never opened/connected
+
+
+def test_schema_mismatch_blocks_writable_open(monkeypatch, capsys):
+    import scripts.collect_approved_wallet_trades as cli  # type: ignore
+
+    monkeypatch.setenv(APPROVED_WALLET_ENV, WALLET)
+    monkeypatch.setenv("POLYCOPY_OPERATIONAL_LOCK_PATH", str(Path("/tmp") / "lock"))
+    monkeypatch.setattr(cli, "_is_production_db", lambda p: True)
+
+    class _Backup:
+        success = True
+        path = "/tmp/backup.db"
+        sha256 = "abc"
+        size = 123
+        integrity_check = "ok"
+        foreign_key_violations = 0
+        schema_version = 99  # differs from source schema 1
+
+    def _backup(_p):
+        return _Backup()
+
+    opened = []
+
+    class _DB:
+        def __init__(self, _p):
+            opened.append("db_open")
+        def connect(self):
+            opened.append("db_connect")
+        def close(self):
+            pass
+        conn = None
+
+    class _Provider:
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(cli, "create_verified_backup", _backup)
+    monkeypatch.setattr(cli, "Database", _DB)
+    monkeypatch.setattr(cli, "_RealDataApiProvider", lambda timeout: _Provider())
+    monkeypatch.setattr(cli, "collect", lambda *a, **k: _sentinel_result())
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro, *a, **k: coro)
+    monkeypatch.setattr(cli, "_read_canonical_schema_version", lambda p: 1)
+    db_path = str(Path("/tmp") / "prod_schemamismatch.db")
+    rc = cli.main(
+        ["--wallet", WALLET, "--source-trade-id", "polymarket:x", "--write",
+         "--allow-live", "--confirm-production-db", "--limit", "1",
+         "--db-path", db_path, "--json"]
+    )
+    assert rc == 1  # schema mismatch -> no write
+    assert opened == []  # Database never opened/connected
 
 
 # ── Checkpoint H: temp-DB end-to-end + replay ──────────────────────────────

@@ -12,9 +12,10 @@ Safety envelope (carried + strengthened by PR68):
   * No --write => no writes (even with --allow-live).
   * No --confirm-production-db => no production DB opened for writing.
   * Production write requires ALL of: --allow-live --write
-    --confirm-production-db --source-trade-id --limit. A production write
-    WITHOUT --source-trade-id is REJECTED (manual-only until automation is
-    explicitly restored in a later operational task).
+    --confirm-production-db --source-trade-id --limit 1. A production write
+    WITHOUT --source-trade-id OR without exactly --limit 1 is REJECTED
+    (manual-only until automation is explicitly restored in a later
+    operational task).
   * Bounds: --limit (min 1, max MAX_RECORDS=25) bounds accepted rows; the
     write path can never exceed it. --source-trade-id selects EXACTLY one
     public external id (no prefix, no internal id, no fuzzy).
@@ -184,6 +185,11 @@ def main(argv: list[str] | None = None) -> int:
         # Manual-only: a production write MUST name the exact source trade.
         if args.source_trade_id is None:
             missing.append("--source-trade-id")
+        # Production writes are ALWAYS exactly one selected BUY. The operator
+        # must supply --limit 1 explicitly; the default (MAX_RECORDS) is
+        # rejected and is never silently coerced.
+        if args.limit != 1:
+            missing.append("--limit 1")
         if missing:
             print(
                 "error: production write requires: " + ", ".join(missing),
@@ -191,7 +197,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    # ── collector ──
+    # ── collector (network + trusted Gamma resolution) ──
+    # This runs BEFORE any writable production DB is opened. The production
+    # safety backup is created/read-only-verified only after live data is
+    # fetched and validated, and strictly BEFORE writable open (below).
     provider = _RealDataApiProvider(timeout=10.0)
     # PR68: build the trusted Gamma resolver for taxonomy enrichment.
     settings = Settings()
@@ -225,50 +234,74 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if not result.errors else 1
 
     # ── write path ──
+    # IMPORTANT ORDERING: a writable production DB is opened ONLY after the
+    # verified online backup + schema-match checks pass. If is_prod, we read
+    # the source schema read-only, create + verify the backup, and only then
+    # call Database(...).connect(). A tempDB write (is_prod False) skips the
+    # backup but still opens the DB here, after the bounded accepted rows are
+    # already reduced to the exact selected set.
     from polycopy.runtime.locks import operational_job_lock  # noqa: E402
 
     backup_meta: Optional[dict[str, Any]] = None
+    writable_opened = False
     try:
         with operational_job_lock("collect", timeout=args.lock_timeout):
+            # Bounded accepted rows (never exceed --limit). In production this
+            # is exactly one selected BUY (gate enforced --limit 1 above).
+            accepted = result.accepted_rows[: args.limit]
+
+            # ── production safety: verify backup BEFORE writable open ──
+            if is_prod:
+                src_schema = _read_canonical_schema_version(args.db_path)
+                backup = create_verified_backup(args.db_path)
+                if not backup.success or backup.integrity_check != "ok":
+                    print(
+                        f"error: production backup failed: {backup.error or 'verify unsatisfied'} "
+                        f"(integrity={backup.integrity_check}, fk={backup.foreign_key_violations}, "
+                        f"schema={backup.schema_version})",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if (backup.foreign_key_violations or 0) != 0:
+                    print(
+                        f"error: production backup has foreign-key violations: "
+                        f"{backup.foreign_key_violations}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not (backup.path and backup.size and backup.sha256):
+                    print(
+                        "error: production backup missing path/size/hash",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if backup.schema_version is None or backup.schema_version != src_schema:
+                    print(
+                        f"error: schema mismatch source={src_schema} backup={backup.schema_version}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                backup_meta = {
+                    "backup_path": backup.path,
+                    "backup_sha256": backup.sha256,
+                    "backup_size_bytes": backup.size,
+                    "backup_integrity_check": backup.integrity_check,
+                    "backup_foreign_key_check_count": backup.foreign_key_violations,
+                    "backup_schema_version": backup.schema_version,
+                }
+
+            # ONLY NOW open the production DB writable (or temp DB).
             db = Database(Path(args.db_path))
             db.connect()
+            writable_opened = True
             try:
-                # Verified online backup BEFORE any writable open (production).
-                if is_prod:
-                    src_schema = _read_canonical_schema_version(args.db_path)
-                    backup = create_verified_backup(args.db_path)
-                    if not backup.success:
-                        print(
-                            f"error: production backup failed: {backup.error or 'verify unsatisfied'} "
-                            f"(integrity={backup.integrity_check}, fk={backup.foreign_key_violations}, "
-                            f"schema={backup.schema_version})",
-                            file=sys.stderr,
-                        )
-                        return 1
-                    if backup.schema_version is None or backup.schema_version != src_schema:
-                        print(
-                            f"error: schema mismatch source={src_schema} backup={backup.schema_version}",
-                            file=sys.stderr,
-                        )
-                        return 1
-                    backup_meta = {
-                        "backup_path": backup.path,
-                        "backup_sha256": backup.sha256,
-                        "backup_size_bytes": backup.size,
-                        "backup_integrity_check": backup.integrity_check,
-                        "backup_foreign_key_check_count": backup.foreign_key_violations,
-                        "backup_schema_version": backup.schema_version,
-                    }
-
-                # Bounded accepted rows (never exceed --limit).
-                accepted = result.accepted_rows[: args.limit]
-
                 # Existing-row enrichment (PR68 Checkpoint E) for the selected id.
                 enriched_status = "n/a"
                 if args.source_trade_id is not None and accepted:
                     chosen = accepted[0]
                     md = chosen.metadata
                     import json as _json
+
                     md_json = _json.dumps(md, sort_keys=True, separators=(",", ":")) if md else "{}"
                     enriched_status = _enrich_existing_row(db, args.source_trade_id, md_json)
                     if enriched_status == "enriched":
@@ -293,7 +326,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-
     report = result.report(
         existing_canonical_records=outcome.existing_duplicates_recognized,
         writes_performed=outcome.inserted,
