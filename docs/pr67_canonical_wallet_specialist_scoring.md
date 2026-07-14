@@ -5,13 +5,15 @@ evaluator** (`evaluate_paper_signals_for_candidate`) that drives the frozen
 *Wallet Skill Score v1 → trusted category taxonomy → Category Wallet Score v1 →
 Trade Copyability v1 → canonical paper decision* flow. It adds a persisted
 BUY-evidence resolver, a two-phase approved-wallet bridge, a decision-only CLI,
-and the safety proofs that keep production untouched.
+and the safety proofs that keep production writes out of scope.
 
 ## 1. Purpose
 
 Replace the legacy bridge scoring/paper shortcut with a single canonical
 specialist evaluation used for **paper/pilot testing only**. No order, position,
-approval, collection, or automation is produced or modified by this PR.
+approval, live execution, or automation is produced or modified by this PR. The
+approved-wallet bridge may create or reuse canonical candidate, snapshot, and
+depth-level inputs before decision-only evaluation.
 
 ## 2. Canonical scoring flow
 
@@ -136,11 +138,12 @@ A SQL trace asserts no DML targets: shadow decision tables, exit experiment
 tables, `orders`, `positions`, `settlement_accounting_ledger`, approval state,
 broker/execution tables, or unrelated source-truth tables.
 
-## 14. No production apply yet
+## 14. No production apply or write
 
-This PR has **not** been run against production. `data/polycopy.db` is unchanged
-by CI; collectors/monitors remain masked and inactive; scans/settlement/updates
-are disabled. See the post-merge plan (§17).
+No production PR67 write or apply occurred. A bounded read-only production
+dry-run was performed against `file:/root/Polycopy/data/polycopy.db?mode=ro`, and
+all database counts remained unchanged. Collectors/monitors remain masked and
+inactive; scans/settlement/updates are disabled. See the post-merge plan (§17).
 
 ## 15. Specialist formula vs Alpha shadow
 
