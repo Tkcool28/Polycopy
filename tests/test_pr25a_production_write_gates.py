@@ -176,7 +176,8 @@ def fake_bridge(monkeypatch):
 
     def _fake(db, *, wallet, limit, dependencies, write,
               write_authorization=None,
-              source_trade_id=None, client_close_hooks=()):
+              source_trade_id=None, evaluate_canonical_decisions=True,
+              client_close_hooks=()):
         # Instrument the closables the CLI passed, exactly as the real bridge
         # would receive them, and run them on ONE shared loop (the bridge's loop).
         recorded = []
@@ -195,6 +196,7 @@ def fake_bridge(monkeypatch):
             "db": db, "wallet": wallet, "limit": limit, "write": write,
             "write_authorization": write_authorization,
             "source_trade_id": source_trade_id,
+            "evaluate_canonical_decisions": evaluate_canonical_decisions,
             "closables": recorded,
         })
         return _FakeReport(write_counts={"copy_candidates": 1})
@@ -264,6 +266,7 @@ def test_prod_write_with_both_gates_runs_backup_then_bridge(tmp_path, force_prod
     # Bridge ran only AFTER backup, and only against the temp path.
     assert len(fake_bridge["calls"]) == 1, "bridge must run after successful backup"
     assert fake_bridge["calls"][0]["write_authorization"] is not None
+    assert fake_bridge["calls"][0]["evaluate_canonical_decisions"] is True
     assert _CONNECT_CALLS == [str(Path(temp).resolve())], f"DB connect to temp only: {_CONNECT_CALLS}"
     out = capsys.readouterr().out
     report = json.loads(out)
@@ -432,7 +435,7 @@ def test_cleanup_failure_preserved_in_report_and_forces_exit1(tmp_path, force_pr
 
     def _fake(db, *, wallet, limit, dependencies, write,
               write_authorization=None, source_trade_id=None,
-              client_close_hooks=()):
+              evaluate_canonical_decisions=True, client_close_hooks=()):
         # Mirror the real bridge: hook errors are recorded, not raised.
         errors = []
         loop = asyncio.new_event_loop()

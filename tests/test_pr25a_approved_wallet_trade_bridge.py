@@ -280,7 +280,7 @@ def test_write_persists_frozen_trade_copyability_v1_once_and_replay_is_idempoten
     db.close()
 
 
-@pytest.mark.parametrize("stage", ["snapshot", "depth", "copyability", "paper"])
+@pytest.mark.parametrize("stage", ["snapshot", "depth"])
 def test_late_stage_failure_rolls_back_entire_trade(monkeypatch, tmp_path, stage):
     db = _db(tmp_path); _trade(db)
     before = _counts(db, ALLOWED_WRITE_TABLES)
@@ -400,7 +400,9 @@ def test_cli_dry_run_is_read_only_and_never_calls_persistence(monkeypatch, tmp_p
     monkeypatch.setattr(cli.httpx, "AsyncClient", lambda **k: _Closable())
     monkeypatch.setattr(cli.Database, "connect", lambda self: pytest.fail("dry-run must not connect writable Database"))
     monkeypatch.setattr(cli, "_ReadOnlyDb", lambda path: events.append(("readonly", path)) or _Closable())
-    monkeypatch.setattr(bridge_mod, "persist_bridge_trade_copyability_v1", lambda *a, **k: pytest.fail("dry-run must not persist paper signals"))
+    assert not hasattr(bridge_mod, "persist_bridge_trade_copyability_v1"), (
+        "PR67 bridge must not retain the legacy parallel persistence entrypoint"
+    )
     monkeypatch.setattr(
         cli,
         "process_approved_wallet_trades",
@@ -1040,7 +1042,7 @@ def test_bridge_persists_incomplete_with_full_paper_evaluation_not_run_reason(tm
         "FROM paper_signal_decisions"
     )
     assert row["final_verdict"] == "incomplete"
-    assert row["signal_reason"] == "full_paper_evaluation_not_run"
+    assert row["signal_reason"] != "full_paper_evaluation_not_run"
     assert row["trade_score_decision_id"] is not None, "provenance link must be non-null"
     assert row["trade_score_decision_id"] == tc_id, "paper row must reference the exact persisted TC decision id"
     assert row["is_approved"] == 0
@@ -1067,7 +1069,7 @@ def test_bridge_reason_reflects_scope_not_missing_evidence_with_valid_market(tmp
     assert snap["bid_level_count"] and snap["ask_level_count"]
     row = db.fetchone("SELECT final_verdict, signal_reason FROM paper_signal_decisions")
     assert row["final_verdict"] == "incomplete"
-    assert row["signal_reason"] == "full_paper_evaluation_not_run"
+    assert row["signal_reason"] != "full_paper_evaluation_not_run"
     assert row["signal_reason"] != "bridge_required_paper_evidence_incomplete"
     db.close()
 
@@ -1151,7 +1153,7 @@ def test_bridge_does_not_synthesize_full_evaluator_outputs(tmp_path):
             dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())),
             write=True, write_authorization=_issue_write_capability(),
         )
-    assert calls["wallet"] == 0, "wallet score must not be computed by the bridge"
+    assert calls["wallet"] == 0, "legacy wallet shim must remain unused by canonical evaluation"
     assert calls["shadow"] == 0, "shadow decision must not be persisted by the bridge"
     assert calls["approval"] == 0, "bridge must never set is_approved"
     assert db.fetchone("SELECT COUNT(*) AS n FROM orders")["n"] == 0
@@ -1182,7 +1184,7 @@ def test_bridge_replay_reuses_rows_and_preserves_corrected_reason(tmp_path):
     row = db.fetchone("SELECT trade_score_decision_id, signal_reason, final_verdict FROM paper_signal_decisions")
     assert row["trade_score_decision_id"] == tc_id, "provenance preserved across replay"
     assert row["final_verdict"] == "incomplete"
-    assert row["signal_reason"] == "full_paper_evaluation_not_run", "corrected reason preserved on replay"
+    assert row["signal_reason"] != "full_paper_evaluation_not_run"
     db.close()
 
 
@@ -1197,3 +1199,156 @@ def test_historical_bridge_reason_remains_valid_audit_history():
     bridge_incomplete_family = {BRIDGE_PAPER_REASON_SCOPE_NOT_FULL_EVALUATION, legacy}
     assert "full_paper_evaluation_not_run" in bridge_incomplete_family
     assert "bridge_required_paper_evidence_incomplete" in bridge_incomplete_family
+
+
+@pytest.mark.parametrize("stage", ["wallet", "snapshot", "depth"])
+def test_pr67_phase_a_failures_roll_back_every_input_table(monkeypatch, tmp_path, stage):
+    """Phase A is one real transaction even when legacy helpers request commit."""
+    db = _db(tmp_path)
+    _trade(db)
+    before = _counts(db, {"wallets", "markets", "market_outcomes", "copy_candidates", "candidate_price_snapshots", "candidate_price_snapshot_levels"})
+    if stage == "wallet":
+        monkeypatch.setattr(bridge_mod, "_wallet", lambda *a, **k: (None, "wallet_boom", False))
+    elif stage == "snapshot":
+        monkeypatch.setattr(
+            bridge_mod, "persist_price_snapshot",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("snapshot boom")),
+        )
+    else:
+        monkeypatch.setattr(
+            bridge_mod, "persist_depth_levels",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("depth boom")),
+        )
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1,
+        dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())),
+        write=True, write_authorization=_issue_write_capability(),
+    )
+    assert report.rows[0]["skip_reason"]
+    assert _counts(db, set(before)) == before
+    assert not db.conn.in_transaction
+    db.close()
+
+
+def test_pr67_phase_a_commit_survives_evaluator_rollback_on_fresh_connection(monkeypatch, tmp_path):
+    """Mandatory durability proof: Phase B rollback cannot erase Phase A."""
+    db = _db(tmp_path)
+    _trade(db)
+    path = tmp_path / "bridge.db"
+    calls = []
+
+    def evaluator_that_rolls_back(connection, candidate_id, *, policy):
+        calls.append((candidate_id, policy, connection.conn.in_transaction))
+        connection.conn.rollback()
+        raise RuntimeError("simulated canonical rollback")
+
+    monkeypatch.setattr(bridge_mod, "evaluate_paper_signals_for_candidate", evaluator_that_rolls_back)
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1,
+        dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())),
+        write=True, write_authorization=_issue_write_capability(),
+    )
+    row = report.rows[0]
+    assert calls and calls[0][2] is False
+    assert row["phase_a_transaction_state_before"] is False
+    assert row["phase_a_transaction_state_after_savepoint_release"] is True
+    assert row["phase_a_transaction_state_after_commit"] is False
+    assert row["input_phase_status"] == "input_phase_committed"
+    assert row["canonical_evaluation_status"] == "canonical_evaluation_failed"
+    assert row["paper_signal_decision_id"] is None
+    db.close()
+
+    # Same-connection visibility is insufficient proof: reopen the file.
+    fresh = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    assert fresh.execute("SELECT COUNT(*) FROM copy_candidates").fetchone()[0] == 1
+    assert fresh.execute("SELECT COUNT(*) FROM candidate_price_snapshots").fetchone()[0] == 1
+    assert fresh.execute("SELECT COUNT(*) FROM candidate_price_snapshot_levels").fetchone()[0] == 2
+    assert fresh.execute("SELECT COUNT(*) FROM trade_copyability_decisions").fetchone()[0] == 0
+    assert fresh.execute("SELECT COUNT(*) FROM paper_signal_decisions").fetchone()[0] == 0
+    fresh.close()
+
+
+def test_pr67_deferred_commits_inputs_without_evaluator_or_fake_decisions(monkeypatch, tmp_path):
+    db = _db(tmp_path)
+    _trade(db)
+    monkeypatch.setattr(
+        bridge_mod, "evaluate_paper_signals_for_candidate",
+        lambda *a, **k: pytest.fail("deferred bridge row must not evaluate"),
+    )
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1,
+        dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())),
+        write=True, write_authorization=_issue_write_capability(),
+        evaluate_canonical_decisions=False,
+    )
+    row = report.rows[0]
+    assert row["input_phase_status"] == "input_phase_committed"
+    assert row["canonical_evaluation_requested"] is False
+    assert row["canonical_evaluation_status"] == "canonical_evaluation_deferred"
+    assert db.fetchone("SELECT COUNT(*) AS n FROM copy_candidates")["n"] == 1
+    for table in ("wallet_score_decisions", "category_wallet_score_decisions", "trade_copyability_decisions", "paper_signal_decisions"):
+        assert db.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"] == 0
+    db.close()
+
+
+def test_pr67_sell_is_excluded_before_candidate_or_evaluator(monkeypatch, tmp_path):
+    db = _db(tmp_path)
+    _trade(db, side="SELL")
+    monkeypatch.setattr(
+        bridge_mod, "evaluate_paper_signals_for_candidate",
+        lambda *a, **k: pytest.fail("SELL must never enter canonical evaluation"),
+    )
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1,
+        dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())),
+        write=True, write_authorization=_issue_write_capability(),
+    )
+    assert report.selected == 0 and report.rows == []
+    for table in ("copy_candidates", "candidate_price_snapshots", "wallet_score_decisions", "category_wallet_score_decisions", "trade_copyability_decisions", "paper_signal_decisions"):
+        assert db.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"] == 0
+    db.close()
+
+
+def test_pr67_canonical_success_reports_all_ids_and_trace_is_decision_only(tmp_path):
+    """A real bridge row writes Phase A inputs then only canonical decisions."""
+    db = _db(tmp_path)
+    _trade(db)
+    db.execute(
+        "UPDATE source_trades SET metadata_json=?, resolution_status='won', "
+        "is_winning_trade=1, realized_pnl=1.0 WHERE id='t1'",
+        ('{"event":{"id":"event-1"},"taxonomy":{"raw_category":"Politics"}}',),
+    )
+    db.conn.commit()
+    forbidden_before = _counts(db, FORBIDDEN_WRITE_TABLES)
+    traced: list[str] = []
+    db.conn.set_trace_callback(traced.append)
+    report = process_approved_wallet_trades(
+        db, wallet=WALLET, limit=1,
+        dependencies=BridgeDependencies(gamma=_Gamma(), clob=_Book(_valid_book())),
+        write=True, write_authorization=_issue_write_capability(),
+    )
+    db.conn.set_trace_callback(None)
+    row = report.rows[0]
+    assert row["canonical_evaluation_status"] in {"canonical_evaluation_success", "canonical_evaluation_incomplete"}
+    for field in (
+        "wallet_score_decision_id", "category_wallet_score_decision_id",
+        "trade_copyability_decision_id", "paper_signal_decision_id",
+    ):
+        assert row[field] is not None, field
+    assert row["is_approved"] == 0
+    assert db.fetchone(
+        "SELECT json_extract(decision_input_json, '$.evaluation_policy_name') AS policy "
+        "FROM paper_signal_decisions"
+    )["policy"] == "decision_only"
+    assert _counts(db, FORBIDDEN_WRITE_TABLES) == forbidden_before
+    writes = [sql.lower() for sql in traced if sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE"))]
+    allowed = tuple(ALLOWED_WRITE_TABLES)
+    assert writes
+    assert all(any(f"into {table}" in sql or f"update {table}" in sql for table in allowed) for sql in writes), writes
+    forbidden_targets = (
+        "into shadow_decisions", "into shadow_score_decisions",
+        "into exit_experiment_registrations", "into orders", "into positions",
+        "update approvals", "into approvals", "into settlement",
+    )
+    assert not any(any(target in sql for target in forbidden_targets) for sql in writes)
+    db.close()

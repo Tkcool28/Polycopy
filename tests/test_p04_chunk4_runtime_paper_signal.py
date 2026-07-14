@@ -1904,11 +1904,11 @@ class TestIdempotencyIdentity:
             "WHERE candidate_id=? ORDER BY id ASC",
             (cid,),
         )
-        # At minimum, the second evaluation should produce a new row.
-        assert len(rows) >= 2, (
-            f"expected >=2 paper signals after category-decision change, "
-            f"got {len(rows)}"
-        )
+        # PR67 canonical evaluation ignores the legacy snapshot/direct-category
+        # decision path: source_trades.metadata_json is absent in this legacy
+        # fixture, so taxonomy is explicitly UNAVAILABLE and the direct row above
+        # cannot change paper provenance or idempotency.
+        assert len(rows) == 1
 
 
 # ──────────────────────────────────────────────────────────────────────
