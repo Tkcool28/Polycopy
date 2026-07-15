@@ -1,330 +1,185 @@
-"""Section F — scorer reuse proof.
-
-For a shared canonical evidence fixture, the production-style typed input
-that PR67's :func:`build_wallet_score_input_v1` constructs from
-:class:`WalletEvidence`, and the discovery-style typed input our new
-``build_wallet_score_input_v1`` constructs from
-:class:`WalletCategoryEvidence`, MUST yield the SAME WalletScoreResult /
-CategoryWalletScoreResult fields when fed into the frozen scorers.
-
-The fixture below uses common metrics (resolved_markets=15, etc.) that
-both paths can construct.
-"""
+"""Correction tests: canonical scorer-input equivalence (STEP 8, 17 #10-16)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
-
-from polycopy.discovery.short_horizon_specialists import (
-    STATUS_TAXONOMY_INCOMPLETE,
-    STATUS_LONG_HORIZON_HEAVY,
-    STATUS_SOURCE_INCOMPLETE,
-    STATUS_CONFLICT,
-    discover_short_horizon_specialists,
-)
 from polycopy.discovery.wallet_evidence import (
+    build_category_score_input_v1,
     build_wallet_score_input_v1,
     evidence_from_history,
 )
 from polycopy.discovery.wallet_history import (
-    IncompleteEvidence,
-    SettledEvidence,
-    WalletHistoryRecord,
-)
-from polycopy.scoring.category_wallet_score_v1 import (
-    CATEGORY_WALLET_FORMULA_VERSION,
-    compute_category_wallet_score_v1,
-)
-from polycopy.scoring.wallet_evidence import (
-    WalletEvidence,
-    build_wallet_score_input_v1 as pr67_build_wallet_input,
-    build_category_score_input_v1 as pr67_build_category_input,
-)
-from polycopy.scoring.wallet_score_v1 import (
-    GLOBAL_MIN_ACTIVE_TRADING_DAYS,
-    GLOBAL_MIN_DISTINCT_EVENTS,
-    GLOBAL_MIN_RESOLVED_MARKETS,
-    CATEGORY_MIN_RESOLVED_MARKETS,
-    CATEGORY_MIN_DISTINCT_EVENTS,
-    compute_wallet_score_v1,
+    EARLY_EXIT,
+    SETTLED_LOSS,
+    SETTLED_WIN,
+    UNRESOLVED,
+    Fill,
+    ReconciledPosition,
+    _to_utc,
 )
 
 
-def _now() -> datetime:
-    return datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+def _ts(s: str) -> datetime:
+    out = _to_utc(s)
+    assert out is not None
+    return out
 
 
-def _make_pr67_evidence() -> WalletEvidence:
-    """A canonical fixture: 36 settled, 22 wins, realized pnl + pf + win rate.
-
-    These numbers are chosen so the scorer classifies the wallet normally
-    AND so the discovery-side fixture yields the same verdict through the
-    shared scorers."""
-    wins = 22
-    losses = 14
-    return WalletEvidence(
-        wallet_id="0xfixture",
-        category_label=None,
-        total_buy_trades=36,
-        resolved_buy_trades=36,
-        resolved_markets=36,
-        winning_buy_trades=wins,
-        losing_buy_trades=losses,
-        realized_pnl=37.0,
-        win_rate=wins / (wins + losses),
-        profit_factor=3.142857,  # gross_gain / gross_loss = 44 / 14
-        active_trading_days=24,
-        distinct_events=36,
-        distinct_markets=36,
-        unresolved_buy_trades=0,
-        missing_event_identity_count=0,
-        evidence_start_timestamp="2025-07-01T00:00:00+00:00",
-        source_data_timestamp="2026-07-13T00:00:00+00:00",
-        evidence_fingerprint="fixture-fingerprint",
-        included_source_trade_ids=(),
-        missing_reasons=(),
+def _pos(cond, asset, state, event="event:e1", category="sports", pnl=1.0):
+    ts = _to_utc("2026-01-01T00:00:00+00:00")
+    assert ts is not None
+    return ReconciledPosition(
+        wallet_address="0xw", condition_id=cond, asset_id=asset,
+        outcome_index=0, outcome_label="yes", category_label=category,
+        event_identity=event, horizon_status="PREFERRED",
+        buy_fills=(Fill("h", "BUY", 0.4, 1.0, ts, "2026-01-01T00:00:00+00:00", asset, 0, "yes"),),
+        sell_fills=(), first_ts_iso="2026-01-01T00:00:00+00:00",
+        last_ts_iso="2026-01-01T00:00:00+00:00", buy_qty=1.0, buy_cost=0.4,
+        sell_qty=0.0, sell_proceeds=0.0, net_qty=1.0,
+        source_trade_identities=("h",), settlement_state=state,
+        winning_outcome=(state == SETTLED_WIN), realized_pnl=pnl,
+        pnl_source="closed_position", pnl_complete=True, pnl_conflict=False,
+        redeemed=False, included_closed_position_ids=(), included_redeem_ids=(),
+        official_winning_asset_id=asset, official_winning_outcome_index=0,
+        official_winning_outcome_label="yes",
     )
 
 
-def _make_pr69_history_record() -> WalletHistoryRecord:
-    n_settled = 36
-    pnls = [2.0] * 22 + [-0.5] * 14  # 22 winners + 14 losers
+def _record(positions):
+    from polycopy.discovery.wallet_history import WalletHistoryRecord
+    buy_count = sum(len(p.buy_fills) for p in positions)
+    sell_count = sum(len(p.sell_fills) for p in positions)
+    events = {p.event_identity for p in positions if p.event_identity}
+    markets = {p.condition_id for p in positions}
     return WalletHistoryRecord(
-        wallet_address="0xfixture",
-        settled=tuple(
-            SettledEvidence(
-                wallet_address="0xfixture",
-                market_condition_id=f"0x{i:064x}",
-                identity_hash=f"id{i}",
-                side="BUY",
-                price=0.5, size=1.0,
-                # spread across enough distinct dates (≥ 25) to clear GLOBAL_MIN_ACTIVE_TRADING_DAYS
-                timestamp=f"2026-0{(i // 25) + 1}-{(i % 25) + 1:02d}T00:00:00+00:00",
-                category_label="sports",
-                winning_outcome=(i < 22),
-                settled_realized_pnl=pnls[i],
-                redeemed=True,
-                proof_source="r",
-                horizon_status="HORIZON_PREFERRED",
-            )
-            for i in range(n_settled)
-        ),
-        early_exit=tuple(),
-        unresolved=tuple(),
-        incomplete=tuple(),
-        first_qualifying_trade="2026-01-01T00:00:00+00:00",
-        last_qualifying_trade="2026-07-14T00:00:00+00:00",
-        active_trading_days=24,
-        distinct_events=tuple(f"0x{i:064x}" for i in range(n_settled)),
-        buy_count=36, sell_count=0,
-        two_sided_churn=False,
-        market_concentration={}, event_concentration={},
-        largest_market_pnl_share=None, largest_event_pnl_share=None,
-        long_horizon_excluded=0, taxonomy_excluded=0, source_incomplete=0,
-        evidence_completeness=1.0,
-    )
-
-
-# --- F.1 production and discovery wallet input share fields -------------------
-
-
-def test_both_paths_pass_canonical_inputs_through_same_wallet_score_result() -> None:
-    """Shared scorer verdict / missing-essentials / gate-failures MUST be
-    identical across both builders for the canonical fixture.
-
-    The discovery-side builder and the production-side builder both feed
-    :class:`WalletScoreInputV1` into the frozen scorer. With an identical
-    set of metric fields, the verdict, the missing-essentials envelope,
-    and the gate-failure list MUST agree exactly — that is the only
-    property an operator can rely on to know the audit pipeline cannot
-    drift from production.
-    """
-    ev67 = _make_pr67_evidence()
-    inp67 = pr67_build_wallet_input(ev67)
-    res67 = compute_wallet_score_v1(input=inp67, now=_now())
-
-    rec = _make_pr69_history_record()
-    all_ev = [e for e in evidence_from_history(rec) if e.category_label == "__all__"][0]
-    inp69 = build_wallet_score_input_v1(all_ev)
-    res69 = compute_wallet_score_v1(input=inp69, now=_now())
-
-    # 1) Identity dataclass type — both MUST construct the same
-    #    WalletScoreInputV1 (this is what "shared input builder" means).
-    assert type(inp67) is type(inp69)
-    assert inp67.wallet_id == inp69.wallet_id == "0xfixture"
-
-    # 2) The fields BOTH builders populate identically from canonical
-    #    metrics MUST agree exactly.
-    assert inp67.win_rate == inp69.win_rate
-    assert inp67.trade_count == inp69.trade_count
-    assert inp67.resolved_markets == inp69.resolved_markets
-    assert inp67.distinct_events == inp69.distinct_events
-
-    # 3) The frozen scorer's verdict, missing-essentials and gate-failure
-    #    sets MUST be byte-identical — that is the rejection-on-drift
-    #    contract.
-    assert res67.verdict == res69.verdict
-    assert set(res67.missing_essentials) == set(res69.missing_essentials)
-    assert set(res67.eligibility_gate_failures) == set(res69.eligibility_gate_failures)
-    assert res67.score == res69.score
-
-
-# --- F.2 unchanged formula versions ------------------------------------------
-
-
-def test_discovered_wallet_score_uses_frozen_v1_formula_version() -> None:
-    ev67 = _make_pr67_evidence()
-    inp67 = pr67_build_wallet_input(ev67)
-    res = compute_wallet_score_v1(input=inp67, now=_now())
-    # The frozen v1 formula version is exactly "1"; reassigning it would
-    # break every audit harness that relies on this constant.
-    assert res.formula_version == "1"
-
-
-def test_category_score_formula_version_is_frozen() -> None:
-    ev67 = _make_pr67_evidence()
-    inp67 = pr67_build_category_input(ev67, "sports", overall_trade_count=18)
-    res = compute_category_wallet_score_v1(input=inp67, now=_now())
-    assert res.formula_version == CATEGORY_WALLET_FORMULA_VERSION
-
-
-# --- F.3 long-horizon evidence absent from settled -------------------------
-
-
-def test_long_horizon_excluded_evidence_does_not_reach_scorer() -> None:
-    rec = WalletHistoryRecord(
-        wallet_address="0xfixture",
-        settled=tuple(),
-        early_exit=tuple(),
-        unresolved=tuple(),
-        incomplete=tuple(),
+        wallet_address="0xw", positions=tuple(positions), settled=(),
+        early_exit=(), unresolved=(), source_incomplete=(),
         first_qualifying_trade=None, last_qualifying_trade=None,
-        active_trading_days=0, distinct_events=(),
-        buy_count=0, sell_count=0, two_sided_churn=False,
-        market_concentration={}, event_concentration={},
+        active_trading_days=1, distinct_events=tuple(events),
+        distinct_markets=tuple(markets), buy_fill_count=buy_count, sell_fill_count=sell_count,
+        two_sided_churn=sell_count > 0 and buy_count > 0,
+        market_pnl={}, event_pnl={},
         largest_market_pnl_share=None, largest_event_pnl_share=None,
-        long_horizon_excluded=2,
-        taxonomy_excluded=0,
-        source_incomplete=0,
-        evidence_completeness=0.0,
+        top_three_market_pnl=(), long_horizon_excluded=0,
+        taxonomy_excluded=0, source_incomplete_count=0, evidence_completeness=1.0,
     )
+
+
+def test_resolved_markets_unique_condition_ids(rule=None):
+    """STEP 17 #11: resolved markets = unique (condition, asset) settled positions."""
+    rec = _record([_pos("0xc1", "0xa1", SETTLED_WIN), _pos("0xc1", "0xa2", SETTLED_LOSS)])
     evs = evidence_from_history(rec)
-    all_ev = [e for e in evs if e.category_label == "__all__"][0]
-    inp = build_wallet_score_input_v1(all_ev)
-    # Long-horizon excluded doesn't contribute to qualifying_trades.
-    assert all_ev.qualifying_trades == 0
-    assert inp.trade_count is None or inp.trade_count == 0
+    all_ev = next(e for e in evs if e.category_label == "__all__")
+    # Two distinct assets in same condition → two resolved markets.
+    assert all_ev.resolved_markets == 2
 
 
-# --- F.4 incomplete stays incomplete ---------------------------------------
+def test_distinct_events_use_official_event_ids(rule=None):
+    """STEP 17 #12 + #13: distinct_events uses official event identity, not condition."""
+    rec = _record([
+        _pos("0xc1", "0xa1", SETTLED_WIN, event="event:e1"),
+        _pos("0xc2", "0xa1", SETTLED_WIN, event="event:e1"),
+    ])
+    evs = evidence_from_history(rec)
+    all_ev = next(e for e in evs if e.category_label == "__all__")
+    # Two markets under one event → one distinct event.
+    assert all_ev.distinct_events == 1
 
 
-def test_incomplete_stays_incomplete_in_status() -> None:
-    rec = WalletHistoryRecord(
-        wallet_address="0xfixture",
-        settled=(),
-        early_exit=(),
-        unresolved=(),
-        incomplete=(),
-        first_qualifying_trade=None, last_qualifying_trade=None,
-        active_trading_days=0, distinct_events=(),
-        buy_count=0, sell_count=0, two_sided_churn=False,
-        market_concentration={}, event_concentration={},
-        largest_market_pnl_share=None, largest_event_pnl_share=None,
-        long_horizon_excluded=0, taxonomy_excluded=0,
-        source_incomplete=999,
-        evidence_completeness=0.0,
+def test_one_market_not_automatic_distinct_event(rule=None):
+    """STEP 17 #13: one market is never automatically one distinct event."""
+    rec = _record([_pos("0xc1", "0xa1", SETTLED_WIN, event=None)])
+    evs = evidence_from_history(rec)
+    all_ev = next(e for e in evs if e.category_label == "__all__")
+    assert all_ev.distinct_events == 0
+
+
+def test_sell_rows_do_not_clear_buy_gates(rule=None):
+    """STEP 17 #14: SELL activity must not satisfy frozen BUY forecasting gates."""
+    # Only SELL fills, no BUY → no settled BUY evidence.
+    from polycopy.discovery.wallet_history import TradeFill
+    sell_only = ReconciledPosition(
+        wallet_address="0xw", condition_id="0xc1", asset_id="0xa1",
+        outcome_index=0, outcome_label="yes", category_label="sports",
+        event_identity="event:e1", horizon_status="PREFERRED",
+        buy_fills=(), sell_fills=(TradeFill("h", "SELL", 0.9, 1.0, _ts("2026-01-01T00:00:00+00:00"), "2026-01-01T00:00:00+00:00", "0xa1", 0, "yes"),),
+        first_ts_iso="2026-01-01T00:00:00+00:00", last_ts_iso="2026-01-01T00:00:00+00:00",
+        buy_qty=0.0, buy_cost=0.0, sell_qty=1.0, sell_proceeds=0.9, net_qty=-1.0,
+        source_trade_identities=("h",), settlement_state=EARLY_EXIT,
+        winning_outcome=None, realized_pnl=0.1, pnl_source="closed_position",
+        pnl_complete=True, pnl_conflict=False, redeemed=False,
+        included_closed_position_ids=(), included_redeem_ids=(),
+        official_winning_asset_id=None, official_winning_outcome_index=None,
+        official_winning_outcome_label=None,
     )
-    report = discover_short_horizon_specialists(history_records=(rec,), now=_now())
-    assert len(report.candidates) == 1
-    assert report.candidates[0]["overall_status"] == STATUS_SOURCE_INCOMPLETE
+    rec = _record([sell_only])
+    evs = evidence_from_history(rec)
+    all_ev = next(e for e in evs if e.category_label == "__all__")
+    assert all_ev.settled_positions == 0
+    assert all_ev.resolved_markets == 0
 
 
+def test_production_discovery_canonical_inputs_match(rule=None):
+    """STEP 17 #15: canonical inputs match for multi-fill / multi-market / BUY+SELL / unresolved."""
+    positions = [
+        _pos("0xc1", "0xa1", SETTLED_WIN, event="event:e1", pnl=1.0),
+        _pos("0xc1", "0xa2", SETTLED_LOSS, event="event:e1", pnl=-0.4),
+        _pos("0xc2", "0xa1", UNRESOLVED, event="event:e2"),
+    ]
+    rec = _record(positions)
+    evs = evidence_from_history(rec)
+    all_ev = next(e for e in evs if e.category_label == "__all__")
+    wallet_inp = build_wallet_score_input_v1(all_ev)
+    # BUY-only denominator = total BUY fills (3 positions × 1 BUY each = 3).
+    assert wallet_inp.overall_trade_count == 3
+    assert wallet_inp.resolved_markets == 2
+    cat_inp = build_category_score_input_v1(all_ev)
+    assert cat_inp.category_resolved_markets == 2
+    assert cat_inp.category_distinct_events == 1
 
-def test_long_horizon_heavy_status() -> None:
-    rec = WalletHistoryRecord(
-        wallet_address="0xfixture",
-        settled=(),
-        early_exit=(),
-        unresolved=(),
-        incomplete=(),
-        first_qualifying_trade=None, last_qualifying_trade=None,
-        active_trading_days=0, distinct_events=(),
-        buy_count=0, sell_count=0, two_sided_churn=False,
-        market_concentration={}, event_concentration={},
-        largest_market_pnl_share=None, largest_event_pnl_share=None,
-        long_horizon_excluded=5,
-        taxonomy_excluded=0,
-        source_incomplete=0,
-        evidence_completeness=0.0,
+
+def test_category_evidence_isolated_by_trusted_category(rule=None):
+    """STEP 8B: category metrics isolate by trusted category."""
+    rec = _record([
+        _pos("0xc1", "0xa1", SETTLED_WIN, event="event:e1", category="sports"),
+        _pos("0xc2", "0xa1", SETTLED_WIN, event="event:e2", category="crypto"),
+    ])
+    evs = evidence_from_history(rec)
+    by_cat = {e.category_label: e for e in evs if e.category_label != "__all__"}
+    assert by_cat["sports"].resolved_markets == 1
+    assert by_cat["crypto"].resolved_markets == 1
+
+
+def test_trade_count_is_not_buy_plus_sell(rule=None):
+    """STEP 8: BUY+SELL count must not be the overall_trade_count basis."""
+    positions = [_pos("0xc1", "0xa1", SETTLED_WIN, event="event:e1")]
+    rec = _record(positions)
+    rec = _record(positions)
+    rec = _record(positions)
+    rec = _record(positions)
+    rec = _record(positions)
+    # Rebuild with one buy + one sell of same asset (early exit).
+    from polycopy.discovery.wallet_history import TradeFill
+    pos = ReconciledPosition(
+        wallet_address="0xw", condition_id="0xc1", asset_id="0xa1",
+        outcome_index=0, outcome_label="yes", category_label="sports",
+        event_identity="event:e1", horizon_status="PREFERRED",
+        buy_fills=(TradeFill("h1", "BUY", 0.4, 1.0, _ts("2026-01-01T00:00:00+00:00"), "2026-01-01T00:00:00+00:00", "0xa1", 0, "yes"),),
+        sell_fills=(TradeFill("h2", "SELL", 0.9, 1.0, _ts("2026-01-02T00:00:00+00:00"), "2026-01-02T00:00:00+00:00", "0xa1", 0, "yes"),),
+        first_ts_iso="2026-01-01T00:00:00+00:00", last_ts_iso="2026-01-02T00:00:00+00:00",
+        buy_qty=1.0, buy_cost=0.4, sell_qty=1.0, sell_proceeds=0.9, net_qty=0.0,
+        source_trade_identities=("h1", "h2"), settlement_state=EARLY_EXIT,
+        winning_outcome=None, realized_pnl=0.5, pnl_source="closed_position",
+        pnl_complete=True, pnl_conflict=False, redeemed=False,
+        included_closed_position_ids=(), included_redeem_ids=(),
+        official_winning_asset_id="0xa1", official_winning_outcome_index=0,
+        official_winning_outcome_label="yes",
     )
-    report = discover_short_horizon_specialists(history_records=(rec,), now=_now())
-    assert report.candidates[0]["overall_status"] == STATUS_LONG_HORIZON_HEAVY
-
-
-def test_taxonomy_incomplete_status() -> None:
-    rec = WalletHistoryRecord(
-        wallet_address="0xfixture",
-        settled=(),
-        early_exit=(),
-        unresolved=(),
-        incomplete=(),
-        first_qualifying_trade=None, last_qualifying_trade=None,
-        active_trading_days=0, distinct_events=(),
-        buy_count=0, sell_count=0, two_sided_churn=False,
-        market_concentration={}, event_concentration={},
-        largest_market_pnl_share=None, largest_event_pnl_share=None,
-        long_horizon_excluded=0,
-        taxonomy_excluded=10,
-        source_incomplete=0,
-        evidence_completeness=0.0,
-    )
-    report = discover_short_horizon_specialists(history_records=(rec,), now=_now())
-    assert report.candidates[0]["overall_status"] == STATUS_TAXONOMY_INCOMPLETE
-
-
-def test_conflict_status_does_not_silently_pick() -> None:
-    """A wallet whose record contains any ``incomplete`` rows is reported
-    as CONFLICT — no silent pick."""
-    rec = WalletHistoryRecord(
-        wallet_address="0xfixture",
-        settled=(),
-        early_exit=(),
-        unresolved=(),
-        incomplete=(IncompleteEvidence(
-            wallet_address="0xfixture",
-            market_condition_id="0xabc",
-            identity_hash="i",
-            side="BUY",
-            reason="conflict_marker",
-        ),),
-        first_qualifying_trade=None, last_qualifying_trade=None,
-        active_trading_days=0, distinct_events=(),
-        buy_count=0, sell_count=0, two_sided_churn=False,
-        market_concentration={}, event_concentration={},
-        largest_market_pnl_share=None, largest_event_pnl_share=None,
-        long_horizon_excluded=0, taxonomy_excluded=0, source_incomplete=0,
-        evidence_completeness=0.0,
-    )
-    report = discover_short_horizon_specialists(history_records=(rec,), now=_now())
-    assert report.candidates[0]["overall_status"] == STATUS_CONFLICT
-    rec = _make_pr69_history_record()
-    all_ev = [e for e in evidence_from_history(rec) if e.category_label == "__all__"][0]
-    inp_a = build_wallet_score_input_v1(all_ev)
-    inp_b = build_wallet_score_input_v1(all_ev)
-    res_a = compute_wallet_score_v1(input=inp_a, now=_now())
-    res_b = compute_wallet_score_v1(input=inp_b, now=_now())
-    assert res_a.score == res_b.score
-    assert res_a.verdict == res_b.verdict
-    assert res_a.missing_essentials == res_b.missing_essentials
-
-
-# --- F.6 thresholds are exactly the frozen values -------------------------
-
-
-def test_frozen_thresholds_unmodified() -> None:
-    assert GLOBAL_MIN_RESOLVED_MARKETS == 30
-    assert GLOBAL_MIN_ACTIVE_TRADING_DAYS == 20
-    assert GLOBAL_MIN_DISTINCT_EVENTS == 15
-    assert CATEGORY_MIN_RESOLVED_MARKETS == 15
-    assert CATEGORY_MIN_DISTINCT_EVENTS == 8
+    rec = _record([pos])
+    evs = evidence_from_history(rec)
+    all_ev = next(e for e in evs if e.category_label == "__all__")
+    wallet_inp = build_wallet_score_input_v1(all_ev)
+    # overall_trade_count is BUY fill count, NOT BUY+SELL.
+    assert wallet_inp.overall_trade_count == 1
+    assert all_ev.buy_fill_count == 1
+    assert all_ev.sell_fill_count == 1

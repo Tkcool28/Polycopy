@@ -31,6 +31,7 @@ import httpx
 from polycopy.adapters.polymarket import PolymarketPublicAdapter
 from polycopy.discovery._safe_get import (
     ERR_BUDGET_EXHAUSTED,
+    PHASE_DEFAULT_PERCENTAGES,
     _RequestBudget,
     safe_get_json,
 )
@@ -771,17 +772,8 @@ PHASE_EVENT_TAGS = "event_tags"
 PHASE_SERIES = "series"
 
 # Default percentage-of-budget allocation for a meaningful audit.
-# These map directly to the operator-requested percentages in STEP 7.
-PHASE_DEFAULT_PERCENTAGES: dict[str, float] = {
-    PHASE_UNIVERSE_TAXONOMY: 0.25,
-    PHASE_MARKET_FIRST_TRADES: 0.15,
-    PHASE_LEADERBOARDS: 0.15,
-    PHASE_HISTORIES: 0.25,
-    PHASE_CLOSED_POSITIONS: 0.08,
-    PHASE_REDEEMS: 0.07,
-    PHASE_REFERENCED_METADATA: 0.05,
-}
-
+# Single source of truth: imported from polycopy.discovery._safe_get.PHASE_DEFAULT_PERCENTAGES
+# (operator-requested percentages per STEP 7 / the canonical PR69 contract).
 
 # Wallet identity role match constants — STEP 3 / STEP 10.
 WALLET_MATCH_ROLE_PROXY = "proxy_wallet"

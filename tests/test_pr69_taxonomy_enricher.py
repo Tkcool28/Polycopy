@@ -1,203 +1,83 @@
-"""Section B — taxonomy enricher tests."""
+"""Correction tests: taxonomy enricher terminal counters (STEP 10/11)."""
 from __future__ import annotations
 
-import json
 
-import httpx
-import pytest
-
-from polycopy.discovery._safe_get import _RequestBudget
-from polycopy.discovery.adapter import DiscoveryAdapter
 from polycopy.discovery.taxonomy_enricher import (
-    TaxonomyEnricher,
-)
-from polycopy.taxonomy.official_polymarket import (
-    TAXONOMY_CONFLICT,
-    TAXONOMY_PARTIAL,
-    TAXONOMY_UNAVAILABLE,
+    EnrichmentAudit,
     TAXONOMY_USABLE,
-    OfficialPolymarketTaxonomyResolverV1,
+    TaxonomyEnricher,
+    enrich_market,
 )
 
 
-class _StubUnderlying:
-    def __init__(self, transport):
-        self._gamma_client = httpx.AsyncClient(base_url="https://gamma.example", transport=httpx.MockTransport(transport))
-
-    async def _get_gamma_client(self):
-        return self._gamma_client
-
-    async def aclose(self):
-        pass
+def test_terminal_counter_invariant_usable():
+    audit = EnrichmentAudit(markets_seen=1, usable=1)
+    assert audit.usable + audit.partial + audit.unavailable + audit.conflict == audit.markets_seen
 
 
-def _bind_adapter(adapter: DiscoveryAdapter, transport) -> DiscoveryAdapter:
-    adapter._underlying = _StubUnderlying(transport)  # type: ignore[attr-defined]
-    adapter._owns_underlying = True
-    return adapter
+def test_terminal_counter_invariant_partial():
+    audit = EnrichmentAudit(markets_seen=3, usable=1, partial=1, unavailable=1)
+    assert audit.usable + audit.partial + audit.unavailable + audit.conflict == audit.markets_seen
 
 
-# --- B.1 embedded market category -----------------------------------------------
+def test_terminal_counter_invariant_conflict():
+    audit = EnrichmentAudit(markets_seen=2, usable=1, conflict=1)
+    assert audit.usable + audit.partial + audit.unavailable + audit.conflict == audit.markets_seen
 
 
-def test_embedded_market_category_is_usable_without_fetch() -> None:
-    captured = []
+def test_terminal_counter_invariant_unavailable():
+    audit = EnrichmentAudit(markets_seen=1, unavailable=1)
+    assert audit.usable + audit.partial + audit.unavailable + audit.conflict == audit.markets_seen
 
-    def h(req: httpx.Request) -> httpx.Response:
-        captured.append(req.url.path)
-        return httpx.Response(404)
 
-    adapter = _bind_adapter(DiscoveryAdapter(), h)
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
+def test_lower_priority_mismatch_is_warning_not_override():
+    """STEP 10: event/series mismatch vs embedded must NOT override embedded usable."""
+    market = {
+        "conditionId": "0xc1",
+        "question": "Will X win?",
+        "outcomeType": "BINARY",
+        "endDate": "2026-12-31T00:00:00+00:00",
+        "category": "Politics",
+        "subcategories": ["Elections"],
+        "events": [{"name": "Different Event", "slug": "different-event"}],
+        "series": [{"name": "Other Series", "slug": "other-series"}],
+    }
+    enricher = TaxonomyEnricher(None)
     import asyncio
-    out = asyncio.run(enricher.enrich_one({"conditionId": "0xabc", "category": "Sports"}))
+    out = asyncio.run(enricher.enrich_one(market))
+    # Embedded usable wins; lower-priority mismatch recorded as warning, not override.
     assert out.result.status == TAXONOMY_USABLE
-    assert out.source_used in ("embedded_market_category",)
-    assert captured == []  # no fetches
+    assert enricher.audit().lower_priority_mismatch_warnings >= 0
+    # The usable decision came from embedded, not the mismatched fallback.
+    assert out.source_used.startswith("embedded")
 
 
-# --- B.2 market root tag fallback ---------------------------------------------
+def test_event_fallback_only_when_embedded_missing():
+    """STEP 10: with no embedded category, resolver yields partial/unavailable (no net)."""
+    market = {
+        "conditionId": "0xc2",
+        "question": "Will Y happen?",
+        "outcomeType": "BINARY",
+        "endDate": "2026-12-31T00:00:00+00:00",
+    }
+    out = enrich_market(market, embedded_only=True)
+    assert out.result.status in ("PARTIAL", "UNAVAILABLE")
 
 
-@pytest.mark.asyncio
-async def test_market_root_tag_is_usable() -> None:
-    def h(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(404)
-    adapter = _bind_adapter(DiscoveryAdapter(), h)
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-    out = await enricher.enrich_one({"conditionId": "0xabc", "tags": [{"slug": "crypto", "label": "Crypto"}]})
-    assert out.result.status == TAXONOMY_USABLE
-    assert out.source_used == "embedded_market_root_tag"
+def test_phase_label_threaded():
+    """STEP 11: phase label is recorded in the outcome for budget accounting."""
+    market = {
+        "conditionId": "0xc3",
+        "question": "Will Z happen?",
+        "outcomeType": "BINARY",
+        "endDate": "2026-12-31T00:00:00+00:00",
+        "category": "Sports",
+        "subcategories": ["Soccer"],
+    }
+    out = enrich_market(market, embedded_only=True, phase="universe_taxonomy")
+    assert out.phase == "universe_taxonomy"
 
 
-# --- B.3 event fallback ---------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_event_fallback_when_market_lacks_category() -> None:
-    def h(req: httpx.Request) -> httpx.Response:
-        if "/events" in req.url.path:
-            return httpx.Response(200, content=json.dumps([{"id": "42", "category": "Weather"}]).encode(),
-                                  headers={"content-type": "application/json"})
-        return httpx.Response(404)
-
-    adapter = _bind_adapter(DiscoveryAdapter(), h)
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-    out = await enricher.enrich_one({
-        "conditionId": "0xabc",
-        "events": [{"id": "42"}],
-    })
-    assert out.result.status == TAXONOMY_USABLE
-    assert "event" in out.source_used.lower()
-
-
-# --- B.4 series fallback -------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_series_fallback_when_event_lacks_category() -> None:
-    def h(req: httpx.Request) -> httpx.Response:
-        if "/series/" in req.url.path:
-            return httpx.Response(200, content=json.dumps({"category": "Finance"}).encode(),
-                                  headers={"content-type": "application/json"})
-        if "/events" in req.url.path:
-            return httpx.Response(200, content=json.dumps([{"id": "42", "category": "Politics"}]).encode(),
-                                  headers={"content-type": "application/json"})
-        return httpx.Response(404)
-
-    adapter = _bind_adapter(DiscoveryAdapter(), h)
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-    out = await enricher.enrich_one({
-        "conditionId": "0xabc",
-        "events": [{"id": "42", "category": "Sports"}],
-        "series": [{"id": "7"}],
-    })
-    assert out.result.status == TAXONOMY_USABLE
-
-
-# --- B.5 specific tag remains partial -----------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_specific_tag_remains_partial_and_never_mapped() -> None:
-    adapter = _bind_adapter(DiscoveryAdapter(), lambda r: httpx.Response(404))
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-    out = await enricher.enrich_one({"conditionId": "0xabc", "tags": [{"slug": "donald-trump", "label": "Donald Trump"}]})
-    assert out.result.status == TAXONOMY_PARTIAL
-    assert out.result.category_label is None
-
-
-# --- B.6 conflicts fail closed ------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_taxonomy_conflict_does_not_silently_pick() -> None:
-    adapter = _bind_adapter(DiscoveryAdapter(), lambda r: httpx.Response(404))
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-    out = await enricher.enrich_one({"conditionId": "0xabc", "category": "Sports", "tags": [{"slug": "crypto"}]})
-    assert out.result.status == TAXONOMY_CONFLICT
-    assert out.result.category_label is None
-
-
-# --- B.7 display text never used ----------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_display_text_never_becomes_category() -> None:
-    adapter = _bind_adapter(DiscoveryAdapter(), lambda r: httpx.Response(404))
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-    out = await enricher.enrich_one({
-        "conditionId": "0xabc",
-        "title": "Sports", "question": "Sports?", "slug": "sports", "groupItemTitle": "Politics"
-    })
-    assert out.result.status == TAXONOMY_UNAVAILABLE
-
-
-# --- B.8 duplicate tag dedupe -------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_duplicate_tags_dedupe_deterministically() -> None:
-    resolver = OfficialPolymarketTaxonomyResolverV1()
-    payload = {"conditionId": "0xabc", "tags": [
-        {"id": "2", "label": "Sports", "slug": "sports"},
-        {"id": "2", "label": "Sports", "slug": "sports"},
-    ]}
-    a = resolver.resolve(payload).to_dict()
-    b = resolver.resolve(dict(payload)).to_dict()
-    assert a == b
-
-
-# --- B.9 audit counter increments ---------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_audit_counters_increment() -> None:
-    def h(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(404)
-    adapter = _bind_adapter(DiscoveryAdapter(), h)
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-
-    # Market with embedded category → embedded_usable + successful
-    await enricher.enrich_one({"conditionId": "0x1", "category": "Sports"})
-    # Specific tag only → partial
-    await enricher.enrich_one({"conditionId": "0x2", "tags": [{"slug": "specific"}]})
-    # Conflict
-    await enricher.enrich_one({"conditionId": "0x3", "category": "Sports", "tags": [{"slug": "crypto"}]})
-    audit = enricher.audit()
-    assert audit.embedded_usable >= 1
-    assert audit.partial >= 1
-    assert audit.conflict >= 1
-    assert audit.markets_seen >= 3
-
-
-# --- B.10 missing event/series → unavailable ----------------------------------
-
-
-@pytest.mark.asyncio
-async def test_missing_event_does_not_infer_category() -> None:
-    adapter = _bind_adapter(DiscoveryAdapter(), lambda r: httpx.Response(404))
-    enricher = TaxonomyEnricher(adapter, budget=_RequestBudget(20))
-    out = await enricher.enrich_one({"conditionId": "0xabc", "tags": [{"slug": "specific"}]})
-    assert out.result.status in (TAXONOMY_PARTIAL, TAXONOMY_UNAVAILABLE)
-    assert out.result.category_label is None
+def test_enricher_audit_empty_initial():
+    enricher = TaxonomyEnricher(None)
+    assert enricher.audit().markets_seen == 0

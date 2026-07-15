@@ -315,6 +315,57 @@ class WalletSeedBuilder:
         )
 
 
+def rank_seed_wallets(
+    seeds: Sequence[SeedWallet],
+    *,
+    channel_a_market_first: Iterable[str] = (),
+    channel_b_leaderboard: Iterable[str] = (),
+) -> list[SeedWallet]:
+    """Deterministic evidence-priority ranking (STEP 14).
+
+    NOT alphabetical address ordering. Rank by, in order:
+      1. wallets found through BOTH channels (market-first ∩ leaderboard);
+      2. greater number of distinct eligible market appearances;
+      3. greater number of leaderboard appearances;
+      4. better (smaller) best leaderboard rank;
+      5. more supported categories (broader coverage);
+      6. normalized address as final tie-breaker.
+
+    ``market_count`` and ``leaderboard_count`` come from the SeedWallet
+    provenance built by :meth:`WalletSeedBuilder.build`. Leaderboard rank
+    remains seed provenance only and must NOT enter the frozen score.
+    """
+    a_set = {w.lower() for w in channel_a_market_first}
+    b_set = {w.lower() for w in channel_b_leaderboard}
+
+    def best_rank(rec: SeedWallet) -> int:
+        ranks = []
+        for r in rec.leaderboard_records:
+            rk = r.get("rank")
+            if isinstance(rk, int):
+                ranks.append(rk)
+            elif isinstance(rk, str) and rk.strip().isdigit():
+                ranks.append(int(rk))
+        return min(ranks) if ranks else 10 ** 9
+
+    def supported_categories(rec: SeedWallet) -> int:
+        return len({str(r.get("category") or "").lower() for r in rec.leaderboard_records if r.get("category")})
+
+    def sort_key(rec: SeedWallet) -> tuple:
+        addr = rec.wallet_address.lower()
+        both = addr in a_set and addr in b_set
+        return (
+            0 if both else 1,                       # both channels first
+            -rec.market_count,                       # more market appearances
+            -rec.leaderboard_count,                  # more leaderboard appearances
+            best_rank(rec),                          # better (smaller) rank
+            -supported_categories(rec),              # broader category coverage
+            addr,                                    # stable tie-breaker
+        )
+
+    return sorted(seeds, key=sort_key)
+
+
 def seed_wallets_from_report(
     seeds: SeedReport,
     markets: Iterable[MarketClassification],
@@ -382,5 +433,6 @@ __all__ = [
     "SeedReport",
     "SeedWallet",
     "WalletSeedBuilder",
+    "rank_seed_wallets",
     "seed_wallets_from_report",
 ]

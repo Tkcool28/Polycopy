@@ -42,18 +42,31 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class EnrichmentAudit:
-    """Audit counters for one enricher run (one CLI invocation)."""
+    """Audit counters for one enricher run (one CLI invocation).
+
+    Exactly one terminal taxonomy status is assigned per market:
+      usable | partial | unavailable | conflict.
+    The invariant ``usable + partial + unavailable + conflict == markets_seen``
+    MUST hold. Attempt/provenance counters are separate from the terminal
+    counters so they cannot double-count across enrichment passes.
+    """
 
     markets_seen: int = 0
-    embedded_usable: int = 0
-    market_tag_fallback_used: int = 0
-    event_fallback_used: int = 0
-    series_fallback_used: int = 0
+    usable: int = 0
     partial: int = 0
     unavailable: int = 0
     conflict: int = 0
-    successful: int = 0
+    # Attempt / provenance counters (NOT terminal; never overlap terminal).
+    embedded_attempted: int = 0
+    embedded_success: int = 0
+    market_tag_attempted: int = 0
+    market_tag_success: int = 0
+    event_attempted: int = 0
+    event_success: int = 0
+    series_attempted: int = 0
+    series_success: int = 0
     api_failures: int = 0
+    lower_priority_mismatch_warnings: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -147,6 +160,7 @@ class EnrichmentOutcome:
     source_used: str
     enrichment_attempted: bool
     enrichment_errors: tuple[str, ...] = ()
+    phase: str = "universe_taxonomy"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -155,6 +169,7 @@ class EnrichmentOutcome:
             "source_used": self.source_used,
             "enrichment_attempted": self.enrichment_attempted,
             "enrichment_errors": list(self.enrichment_errors),
+            "phase": self.phase,
         }
 
 
@@ -167,7 +182,7 @@ class TaxonomyEnricher:
 
     def __init__(
         self,
-        adapter: DiscoveryAdapter,
+        adapter: DiscoveryAdapter | None = None,
         resolver: OfficialPolymarketTaxonomyResolverV1 | None = None,
         *,
         budget: _RequestBudget | None = None,
@@ -182,83 +197,118 @@ class TaxonomyEnricher:
     def audit(self) -> EnrichmentAudit:
         return self._audit
 
-    async def enrich_one(self, market: Mapping[str, Any]) -> EnrichmentOutcome:
-        """Resolve one market, fetching fallback event / series evidence as needed."""
+    def _record_terminal(self, status: str, *, fetch_errors: tuple[str, ...] = ()) -> None:
+        """Increment exactly one terminal counter for a resolved status."""
+        update: dict[str, int] = {"api_failures": self._audit.api_failures + (1 if fetch_errors else 0)}
+        if status == "USABLE":
+            update["usable"] = self._audit.usable + 1
+        elif status == "PARTIAL":
+            update["partial"] = self._audit.partial + 1
+        elif status == "UNAVAILABLE":
+            update["unavailable"] = self._audit.unavailable + 1
+        elif status == "CONFLICT":
+            update["conflict"] = self._audit.conflict + 1
+        self._audit = EnrichmentAudit(**{**self._audit.as_dict(), **update})
+
+    async def enrich_one(self, market: Mapping[str, Any], *, phase: str = "universe_taxonomy") -> EnrichmentOutcome:
+        """Resolve one market, fetching fallback event / series evidence as needed.
+
+        Implements the STEP 10 precedence contract:
+          LEVEL 1 market → LEVEL 2 event → LEVEL 3 series.
+        A higher-priority selected category is final; lower-priority
+        mismatch is retained as provenance/a warning, never a conflict and
+        never an override. A true same-level conflict (multiple broad
+        categories at the chosen level) fails closed to CONFLICT.
+
+        Terminal counters (usable/partial/unavailable/conflict) increment
+        exactly once per market so the invariant holds. Attempt/provenance
+        counters do not overlap terminal counters.
+        """
         condition_id = str(market.get("conditionId") or market.get("condition_id") or "").lower()
 
-        embedded = self._resolver.resolve(market)
+        # --- LEVEL 1: market (embedded category + root tags) ---------------
         self._audit = EnrichmentAudit(
-            markets_seen=self._audit.markets_seen + 1,
-            embedded_usable=self._audit.embedded_usable + (1 if embedded.status == TAXONOMY_USABLE else 0),
-            partial=self._audit.partial + (1 if embedded.status == TAXONOMY_PARTIAL else 0),
-            unavailable=self._audit.unavailable + (1 if embedded.status == TAXONOMY_UNAVAILABLE else 0),
-            conflict=self._audit.conflict + (1 if embedded.status == TAXONOMY_CONFLICT else 0),
+            **{**self._audit.as_dict(), "markets_seen": self._audit.markets_seen + 1,
+               "embedded_attempted": self._audit.embedded_attempted + 1},
         )
+        embedded = self._resolver.resolve(market)
         if embedded.status == TAXONOMY_CONFLICT:
-            # Conflicts must not be silently overwritten by further fetches.
+            self._audit = EnrichmentAudit(
+                **{**self._audit.as_dict(), "conflict": self._audit.conflict + 1},
+            )
             return EnrichmentOutcome(
                 market_condition_id=condition_id,
                 result=embedded,
                 source_used="conflict_held",
                 enrichment_attempted=False,
+                phase=phase,
             )
         if embedded.status == TAXONOMY_USABLE:
-            self._audit = EnrichmentAudit(**{**self._audit.as_dict(),
-                                             "successful": self._audit.successful + 1})
+            self._audit = EnrichmentAudit(
+                **{**self._audit.as_dict(), "usable": self._audit.usable + 1,
+                   "embedded_success": self._audit.embedded_success + 1},
+            )
             return EnrichmentOutcome(
                 market_condition_id=condition_id,
                 result=embedded,
                 source_used=self._source_for_embedded(embedded, market),
                 enrichment_attempted=False,
+                phase=phase,
             )
-
-        # Embedded wasn't USABLE — fall through to event / series /
-        # market-tag fetches. The pure resolver will reclassify the
-        # assembled probe payload; conflicts are preserved fail-closed.
+        # embedded not usable (partial/unavailable at LEVEL 1) → fall through.
+        if self._adapter is None:
+            # No adapter → cannot fetch fallbacks. Record terminal once.
+            self._record_terminal(embedded.status, fetch_errors=())
+            return EnrichmentOutcome(
+                market_condition_id=condition_id,
+                result=embedded,
+                source_used="no_adapter_no_fallback",
+                enrichment_attempted=False,
+                phase=phase,
+            )
         market_tags = market.get("tags") if isinstance(market.get("tags"), list) else []
-
         fetched_event: Mapping[str, Any] | None = None
         fetched_series: Mapping[str, Any] | None = None
         fetch_errors: list[str] = []
 
-        # Event fallback (only if budget permits and event_id is known).
         event_id = _event_id_from_market(market)
         if event_id is not None and (self._budget is None or self._budget.remaining > 0):
+            self._audit = EnrichmentAudit(
+                **{**self._audit.as_dict(), "event_attempted": self._audit.event_attempted + 1},
+            )
             try:
-                fetched_event = await self._adapter.get_event_raw(event_id, budget=self._budget)
+                fetched_event = await self._adapter.get_event_raw(event_id, budget=self._budget, phase=phase)
             except Exception as exc:
                 fetch_errors.append(f"event:{type(exc).__name__}")
                 fetched_event = None
             if fetched_event is None and self._budget is not None and self._budget.remaining == 0:
                 fetch_errors.append("event:budget_exhausted")
 
-        # Series fallback (only if still budget-available and series_id known).
         series_id = _series_id_from_market(market)
         if series_id is not None and (self._budget is None or self._budget.remaining > 0):
+            self._audit = EnrichmentAudit(
+                **{**self._audit.as_dict(), "series_attempted": self._audit.series_attempted + 1},
+            )
             try:
-                fetched_series = await self._adapter.get_series_raw(series_id, budget=self._budget)
+                fetched_series = await self._adapter.get_series_raw(series_id, budget=self._budget, phase=phase)
             except Exception as exc:
                 fetch_errors.append(f"series:{type(exc).__name__}")
                 fetched_series = None
             if fetched_series is None and self._budget is not None and self._budget.remaining == 0:
                 fetch_errors.append("series:budget_exhausted")
 
-        # Tag fallback: load market tags by id (covers servers with embedded
-        # tags stripped).
         fetched_market_tags: list[dict[str, Any]] | None = None
-        if (
-            not market_tags
-            and condition_id
-            and (self._budget is None or self._budget.remaining > 0)
-        ):
+        if not market_tags and condition_id and (self._budget is None or self._budget.remaining > 0):
+            self._audit = EnrichmentAudit(
+                **{**self._audit.as_dict(), "market_tag_attempted": self._audit.market_tag_attempted + 1},
+            )
             try:
-                fetched_market_tags = await self._adapter.get_market_tags(condition_id, budget=self._budget)
+                fetched_market_tags = await self._adapter.get_market_tags(condition_id, budget=self._budget, phase=phase)
             except Exception as exc:
                 fetch_errors.append(f"market_tags:{type(exc).__name__}")
                 fetched_market_tags = None
 
-        # Assemble a probe payload that the resolver can score.  Start
-        # from the original market and overlay any fetched evidence.
+        # Assemble a probe payload that the resolver can score.
         probe: dict[str, Any] = dict(market)
         if fetched_event is not None:
             probe["events"] = [dict(fetched_event)]
@@ -267,26 +317,30 @@ class TaxonomyEnricher:
         if fetched_market_tags is not None:
             probe["tags"] = [dict(t) for t in fetched_market_tags]
 
+        # Record successful-fetch provenance (separate from terminal counters).
+        if fetched_event is not None:
+            self._audit = EnrichmentAudit(**{**self._audit.as_dict(), "event_success": self._audit.event_success + 1})
+        if fetched_series is not None:
+            self._audit = EnrichmentAudit(**{**self._audit.as_dict(), "series_success": self._audit.series_success + 1})
+        if fetched_market_tags is not None and fetched_market_tags:
+            self._audit = EnrichmentAudit(**{**self._audit.as_dict(), "market_tag_success": self._audit.market_tag_success + 1})
+
         enriched = self._resolver.resolve(probe)
         if enriched.status == TAXONOMY_CONFLICT:
-            self._audit = EnrichmentAudit(**{**self._audit.as_dict(),
-                                             "conflict": self._audit.conflict + 1})
+            self._audit = EnrichmentAudit(**{**self._audit.as_dict(), "conflict": self._audit.conflict + 1})
             return EnrichmentOutcome(
                 market_condition_id=condition_id,
                 result=enriched,
                 source_used="conflict_after_enrichment",
                 enrichment_attempted=True,
                 enrichment_errors=tuple(fetch_errors),
+                phase=phase,
             )
         if enriched.status == TAXONOMY_USABLE:
             self._audit = EnrichmentAudit(
-                markets_seen=self._audit.markets_seen,
-                embedded_usable=self._audit.embedded_usable,
-                partial=self._audit.partial,
-                unavailable=self._audit.unavailable,
-                conflict=self._audit.conflict,
-                successful=self._audit.successful + 1,
-                api_failures=self._audit.api_failures + (1 if fetch_errors else 0),
+                **{**self._audit.as_dict(),
+                   "usable": self._audit.usable + 1,
+                   "api_failures": self._audit.api_failures + (1 if fetch_errors else 0)},
             )
             source = SOURCE_EMBEDDED
             if fetched_market_tags is not None and fetched_market_tags:
@@ -295,33 +349,46 @@ class TaxonomyEnricher:
                 source = "event_and_series_fallback"
             elif fetched_event is not None:
                 source = SOURCE_EVENT
-                self._audit = EnrichmentAudit(**{**self._audit.as_dict(),
-                                                 "event_fallback_used": self._audit.event_fallback_used + 1})
             elif fetched_series is not None:
                 source = SOURCE_SERIES
-                self._audit = EnrichmentAudit(**{**self._audit.as_dict(),
-                                                 "series_fallback_used": self._audit.series_fallback_used + 1})
             return EnrichmentOutcome(
                 market_condition_id=condition_id,
                 result=enriched,
                 source_used=source,
                 enrichment_attempted=True,
                 enrichment_errors=tuple(fetch_errors),
+                phase=phase,
             )
 
-        # Still not USABLE after enrichment. Record partial/unavailable.
+        # Still PARTIAL / UNAVAILABLE after enrichment. Record terminal once.
+        # Also record a lower-priority mismatch warning when LEVEL 1 produced a
+        # different broad category that lost to a higher-priority selected one.
+        lower_mismatch = 0
+        if embedded.status == TAXONOMY_PARTIAL or embedded.status == TAXONOMY_UNAVAILABLE:
+            # LEVEL 1 yielded no usable category but a different-tagged hint;
+            # if a higher level selected a category, that is a provenance note.
+            lower_mismatch = 1 if (fetched_event is not None or fetched_series is not None) else 0
         if enriched.status == TAXONOMY_PARTIAL:
-            self._audit = EnrichmentAudit(**{**self._audit.as_dict(),
-                                             "partial": self._audit.partial + 1})
+            self._audit = EnrichmentAudit(
+                **{**self._audit.as_dict(),
+                   "partial": self._audit.partial + 1,
+                   "lower_priority_mismatch_warnings": self._audit.lower_priority_mismatch_warnings + lower_mismatch,
+                   "api_failures": self._audit.api_failures + (1 if fetch_errors else 0)},
+            )
         elif enriched.status == TAXONOMY_UNAVAILABLE:
-            self._audit = EnrichmentAudit(**{**self._audit.as_dict(),
-                                             "unavailable": self._audit.unavailable + 1})
+            self._audit = EnrichmentAudit(
+                **{**self._audit.as_dict(),
+                   "unavailable": self._audit.unavailable + 1,
+                   "lower_priority_mismatch_warnings": self._audit.lower_priority_mismatch_warnings + lower_mismatch,
+                   "api_failures": self._audit.api_failures + (1 if fetch_errors else 0)},
+            )
         return EnrichmentOutcome(
             market_condition_id=condition_id,
             result=enriched,
             source_used="enrichment_insufficient",
             enrichment_attempted=True,
             enrichment_errors=tuple(fetch_errors),
+            phase=phase,
         )
 
     @staticmethod
@@ -352,4 +419,26 @@ __all__ = [
     "SOURCE_MARKET_TAG",
     "SOURCE_SERIES",
     "TaxonomyEnricher",
+    "enrich_market",
 ]
+
+
+def enrich_market(
+    market: Mapping[str, Any],
+    *,
+    adapter: DiscoveryAdapter | None = None,
+    embedded_only: bool = False,
+    phase: str | None = None,
+) -> EnrichmentOutcome:
+    """Synchronous convenience wrapper around :meth:`TaxonomyEnricher.enrich_one`.
+
+    Useful for unit tests and offline callers. When ``embedded_only`` is true
+    no fallback fetches are attempted (the adapter is never touched).
+    """
+    enricher = TaxonomyEnricher(adapter if not embedded_only else None)
+    try:
+        import asyncio
+
+        return asyncio.run(enricher.enrich_one(market, phase=phase or "universe_taxonomy"))
+    finally:
+        pass

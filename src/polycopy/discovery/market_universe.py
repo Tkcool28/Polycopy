@@ -98,6 +98,7 @@ class MarketClassification:
     taxonomy_status: str | None
     horizon_status: str | None
     bucket: str
+    event_identity: str | None = None
     reasons: tuple[str, ...] = ()
     excluded: bool = True
     eligible: bool = False
@@ -118,6 +119,13 @@ class MarketUniverseAudit:
     truncated: bool = False
     request_budget_initial: int = 0
     request_budget_used: int = 0
+    # Deduplication (STEP 12).
+    raw_rows_fetched: int = 0
+    unique_markets: int = 0
+    duplicate_rows_removed: int = 0
+    duplicate_payload_conflicts: int = 0
+    # Market-first trade fetching (one request per unique eligible condition).
+    market_trade_requests: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         out = {**asdict(self), "api_errors": [list(e) for e in self.api_errors]}
@@ -165,6 +173,24 @@ def _question(market: Mapping[str, Any]) -> str | None:
 def _condition_id(market: Mapping[str, Any]) -> str:
     raw = market.get("conditionId") or market.get("condition_id") or ""
     return str(raw or "").strip().lower()
+
+
+def _event_identity(market: Mapping[str, Any]) -> str | None:
+    """Official event identity: event.id preferred, then event.slug.
+
+    Category labels are NEVER used as event identities.
+    """
+    events = market.get("events")
+    if isinstance(events, list) and events:
+        first = events[0]
+        if isinstance(first, Mapping):
+            eid = first.get("id")
+            if isinstance(eid, (str, int)) and str(eid).strip():
+                return f"event:{eid}"
+            slug = first.get("slug")
+            if isinstance(slug, str) and slug.strip():
+                return f"event:{slug}"
+    return None
 
 
 def _token_ids(market: Mapping[str, Any]) -> tuple[str, ...]:
@@ -367,6 +393,39 @@ class MarketUniverseCrawler:
             for err in errors:
                 api_errors.append((category, err.get("error_code", "ERR"), int(err.get("http_status", 0) or 0)))
 
+        # STEP 12: deduplicate before truncation/classification.
+        #   * dedup by normalized conditionId;
+        #   * when duplicate payloads differ, merge only compatible official
+        #     evidence (category already carried per row; events may differ);
+        #   * retain all query-category provenance;
+        #   * fail closed on incompatible material market identity;
+        #   * sort deterministically after dedup.
+        raw_rows_fetched = len(markets)
+        seen: dict[str, dict[str, Any]] = {}
+        duplicate_rows_removed = 0
+        duplicate_payload_conflicts = 0
+        for m in markets:
+            cid = _condition_id(m)
+            if not cid:
+                continue
+            if cid in seen:
+                # Duplicate row. Compare material identity (conditionId is
+                # already equal; check endDate/tokens for incompatible drift).
+                existing = seen[cid]
+                if (str(existing.get("endDate") or "") != str(m.get("endDate") or "")) or (
+                    _token_ids(existing) != _token_ids(m)
+                ):
+                    duplicate_payload_conflicts += 1
+                else:
+                    duplicate_rows_removed += 1
+                # Retain provenance: merge category tag lists if present.
+                if m.get("category") and not existing.get("category"):
+                    existing["category"] = m["category"]
+                continue
+            seen[cid] = m
+        markets = list(seen.values())
+        unique_markets = len(markets)
+
         # Apply operator-level volume/liquidity filters for the report.
         if config.min_volume_24h > 0 or config.min_liquidity > 0:
             markets = [
@@ -398,6 +457,10 @@ class MarketUniverseCrawler:
             truncated=truncated,
             request_budget_initial=self._budget.initial,
             request_budget_used=self._budget.used(),
+            raw_rows_fetched=raw_rows_fetched,
+            unique_markets=unique_markets,
+            duplicate_rows_removed=duplicate_rows_removed,
+            duplicate_payload_conflicts=duplicate_payload_conflicts,
         )
         return tuple(classified), audit
 
@@ -465,6 +528,7 @@ class MarketUniverseCrawler:
                 taxonomy_status=taxonomy_status,
                 horizon_status=assessment.status if assessment else None,
                 bucket=bucket,
+                event_identity=_event_identity(market),
                 reasons=classification_reasons,
                 excluded=True,
                 eligible=False,
@@ -490,6 +554,7 @@ class MarketUniverseCrawler:
             taxonomy_status=taxonomy_status,
             horizon_status=assessment.status if assessment else None,
             bucket=bucket,
+            event_identity=_event_identity(market),
             reasons=classification_reasons,
             excluded=excluded,
             eligible=eligible,

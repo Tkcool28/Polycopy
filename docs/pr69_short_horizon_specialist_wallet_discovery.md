@@ -90,13 +90,27 @@ optional per-phase caps). Phase identifiers:
 
 | Phase | Scope |
 | --- | --- |
-| `universe_taxonomy` | market universe + taxonomy (25%) |
-| `market_first_trades` | market-first trade discovery (15%) |
-| `leaderboards` | category leaderboards (15%) |
-| `histories` | wallet `/trades` history (25%) |
-| `closed_positions` | `/closed-positions` (8%) |
-| `redeems` | `/activity?type=REDEEM` (7%) |
-| `referenced_metadata` | referenced market metadata (5%) |
+| `universe_taxonomy` | market universe + taxonomy (20%) |
+| `market_first_trades` | market-first trade discovery (18%) |
+| `leaderboards` | category leaderboards (7%) |
+| `histories` | wallet `/trades` history (22%) |
+| `closed_positions` | `/closed-positions` (13%) |
+| `redeems` | `/activity?type=REDEEM` (12%) |
+| `referenced_metadata` | referenced market metadata (8%) |
+
+The percentages are defined **once** in
+`polycopy.discovery._safe_get.PHASE_DEFAULT_PERCENTAGES` and re-exported (not
+redefined) by `polycopy.discovery.adapter`. The CLI allocates via
+`split_phase_caps(max_requests, PHASE_DEFAULT_PERCENTAGES)` so the residual from
+integer truncation flows to the largest phase (`histories`). Total always sums
+to `max_requests` exactly.
+
+> Correction note (PR69 re-pass): an earlier copy of `PHASE_DEFAULT_PERCENTAGES`
+> lived in `adapter.py` with divergent values (25/15/15/25/8/7/5). That duplicate
+> was removed; `adapter.PHASE_DEFAULT_PERCENTAGES` now aliases the single
+> `_safe_get` source of truth. A regression test
+> (`test_cli_phase_percentages_match_canonical_contract`) guards against future
+> divergence.
 
 Every phase is allocated budget so the audit exercises all three wallet sources
 and the referenced-market metadata path, not just the trade endpoint.

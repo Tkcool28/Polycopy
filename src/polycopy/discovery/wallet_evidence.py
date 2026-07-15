@@ -6,8 +6,8 @@ scorers. Both the discovery CLI and (optionally) the production bridge
 ingestion pipeline MUST go through this builder so a single source
 fixture yields identical scoring inputs on both sides.
 
-The build helpers are pure; they take a :class:`WalletHistoryRecord` and
-return:
+The build helpers are pure; they take a :class:`WalletHistoryRecord` (now
+rolled up from **positions**, not per-fill) and return:
   * :class:`polycopy.scoring.wallet_score_v1.WalletScoreInputV1` for
     the wallet-wide score.
   * :class:`polycopy.scoring.category_wallet_score_v1.CategoryWalletScoreInputV1`
@@ -20,10 +20,19 @@ so an identical canonical fixture MUST produce identical inputs on both
 sides — and therefore identical scores, missing essentials, and gate
 failures. This is the "scorer reuse proof" the operator audit relies on.
 
-The shared builder lives here (NOT duplicated) and is consumed by
-``short_horizon_specialists`` for scoring. Production code can also call
-it on a populated WalletEvidence by passing the per-account metrics it
-already knows — the input shape is identical.
+PR69 correction (evaluation correctness):
+  * BUY-only forecasting evidence (SELL activity is coverage, never a
+    settled win/loss gate).
+  * Unique resolved markets = unique (condition, asset) positions that
+    settled, NOT ``len(settled fills)``.
+  * distinct_events uses the official event identity, never condition IDs
+    and never category labels.
+  * realized PnL comes from one position-level ledger (no per-fill
+    multiplication).
+  * The overall ``trade_count`` denominator is the number of distinct
+    settled BUY positions (matching PR67's resolved_buy_trades basis),
+    never BUY+SELL.
+  * Category evidence is isolated by trusted category.
 """
 from __future__ import annotations
 
@@ -33,9 +42,12 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from polycopy.discovery.wallet_history import (
-    EarlyExitEvidence,
-    SettledEvidence,
-    UnresolvedEvidence,
+    EARLY_EXIT,
+    RESOLVED_OUTCOME_UNKNOWN,
+    REDEEM_CONFIRMED_OUTCOME_UNKNOWN,
+    SETTLED_LOSS,
+    SETTLED_WIN,
+    UNRESOLVED,
     WalletHistoryRecord,
 )
 from polycopy.scoring.category_wallet_score_v1 import CategoryWalletScoreInputV1
@@ -46,24 +58,21 @@ from polycopy.scoring.wallet_score_v1 import WalletScoreInputV1
 class WalletCategoryEvidence:
     """Per-wallet+category roll-up used by the scorer.
 
-    Only rows that passed the horizon gate and had a USABLE category at
-    trade-time participate. Early-exit rows are exposed in coverage but
-    excluded from settled win/loss counts per spec.
+    Only positions that passed the horizon gate and had a USABLE category
+    at trade-time participate. Early-exit positions are exposed in coverage
+    but excluded from settled win/loss counts per spec.
     """
 
     wallet_address: str
     category_label: str
-    qualifying_trades: int
-    preferred_trades: int
-    preferred_share: float
-    hard_eligible_share: float
-    settled_trades: int
+    qualifying_positions: int
+    settled_positions: int
     settled_wins: int
     settled_losses: int
-    redeemed_trades: int
-    resolved_without_redeem: int
+    outcome_unknown: int
     early_exits: int
-    unresolved_trades: int
+    unresolved_positions: int
+    redeemed_positions: int
     realized_qualifying_pnl: float | None
     win_rate: float | None
     profit_factor: float | None
@@ -72,33 +81,30 @@ class WalletCategoryEvidence:
     last_qualifying_trade: str | None
     resolved_markets: int
     distinct_events: int
-    buy_count: int
-    sell_count: int
+    distinct_markets: int
+    buy_fill_count: int
+    sell_fill_count: int
     two_sided_churn: bool
     largest_market_pnl_share: float | None
     largest_event_pnl_share: float | None
-
     # Raw counts (kept for audit and for PR67 wallet-evidence parity).
     long_horizon_excluded: int
     taxonomy_excluded: int
-    source_incomplete: int
+    source_incomplete_count: int
     evidence_completeness: float
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "wallet_address": self.wallet_address,
             "category_label": self.category_label,
-            "qualifying_trades": self.qualifying_trades,
-            "preferred_trades": self.preferred_trades,
-            "preferred_share": self.preferred_share,
-            "hard_eligible_share": self.hard_eligible_share,
-            "settled_trades": self.settled_trades,
+            "qualifying_positions": self.qualifying_positions,
+            "settled_positions": self.settled_positions,
             "settled_wins": self.settled_wins,
             "settled_losses": self.settled_losses,
-            "redeemed_trades": self.redeemed_trades,
-            "resolved_without_redeem": self.resolved_without_redeem,
+            "outcome_unknown": self.outcome_unknown,
             "early_exits": self.early_exits,
-            "unresolved_trades": self.unresolved_trades,
+            "unresolved_positions": self.unresolved_positions,
+            "redeemed_positions": self.redeemed_positions,
             "realized_qualifying_pnl": self.realized_qualifying_pnl,
             "win_rate": self.win_rate,
             "profit_factor": self.profit_factor,
@@ -107,14 +113,15 @@ class WalletCategoryEvidence:
             "last_qualifying_trade": self.last_qualifying_trade,
             "resolved_markets": self.resolved_markets,
             "distinct_events": self.distinct_events,
-            "buy_count": self.buy_count,
-            "sell_count": self.sell_count,
+            "distinct_markets": self.distinct_markets,
+            "buy_fill_count": self.buy_fill_count,
+            "sell_fill_count": self.sell_fill_count,
             "two_sided_churn": self.two_sided_churn,
             "largest_market_pnl_share": self.largest_market_pnl_share,
             "largest_event_pnl_share": self.largest_event_pnl_share,
             "long_horizon_excluded": self.long_horizon_excluded,
             "taxonomy_excluded": self.taxonomy_excluded,
-            "source_incomplete": self.source_incomplete,
+            "source_incomplete_count": self.source_incomplete_count,
             "evidence_completeness": self.evidence_completeness,
         }
 
@@ -127,125 +134,108 @@ def evidence_from_history(
     """Roll up a wallet's history into one evidence row per category.
 
     Args:
-        record: a fully reconciled wallet history row.
+        record: a fully reconciled wallet history row (position-level).
         category_label: when set, restricts the rollup to a single
             category (the per-category score path). When ``None``,
             returns one row per category plus a wallet-wide row
             (where ``category_label='__all__'``).
     """
-    settled: list[SettledEvidence] = list(record.settled)
-    early: list[EarlyExitEvidence] = list(record.early_exit)
-    unresolved: list[UnresolvedEvidence] = list(record.unresolved)
+    positions = list(record.positions)
 
-    def scope(filter_: Iterable[SettledEvidence] | Iterable[UnresolvedEvidence] | Iterable[EarlyExitEvidence]):
+    def scope(pos: Iterable) -> list:
         if category_label is None:
-            return list(filter_)
-        return [ev for ev in filter_ if getattr(ev, "category_label", None) == category_label]
+            return list(pos)
+        return [p for p in pos if (p.category_label or "__unknown__") == category_label]
 
-    def build_one(label: str, settled_scope: list, early_scope: list, unresolved_scope: list) -> WalletCategoryEvidence:
-        qualifying = settled_scope + early_scope + unresolved_scope
-        # PnL aggregation for the canonical evidence:
+    def build_one(label: str, scoped_positions: list) -> WalletCategoryEvidence:
+        settled = [p for p in scoped_positions if p.settlement_state in (SETTLED_WIN, SETTLED_LOSS, RESOLVED_OUTCOME_UNKNOWN, REDEEM_CONFIRMED_OUTCOME_UNKNOWN)]
+        early = [p for p in scoped_positions if p.settlement_state == EARLY_EXIT]
+        unresolved = [p for p in scoped_positions if p.settlement_state == UNRESOLVED]
+        qualifying = settled + early + unresolved
+
+        wins = sum(1 for p in settled if p.settlement_state == SETTLED_WIN)
+        losses = sum(1 for p in settled if p.settlement_state == SETTLED_LOSS)
+        outcome_unknown = sum(
+            1 for p in settled if p.settlement_state in (RESOLVED_OUTCOME_UNKNOWN, REDEEM_CONFIRMED_OUTCOME_UNKNOWN)
+        )
+        redeemed = sum(1 for p in settled if p.redeemed)
+
+        # PnL aggregation — one canonical position-level ledger.
         complete_pnl: list[float] = []
-        partial_pnl_list: list[float] = []
-        wins = 0
-        losses = 0
-        redeemed = 0
-        resolved_no_redeem = 0
-        for ev in settled_scope:
-            if ev.winning_outcome:
-                wins += 1
-            else:
-                losses += 1
-            if ev.redeemed:
-                redeemed += 1
-            if ev.settled_realized_pnl is not None:
-                complete_pnl.append(ev.settled_realized_pnl)
-        for ev in early_scope:
-            if ev.realized_pnl is not None:
-                partial_pnl_list.append(ev.realized_pnl)
-        pnl_known = len(complete_pnl) == len(settled_scope)
-        total_pnl = sum(complete_pnl) if pnl_known else None
-        win_rate = (wins / len(settled_scope)) if settled_scope else None
+        for p in settled:
+            if p.pnl_conflict:
+                # CONFLICT PnL is excluded from scoring (per spec).
+                continue
+            if p.realized_pnl is not None:
+                complete_pnl.append(p.realized_pnl)
+        total_pnl = sum(complete_pnl) if (complete_pnl and not any(p.pnl_conflict for p in settled)) else None
+        if any(p.pnl_conflict for p in settled):
+            total_pnl = None
+        win_rate = (wins / len(settled)) if settled else None
         gross_gain = sum(max(0.0, v) for v in complete_pnl)
         gross_loss = -sum(min(0.0, v) for v in complete_pnl)
-        profit_factor = (gross_gain / gross_loss) if pnl_known and gross_loss > 0 else None
-        preferred_trades = len([ev for ev in qualifying if getattr(ev, "horizon_status", "") == "HORIZON_PREFERRED"])
-        qualifying_count = len(qualifying)
-        preferred_share = (preferred_trades / qualifying_count) if qualifying_count else 0.0
-        hard_eligible_share = 1.0 if (qualifying_count > 0) else 0.0
+        profit_factor = (gross_gain / gross_loss) if (complete_pnl and gross_loss > 0) else None
+
+        # Active trading days derived from the actual position fill timestamps.
+        active_days: set[str] = set()
         first_qualifying = None
         last_qualifying = None
-        active_days = set()
-        for ev in qualifying:
-            ts = getattr(ev, "timestamp", "") or ""
-            if ts:
-                if first_qualifying is None or ts < first_qualifying:
-                    first_qualifying = ts
-                if last_qualifying is None or ts > last_qualifying:
-                    last_qualifying = ts
-                if len(ts) >= 10:
-                    active_days.add(ts[:10])
-        # Resolved-without-redeem is a coverage metric settled outputs cannot
-        # deliver because redemption status is the REDEEM probe.
-        resolved_no_redeem = max(0, len(settled_scope) - redeemed)
+        for p in qualifying:
+            for f in p.buy_fills + p.sell_fills:
+                if f.ts_iso:
+                    d = f.ts_iso[:10]
+                    active_days.add(d)
+                    if first_qualifying is None or f.ts_iso < first_qualifying:
+                        first_qualifying = f.ts_iso
+                    if last_qualifying is None or f.ts_iso > last_qualifying:
+                        last_qualifying = f.ts_iso
 
-        distinct_events = sorted({ev.market_condition_id for ev in settled_scope})
+        # Resolved markets = unique (condition, asset) settled positions.
+        resolved_market_keys = {(p.condition_id, p.asset_id) for p in settled}
+        distinct_events = sorted({p.event_identity for p in settled if p.event_identity})
+        distinct_markets = sorted({p.condition_id for p in settled})
 
         return WalletCategoryEvidence(
             wallet_address=record.wallet_address,
             category_label=label,
-            qualifying_trades=qualifying_count,
-            preferred_trades=preferred_trades,
-            preferred_share=preferred_share,
-            hard_eligible_share=hard_eligible_share,
-            settled_trades=len(settled_scope),
+            qualifying_positions=len(qualifying),
+            settled_positions=len(settled),
             settled_wins=wins,
             settled_losses=losses,
-            redeemed_trades=redeemed,
-            resolved_without_redeem=resolved_no_redeem,
-            early_exits=len(early_scope),
-            unresolved_trades=len(unresolved_scope),
+            outcome_unknown=outcome_unknown,
+            early_exits=len(early),
+            unresolved_positions=len(unresolved),
+            redeemed_positions=redeemed,
             realized_qualifying_pnl=total_pnl,
             win_rate=win_rate,
             profit_factor=profit_factor,
             active_trading_days=len(active_days),
             first_qualifying_trade=first_qualifying,
             last_qualifying_trade=last_qualifying,
-            resolved_markets=len(settled_scope),
+            resolved_markets=len(resolved_market_keys),
             distinct_events=len(distinct_events),
-            buy_count=record.buy_count,
-            sell_count=record.sell_count,
+            distinct_markets=len(distinct_markets),
+            buy_fill_count=record.buy_fill_count,
+            sell_fill_count=record.sell_fill_count,
             two_sided_churn=record.two_sided_churn,
             largest_market_pnl_share=record.largest_market_pnl_share,
             largest_event_pnl_share=record.largest_event_pnl_share,
             long_horizon_excluded=record.long_horizon_excluded,
             taxonomy_excluded=record.taxonomy_excluded,
-            source_incomplete=record.source_incomplete,
+            source_incomplete_count=record.source_incomplete_count,
             evidence_completeness=record.evidence_completeness,
         )
 
     if category_label is not None:
-        # One shot.
-        return (build_one(category_label, scope(settled), scope(early), scope(unresolved)),)
+        return (build_one(category_label, scope(positions)),)
 
-    by_category: dict[str, dict[str, list]] = {}
-    for ev in settled:
-        by_category.setdefault(ev.category_label or "__unknown__", {"s": [], "e": [], "u": []})["s"].append(ev)
-    for ev in early:
-        by_category.setdefault(ev.category_label or "__unknown__", {"s": [], "e": [], "u": []})["e"].append(ev)
-    for ev in unresolved:
-        by_category.setdefault(ev.category_label or "__unknown__", {"s": [], "e": [], "u": []})["u"].append(ev)
+    by_category: dict[str, list] = {}
+    for p in positions:
+        by_category.setdefault(p.category_label or "__unknown__", []).append(p)
     out: list[WalletCategoryEvidence] = []
-    for label, groups in sorted(by_category.items()):
-        out.append(build_one(label, groups["s"], groups["e"], groups["u"]))
-    # Always include an "__all__" overall evidence so wallet-wide scores
-    # have a single canonical row.
-    out.append(build_one(
-        "__all__",
-        list(settled),
-        list(early),
-        list(unresolved),
-    ))
+    for label, group in sorted(by_category.items()):
+        out.append(build_one(label, group))
+    out.append(build_one("__all__", list(positions)))
     return tuple(out)
 
 
@@ -256,16 +246,17 @@ def build_wallet_score_input_v1(
 ) -> WalletScoreInputV1:
     """Construct the canonical typed input for the wallet-wide scorer.
 
-    Pure; does not call the scorer. The fields map onto the same shape
-    that :func:`polycopy.scoring.wallet_evidence.build_wallet_score_input_v1`
-    returns for production — a fixture fed through BOTH builders MUST
-    produce structurally identical inputs.
+    Pure; does not call the scorer. Mirrors PR67's persisted BUY-evidence
+    denominator: ``overall_trade_count`` is the total BUY fill count
+    (the PR67 ``total_buy_trades`` basis), while ``trade_count`` is the
+    number of **distinct settled BUY positions** (PR67's
+    ``resolved_buy_trades`` denominator). Category counts are isolated.
     """
     if overall_trade_count is None:
-        overall_trade_count = evidence.buy_count + evidence.sell_count
+        overall_trade_count = evidence.buy_fill_count
     return WalletScoreInputV1(
         wallet_id=evidence.wallet_address,
-        trade_count=evidence.settled_trades or evidence.qualifying_trades or None,
+        trade_count=evidence.settled_positions or evidence.qualifying_positions or None,
         win_rate=evidence.win_rate,
         profit_factor=evidence.profit_factor,
         sample_fraction=0.0,
@@ -288,18 +279,24 @@ def build_category_score_input_v1(
     *,
     overall_trade_count: int | None = None,
 ) -> CategoryWalletScoreInputV1:
-    """Construct the canonical typed input for the per-category scorer."""
+    """Construct the canonical typed input for the per-category scorer.
+
+    BUY-only basis: ``category_trade_count`` is the count of qualifying
+    BUY positions (not BUY+SELL); ``trade_count`` is the distinct settled
+    BUY positions. The category gates consume ``category_resolved_markets``
+    (unique settled positions in the category) and ``category_distinct_events``.
+    """
     if overall_trade_count is None:
-        overall_trade_count = evidence.buy_count + evidence.sell_count
+        overall_trade_count = evidence.buy_fill_count
     return CategoryWalletScoreInputV1(
         wallet_id=evidence.wallet_address,
         category_label=evidence.category_label,
-        trade_count=evidence.settled_trades or evidence.qualifying_trades or None,
+        trade_count=evidence.settled_positions or evidence.qualifying_positions or None,
         win_rate=evidence.win_rate,
         profit_factor=evidence.profit_factor,
         sample_fraction=0.0,
-        category_trade_count=evidence.qualifying_trades,
-        category_distinct_markets=evidence.distinct_events,
+        category_trade_count=evidence.qualifying_positions,
+        category_distinct_markets=evidence.distinct_markets,
         overall_trade_count=overall_trade_count,
         largest_winner_share=evidence.largest_market_pnl_share,
         top_3_concentration=None,

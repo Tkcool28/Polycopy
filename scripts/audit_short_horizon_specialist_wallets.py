@@ -40,30 +40,39 @@ sys.path.insert(0, str(ROOT / "src"))
 from polycopy.discovery.adapter import (  # noqa: E402
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
+    PHASE_DEFAULT_PERCENTAGES,
     DiscoveryAdapter,
     list_broad_categories,
 )
-from polycopy.discovery.market_universe import (
-    MarketUniverseAudit,
+from polycopy.discovery.market_universe import (  # noqa: E402
     MarketUniverseConfig,
     MarketUniverseCrawler,
     PREFERRED_SHORT_HORIZON,
     ELIGIBLE_SHORT_HORIZON,
     validate_config,
 )
-from polycopy.discovery._safe_get import _RequestBudget  # noqa: E402
+from polycopy.discovery._safe_get import _RequestBudget, split_phase_caps  # noqa: E402
 from polycopy.discovery.short_horizon_specialists import (  # noqa: E402
     DISCOVERY_CONTRACT_VERSION,
-    DiscoveryReport,
     attach_frozen_thresholds,
     discover_short_horizon_specialists,
 )
 from polycopy.discovery.taxonomy_enricher import TaxonomyEnricher  # noqa: E402
-from polycopy.discovery.wallet_history import WalletHistoryFetcher  # noqa: E402
+from polycopy.discovery.wallet_history import (  # noqa: E402
+    WalletHistoryFetcher,
+    EARLY_EXIT,
+    SETTLED_WIN,
+    SETTLED_LOSS,
+    RESOLVED_OUTCOME_UNKNOWN,
+    REDEEM_CONFIRMED_OUTCOME_UNKNOWN,
+    UNRESOLVED,
+)
 from polycopy.discovery.wallet_seeds import (  # noqa: E402
     DEFAULT_LEADERBOARD_TOP,
     DEFAULT_MAX_WALLETS,
+    SeedWallet,
     WalletSeedBuilder,
+    rank_seed_wallets,
 )
 
 MAX_LOCK_CAP = 30
@@ -142,12 +151,18 @@ def _build_requested(args: argparse.Namespace) -> dict[str, Any]:
         "allow_live": bool(args.allow_live),
         "min_volume_24h": float(args.min_volume_24h),
         "min_liquidity": float(args.min_liquidity),
+        "phase_default_percentages": dict(PHASE_DEFAULT_PERCENTAGES),
     }
 
 
 async def _run_live(args: argparse.Namespace) -> dict[str, Any]:
     adapter = _adapter_from_kwargs(args)
-    budget = _RequestBudget(int(args.max_requests))
+    # STEP 13: activate phase budgets from PHASE_DEFAULT_PERCENTAGES so that
+    # every network call draws from its reserved phase allocation. Each call
+    # passes a `phase` label; one phase cannot silently consume another
+    # phase's reserved capacity.
+    phase_caps = split_phase_caps(int(args.max_requests), PHASE_DEFAULT_PERCENTAGES)
+    budget = _RequestBudget(int(args.max_requests), phase_caps=phase_caps)
     enricher = TaxonomyEnricher(adapter, budget=budget)
     config = MarketUniverseConfig(
         as_of=_parse_as_of(args.as_of),
@@ -179,10 +194,14 @@ async def _run_live(args: argparse.Namespace) -> dict[str, Any]:
         concurrency=int(args.concurrency),
     )
     seed_report = await seeds.build(classifications=classifications, categories=config.categories)
-    from polycopy.discovery.wallet_seeds import SeedWallet
-    seed_wallets = tuple(
-        SeedWallet(wallet_address=w, sources=())
-        for w in seed_report.union_wallets
+    # STEP 14: preserve actual seed provenance and rank deterministically by
+    # evidence priority (NOT alphabetical address). The fetcher receives the
+    # ranked SeedWallet records carrying sources / market_count /
+    # leaderboard_count / leaderboard_records.
+    ranked_seeds = rank_seed_wallets(
+        [SeedWallet(wallet_address=w, sources=()) for w in seed_report.union_wallets],
+        channel_a_market_first=seed_report.market_first_wallets,
+        channel_b_leaderboard=seed_report.leaderboard_wallets,
     )
     history = WalletHistoryFetcher(
         adapter,
@@ -190,7 +209,7 @@ async def _run_live(args: argparse.Namespace) -> dict[str, Any]:
         history_days=int(args.history_days),
     )
     history_report = await history.fetch(
-        seeds=seed_wallets,
+        seeds=ranked_seeds,
         classifications=classifications,
         as_of=config.as_of,
     )
@@ -211,30 +230,78 @@ async def _run_live(args: argparse.Namespace) -> dict[str, Any]:
         "by_bucket": universe_audit.bucket_counts,
         "truncated": universe_audit.truncated,
         "request_budget_used": universe_audit.request_budget_used,
+        "raw_rows_fetched": universe_audit.raw_rows_fetched,
+        "unique_markets": universe_audit.unique_markets,
+        "duplicate_rows_removed": universe_audit.duplicate_rows_removed,
+        "duplicate_payload_conflicts": universe_audit.duplicate_payload_conflicts,
+        "market_trade_requests": universe_audit.market_trade_requests,
         "eligibility_count": len(eligibility),
     }
+    ta = enricher.audit()
     taxonomy_summary = {
-        "embedded_usable": enricher.audit().embedded_usable,
-        "market_tag_fallback": enricher.audit().market_tag_fallback_used,
-        "event_fallback": enricher.audit().event_fallback_used,
-        "series_fallback": enricher.audit().series_fallback_used,
-        "partial": enricher.audit().partial,
-        "unavailable": enricher.audit().unavailable,
-        "conflict": enricher.audit().conflict,
-        "api_failures": enricher.audit().api_failures,
+        "markets_seen": ta.markets_seen,
+        "usable": ta.usable,
+        "partial": ta.partial,
+        "unavailable": ta.unavailable,
+        "conflict": ta.conflict,
+        "embedded_attempted": ta.embedded_attempted,
+        "embedded_success": ta.embedded_success,
+        "market_tag_attempted": ta.market_tag_attempted,
+        "market_tag_success": ta.market_tag_success,
+        "event_attempted": ta.event_attempted,
+        "event_success": ta.event_success,
+        "series_attempted": ta.series_attempted,
+        "series_success": ta.series_success,
+        "api_failures": ta.api_failures,
+        "lower_priority_mismatch_warnings": ta.lower_priority_mismatch_warnings,
+        "invariant_holds": (
+            ta.usable + ta.partial + ta.unavailable + ta.conflict == ta.markets_seen
+        ),
     }
     seeds_summary = {
         "market_first_wallets": len(seed_report.market_first_wallets),
         "leaderboard_wallets": len(seed_report.leaderboard_wallets),
         "union_wallets": len(seed_report.union_wallets),
+        "both_channel_wallets": len(
+            set(w.lower() for w in seed_report.market_first_wallets)
+            & set(w.lower() for w in seed_report.leaderboard_wallets)
+        ),
         "duplicate_wallets": len(seed_report.duplicate_wallets),
         "truncated": seed_report.truncated,
         "dropped_count": seed_report.dropped_count,
+        "ranked_selection": [s.wallet_address for s in ranked_seeds][: int(args.max_wallets)],
     }
     history_summary = {
         "wallets_fetched": len(history_report.wallets),
         "trades_seen": history_report.trades_seen,
         "history_days": history_report.history_days,
+        "position_groups": sum(len(r.positions) for r in history_report.wallets),
+        "settled_positions": sum(
+            1 for r in history_report.wallets for p in r.positions
+            if p.settlement_state in (SETTLED_WIN, SETTLED_LOSS, RESOLVED_OUTCOME_UNKNOWN, REDEEM_CONFIRMED_OUTCOME_UNKNOWN)
+        ),
+        "settled_wins": sum(
+            1 for r in history_report.wallets for p in r.positions
+            if p.settlement_state == SETTLED_WIN
+        ),
+        "settled_losses": sum(
+            1 for r in history_report.wallets for p in r.positions
+            if p.settlement_state == SETTLED_LOSS
+        ),
+        "outcome_unknown": sum(
+            1 for r in history_report.wallets for p in r.positions
+            if p.settlement_state in (RESOLVED_OUTCOME_UNKNOWN, REDEEM_CONFIRMED_OUTCOME_UNKNOWN)
+        ),
+        "early_exits": sum(
+            1 for r in history_report.wallets for p in r.positions
+            if p.settlement_state == EARLY_EXIT
+        ),
+        "unresolved": sum(
+            1 for r in history_report.wallets for p in r.positions
+            if p.settlement_state == UNRESOLVED
+        ),
+        "source_incomplete": len(history_report.source_incomplete),
+        "conflicts": len(history_report.conflicts),
     }
 
     final["audit_summary"] = {
@@ -244,6 +311,9 @@ async def _run_live(args: argparse.Namespace) -> dict[str, Any]:
         "history": history_summary,
         "request_budget_initial": budget.initial,
         "request_budget_used": budget.used(),
+        "phase_caps": budget.phase_caps,
+        "phase_used": budget.phase_used,
+        "phase_skipped": {k: max(0, phase_caps.get(k, 0) - v) for k, v in budget.phase_used.items()},
         "adapter_timeout_seconds": float(args.timeout),
         "adapter_max_retries": int(args.max_retries),
     }
@@ -264,7 +334,6 @@ def _load_offline(args: argparse.Namespace) -> dict[str, Any]:
     market_trades: dict[str, list[dict[str, Any]]] = {
         str(k).lower(): list(v) for k, v in (payload.get("market_trades") or {}).items()
     }
-    leaderboard = list(payload.get("leaderboard", []))
     history_records = list(payload.get("history_records", []))
     requested = _build_requested(args)
     requested.update({

@@ -232,6 +232,50 @@ async def safe_get_json(
     )
 
 
+PHASE_DEFAULT_PERCENTAGES: dict[str, float] = {
+    "universe_taxonomy": 0.20,
+    "market_first_trades": 0.18,
+    "leaderboards": 0.07,
+    "histories": 0.22,
+    "closed_positions": 0.13,
+    "redeems": 0.12,
+    "referenced_metadata": 0.08,
+}
+
+
+def split_phase_caps(
+    total: int,
+    percentages: dict[str, float] | None = None,
+) -> dict[str, int]:
+    """Deterministically allocate ``total`` requests across phases.
+
+    Honors each phase's reserved percentage. The residual from integer
+    truncation is assigned to the largest phase (histories) so the sum
+    equals ``total`` exactly. One phase cannot silently consume another
+    phase's reserved capacity — :meth:`_RequestBudget.acquire` enforces
+    the per-phase cap independently.
+    """
+    pct = dict(percentages or PHASE_DEFAULT_PERCENTAGES)
+    if not pct:
+        return {}
+    total_weight = sum(pct.values())
+    if total_weight <= 0:
+        return {k: 0 for k in pct}
+    raw = {k: total * (v / total_weight) for k, v in pct.items()}
+    caps = {k: int(v) for k, v in raw.items()}
+    remainder = total - sum(caps.values())
+    if remainder != 0:
+        # Assign the leftover to the phase with the largest fractional part.
+        order = sorted(pct.keys(), key=lambda k: raw[k] - caps[k], reverse=True)
+        idx = 0
+        while remainder != 0 and order:
+            k = order[idx % len(order)]
+            caps[k] += 1 if remainder > 0 else -1
+            remainder += -1 if remainder > 0 else 1
+            idx += 1
+    return caps
+
+
 __all__ = [
     "ERR_BUDGET_EXHAUSTED",
     "ERR_CONNECTION_ERROR",
@@ -243,7 +287,9 @@ __all__ = [
     "ERR_RETRIES_EXHAUSTED",
     "ERR_RETRY_AFTER_EXCEEDED",
     "ERR_TIMEOUT",
+    "PHASE_DEFAULT_PERCENTAGES",
     "SafeGetResult",
     "_RequestBudget",
+    "split_phase_caps",
     "safe_get_json",
 ]
