@@ -760,15 +760,32 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
             raise ValueError("Gamma active-market response must be a list")
         return [dict(item) for item in payload if isinstance(item, dict)][:bounded_limit]
 
-    async def get_public_leaderboard(self, *, limit: int = 20) -> list[dict[str, Any]]:
+    async def get_public_leaderboard(
+        self,
+        *,
+        limit: int = 20,
+        category: str | None = None,
+        time_period: str | None = None,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Bounded read of the public data-api leaderboard endpoint.
 
-        The upstream response shape is intentionally left raw.  Consumers must
-        validate an address rather than treating rank/name as an identity.
+        Optional category filter (e.g. ``POLITICS``, ``SPORTS``),
+        ``time_period`` (``DAY`` / ``WEEK`` / ``MONTH`` / ``ALL``), and
+        ``order_by`` (``PNL`` / ``VOL``). Upstream response is left raw;
+        consumers must validate an address rather than treating rank or
+        display name as identity.
         """
         bounded_limit = max(1, min(int(limit), 100))
+        params: dict[str, Any] = {"limit": bounded_limit}
+        if category:
+            params["category"] = str(category).upper()
+        if time_period:
+            params["timePeriod"] = str(time_period).upper()
+        if order_by:
+            params["orderBy"] = str(order_by).upper()
         client = await self._get_data_client()
-        response = await client.get("/v1/leaderboard", params={"limit": bounded_limit})
+        response = await client.get("/v1/leaderboard", params=params)
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
