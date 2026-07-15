@@ -190,11 +190,16 @@ def evidence_from_history(
                     if last_qualifying is None or f.ts_iso > last_qualifying:
                         last_qualifying = f.ts_iso
 
-        # Resolved markets = unique (condition, asset) settled positions
-        # (incl. outcome-unknown/redeem-unknown — the market resolved; only
-        # UNRESOLVED/EARLY_EXIT/SOURCE_INCOMPLETE are excluded). Win-rate and
-        # score trade_count use the decision subset (wins+losses) below.
-        resolved_market_keys = {(p.condition_id, p.asset_id) for p in settled}
+        # Resolved markets = unique condition_id among settled evidence
+        # (decision SETTLED_WIN/LOSS + outcome-unknown/redeem-unknown — the
+        # market resolved; UNRESOLVED/EARLY_EXIT/SOURCE_INCOMPLETE excluded).
+        # A single market is counted ONCE even when the wallet traded both the
+        # YES and NO outcomes (one resolved market, not two). Win-rate and the
+        # score trade_count still use the decision subset (wins+losses) below.
+        resolved_market_keys = {p.condition_id for p in settled}
+        # Distinct settled decision position keys (condition, asset) — the
+        # actual reconciled positions that reached a win/loss decision.
+        settled_decision_keys = {(p.condition_id, p.asset_id) for p in decision}
         distinct_events = sorted({p.event_identity for p in settled if p.event_identity})
         distinct_markets = sorted({p.condition_id for p in settled})
 
@@ -202,7 +207,7 @@ def evidence_from_history(
             wallet_address=record.wallet_address,
             category_label=label,
             qualifying_positions=len(qualifying),
-            settled_positions=len(decision),
+            settled_positions=len(settled_decision_keys),
             settled_wins=wins,
             settled_losses=losses,
             outcome_unknown=outcome_unknown,

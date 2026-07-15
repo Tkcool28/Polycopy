@@ -66,12 +66,15 @@ def _record(positions):
 
 
 def test_resolved_markets_unique_condition_ids(rule=None):
-    """STEP 17 #11: resolved markets = unique (condition, asset) settled positions."""
+    """PR69 final: resolved markets = unique condition_id among settled evidence.
+
+    Two distinct assets in the SAME condition is ONE resolved market, not two.
+    """
     rec = _record([_pos("0xc1", "0xa1", SETTLED_WIN), _pos("0xc1", "0xa2", SETTLED_LOSS)])
     evs = evidence_from_history(rec)
     all_ev = next(e for e in evs if e.category_label == "__all__")
-    # Two distinct assets in same condition → two resolved markets.
-    assert all_ev.resolved_markets == 2
+    # Both assets belong to condition 0xc1 → one resolved market.
+    assert all_ev.resolved_markets == 1
 
 
 def test_distinct_events_use_official_event_ids(rule=None):
@@ -132,9 +135,11 @@ def test_production_discovery_canonical_inputs_match(rule=None):
     wallet_inp = build_wallet_score_input_v1(all_ev)
     # BUY-only denominator = total BUY fills (3 positions × 1 BUY each = 3).
     assert wallet_inp.overall_trade_count == 3
-    assert wallet_inp.resolved_markets == 2
+    # Settled set = {0xc1:a1 WIN, 0xc1:a2 LOSS}; 0xc2 is UNRESOLVED (excluded).
+    # Unique condition_id among settled = {0xc1} → 1 resolved market.
+    assert wallet_inp.resolved_markets == 1
     cat_inp = build_category_score_input_v1(all_ev)
-    assert cat_inp.category_resolved_markets == 2
+    assert cat_inp.category_resolved_markets == 1
     assert cat_inp.category_distinct_events == 1
 
 
