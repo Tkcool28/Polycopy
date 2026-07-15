@@ -740,6 +740,60 @@ class PolymarketPublicAdapter(MarketDataProvider, TradeFeedProvider, ResolutionP
         resp.raise_for_status()
         return [self._parse_gamma_market(m) for m in resp.json()]
 
+    async def list_active_markets_raw(self, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        """Bounded public Gamma read retaining official taxonomy fields.
+
+        This deliberately has no persistence or discovery side effect.  It is
+        the raw counterpart to :meth:`list_active_markets` for report-only
+        callers that need ``category``, event, series, and tag provenance.
+        """
+        bounded_limit = max(1, min(int(limit), 100))
+        bounded_offset = max(0, int(offset))
+        client = await self._get_gamma_client()
+        response = await client.get("/markets", params={
+            "active": "true", "closed": "false", "limit": bounded_limit,
+            "offset": bounded_offset, "order": "volume24hr", "ascending": "false",
+        })
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise ValueError("Gamma active-market response must be a list")
+        return [dict(item) for item in payload if isinstance(item, dict)][:bounded_limit]
+
+    async def get_public_leaderboard(
+        self,
+        *,
+        limit: int = 20,
+        category: str | None = None,
+        time_period: str | None = None,
+        order_by: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Bounded read of the public data-api leaderboard endpoint.
+
+        Optional category filter (e.g. ``POLITICS``, ``SPORTS``),
+        ``time_period`` (``DAY`` / ``WEEK`` / ``MONTH`` / ``ALL``), and
+        ``order_by`` (``PNL`` / ``VOL``). Upstream response is left raw;
+        consumers must validate an address rather than treating rank or
+        display name as identity.
+        """
+        bounded_limit = max(1, min(int(limit), 100))
+        params: dict[str, Any] = {"limit": bounded_limit}
+        if category:
+            params["category"] = str(category).upper()
+        if time_period:
+            params["timePeriod"] = str(time_period).upper()
+        if order_by:
+            params["orderBy"] = str(order_by).upper()
+        client = await self._get_data_client()
+        response = await client.get("/v1/leaderboard", params=params)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            payload = payload.get("data", payload.get("leaderboard", []))
+        if not isinstance(payload, list):
+            raise ValueError("public leaderboard response must be a list")
+        return [dict(item) for item in payload if isinstance(item, dict)][:bounded_limit]
+
     async def search_markets(self, query: str, limit: int = 20) -> list[Market]:
         """Search markets — Gamma API doesn't have full text search, so we filter client-side."""
         all_markets = await self.list_active_markets(limit=200)

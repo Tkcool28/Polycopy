@@ -11,6 +11,12 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from polycopy.taxonomy.official_polymarket import (
+    TAXONOMY_USABLE,
+    OfficialPolymarketTaxonomyResolverV1,
+    OfficialTaxonomyResult,
+)
+
 METADATA_VERSION = "1"
 _CANONICAL_SEPARATORS = (",", ":")
 
@@ -79,6 +85,24 @@ def normalize_source_trade_metadata(raw: Mapping[str, Any] | None) -> dict[str, 
     }
 
 
+def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> str | None:
+    """Return only a conflict-free trusted broad category for metadata v1.
+
+    Metadata v1 deliberately has no provenance field.  Preserve its exact shape
+    and pass only resolver-approved evidence to ``raw_category``; unknown,
+    specific-tag, and conflicting evidence stays unavailable fail-closed.
+    """
+    if result.status != TAXONOMY_USABLE:
+        return None
+    if result.source == "market.category":
+        return result.market_category_value
+    if result.source == "event.category":
+        return result.event_category_value
+    if result.source == "series.category":
+        return result.series_category_value
+    return result.category_label
+
+
 def build_metadata_from_gamma_market(
     trade: Mapping[str, Any] | None,
     gamma_market: Mapping[str, Any] | None,
@@ -138,6 +162,13 @@ def build_metadata_from_gamma_market(
         series = market.get("series")
         if isinstance(series, list) and series:
             source["series"] = series[0]
+    # Preserve the PR66 metadata-v1 shape.  The resolver is the sole category
+    # authority here; display fields and arbitrary specific tags cannot reach
+    # taxonomy.raw_category through this enrichment path.
+    source = dict(source)
+    source["category"] = _official_category_for_v1_metadata(
+        OfficialPolymarketTaxonomyResolverV1().resolve(source)
+    )
     return normalize_source_trade_metadata(source)
 
 
