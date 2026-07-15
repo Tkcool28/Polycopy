@@ -29,13 +29,6 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-# Exclude stray scratch DB-probe scripts (untracked, open polycopy.db directly)
-# that are outside the PR69 discovery/audit scope.
-extend-exclude = [
-    "scripts/_baseline_probe.py",
-    "scripts/_preview_select.py",
-    "scripts/collect_approved_wallet_trades.py",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

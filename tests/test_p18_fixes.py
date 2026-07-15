@@ -28,6 +28,8 @@ def _reset_app_state(monkeypatch, tmp_path):
     import polycopy.config.settings as settings_module
     import polycopy.db.database as database_module
     from polycopy.api.app import _bidask_provider, _idempotency_store
+    from polycopy.config.settings import get_settings
+    from polycopy.db.database import Database
 
     if database_module._db is not None:
         database_module._db.close()
@@ -36,6 +38,20 @@ def _reset_app_state(monkeypatch, tmp_path):
     _idempotency_store._db = None  # noqa: SLF001
     _idempotency_store._ensured_table = False  # noqa: SLF001
     _bidask_provider.clear()
+
+    # Bind the global DB singleton explicitly to THIS test's tmp_path so the
+    # test can neither leak nor inherit another test's SQLite file, independent
+    # of how POLYCOPY_DB_PATH env-resolution behaves across Python/CI versions.
+    # (See CI run 343: P18 approval tests returned 409/state-pollution on
+    # Python 3.12 because the shared singleton occasionally resolved to a
+    # prior test's DB. Explicit binding makes isolation deterministic.)
+    settings = get_settings(reload=True)
+    db_path = tmp_path / "p18.sqlite"
+    settings.db_path = db_path
+    fresh_db = Database(db_path=db_path)
+    fresh_db.connect()
+    database_module._db = fresh_db
+    _idempotency_store._db = fresh_db  # noqa: SLF001
     return database_module, settings_module, _bidask_provider, _idempotency_store
 
 
