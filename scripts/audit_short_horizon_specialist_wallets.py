@@ -302,7 +302,28 @@ async def _run_live(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "source_incomplete": len(history_report.source_incomplete),
         "conflicts": len(history_report.conflicts),
+        "stage_counters": history_report.stage_counters.as_dict(),
     }
+
+    # STEP 12: report-consistency invariants.
+    decision_total = sum(
+        1 for r in history_report.wallets for p in r.positions
+        if p.settlement_state in (SETTLED_WIN, SETTLED_LOSS)
+    )
+    stage = history_report.stage_counters
+    history_summary["invariant_wins_losses_eq_decision"] = (
+        decision_total == stage.settled_wins + stage.settled_losses
+    )
+    # Stage counters should reconcile: positions_grouped + unresolved + early_exit
+    # + settled_wins + settled_losses + outcome_unknown + redeem_unknown == grouped,
+    # plus rejected/excluded rows tracked separately.
+    history_summary["invariant_stage_reconciles"] = (
+        stage.positions_grouped
+        >= stage.settled_wins + stage.settled_losses
+        + stage.resolved_outcome_unknown + stage.redeem_confirmed_outcome_unknown
+        + stage.unresolved_positions + stage.early_exit_positions
+    )
+
 
     final["audit_summary"] = {
         "universe": universe_summary,

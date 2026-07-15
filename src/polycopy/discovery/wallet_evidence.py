@@ -148,16 +148,16 @@ def evidence_from_history(
         return [p for p in pos if (p.category_label or "__unknown__") == category_label]
 
     def build_one(label: str, scoped_positions: list) -> WalletCategoryEvidence:
-        settled = [p for p in scoped_positions if p.settlement_state in (SETTLED_WIN, SETTLED_LOSS, RESOLVED_OUTCOME_UNKNOWN, REDEEM_CONFIRMED_OUTCOME_UNKNOWN)]
+        decision = [p for p in scoped_positions if p.settlement_state in (SETTLED_WIN, SETTLED_LOSS)]
+        outcome_unknown_positions = [p for p in scoped_positions if p.settlement_state in (RESOLVED_OUTCOME_UNKNOWN, REDEEM_CONFIRMED_OUTCOME_UNKNOWN)]
         early = [p for p in scoped_positions if p.settlement_state == EARLY_EXIT]
         unresolved = [p for p in scoped_positions if p.settlement_state == UNRESOLVED]
+        settled = decision + outcome_unknown_positions
         qualifying = settled + early + unresolved
 
-        wins = sum(1 for p in settled if p.settlement_state == SETTLED_WIN)
-        losses = sum(1 for p in settled if p.settlement_state == SETTLED_LOSS)
-        outcome_unknown = sum(
-            1 for p in settled if p.settlement_state in (RESOLVED_OUTCOME_UNKNOWN, REDEEM_CONFIRMED_OUTCOME_UNKNOWN)
-        )
+        wins = sum(1 for p in decision if p.settlement_state == SETTLED_WIN)
+        losses = sum(1 for p in decision if p.settlement_state == SETTLED_LOSS)
+        outcome_unknown = len(outcome_unknown_positions)
         redeemed = sum(1 for p in settled if p.redeemed)
 
         # PnL aggregation — one canonical position-level ledger.
@@ -171,7 +171,7 @@ def evidence_from_history(
         total_pnl = sum(complete_pnl) if (complete_pnl and not any(p.pnl_conflict for p in settled)) else None
         if any(p.pnl_conflict for p in settled):
             total_pnl = None
-        win_rate = (wins / len(settled)) if settled else None
+        win_rate = (wins / (wins + losses)) if (wins + losses) > 0 else None
         gross_gain = sum(max(0.0, v) for v in complete_pnl)
         gross_loss = -sum(min(0.0, v) for v in complete_pnl)
         profit_factor = (gross_gain / gross_loss) if (complete_pnl and gross_loss > 0) else None
@@ -190,7 +190,10 @@ def evidence_from_history(
                     if last_qualifying is None or f.ts_iso > last_qualifying:
                         last_qualifying = f.ts_iso
 
-        # Resolved markets = unique (condition, asset) settled positions.
+        # Resolved markets = unique (condition, asset) settled positions
+        # (incl. outcome-unknown/redeem-unknown — the market resolved; only
+        # UNRESOLVED/EARLY_EXIT/SOURCE_INCOMPLETE are excluded). Win-rate and
+        # score trade_count use the decision subset (wins+losses) below.
         resolved_market_keys = {(p.condition_id, p.asset_id) for p in settled}
         distinct_events = sorted({p.event_identity for p in settled if p.event_identity})
         distinct_markets = sorted({p.condition_id for p in settled})
@@ -199,7 +202,7 @@ def evidence_from_history(
             wallet_address=record.wallet_address,
             category_label=label,
             qualifying_positions=len(qualifying),
-            settled_positions=len(settled),
+            settled_positions=len(decision),
             settled_wins=wins,
             settled_losses=losses,
             outcome_unknown=outcome_unknown,
@@ -256,7 +259,7 @@ def build_wallet_score_input_v1(
         overall_trade_count = evidence.buy_fill_count
     return WalletScoreInputV1(
         wallet_id=evidence.wallet_address,
-        trade_count=evidence.settled_positions or evidence.qualifying_positions or None,
+        trade_count=(evidence.settled_wins + evidence.settled_losses) or None,
         win_rate=evidence.win_rate,
         profit_factor=evidence.profit_factor,
         sample_fraction=0.0,
@@ -291,7 +294,7 @@ def build_category_score_input_v1(
     return CategoryWalletScoreInputV1(
         wallet_id=evidence.wallet_address,
         category_label=evidence.category_label,
-        trade_count=evidence.settled_positions or evidence.qualifying_positions or None,
+        trade_count=(evidence.settled_wins + evidence.settled_losses) or None,
         win_rate=evidence.win_rate,
         profit_factor=evidence.profit_factor,
         sample_fraction=0.0,
