@@ -739,6 +739,24 @@ print('Yes - procedures documented in rollback section')
 
 ---
 
+## Specialist Paper Execution Spine (separate branch)
+
+The specialist approval → copyable paper-signal → authorized → executed → marked →
+settled loop lives on `feat/specialist-paper-execution-spine` and is documented in
+[`docs/specialist_paper_execution_spine.md`](specialist_paper_execution_spine.md).
+
+Canonical authoritative tables for that spine are the `paper_*` family
+(`paper_orders`, `paper_fills`, `paper_positions`, `paper_position_lots`,
+`paper_position_marks`, `paper_position_settlements`) plus `specialist_approvals`,
+`source_trade_enrichments`, `approved_specialist_trade_dispatches`, `copy_candidates`,
+and `paper_signal_execution_authorizations`. The legacy `orders`/`positions` tables are
+sample/demo-only and are **not** authoritative for the specialist spine.
+
+Operator commands, service templates (`deploy-units/*.service.template`), rollout
+sequence, and rollback for the specialist spine are all described in that document.
+
+---
+
 **Last Updated:** Documentation-only update for P2.1 blocker fixes
 **SHA:** 16a04b8e2f3007f1833b94006de519579592fdf0
 **Status:** Paper-only pilot release

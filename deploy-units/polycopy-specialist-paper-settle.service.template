@@ -1,0 +1,23 @@
+# Review-only template. Do not install, start, or enable during this PR.
+[Unit]
+Description=Polycopy specialist paper position settlement (canonical path)
+After=network-online.target polycopy-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Polycopy
+EnvironmentFile=/root/Polycopy/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYCOPY_MAX_RSS_MB=256
+# Settles one specialist paper position through authoritative market-resolution
+# evidence. Never uses sample fallback. Never deletes the only position record.
+# Uses only paper_position_settlements. Conflicting evidence blocks.
+ExecStart=/root/Polycopy/.venv/bin/python /root/Polycopy/scripts/settle_specialist_paper_positions.py --position-id REPLACE_POSITION_ID --resolution-outcome REPLACE_OUTCOME --evidence-source authoritative --write --confirm-production-db
+TimeoutStartSec=120
+Restart=no
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+# Installation and scheduling are separate approved operations.

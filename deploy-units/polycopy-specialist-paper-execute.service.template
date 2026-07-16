@@ -1,0 +1,24 @@
+# Review-only template. Do not install, start, or enable during this PR.
+[Unit]
+Description=Polycopy authorized-specialist paper execution (paper only)
+After=network-online.target polycopy-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Polycopy
+EnvironmentFile=/root/Polycopy/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYCOPY_MAX_RSS_MB=512
+# Executes ONE authorized signal via the canonical specialist spine. Paper only;
+# never live-money. Requires --write --confirm-production-db --allow-paper-execution
+# AND the configured guard specialist_paper_allow_production_execution=true.
+# Kill switch remains authoritative and is NEVER disabled here.
+ExecStart=/root/Polycopy/.venv/bin/python /root/Polycopy/scripts/execute_authorized_specialist_signals.py --authorization-id REPLACE_AUTHORIZATION_ID --limit 1 --write --confirm-production-db --allow-paper-execution
+TimeoutStartSec=120
+Restart=no
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+# Installation and scheduling are separate approved operations.
