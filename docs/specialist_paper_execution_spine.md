@@ -141,8 +141,12 @@ python scripts/enrich_approved_source_trade.py --source-trade-id STID --write --
 
 ### Dispatch
 ```bash
-python scripts/process_approved_specialist_trades.py --approval-id ID --source-trade-id STID --dry-run
-python scripts/process_approved_specialist_trades.py --approval-id ID --source-trade-id STID --write --confirm-production-db
+# Discovery + enrichment + dispatch for an approval (dry run by default; omit --write)
+python scripts/process_approved_specialist_trades.py --approval-id ID
+# Write (persists all stages; requires --confirm-production-db on production)
+python scripts/process_approved_specialist_trades.py --approval-id ID --write --confirm-production-db
+# Optionally bound newly-collected trades
+python scripts/process_approved_specialist_trades.py --approval-id ID --max-new-trades 1 --write --confirm-production-db
 ```
 
 ### Authorization (explicit execution gate)

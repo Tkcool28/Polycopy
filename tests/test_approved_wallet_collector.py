@@ -94,7 +94,7 @@ def test_service_template_uses_safe_command_and_stays_timer_free():
     text = (
         Path(__file__).parents[1] / "deploy-units/polycopy-approved-wallet-collect.service.template"
     ).read_text()
-    assert "collect_approved_wallet_trades.py --write" in text
+    assert "collect_approved_wallet_trades.py --approval-id REPLACE_APPROVAL_ID --max-new-trades 1 --write" in text
     assert "POLYCOPY_MAX_RSS_MB=512" in text
     assert ".timer" not in text and "[Install]" not in text
     assert "PrivateTmp=true" not in text

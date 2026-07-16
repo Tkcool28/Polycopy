@@ -99,13 +99,15 @@ def _validate_authorization_inputs(db: Database, *, paper_signal_decision_id: in
     )
     if sig is None:
         return ["signal_missing"]
+    # Normalize sqlite3.Row -> dict for optional-key access below.
+    sig_d = dict(sig)
 
     # 3. Verdict eligible.
     if sig["final_verdict"] != ELIGIBLE_SIGNAL_VERDICT:
         reasons.append(f"signal_verdict_not_eligible:{sig['final_verdict']}")
 
     # 4. Legacy is_approved invariant (must remain 0).
-    if int(sig.get("is_approved", 0)) != 0:
+    if int(sig_d.get("is_approved", 0)) != 0:
         reasons.append("legacy_is_approved_nonzero:contract_violation")
 
     # 5. Source trade belongs to approval wallet.

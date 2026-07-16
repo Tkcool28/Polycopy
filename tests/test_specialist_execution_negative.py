@@ -16,7 +16,6 @@ All runs use temporary databases only.
 
 from __future__ import annotations
 
-import math
 import tempfile
 from pathlib import Path
 
@@ -111,7 +110,8 @@ def test_schema_v18_new_tables_exist():
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (t,)
         )
         assert row is not None, f"missing table {t}"
-    db.close(); n.unlink()
+    db.close()
+    n.unlink()
 
 
 def test_execution_risk_decision_pk_type_and_columns():
@@ -127,7 +127,8 @@ def test_execution_risk_decision_pk_type_and_columns():
         "policy_version", "evidence_timestamp", "evaluated_at",
     ]:
         assert required in cols, f"missing column {required}"
-    db.close(); n.unlink()
+    db.close()
+    n.unlink()
 
 
 def test_invalid_fk_insert_fails():
@@ -144,7 +145,8 @@ def test_invalid_fk_insert_fails():
              "bad-w", "bad-m", "bad-w", "BUY", "Yes", 1.0, 0.4, "filled",
              1.0, 0.4, "fill_model_v1", "now", "v1"),
         )
-    db.close(); n.unlink()
+    db.close()
+    n.unlink()
 
 
 # --------------------------------------------------------------------------- #
@@ -440,7 +442,7 @@ def test_settlement_replay_returns_existing(tmp_path: Path):
     db, ap, auth, psid, ing = _seed_score_authorize(tmp_path)
     res = consume_eligible_signal(db, psid, _runtime())
     assert res.status == "executed"
-    mr = mark_specialist_position(db, res.position_id, mark_price=0.5, bid_price=0.45,
+    _mr = mark_specialist_position(db, res.position_id, mark_price=0.5, bid_price=0.45,
                                   ask_price=0.55, evidence_source="test")
     so1 = settle_specialist_position(db, res.position_id, resolution_outcome="YES",
                                      evidence_source="test")
@@ -456,10 +458,10 @@ def test_conflicting_settlement_blocked(tmp_path: Path):
     db, ap, auth, psid, ing = _seed_score_authorize(tmp_path)
     res = consume_eligible_signal(db, psid, _runtime())
     assert res.status == "executed"
-    mr = mark_specialist_position(db, res.position_id, mark_price=0.5, bid_price=0.45,
+    _mr = mark_specialist_position(db, res.position_id, mark_price=0.5, bid_price=0.45,
                                   ask_price=0.55, evidence_source="test")
-    so1 = settle_specialist_position(db, res.position_id, resolution_outcome="YES",
-                                     evidence_source="test")
+    _so1 = settle_specialist_position(db, res.position_id, resolution_outcome="YES",
+                                      evidence_source="test")
     # Different resolution evidence (NO) must not create a second settlement.
     so2 = settle_specialist_position(db, res.position_id, resolution_outcome="NO",
                                      evidence_source="conflict")

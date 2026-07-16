@@ -576,12 +576,17 @@ class Database:
     def rollback(self) -> None:
         self.conn.rollback()
 
-    def fetchone(self, sql: str, params: tuple = ()) -> Optional[dict]:
-        row = self.conn.execute(sql, params).fetchone()
-        return dict(row) if row is not None else None
+    def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        # Established repository contract: returns ``sqlite3.Row`` (supports both
+        # positional ``row[0]`` and mapping ``row["key"]`` access) or ``None``.
+        # New specialist-execution code that needs a ``dict`` must normalize at its
+        # module boundary via ``dict(row)`` — see specialist_approval.py,
+        # specialist_spine.py, source_trade_enrichment.py,
+        # approved_specialist_dispatcher.py.
+        return self.conn.execute(sql, params).fetchone()
 
-    def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
-        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+    def fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        return self.conn.execute(sql, params).fetchall()
 
     # ── Bounded query iteration (PR24B) ─────────────────────────────────────
     #

@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from polycopy.scoring.category_wallet_score_v1 import CategoryWalletScoreInputV1

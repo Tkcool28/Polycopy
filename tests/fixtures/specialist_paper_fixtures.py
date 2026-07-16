@@ -54,7 +54,7 @@ class _FakeOutcome:
         self.volume = 100.0
 
 
-import collections.abc
+import collections.abc  # noqa: E402
 
 
 class _FakeMarket(collections.abc.Mapping):
@@ -117,7 +117,7 @@ class FakeGamma:
         return _FakeMarket(condition_id)
 
 
-from polycopy.adapters.polymarket_clob import ClobBook, ClobBookLevel
+from polycopy.adapters.polymarket_clob import ClobBook, ClobBookLevel  # noqa: E402
 
 
 class FakeBook(ClobBook):

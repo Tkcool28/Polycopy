@@ -396,7 +396,9 @@ def consume_eligible_signal(
         approval_id = str(auth["specialist_approval_id"])
         # The legacy is_approved column must agree it was never auto-granted.
         # (Read-only: we only assert it is 0, per PR4 invariant.)
-        if int(signal.get("is_approved", 0)) != 0:
+        # ``signal`` is a sqlite3.Row here; normalize for the optional-key access.
+        signal_d = dict(signal)
+        if int(signal_d.get("is_approved", 0)) != 0:
             reasons.append("legacy_is_approved_nonzero:contract_violation")
         # Re-check approval still enabled & unrevoked.
         ap = db.fetchone(
@@ -431,8 +433,10 @@ def consume_eligible_signal(
     if st is None:
         reasons.append("source_trade_missing")
         market_source_id = None
+        st_d = None
     else:
         market_source_id = st["market_source_id"]
+        st_d = dict(st)
         if str(st["side"] or "").upper() != "BUY":
             reasons.append("source_trade_not_buy")
 
@@ -445,7 +449,7 @@ def consume_eligible_signal(
         reasons.append("depth_missing")
 
     # ---- 7. Market open/tradable/unresolved ----------------------------- #
-    if st is not None and str(st.get("resolution_status") or "").lower() in {
+    if st_d is not None and str(st_d.get("resolution_status") or "").lower() in {
         "won", "lost", "resolved"
     }:
         reasons.append("source_market_resolved")
@@ -480,22 +484,23 @@ def consume_eligible_signal(
         result.order_id = existing_order["id"]
         result.rejection_reasons.append("signal_already_executed")
         # Fetch the linked risk decision for the existing execution.
+        # Normalize sqlite3.Row -> dict for optional-key access.
         erow = db.fetchone(
             "SELECT risk_decision_id FROM execution_risk_decisions "
             "WHERE paper_signal_decision_id=? ORDER BY evaluated_at DESC LIMIT 1",
             (paper_signal_decision_id,),
         )
-        result.risk_decision_id = (erow or {}).get("risk_decision_id")
+        result.risk_decision_id = (dict(erow) if erow is not None else {}).get("risk_decision_id")
         existing_fill = db.fetchone(
             "SELECT fill_id FROM paper_fills WHERE order_id=?",
             (existing_order["id"],),
         )
-        result.fill_id = (existing_fill or {}).get("fill_id")
+        result.fill_id = (dict(existing_fill) if existing_fill is not None else {}).get("fill_id")
         existing_pos = db.fetchone(
             "SELECT id FROM paper_positions WHERE paper_order_id=?",
             (existing_order["id"],),
         )
-        result.position_id = (existing_pos or {}).get("id")
+        result.position_id = (dict(existing_pos) if existing_pos is not None else {}).get("id")
         return result
 
     # ---- Derive + validate requested quantity/price (fail-closed) ------- #

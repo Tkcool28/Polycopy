@@ -30,11 +30,10 @@ All runs use temporary databases only. No production DB, no network, no deploy.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
-from typing import Any, Optional
+from typing import Any
 
 from polycopy.db.database import Database
 from polycopy.execution import specialist_approval as sa
@@ -268,11 +267,9 @@ def test_revoked_approval_blocks(tmp_path: Path):
     db.close()
 
 
-def test_database_fetch_returns_dicts(tmp_path: Path):
-    db = Database(tmp_path / "dict.db").connect()
-    fx.seed_resolved_evidence(db)
-    row = db.fetchone("SELECT approval_id FROM specialist_approvals LIMIT 1")
-    assert row is None or isinstance(row, dict)
-    rows = db.fetchall("SELECT 1 AS x")
-    assert isinstance(rows, list) and (not rows or isinstance(rows[0], dict))
-    db.close()
+def test_specialist_spine_imports_clean():
+    # Placeholder to retain module identity after removing the dict-blessing
+    # test. The correct Database fetch contract (sqlite3.Row) is verified in
+    # tests/test_p37_sqlite_foreign_key_enforcement.py::TestDatabaseFetchContract.
+    from polycopy.execution import specialist_spine  # noqa: F401
+    assert specialist_spine is not None
