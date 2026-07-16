@@ -21,10 +21,34 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-APPROVED_WALLET = "0xcac76b761231464900cce5da7c20233d59b20579"
 EXPECTED_MARKER_SHA256 = "4db6f658108c7978b9ed53d2591e0ecd22e3c005ce970d875fcc3e59a9b60274"
 COLLECTOR_TIMER = "polycopy-approved-wallet-collect.timer"
 COLLECTOR_SERVICE = "polycopy-approved-wallet-collect.service"
+
+
+def _redact_wallet(addr: str) -> str:
+    if not addr:
+        return addr
+    if len(addr) <= 10:
+        return "[REDACTED]"
+    return f"{addr[:6]}…{addr[-4:]}"
+
+
+def load_active_approvals(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Read enabled, non-revoked approvals from the canonical approval table.
+
+    This is the single authoritative wallet source for the monitor. The monitor
+    NEVER reads a wallet list from source code. Returns list of
+    {approval_id, wallet_address, specialist_category}.
+    """
+    rows = conn.execute(
+        "SELECT approval_id, wallet_address, specialist_category FROM "
+        "specialist_approvals WHERE enabled=1 AND revoked_at IS NULL"
+    ).fetchall()
+    return [
+        {"approval_id": r[0], "wallet_address": r[1], "specialist_category": r[2]}
+        for r in rows
+    ]
 
 
 def utcnow() -> datetime:
@@ -211,9 +235,33 @@ class SystemProbe(Probe):
             out["integrity"] = integrity[0] if integrity else None
             out["foreign_key_violations"] = len(conn.execute("PRAGMA foreign_key_check").fetchall())
             out["canonical_duplicate_groups"] = conn.execute("SELECT COUNT(*) FROM (SELECT source, source_trade_id FROM source_trades GROUP BY source, source_trade_id HAVING COUNT(*) > 1)").fetchone()[0]
-            out["approved_wallet_buy_rows"] = conn.execute("SELECT COUNT(*) FROM source_trades WHERE lower(trader_address)=? AND upper(side)='BUY'", (APPROVED_WALLET,)).fetchone()[0]
-            out["approved_wallet_sell_rows"] = conn.execute("SELECT COUNT(*) FROM source_trades WHERE lower(trader_address)=? AND upper(side)='SELL'", (APPROVED_WALLET,)).fetchone()[0]
-            out["unapproved_identities"] = [list(row) for row in conn.execute("SELECT source, source_trade_id FROM source_trades WHERE lower(COALESCE(trader_address,'')) != ? ORDER BY source, source_trade_id", (APPROVED_WALLET,))]
+            # Authoritative approval source: enabled, non-revoked rows only.
+            approvals = load_active_approvals(conn)
+            approved_wallets = [a["wallet_address"].lower() for a in approvals]
+            if approved_wallets:
+                placeholders = ",".join("?" for _ in approved_wallets)
+                out["approved_wallet_buy_rows"] = conn.execute(
+                    f"SELECT COUNT(*) FROM source_trades WHERE lower(trader_address) IN ({placeholders}) AND upper(side)='BUY'",
+                    tuple(approved_wallets)).fetchone()[0]
+                out["approved_wallet_sell_rows"] = conn.execute(
+                    f"SELECT COUNT(*) FROM source_trades WHERE lower(trader_address) IN ({placeholders}) AND upper(side)='SELL'",
+                    tuple(approved_wallets)).fetchone()[0]
+                out["unapproved_identities"] = [list(row) for row in conn.execute(
+                    f"SELECT source, source_trade_id FROM source_trades WHERE lower(COALESCE(trader_address,'')) NOT IN ({placeholders}) ORDER BY source, source_trade_id",
+                    tuple(approved_wallets))]
+            else:
+                # No active approvals: every source trade is "unapproved" by
+                # definition (the monitor still flags new ones vs baseline).
+                out["approved_wallet_buy_rows"] = 0
+                out["approved_wallet_sell_rows"] = 0
+                out["unapproved_identities"] = [list(row) for row in conn.execute(
+                    "SELECT source, source_trade_id FROM source_trades ORDER BY source, source_trade_id")]
+            out["approved_approvals"] = [
+                {"approval_id": a["approval_id"],
+                 "wallet_address": _redact_wallet(a["wallet_address"]),
+                 "specialist_category": a["specialist_category"]}
+                for a in approvals
+            ]
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             for table in config.downstream_tables:
                 out["table_counts"][table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] if table in tables else None
@@ -301,7 +349,8 @@ def build_baseline(probe: Probe, config: MonitorConfig) -> dict[str, Any]:
     if db.get("integrity") != "ok" or db.get("foreign_key_violations") != 0 or db.get("error"):
         raise ValueError("refusing baseline: database integrity/FK validation failed")
     marker = probe.marker(config)
-    return {"schema_version": 1, "created_at_utc": iso(config.now()), "approved_wallet": APPROVED_WALLET,
+    return {"schema_version": 1, "created_at_utc": iso(config.now()),
+      "approved_approvals": db.get("approved_approvals", []),
       "marker_sha256": marker.get("sha256"), "unapproved_source_trade_identities": db["unapproved_identities"],
       "downstream_table_counts": db["table_counts"], "expected_disabled_timers": list(config.legacy_timers)}
 
@@ -310,7 +359,7 @@ def valid_baseline(baseline: dict[str, Any]) -> bool:
     """A baseline is an administrative trust boundary, never an empty default."""
     return (
         baseline.get("schema_version") == 1
-        and baseline.get("approved_wallet") == APPROVED_WALLET
+        and isinstance(baseline.get("approved_approvals"), list)
         and baseline.get("marker_sha256") == EXPECTED_MARKER_SHA256
         and isinstance(baseline.get("unapproved_source_trade_identities"), list)
         and isinstance(baseline.get("downstream_table_counts"), dict)
@@ -390,7 +439,7 @@ def evaluate(probe: Probe, config: MonitorConfig, *, no_remediation: bool) -> di
         elif no_remediation: action["details"] = "no-remediation mode"
         else:
             action["attempted"] = True; action["succeeded"], action["details"] = probe.disable_collector_timer()
-    report = {"schema_version": 1, "status": status, "checked_at_utc": iso(now), "hostname": os.uname().nodename, "monitor_version": "1.0.0", "approved_wallet": APPROVED_WALLET,
+    report = {"schema_version": 1, "status": status, "checked_at_utc": iso(now), "hostname": os.uname().nodename, "monitor_version": "1.0.0", "approved_approvals": db.get("approved_approvals", []),
       "collector_timer": timer, "collector_service": {**service, "last_success_age_minutes": round(age, 1) if age is not None else None}, "collector_result": result,
       "database": {"integrity": db.get("integrity"), "foreign_key_violations": db.get("foreign_key_violations"), "canonical_duplicate_groups": db.get("canonical_duplicate_groups"), "approved_wallet_buy_rows": db.get("approved_wallet_buy_rows"), "approved_wallet_sell_rows": db.get("approved_wallet_sell_rows"), "new_unapproved_wallet_rows": len(new_unapproved)},
       "downstream": {"unexpected_changes": [x for x in reasons if x.startswith("unexpected_downstream_write:")]}, "api": {"healthy": api.get("healthy"), "http_status": api.get("http_status"), "consecutive_failures": failures}, "storage": storage, "marker": marker, "safety": safety, "memory": {key: value for key, value in memory.items() if key != "processes"}, "reasons": reasons, "warnings": warnings, "automatic_action": action,
@@ -409,6 +458,7 @@ def evaluate(probe: Probe, config: MonitorConfig, *, no_remediation: bool) -> di
 def render_text(report: dict[str, Any]) -> str:
     timer = report["collector_timer"]; db = report["database"]; storage = report["storage"]; action = report["automatic_action"]
     gib = storage.get("available_bytes", 0) / 1024**3
-    lines = [f"POLYCOPY APPROVED-WALLET MONITOR: {report['status']}", f"Checked: {report['checked_at_utc']}", f"Collector timer: {'enabled' if timer.get('enabled') else 'disabled'} / {'active' if timer.get('active') else 'inactive'}", f"Last successful collection: {report['collector_service'].get('last_success_age_minutes')} minutes ago", f"Database integrity: {db['integrity']}", f"Foreign-key violations: {db['foreign_key_violations']}", f"Approved-wallet SELL rows: {db['approved_wallet_sell_rows']}", f"Canonical duplicate groups: {db['canonical_duplicate_groups']}", f"API: {'healthy' if report['api'].get('healthy') else 'unhealthy'}", f"Disk: {storage.get('free_percent', 0):.1f}% free, {gib:.1f} GiB available", f"Automatic action: {action.get('details') or 'none'}"]
+    approvals = report.get("approved_approvals", [])
+    lines = [f"POLYCOPY APPROVED-WALLET MONITOR: {report['status']}", f"Checked: {report['checked_at_utc']}", f"Collector timer: {'enabled' if timer.get('enabled') else 'disabled'} / {'active' if timer.get('active') else 'inactive'}", f"Last successful collection: {report['collector_service'].get('last_success_age_minutes')} minutes ago", f"Database integrity: {db['integrity']}", f"Foreign-key violations: {db['foreign_key_violations']}", f"Active approvals: {len(approvals)}", f"Approved-wallet SELL rows: {db['approved_wallet_sell_rows']}", f"Canonical duplicate groups: {db['canonical_duplicate_groups']}", f"API: {'healthy' if report['api'].get('healthy') else 'unhealthy'}", f"Disk: {storage.get('free_percent', 0):.1f}% free, {gib:.1f} GiB available", f"Automatic action: {action.get('details') or 'none'}"]
     lines.extend(f"Reason: {item}" for item in report["reasons"] + report["warnings"])
     return "\n".join(lines) + "\n"

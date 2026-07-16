@@ -288,6 +288,20 @@ class Database:
         "idx_paper_position_marks_position",
         "idx_paper_position_settlements_position",
     )
+    # v19 — specialist approved-trade enrichment + durable dispatch. The
+    # reconciliation short-circuit must require every newly created table +
+    # index to be physically present before it claims the target shape;
+    # otherwise a DB at v18 metadata would be bumped to v19 without applying
+    # the new tables.
+    _REQUIRED_V19_OBJECTS: tuple[str, ...] = (
+        "source_trade_enrichments",
+        "approved_specialist_trade_dispatches",
+        "idx_source_trade_enrichments_internal",
+        "idx_source_trade_enrichments_status",
+        "idx_astd_approval",
+        "idx_astd_source_trade",
+        "idx_astd_status",
+    )
 
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
@@ -329,6 +343,9 @@ class Database:
             if not self._index_exists(obj):
                 return False
         for obj in self._REQUIRED_V18_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        for obj in self._REQUIRED_V19_OBJECTS:
             if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         return True

@@ -22,6 +22,7 @@ from typing import Any, Iterator
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from polycopy.db.schema import SCHEMA_VERSION  # noqa: E402
 from polycopy.runtime.locks import LockError, operational_job_lock  # noqa: E402
 from polycopy.scoring.evaluation_policy import (  # noqa: E402
     DECISION_ONLY_EVALUATION_POLICY,
@@ -32,7 +33,10 @@ from polycopy.scoring.paper_signal import evaluate_paper_signals_for_candidate  
 PRODUCTION_DB = (REPO_ROOT / "data" / "polycopy.db").resolve()
 DEFAULT_LIMIT = 6
 MAX_LIMIT = 50
-EXPECTED_PRODUCTION_SCHEMA_VERSION = 17
+# Production write gate: the production DB must match the code's schema version.
+# Bumping SCHEMA_VERSION (e.g. for additive migrations) advances this automatically;
+# a mismatch between code and a live production DB is rejected as unsafe.
+EXPECTED_PRODUCTION_SCHEMA_VERSION = SCHEMA_VERSION
 ALLOWED_WRITE_TABLES = {
     "wallet_score_decisions",
     "category_wallet_score_decisions",

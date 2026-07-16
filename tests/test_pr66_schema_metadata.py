@@ -58,7 +58,7 @@ def test_fresh_db_has_v17_metadata_column_and_wallet_history_index(tmp_path: Pat
     try:
         assert db.conn.execute(
             "SELECT value FROM _meta WHERE key='schema_version'"
-        ).fetchone()[0] == "17"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
         columns = {row[1] for row in db.conn.execute("PRAGMA table_info(source_trades)")}
         assert "metadata_json" in columns
         index_rows = {
@@ -102,11 +102,11 @@ def test_genuine_v16_upgrade_preserves_rows_and_matches_fresh_shape(
 
     monkeypatch.setattr(database_module, "SCHEMA_VERSION", SCHEMA_VERSION)
     upgraded = Database(legacy_path).connect()
-    fresh = Database(tmp_path / "fresh-v17.db").connect()
+    fresh = Database(tmp_path / "fresh.db").connect()
     try:
         assert upgraded.conn.execute(
             "SELECT value FROM _meta WHERE key='schema_version'"
-        ).fetchone()[0] == "17"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
         assert upgraded.conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0] == 1
         assert upgraded.conn.execute(
             "SELECT source_trade_id FROM source_trades WHERE id='legacy-id'"
