@@ -300,7 +300,8 @@ def _select_snapshot_deterministic(
                    best_bid_size, best_ask_size, spread,
                    trade_age_seconds, seconds_to_market_end,
                    market_active_at_fetch, market_closed_at_fetch,
-                   market_resolved_at_fetch, book_summary_json
+                   market_resolved_at_fetch, book_summary_json,
+                   price_deterioration_pct, source_trade_price
             FROM candidate_price_snapshots
             WHERE candidate_id = ?
               AND fetched_at <= ?
@@ -608,6 +609,11 @@ def resolve_category_label_for_inputs(
 
     Resolution order (first non-empty wins, NO synthesized fallback):
 
+      0. ``source_trades.metadata_json.taxonomy`` joined via the
+         candidate's ``source_trade_internal_id``. This is the
+         authoritative PR66 provenance (see ``resolve_candidate_taxonomy``)
+         and is the canonical source for the point-in-time category
+         decision lookup so the loader and the bridge evaluator agree.
       1. ``snapshot.book_summary_json`` decoded, key ``category_label``.
       2. ``snapshot.book_summary_json`` decoded, key ``category``
          (legacy / alternate spelling).
@@ -619,6 +625,30 @@ def resolve_category_label_for_inputs(
          INCOMPLETE. There is no ``f"market:{market_id}"`` synthetic
          label any more.
     """
+    # Step 0: authoritative PR66 taxonomy from the candidate's source trade.
+    if candidate is not None:
+        st_internal_id = candidate.get("source_trade_internal_id")
+        if st_internal_id:
+            try:
+                st_row = db.fetchone(
+                    "SELECT metadata_json FROM source_trades WHERE id = ?",
+                    (st_internal_id,),
+                )
+            except sqlite3.Error:
+                st_row = None
+            st_dict = _row_to_dict(st_row)
+            if st_dict is not None:
+                raw_md = st_dict.get("metadata_json")
+                if isinstance(raw_md, str) and raw_md.strip():
+                    try:
+                        md = json.loads(raw_md)
+                    except (ValueError, TypeError):
+                        md = None
+                    if isinstance(md, dict):
+                        label = classify_category_taxonomy(md).category_label
+                        if isinstance(label, str) and label.strip():
+                            return label.strip()
+
     parsed: Optional[dict] = None
     if snapshot is not None:
         summary = snapshot.get("book_summary_json")

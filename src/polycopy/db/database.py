@@ -266,6 +266,28 @@ class Database:
     _REQUIRED_V17_OBJECTS: tuple[str, ...] = (
         "idx_source_trades_wallet_timestamp",
     )
+    # v18 — specialist paper execution spine. The reconciliation short-circuit
+    # must require every newly created table + unique index to be physically
+    # present before it claims the target shape; otherwise a DB at v17 metadata
+    # would be bumped to v18 without applying the new tables.
+    _REQUIRED_V18_OBJECTS: tuple[str, ...] = (
+        "specialist_approvals",
+        "paper_signal_execution_authorizations",
+        "execution_risk_decisions",
+        "paper_orders",
+        "paper_fills",
+        "paper_positions",
+        "paper_position_marks",
+        "paper_position_settlements",
+        "ux_specialist_approvals_active",
+        "idx_paper_signal_exec_authz_signal",
+        "idx_execution_risk_signal",
+        "idx_paper_orders_signal",
+        "idx_paper_fills_order",
+        "idx_paper_positions_order",
+        "idx_paper_position_marks_position",
+        "idx_paper_position_settlements_position",
+    )
 
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
@@ -305,6 +327,9 @@ class Database:
                 return False
         for obj in self._REQUIRED_V17_OBJECTS:
             if not self._index_exists(obj):
+                return False
+        for obj in self._REQUIRED_V18_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         return True
 
@@ -528,11 +553,18 @@ class Database:
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)
 
-    def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-        return self.conn.execute(sql, params).fetchone()
+    def commit(self) -> None:
+        self.conn.commit()
 
-    def fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
-        return self.conn.execute(sql, params).fetchall()
+    def rollback(self) -> None:
+        self.conn.rollback()
+
+    def fetchone(self, sql: str, params: tuple = ()) -> Optional[dict]:
+        row = self.conn.execute(sql, params).fetchone()
+        return dict(row) if row is not None else None
+
+    def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     # ── Bounded query iteration (PR24B) ─────────────────────────────────────
     #

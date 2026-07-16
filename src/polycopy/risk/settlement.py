@@ -133,14 +133,19 @@ class SettlementEngine:
         Returns:
             SettlementResult with payout and evidence
         """
+        # Resolution outcome comparison is case-insensitive: positions store
+        # "Yes"/"No" while resolution evidence commonly uses "YES"/"NO".
+        outcome_norm = (outcome or "").strip().upper()
+        resolution_norm = (evidence.resolution_outcome or "").strip().upper()
+        is_win = outcome_norm == resolution_norm and outcome_norm in ("YES", "NO")
         result = SettlementResult(
             position_id=position_id,
             market_id=market_id,
             wallet_id=wallet_id,
             outcome=outcome,
             resolution_outcome=evidence.resolution_outcome,
-            is_winner=(outcome == evidence.resolution_outcome),
-            payout=quantity if outcome == evidence.resolution_outcome else 0.0,
+            is_winner=is_win,
+            payout=quantity if is_win else 0.0,
             evidence_hash=evidence.evidence_hash,
             is_sample=is_sample,
         )
