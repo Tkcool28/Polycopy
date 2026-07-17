@@ -119,3 +119,104 @@ def test_merge_no_title_inference():
     new_meta, status, rc = merge_canonical_metadata(None, no_cat, condition_id="0xc2")
     assert status == MERGE_UNAVAILABLE
     assert "taxonomy_unavailable" in rc
+
+
+# ── S3 canonical-metadata tags contract ──────────────────────────────────────
+# tags rules:
+#   * missing / None / "" / empty list / empty tuple  -> fillable
+#   * non-empty list                                  -> compared as a normalized
+#                                                      order-insensitive set
+#   * non-empty non-list (str/dict/scalar)            -> TYPE CONFLICT (not
+#                                                      overwritten)
+
+
+def _gamma_with_tags(tags):
+    return FakeMarket(
+        {
+            "conditionId": "0xc1",
+            "category": "Politics",
+            "clobTokenIds": json.dumps(["0xtok_a"]),
+            "tags": tags,
+        }
+    )
+
+
+def test_missing_tags_fillable_from_gamma():
+    gamma = _gamma_with_tags(["election"])
+    existing = json.dumps({"taxonomy": {"raw_category": "Politics"}}, sort_keys=True)
+    merged, status, rc = merge_canonical_metadata(
+        existing, gamma, condition_id="0xc1", token_id="0xtok_a"
+    )
+    assert status == MERGE_FILLED
+    assert merged["taxonomy"].get("tags") == ["election"], merged
+
+
+def test_empty_string_tags_fillable():
+    gamma = _gamma_with_tags(["election"])
+    existing = json.dumps(
+        {"taxonomy": {"raw_category": "Politics", "tags": ""}}, sort_keys=True
+    )
+    merged, status, rc = merge_canonical_metadata(
+        existing, gamma, condition_id="0xc1", token_id="0xtok_a"
+    )
+    assert status == MERGE_FILLED
+    assert merged["taxonomy"]["tags"] == ["election"], merged
+
+
+def test_list_tags_compared_as_normalized_set():
+    gamma = _gamma_with_tags(["election", "2026"])
+    # Start from the real producer output (full canonical shape, empty event/
+    # series) and only reorder the tags — that is the realistic stored row.
+    existing = build_canonical_metadata({}, gamma)
+    existing["taxonomy"]["tags"] = ["2026", "election"]
+    existing = json.dumps(existing, sort_keys=True)
+    merged, status, rc = merge_canonical_metadata(
+        existing, gamma, condition_id="0xc1", token_id="0xtok_a"
+    )
+    assert status == MERGE_UNCHANGED, (status, rc)
+    assert merged["taxonomy"]["tags"] == ["2026", "election"], merged
+
+
+def test_wrong_type_tags_string_conflict_not_overwritten():
+    gamma = _gamma_with_tags(["election"])
+    existing_tags = "election"  # non-empty non-list -> type conflict
+    existing = json.dumps(
+        {"taxonomy": {"raw_category": "Politics", "tags": existing_tags}},
+        sort_keys=True,
+    )
+    merged, status, rc = merge_canonical_metadata(
+        existing, gamma, condition_id="0xc1", token_id="0xtok_a"
+    )
+    assert status == MERGE_CONFLICT
+    assert any("type_conflict" in c for c in rc), rc
+    assert merged["taxonomy"]["tags"] == existing_tags, merged
+
+
+def test_wrong_type_tags_dict_conflict_not_overwritten():
+    gamma = _gamma_with_tags(["election"])
+    existing_tags = {"a": 1}  # non-empty non-list -> type conflict
+    existing = json.dumps(
+        {"taxonomy": {"raw_category": "Politics", "tags": existing_tags}},
+        sort_keys=True,
+    )
+    merged, status, rc = merge_canonical_metadata(
+        existing, gamma, condition_id="0xc1", token_id="0xtok_a"
+    )
+    assert status == MERGE_CONFLICT
+    assert any("type_conflict" in c for c in rc), rc
+    assert merged["taxonomy"]["tags"] == existing_tags, merged
+
+
+def test_wrong_type_tags_scalar_conflict_not_overwritten():
+    gamma = _gamma_with_tags(["election"])
+    existing_tags = 42  # non-empty scalar -> type conflict
+    existing = json.dumps(
+        {"taxonomy": {"raw_category": "Politics", "tags": existing_tags}},
+        sort_keys=True,
+    )
+    merged, status, rc = merge_canonical_metadata(
+        existing, gamma, condition_id="0xc1", token_id="0xtok_a"
+    )
+    assert status == MERGE_CONFLICT
+    assert any("type_conflict" in c for c in rc), rc
+    assert merged["taxonomy"]["tags"] == existing_tags, merged

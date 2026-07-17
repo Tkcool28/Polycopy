@@ -82,11 +82,40 @@ def _first_scalar(*values: Any) -> Optional[str]:
 
 
 def _tags(value: Any) -> list[str]:
-    """Normalize raw tags to a deterministic, de-duplicated string list."""
+    """Normalize raw tags to a deterministic, de-duplicated string list.
+
+    Fillable/empty input (``None``, ``""``, ``[]``) yields ``[]`` so the
+    builder never emits a populated tags list for an empty source. A
+    non-empty scalar/dict/list-of-non-scalars is returned as ``[]`` here too
+    (the merge layer is where a non-empty wrong-type *existing* tags value is
+    detected as a type conflict, not silently coerced).
+    """
+    if value is None or value == "":
+        return []
     if not isinstance(value, (list, tuple, set, frozenset)):
+        # Non-empty wrong type (str/dict/scalar) -> treated as no usable tags.
         return []
     normalized = {_scalar(item) for item in value}
     return sorted(tag for tag in normalized if tag is not None)
+
+
+def _tags_conflict(value: Any) -> bool:
+    """True iff ``value`` is a NON-EMPTY tags value that is NOT a list.
+
+    Per the canonical-metadata contract:
+      * missing / None / "" / empty list / empty tuple -> fillable (no conflict)
+      * non-empty non-list (str, dict, scalar, etc.) -> TYPE CONFLICT
+
+    A populated list is never a conflict (it is compared as a normalized
+    order-insensitive set by the merge layer).
+    """
+    if value is None or value == "":
+        return False
+    if isinstance(value, (list, tuple, set, frozenset)):
+        # Empty collection -> fillable; non-empty list -> compared as a set.
+        return len(value) == 0
+    # Non-empty non-list value -> wrong type conflict.
+    return True
 
 
 def normalize_source_trade_metadata(raw: Optional[Mapping[str, Any]]) -> dict[str, Any]:
@@ -363,17 +392,27 @@ def merge_canonical_metadata(
                 merged_ns[k] = v
                 changed = True
             elif k == "tags":
-                # tags are an order-insensitive set: canonicalize both.
-                ev_set = set(existing_ns[k]) if isinstance(existing_ns[k], list) else set()
-                v_set = set(v) if isinstance(v, list) else set()
-                if ev_set == v_set:
-                    continue
-                if not ev_set:
+                # tags are an order-insensitive set when both sides are lists.
+                ev_raw = existing_ns[k]
+                # Empty / missing / None / "" existing tags -> fillable.
+                if ev_raw is None or ev_raw == "" or (
+                    isinstance(ev_raw, (list, tuple, set, frozenset)) and not ev_raw
+                ):
                     merged_ns[k] = v
                     changed = True
-                else:
+                elif isinstance(ev_raw, (list, tuple, set, frozenset)):
+                    # Both sides are lists -> compare as normalized sets.
+                    ev_set = set(_tags(ev_raw))
+                    v_set = set(_tags(v))
+                    if ev_set == v_set:
+                        continue
                     conflict = True
                     reason_codes.append("taxonomy_tags_conflict")
+                else:
+                    # Existing non-empty tags that is NOT a list -> TYPE
+                    # CONFLICT. Must NOT be overwritten (existing preserved).
+                    conflict = True
+                    reason_codes.append("taxonomy_tags_type_conflict")
             else:
                 ev = existing_ns[k]
                 if ev == v:

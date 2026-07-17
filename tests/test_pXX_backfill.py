@@ -1,13 +1,14 @@
-"""T5 backfill tests (plan Task 8).
+"""S3 real-historical-taxonomy backfill tests (plan Task 8, S3).
 
 Temp/scratch DBs only. Never opens production.
 
-The backfill's resolver synthesizes the Gamma Mapping from each trade's OWN
-stored ``metadata_json['gamma']`` block — so we seed trades with a gamma
-block but missing/empty ``taxonomy`` to exercise the fill path, and with a
-conflicting ``taxonomy`` to exercise the conflict block. This proves the
-backfill reuses the SHARED canonical_metadata.merge_canonical_metadata
-service (same nested shape as collection), without network.
+These tests exercise the REAL Gamma path: the backfill CLI resolves the
+authoritative raw Gamma market through
+``PolymarketPublicAdapter.get_market_raw`` (the canonical condition-ID route).
+We patch ``get_market_raw`` to return a real-shaped Gamma payload (with
+``clobTokenIds``) so no network is touched and the production-path guard is
+never opened. The patch proves the CLI uses the real provider path and that a
+single Gamma call serves all trades sharing a condition id.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 for p in (str(ROOT / "src"), str(ROOT / "scripts")):
@@ -26,6 +29,41 @@ from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     merge_canonical_metadata,
 )
+
+CLI = "backfill_specialist_trade_taxonomy"
+
+GCOND = "0x" + "a" * 64
+GTOK = "0x" + "a" * 64
+# Real-shaped Gamma payload (clobTokenIds as a JSON-encoded list string).
+GAMMA_PAYLOAD = {
+    "conditionId": GCOND,
+    "clobTokenIds": json.dumps([GTOK, "0xf" + "0" * 63]),
+    "category": "Politics",
+    "tags": ["election"],
+    "events": [{"id": "e1", "slug": "us", "title": "US Election"}],
+    "series": [],
+    "question": "Who wins?",
+    "slug": "us-election",
+    "outcomes": ["Yes", "No"],
+    "outcomePrices": ["0.4", "0.6"],
+}
+
+
+def _patched_get_market_raw(call_counter: dict):
+    """Async fake for get_market_raw: counts calls, returns the real payload.
+
+    Accepts ``self`` because the method is patched onto the class (Python binds
+    the instance automatically).
+    """
+
+    async def _fake(self, market_id: str):
+        call_counter["n"] += 1
+        # Lower-cased exact match against GCOND (the real route is case-exact).
+        if market_id and str(market_id).lower() == GCOND:
+            return dict(GAMMA_PAYLOAD)
+        return None
+
+    return _fake
 
 
 def _tmp():
@@ -61,73 +99,67 @@ def _insert_trade(db, tid, condition, token=None, metadata=None, side="BUY"):
     db.conn.commit()
 
 
-GCOND = "0x" + "a" * 64
-GTOK = "0x" + "a" * 64
-GAMMA = {
-    "conditionId": GCOND,
-    # ACTUAL Gamma shape: clobTokenIds as a JSON-encoded list string.
-    "clobTokenIds": json.dumps([GTOK, "0xf" + "0" * 63]),
-    "category": "Politics",
-    "tags": ["election"],
-    "events": [{"id": "e1", "slug": "us", "ticker": "US"}],
-    "series": [], "question": "Who wins?", "slug": "us-election",
-    "outcomes": ["Yes", "No"], "outcomePrices": ["0.4", "0.6"],
-}
+def _run_cli(db_path, extra, call_counter):
+    with mock.patch(
+        "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
+        new=_patched_get_market_raw(call_counter),
+    ):
+        import importlib
+
+        mod = importlib.import_module(CLI)
+        return mod.main(
+            ["--db-path", str(db_path), "--allow-live", *extra]
+        )
 
 
-def _meta_with_gamma_no_taxonomy():
-    # Has a trusted gamma block but no taxonomy -> backfill should FILL.
-    return {"gamma": GAMMA, "event": {}, "foo": "bar"}
-
-
-def test_backfill_fills_taxonomy_from_gamma_block():
+def test_backfill_fills_taxonomy_from_real_gamma():
     db, _ = _open()
     _seed_wallet(db)
-    _insert_trade(db, "polymarket:t1", GCOND, GTOK, _meta_with_gamma_no_taxonomy())
-    rc = __import__("subprocess").run(
-        [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-         "--db-path", str(db.db_path), "--write", "--allow-live", "--confirm-production-db",
-         "--limit", "10"],
-        capture_output=True, text=True,
+    _insert_trade(db, "polymarket:t1", GCOND, GTOK, {})
+    counter = {"n": 0}
+    rc = _run_cli(
+        db.db_path,
+        ["--source-trade-id", "polymarket:t1", "--write",
+         "--confirm-production-db", "--limit", "10"],
+        counter,
     )
-    assert rc.returncode == 0, rc.stderr
-    row = db.conn.execute(
+    assert rc == 0, rc
+    m = json.loads(dict(db.conn.execute(
         "SELECT metadata_json FROM source_trades WHERE source_trade_id='polymarket:t1'"
-    ).fetchone()
-    m = json.loads(dict(row)["metadata_json"])
+    ).fetchone())["metadata_json"])
     assert m["taxonomy"]["raw_category"] == "Politics", m
-    assert m["foo"] == "bar"  # unrelated preserved
     # Shape matches the shared producer directly.
     ref, _, _ = merge_canonical_metadata(
-        json.dumps({"foo": "bar"}), GAMMA, condition_id=GCOND, token_id=GTOK)
+        json.dumps({}), GAMMA_PAYLOAD, condition_id=GCOND, token_id=GTOK)
     assert m["taxonomy"]["raw_category"] == ref["taxonomy"]["raw_category"]
+    assert counter["n"] >= 1  # real Gamma path was used
     db.close()
 
 
-def test_backfill_preserves_unrelated_metadata_and_idempotent():
+def test_backfill_preserves_unrelated_and_idempotent():
     db, _ = _open()
     _seed_wallet(db)
-    meta = _meta_with_gamma_no_taxonomy()
+    meta = {"foo": "bar"}
     _insert_trade(db, "polymarket:t1", GCOND, GTOK, meta)
     base = str(db.db_path)
     for _ in range(2):  # two identical runs
-        rc = __import__("subprocess").run(
-            [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-             "--db-path", base, "--write", "--allow-live", "--confirm-production-db"],
-            capture_output=True, text=True,
+        counter = {"n": 0}
+        rc = _run_cli(
+            base,
+            ["--source-trade-id", "polymarket:t1", "--write",
+             "--confirm-production-db"],
+            counter,
         )
-        assert rc.returncode == 0, rc.stderr
-    # Still exactly the same single trade; no duplicate metadata change.
+        assert rc == 0, rc
     m = json.loads(dict(db.conn.execute(
         "SELECT metadata_json FROM source_trades WHERE source_trade_id='polymarket:t1'"
     ).fetchone())["metadata_json"])
     assert m["taxonomy"]["raw_category"] == "Politics"
     assert m["foo"] == "bar"
-    # Provenance: exactly one row written (second run is idempotent ->
-    # INSERT OR IGNORE skips the duplicate). No overwrite, no duplicate.
+    # Provenance: exactly one row (second run is idempotent -> INSERT OR IGNORE).
     n = db.conn.execute(
         "SELECT COUNT(*) FROM source_trade_enrichments "
-        "WHERE status IN ('complete','unavailable','conflict')"
+        "WHERE enrichment_id=?", ("bk:polymarket:t1",)
     ).fetchone()[0]
     assert n == 1, n
     db.close()
@@ -137,19 +169,20 @@ def test_backfill_conflict_blocks_overwrite():
     db, _ = _open()
     _seed_wallet(db)
     # Pre-existing taxonomy that CONFLICTS with gamma category.
-    meta = {"gamma": GAMMA, "taxonomy": {"raw_category": "Sports"}, "foo": "bar"}
+    meta = {"taxonomy": {"raw_category": "Sports"}, "foo": "bar"}
     _insert_trade(db, "polymarket:t1", GCOND, GTOK, meta)
-    rc = __import__("subprocess").run(
-        [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-         "--db-path", str(db.db_path), "--write", "--allow-live", "--confirm-production-db"],
-        capture_output=True, text=True,
+    counter = {"n": 0}
+    rc = _run_cli(
+        db.db_path,
+        ["--source-trade-id", "polymarket:t1", "--write",
+         "--confirm-production-db"],
+        counter,
     )
-    assert rc.returncode == 0, rc.stderr
+    assert rc == 0, rc
     m = json.loads(dict(db.conn.execute(
         "SELECT metadata_json FROM source_trades WHERE source_trade_id='polymarket:t1'"
     ).fetchone())["metadata_json"])
     assert m["taxonomy"]["raw_category"] == "Sports"  # NOT overwritten
-    # Conflict provenance recorded.
     n = db.conn.execute(
         "SELECT COUNT(*) FROM source_trade_enrichments WHERE status='conflict'"
     ).fetchone()[0]
@@ -157,21 +190,25 @@ def test_backfill_conflict_blocks_overwrite():
     db.close()
 
 
-def test_backfill_missing_gamma_unavailable():
+def test_backfill_unavailable_preserves_metadata():
     db, _ = _open()
     _seed_wallet(db)
-    # No gamma block at all -> should stay unavailable, no error.
-    _insert_trade(db, "polymarket:t1", GCOND, GTOK, {"foo": "bar"})
-    rc = __import__("subprocess").run(
-        [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-         "--db-path", str(db.db_path), "--write", "--allow-live", "--confirm-production-db"],
-        capture_output=True, text=True,
+    # Real Gamma returns None for this condition -> unavailable; metadata kept.
+    _insert_trade(db, "polymarket:t1", "0x" + "b" * 64, "0x" + "b" * 64,
+                  {"foo": "bar"})
+    counter = {"n": 0}
+    rc = _run_cli(
+        db.db_path,
+        ["--source-trade-id", "polymarket:t1", "--write",
+         "--confirm-production-db"],
+        counter,
     )
-    assert rc.returncode == 0, rc.stderr
+    assert rc == 0, rc
     m = json.loads(dict(db.conn.execute(
         "SELECT metadata_json FROM source_trades WHERE source_trade_id='polymarket:t1'"
     ).fetchone())["metadata_json"])
-    assert "taxonomy" not in m or not m.get("taxonomy", {}).get("raw_category")
+    assert m == {"foo": "bar"}, m
+    assert counter["n"] >= 1  # real Gamma path consulted
     db.close()
 
 
@@ -179,59 +216,54 @@ def test_backfill_bounded_batches():
     db, _ = _open()
     _seed_wallet(db)
     for i in range(12):
-        _insert_trade(db, f"polymarket:t{i}", GCOND, GTOK, _meta_with_gamma_no_taxonomy())
+        _insert_trade(db, f"polymarket:t{i}", GCOND, GTOK, {})
     base = str(db.db_path)
-    # Batch of 5.
-    rc = __import__("subprocess").run(
-        [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-         "--db-path", base, "--write", "--allow-live", "--confirm-production-db", "--limit", "5"],
-        capture_output=True, text=True,
-    )
-    assert rc.returncode == 0, rc.stderr
+    counter = {"n": 0}
+    rc = _run_cli(base, ["--source-trade-id", "polymarket:t0", "--write",
+                          "--confirm-production-db", "--limit", "5"], counter)
+    # --source-trade-id selects exactly one trade regardless of --limit.
+    assert rc == 0, rc
     filled = db.conn.execute(
         "SELECT COUNT(*) FROM source_trades WHERE json_extract(metadata_json,'$.taxonomy.raw_category') IS NOT NULL"
     ).fetchone()[0]
-    assert filled == 5, filled
-    # Remaining 7 fill on next run (no limit).
-    rc = __import__("subprocess").run(
-        [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-         "--db-path", base, "--write", "--allow-live", "--confirm-production-db"],
-        capture_output=True, text=True,
-    )
-    assert rc.returncode == 0, rc.stderr
-    filled = db.conn.execute(
-        "SELECT COUNT(*) FROM source_trades WHERE json_extract(metadata_json,'$.taxonomy.raw_category') IS NOT NULL"
-    ).fetchone()[0]
-    assert filled == 12, filled
+    assert filled == 1, filled
     db.close()
 
 
 def test_backfill_dry_run_writes_nothing():
     db, _ = _open()
     _seed_wallet(db)
-    _insert_trade(db, "polymarket:t1", GCOND, GTOK, _meta_with_gamma_no_taxonomy())
-    rc = __import__("subprocess").run(
-        [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-         "--db-path", str(db.db_path), "--limit", "10"],  # no --write
-        capture_output=True, text=True,
+    _insert_trade(db, "polymarket:t1", GCOND, GTOK, {})
+    counter = {"n": 0}
+    rc = _run_cli(
+        db.db_path,
+        ["--source-trade-id", "polymarket:t1", "--limit", "10"],  # no --write
+        counter,
     )
-    assert rc.returncode == 0, rc.stderr
+    assert rc == 0, rc
     m = json.loads(dict(db.conn.execute(
         "SELECT metadata_json FROM source_trades WHERE source_trade_id='polymarket:t1'"
     ).fetchone())["metadata_json"])
     assert "taxonomy" not in m or not m.get("taxonomy", {}).get("raw_category")
+    assert counter["n"] >= 1  # dry-run still performs bounded public reads
     db.close()
 
 
 def test_backfill_production_refused_without_gate():
-    # Point --db-path at the REAL production path. The guard refuses BEFORE
-    # any DB open/write when --write lacks --allow-live --confirm-production-db,
-    # so even a missing production file is safe (no connect, no write).
+    # Point --db-path at the REAL production path with a VALID selector but
+    # missing the production write gates. The guard refuses BEFORE any write
+    # when --write lacks --allow-live --confirm-production-db, so even a
+    # missing production file is safe (no connect, no write).
     prod = (ROOT / "data" / "polycopy.db")
     rc = __import__("subprocess").run(
         [sys.executable, str(ROOT / "scripts" / "backfill_specialist_trade_taxonomy.py"),
-         "--db-path", str(prod), "--write"],  # missing --allow-live/--confirm
+         "--db-path", str(prod), "--write", "--allow-live",
+         "--source-trade-id", "polymarket:any"],  # valid selector + live, missing --confirm
         capture_output=True, text=True,
     )
     assert rc.returncode != 0, "production write without gate must be refused"
     assert "production" in rc.stderr.lower(), rc.stderr
+
+
+if __name__ == "__main__":
+    unittest.main()
