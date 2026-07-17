@@ -18,7 +18,6 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MERGE_UNAVAILABLE,
     build_canonical_metadata,
     merge_canonical_metadata,
-    normalize_source_trade_metadata,
 )
 
 

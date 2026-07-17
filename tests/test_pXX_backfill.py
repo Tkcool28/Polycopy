@@ -24,7 +24,6 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
 
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.canonical_metadata import (  # noqa: E402
-    build_canonical_metadata,
     merge_canonical_metadata,
 )
 

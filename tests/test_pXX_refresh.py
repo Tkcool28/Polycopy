@@ -64,11 +64,14 @@ def test_refresh_works_without_markets_row():
     db, _ = _open()
     _seed_wallet(db)
     _insert_trade(db, "polymarket:t1", COND)  # unresolved, no markets row
-    resolver = lambda cid: {"resolutionStatus": "resolved", "winner": TOK}
+
+    def _resolver(cid):
+        return {"resolutionStatus": "resolved", "winner": TOK}
+
     rc = refresh.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
          "--confirm-production-db"],
-        get_market=resolver,
+        get_market=_resolver,
     )
     assert rc == 0, rc
     row = db.conn.execute(
@@ -85,11 +88,14 @@ def test_refresh_updates_all_linked_trades():
     _seed_wallet(db)
     for i in range(3):
         _insert_trade(db, f"polymarket:t{i}", COND)
-    resolver = lambda cid: {"resolutionStatus": "resolved", "winner": TOK}
+
+    def _resolver(cid):
+        return {"resolutionStatus": "resolved", "winner": TOK}
+
     rc = refresh.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
          "--confirm-production-db"],
-        get_market=resolver,
+        get_market=_resolver,
     )
     assert rc == 0, rc
     n = db.conn.execute(
@@ -110,11 +116,14 @@ def test_refresh_unresolved_no_claim():
     db, _ = _open()
     _seed_wallet(db)
     _insert_trade(db, "polymarket:t1", COND)
-    resolver = lambda cid: {"resolutionStatus": "unresolved"}  # upstream unresolved
+
+    def _resolver(cid):
+        return {"resolutionStatus": "unresolved"}  # upstream unresolved
+
     rc = refresh.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
          "--confirm-production-db"],
-        get_market=resolver,
+        get_market=_resolver,
     )
     assert rc == 0, rc
     row = db.conn.execute(
@@ -130,12 +139,15 @@ def test_refresh_replay_unchanged():
     db, _ = _open()
     _seed_wallet(db)
     _insert_trade(db, "polymarket:t1", COND)
-    resolver = lambda cid: {"resolutionStatus": "resolved", "winner": TOK}
+
+    def _resolver(cid):
+        return {"resolutionStatus": "resolved", "winner": TOK}
+
     for _ in range(2):
         rc = refresh.main(
             ["--db-path", str(db.db_path), "--write", "--allow-live",
              "--confirm-production-db"],
-            get_market=resolver,
+            get_market=_resolver,
         )
         assert rc == 0, rc
     n = db.conn.execute(
@@ -151,11 +163,14 @@ def test_refresh_conflict_blocks():
     # Pre-existing conflicting winners on disk.
     _insert_trade(db, "polymarket:t1", COND, status="resolved", winner=TOK)
     _insert_trade(db, "polymarket:t2", COND, status="resolved", winner="0x" + "d" * 64)
-    resolver = lambda cid: {"resolutionStatus": "resolved", "winner": TOK}
+
+    def _resolver(cid):
+        return {"resolutionStatus": "resolved", "winner": TOK}
+
     rc = refresh.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
          "--confirm-production-db"],
-        get_market=resolver,
+        get_market=_resolver,
     )
     assert rc == 0, rc
     # First trade keeps its winner; second keeps its different winner (no overwrite).
@@ -173,10 +188,13 @@ def test_refresh_dry_run_writes_nothing():
     db, _ = _open()
     _seed_wallet(db)
     _insert_trade(db, "polymarket:t1", COND)
-    resolver = lambda cid: {"resolutionStatus": "resolved", "winner": TOK}
+
+    def _resolver(cid):
+        return {"resolutionStatus": "resolved", "winner": TOK}
+
     rc = refresh.main(
         ["--db-path", str(db.db_path)],  # no --write
-        get_market=resolver,
+        get_market=_resolver,
     )
     assert rc == 0, rc
     row = db.conn.execute(

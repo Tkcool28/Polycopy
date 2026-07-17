@@ -17,14 +17,11 @@ from collections.abc import Mapping
 from typing import Any
 
 from polycopy.ingestion.canonical_metadata import (
-    METADATA_VERSION,
-    _official_category_for_v1_metadata,
     build_canonical_metadata,
     normalize_source_trade_metadata as _normalize_source_trade_metadata,
 )
 from polycopy.taxonomy.official_polymarket import (
     TAXONOMY_USABLE,
-    OfficialPolymarketTaxonomyResolverV1,
     OfficialTaxonomyResult,
 )
 

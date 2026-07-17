@@ -34,17 +34,12 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from polycopy.ingestion.canonical_metadata import (
-    MERGE_CONFLICT,
-    MERGE_FILLED,
-    MERGE_UNAVAILABLE,
-    MERGE_UNCHANGED,
     merge_canonical_metadata,
 )
 from polycopy.scoring.wallet_evidence import (
     CATEGORY_TAXONOMY_PARTIAL,
     CATEGORY_TAXONOMY_USABLE,
     classify_category_taxonomy,
-    normalize_category_label,
 )
 
 # Status vocabulary for source_trade_enrichments.status.
