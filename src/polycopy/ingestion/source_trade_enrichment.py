@@ -27,11 +27,19 @@ Design rules (per Pass 2 spec):
 
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from polycopy.ingestion.canonical_metadata import (
+    MERGE_CONFLICT,
+    MERGE_FILLED,
+    MERGE_UNAVAILABLE,
+    MERGE_UNCHANGED,
+    merge_canonical_metadata,
+)
 from polycopy.scoring.wallet_evidence import (
     CATEGORY_TAXONOMY_PARTIAL,
     CATEGORY_TAXONOMY_USABLE,
@@ -87,51 +95,56 @@ def _coerce_metadata_json(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def _resolve_market_meta(market: Any) -> dict[str, Any]:
-    """Extract taxonomy/event/series from a Gamma market object (Mapping or dict)."""
-    if market is None:
-        return {}
-    get = market.get if isinstance(market, dict) else (
-        lambda k, d=None: market.get(k, d) if hasattr(market, "get") else d
-    )
-    out: dict[str, Any] = {}
-    cat = normalize_category_label(get("category"))
-    if cat is not None:
-        out["category"] = cat
-    tags = get("tags")
-    if isinstance(tags, list):
-        out["tags"] = tags
-    event = get("events")
-    if isinstance(event, list) and event:
-        out["event"] = event[0]
-    series = get("series")
-    if isinstance(series, list) and series:
-        out["series"] = series[0]
+def _call_gamma_resolver(gamma_resolver: Callable[[str], Any], condition_id: str) -> Any:
+    """Invoke a sync OR async gamma resolver, bounded to one call.
+
+    The dispatcher passes a synchronous ``gamma.get_market``; the research
+    collector passes an ``async`` resolver. Support both without leaking a
+    coroutine into the canonical builder.
+    """
+    market = gamma_resolver(condition_id)
+    if inspect.isawaitable(market):
+        import asyncio
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Rare: nested loop. Fall back to a fresh loop in a thread.
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    return ex.submit(asyncio.run, market).result()
+        except RuntimeError:
+            pass
+        return asyncio.run(market)
+    return market
+
+
+def _gamma_slug(gamma_market: Any) -> Optional[str]:
+    if gamma_market is None:
+        return None
+    get = gamma_market.get if hasattr(gamma_market, "get") else (lambda k, d=None: d)
     slug = get("slug")
     if isinstance(slug, str) and slug.strip():
-        out["market_slug"] = slug
-    title = get("question") or get("title")
-    if isinstance(title, str) and title.strip():
-        out["market_title"] = title
-    end_date = get("end_date")
-    if end_date is not None:
-        out["end_date"] = str(end_date)
-    return out
+        return slug.strip()
+    return None
 
 
 def _build_evidence(
     row: dict[str, Any],
+    canonical_metadata: dict[str, Any],
     *,
     gamma_market: Optional[Any] = None,
 ) -> dict[str, Any]:
-    """Resolve normalized evidence from the source trade + optional Gamma market.
+    """Resolve normalized evidence from the CANONICAL nested metadata.
 
-    The source_trades.metadata_json is the trusted provenance; if a live Gamma
-    market is supplied it is merged ONLY for fields the metadata does not
-    already carry (no silent overwrite). Category is taken from taxonomy only;
-    it is never inferred from wallet behavior.
+    ``canonical_metadata`` is the shared nested shape produced by
+    ``merge_canonical_metadata`` (``taxonomy``/``event``/``series``). The
+    scorer-facing taxonomy lives ONLY in
+    ``canonical_metadata["taxonomy"]["raw_category"]``; this provenance row is
+    audit-only. Category is taken from taxonomy classification only, and is
+    NEVER inferred from wallet behavior or market title.
     """
-    meta = _coerce_metadata_json(row.get("metadata_json"))
     ev: dict[str, Any] = {}
 
     # Token / condition / market identity (system of record precedence).
@@ -147,13 +160,9 @@ def _build_evidence(
     if row.get("outcome"):
         ev["outcome_identity"] = row["outcome"]
 
-    # Market metadata from source-trade provenance (trusted).
-    gm = _resolve_market_meta(gamma_market) if gamma_market is not None else {}
-    merged_meta = dict(meta)
-    for k, v in gm.items():
-        merged_meta.setdefault(k, v)  # never overwrite existing provenance
-
-    classification = classify_category_taxonomy(merged_meta)
+    # Classify taxonomy from the CANONICAL nested metadata (the fix: the scorer
+    # reads this exact shape, so enrichment must classify the identical shape).
+    classification = classify_category_taxonomy(canonical_metadata)
     status = str(classification.status)
     if status == CATEGORY_TAXONOMY_USABLE and classification.category_label:
         ev["normalized_category"] = classification.category_label
@@ -163,24 +172,18 @@ def _build_evidence(
     else:
         ev["taxonomy_status"] = "unavailable"
 
-    event = merged_meta.get("event")
+    event = canonical_metadata.get("event")
     if isinstance(event, dict):
         ev["event_identity"] = event.get("id") or event.get("slug")
 
-    slug = merged_meta.get("market_slug") or (gm.get("market_slug") if gm else None)
+    slug = _gamma_slug(gamma_market)
     if slug:
         ev["market_slug"] = slug
-    title = merged_meta.get("market_title") or (gm.get("market_title") if gm else None)
-    if title:
-        ev["market_title"] = title
 
-    end_date = merged_meta.get("end_date") or (gm.get("end_date") if gm else None)
-    if end_date:
-        ev["market_end_at"] = str(end_date)
     if row.get("timestamp"):
         ev["market_start_at"] = str(row["timestamp"])
 
-    ev["evidence_source"] = "source_trade_metadata"
+    ev["evidence_source"] = "canonical_metadata"
     if gamma_market is not None:
         ev["gamma_source"] = "gamma_market_resolver"
     return ev
@@ -272,14 +275,26 @@ def enrich_source_trade(
         try:
             condition_id = row.get("market_source_id")
             if condition_id:
-                gamma_market = gamma_resolver(condition_id)
+                gamma_market = _call_gamma_resolver(gamma_resolver, condition_id)
         except Exception:  # bounded; record and continue on metadata only
             reason_codes.append("gamma_error")
             gamma_market = None
             # Do not fail enrichment on a network error; mark as durable error
             # state but still persist the metadata-derived evidence.
 
-    ev = _build_evidence(row, gamma_market=gamma_market)
+    # Build the CANONICAL nested metadata via the shared service. This reuses
+    # the exact shape the scorer reads (taxonomy.raw_category), merging the
+    # resolved Gamma market onto the stored source_trades.metadata_json
+    # (never overwriting existing trusted provenance). Fixes the prior defect
+    # where a flat Gamma dict was classified instead of the nested shape.
+    canonical_meta, _merge_status, _merge_reasons = merge_canonical_metadata(
+        row.get("metadata_json"),
+        gamma_market,
+        condition_id=row.get("market_source_id") or "",
+        token_id=row.get("token_id"),
+    )
+
+    ev = _build_evidence(row, canonical_meta, gamma_market=gamma_market)
     if ev.get("taxonomy_status") == "unavailable":
         reason_codes.append("taxonomy_unavailable")
     elif ev.get("taxonomy_status") == "partial":
