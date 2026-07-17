@@ -1,0 +1,23 @@
+# Review-only template. Do not install, start, or enable during this PR.
+[Unit]
+Description=Polycopy specialist paper position marking (canonical path)
+After=network-online.target polycopy-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Polycopy
+EnvironmentFile=/root/Polycopy/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYCOPY_MAX_RSS_MB=256
+# Marks one specialist paper position from authoritative market evidence. Never
+# operates on legacy positions. Provides mark/ask evidence explicitly; missing
+# evidence creates no invented mark.
+ExecStart=/root/Polycopy/.venv/bin/python /root/Polycopy/scripts/mark_specialist_paper_positions.py --position-id REPLACE_POSITION_ID --mark-price REPLACE_MARK --bid-price REPLACE_BID --ask-price REPLACE_ASK --evidence-source authoritative --write --confirm-production-db
+TimeoutStartSec=120
+Restart=no
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+# Installation and scheduling are separate approved operations.

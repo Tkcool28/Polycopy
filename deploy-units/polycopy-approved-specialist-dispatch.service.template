@@ -1,0 +1,24 @@
+# Review-only template. Do not install, start, or enable during this PR.
+[Unit]
+Description=Polycopy approved-specialist enrichment + durable dispatch
+After=network-online.target polycopy-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/Polycopy
+EnvironmentFile=/root/Polycopy/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYCOPY_MAX_RSS_MB=512
+# Bounded orchestration: enrich one approved source trade, then durable dispatch
+# through the canonical approved-wallet bridge. Paper-only, no order creation.
+# Dry run by default; add --write --confirm-production-db ONLY after explicit
+# operator review of the specific approval_id.
+ExecStart=/root/Polycopy/.venv/bin/python /root/Polycopy/scripts/process_approved_specialist_trades.py --approval-id REPLACE_APPROVAL_ID --source-trade-id REPLACE_SOURCE_TRADE_ID --dry-run
+TimeoutStartSec=300
+Restart=no
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+# Installation and scheduling are separate approved operations.

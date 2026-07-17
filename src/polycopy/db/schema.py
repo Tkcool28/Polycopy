@@ -43,7 +43,7 @@ natively idempotent in SQLite.
 from __future__ import annotations
 
 # ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 20
 
 # Import v10 schema changes
 from polycopy.db.schema_v10 import _V10_DDL  # noqa: E402
@@ -84,6 +84,19 @@ from polycopy.db.schema_v15 import _V15_DDL  # noqa: E402
 # next connect).
 from polycopy.db.schema_v16 import _V16_DDL  # noqa: E402
 from polycopy.db.schema_v17 import _V17_DDL  # noqa: E402
+# v18 — Specialist paper execution spine (durable approvals, provenance-tracked
+# paper orders/fills/positions, execution-risk + settlement evidence). See
+# ``schema_v18.py`` for the full design contract. Purely additive; v17 schema is
+# preserved for backward compatibility.
+from polycopy.db.schema_v18 import _V18_DDL  # noqa: E402
+# v19 — Specialist approved-trade enrichment + durable dispatch. Purely
+# additive; v18 schema (approvals + execution spine) is preserved.
+from polycopy.db.schema_v19 import _V19_DDL  # noqa: E402
+# v20 — Retryable blocked execution: rebuild execution_risk_decisions without
+# UNIQUE(paper_signal_decision_id) and add immutable attempt identity
+# (execution_attempt_id, authorization_id, attempt_number). Preserves existing
+# risk-decision IDs and the paper_orders FK into risk_decision_id.
+from polycopy.db.schema_v20 import _V20_DDL  # noqa: E402
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -822,6 +835,9 @@ MIGRATIONS: dict[int, list[str]] = {
     15: _V15_DDL,
     16: _V16_DDL,
     17: _V17_DDL,
+    18: _V18_DDL,
+    19: _V19_DDL,
+    20: _V20_DDL,
 }
 
 # Current DDL is the latest migration

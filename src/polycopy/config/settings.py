@@ -226,6 +226,44 @@ class Settings(BaseSettings):
         description="If True, mark positions at bid price (worst-case) instead of mid.",
     )
 
+    # ── Specialist paper execution spine (milestone: paper-only copy loop) ──
+    # Conservative limits for the NEW automatic specialist-paper path. Unlike
+    # the legacy sample order path, these are NOT allowed to default to 0
+    # (unlimited). The spine refuses to execute when any configured limit is
+    # <= 0 (fail-closed), so an operator must explicitly authorize a non-zero
+    # paper exposure for this path even in isolated test settings.
+    specialist_paper_max_order_size: float = Field(
+        default=0.0,
+        description="Conservative max notional of a single specialist paper order. "
+        "0 (or negative) disables the path fail-closed.",
+    )
+    specialist_paper_max_per_market: float = Field(
+        default=0.0,
+        description="Conservative max notional specialist paper exposure per market. "
+        "0 (or negative) disables the path fail-closed.",
+    )
+    specialist_paper_max_per_wallet: float = Field(
+        default=0.0,
+        description="Conservative max notional specialist paper exposure per wallet. "
+        "0 (or negative) disables the path fail-closed.",
+    )
+    specialist_paper_max_global: float = Field(
+        default=0.0,
+        description="Conservative max global specialist paper notional exposure. "
+        "0 (or negative) disables the path fail-closed.",
+    )
+    specialist_paper_snapshot_max_age_seconds: float = Field(
+        default=300.0,
+        description="Max age (seconds) of a snapshot/depth used to evaluate or fill a "
+        "specialist paper order. Stale evidence blocks execution fail-closed.",
+    )
+    specialist_paper_allow_production_execution: bool = Field(
+        default=False,
+        description="Defense-in-depth guard: the specialist paper spine will never "
+        "perform execution writes against a database that is not explicitly a "
+        "temporary/isolated test database, regardless of other settings. Keep False.",
+    )
+
     # ── Fail-closed validators ──────────────────────────────────────────────
 
     @field_validator("log_level")

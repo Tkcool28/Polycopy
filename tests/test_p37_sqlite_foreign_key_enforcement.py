@@ -787,3 +787,58 @@ class TestV11ColumnAddsIdempotent:
             assert "candidate_price_snapshots" in fk_targets
         finally:
             conn.close()
+
+
+# ─── 11. Database.fetchone / fetchall contract (sqlite3.Row) ──────────────── #
+
+
+class TestDatabaseFetchContract:
+    """The ``Database.fetchone`` / ``fetchall`` contract returns
+    ``sqlite3.Row`` objects (positional ``row[0]`` AND mapping ``row["key"]``
+    access), not ``dict``. This is the historical repository contract; a
+    Pass-1 specialist change briefly returned ``dict`` and broke positional
+    callers (test_p37). New specialist-execution code normalizes via
+    ``dict(row)`` at its module boundary instead of changing this contract.
+    """
+
+    def test_fetchone_returns_sqlite3_row(self, tmp_path: Path):
+        from sqlite3 import Row
+
+        db_path = tmp_path / "contract-one.db"
+        with Database(db_path=db_path) as db:
+            db.execute(
+                "CREATE TABLE t (id INTEGER, name TEXT)",
+            )
+            db.execute("INSERT INTO t (id, name) VALUES (?, ?)", (7, "seven"))
+            db.conn.commit()
+            row = db.fetchone("SELECT id, name FROM t WHERE id=?", (7,))
+            assert isinstance(row, Row), f"expected sqlite3.Row, got {type(row)}"
+            # Positional access.
+            assert row[0] == 7
+            assert row[1] == "seven"
+            # Mapping access.
+            assert row["id"] == 7
+            assert row["name"] == "seven"
+
+    def test_fetchone_returns_none_on_empty(self, tmp_path: Path):
+        db_path = tmp_path / "contract-none.db"
+        with Database(db_path=db_path) as db:
+            db.execute("CREATE TABLE t (id INTEGER)")
+            db.conn.commit()
+            assert db.fetchone("SELECT id FROM t WHERE id=?", (1,)) is None
+
+    def test_fetchall_returns_list_of_rows(self, tmp_path: Path):
+        from sqlite3 import Row
+
+        db_path = tmp_path / "contract-all.db"
+        with Database(db_path=db_path) as db:
+            db.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+            db.execute("INSERT INTO t (id, name) VALUES (?, ?)", (1, "a"))
+            db.execute("INSERT INTO t (id, name) VALUES (?, ?)", (2, "b"))
+            db.conn.commit()
+            rows = db.fetchall("SELECT id, name FROM t ORDER BY id")
+            assert isinstance(rows, list)
+            assert len(rows) == 2
+            assert all(isinstance(r, Row) for r in rows)
+            assert rows[0][0] == 1 and rows[0]["name"] == "a"
+            assert rows[1]["id"] == 2

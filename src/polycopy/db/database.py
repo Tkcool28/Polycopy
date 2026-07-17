@@ -266,6 +266,50 @@ class Database:
     _REQUIRED_V17_OBJECTS: tuple[str, ...] = (
         "idx_source_trades_wallet_timestamp",
     )
+    # v18 — specialist paper execution spine. The reconciliation short-circuit
+    # must require every newly created table + unique index to be physically
+    # present before it claims the target shape; otherwise a DB at v17 metadata
+    # would be bumped to v18 without applying the new tables.
+    _REQUIRED_V18_OBJECTS: tuple[str, ...] = (
+        "specialist_approvals",
+        "paper_signal_execution_authorizations",
+        "execution_risk_decisions",
+        "paper_orders",
+        "paper_fills",
+        "paper_positions",
+        "paper_position_marks",
+        "paper_position_settlements",
+        "ux_specialist_approvals_active",
+        "idx_paper_signal_exec_authz_signal",
+        "idx_execution_risk_signal",
+        "idx_paper_orders_signal",
+        "idx_paper_fills_order",
+        "idx_paper_positions_order",
+        "idx_paper_position_marks_position",
+        "idx_paper_position_settlements_position",
+    )
+    # v19 — specialist approved-trade enrichment + durable dispatch. The
+    # reconciliation short-circuit must require every newly created table +
+    # index to be physically present before it claims the target shape;
+    # otherwise a DB at v18 metadata would be bumped to v19 without applying
+    # the new tables.
+    _REQUIRED_V19_OBJECTS: tuple[str, ...] = (
+        "source_trade_enrichments",
+        "approved_specialist_trade_dispatches",
+        "idx_source_trade_enrichments_internal",
+        "idx_source_trade_enrichments_status",
+        "idx_astd_approval",
+        "idx_astd_source_trade",
+        "idx_astd_status",
+    )
+    # v20 — retryable blocked execution. The rebuilt execution_risk_decisions
+    # table keeps its name, so discriminate on the new indexes that only v20
+    # adds (idx_execution_risk_authz, idx_execution_risk_attempt). Otherwise a
+    # DB at v19 metadata would be bumped to v20 without applying the rebuild.
+    _REQUIRED_V20_OBJECTS: tuple[str, ...] = (
+        "idx_execution_risk_authz",
+        "idx_execution_risk_attempt",
+    )
 
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
@@ -305,6 +349,15 @@ class Database:
                 return False
         for obj in self._REQUIRED_V17_OBJECTS:
             if not self._index_exists(obj):
+                return False
+        for obj in self._REQUIRED_V18_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        for obj in self._REQUIRED_V19_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        for obj in self._REQUIRED_V20_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         return True
 
@@ -528,7 +581,19 @@ class Database:
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)
 
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
     def fetchone(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        # Established repository contract: returns ``sqlite3.Row`` (supports both
+        # positional ``row[0]`` and mapping ``row["key"]`` access) or ``None``.
+        # New specialist-execution code that needs a ``dict`` must normalize at its
+        # module boundary via ``dict(row)`` — see specialist_approval.py,
+        # specialist_spine.py, source_trade_enrichment.py,
+        # approved_specialist_dispatcher.py.
         return self.conn.execute(sql, params).fetchone()
 
     def fetchall(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:

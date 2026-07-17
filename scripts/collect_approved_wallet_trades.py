@@ -55,6 +55,7 @@ from polycopy.ingestion.approved_wallet_collector import (  # noqa: E402
     collect,
     resolve_wallet,
 )
+from polycopy.execution.specialist_approval import get_approval  # noqa: E402
 from polycopy.ingestion.source_trade_writer import (  # noqa: E402
     create_verified_backup,
     write_valid_rows,
@@ -139,8 +140,11 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Bounded canonical approved-wallet BUY ingestion (ingestion-only)"
     )
-    p.add_argument("--wallet", help="Must exactly match POLYCOPY_APPROVED_SOURCE_WALLET")
+    p.add_argument("--wallet", help="Must exactly match POLYCOPY_APPROVED_SOURCE_WALLET (deprecated) or an approval")
+    p.add_argument("--approval-id", help="Exact specialist_approvals.approval_id (authoritative approval-driven discovery)")
     p.add_argument("--source-trade-id", help="Exact public external source_trade_id (no prefix/fuzzy)")
+    p.add_argument("--max-new-trades", type=int, default=None,
+                   help="Strict upper bound on NEW source trades for approval-driven discovery (default 1)")
     p.add_argument("--limit", type=int, default=MAX_RECORDS,
                    help=f"Bounded accepted-row limit (1..{MAX_RECORDS})")
     p.add_argument("--write", action="store_true", help="Persist only selected source_trades rows")
@@ -154,11 +158,41 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     # ── argument validation ──
-    try:
-        wallet = resolve_wallet(args.wallet)
-    except UnsafeCollectorConfiguration as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+    approval_resolved_wallet: Optional[str] = None
+    approval_category: Optional[str] = None
+    if args.approval_id is not None:
+        # Approval-driven discovery: the approval table is the authoritative
+        # wallet source. Reject unknown / disabled / revoked approvals. No
+        # .env wallet and no implicit approval creation may override it.
+        db_read = Database(Path(args.db_path))
+        db_read.connect()
+        try:
+            try:
+                rec = get_approval(db_read, args.approval_id)
+            except KeyError:
+                print("error: unknown approval_id", file=sys.stderr)
+                return 2
+            if not rec.enabled or rec.revoked_at is not None:
+                kind = "revoked" if rec.revoked_at is not None else "disabled"
+                print(f"error: approval is {kind}", file=sys.stderr)
+                return 2
+            approval_resolved_wallet = rec.wallet_address
+            approval_category = rec.specialist_category
+        finally:
+            db_read.close()
+        # Strict bound for approval-driven discovery.
+        max_new = args.max_new_trades if args.max_new_trades is not None else 1
+        if max_new < 1:
+            print("error: --max-new-trades must be >= 1", file=sys.stderr)
+            return 2
+        # Approval-driven discovery replaces the exact-source-trade requirement.
+        wallet = approval_resolved_wallet
+    else:
+        try:
+            wallet = resolve_wallet(args.wallet)
+        except UnsafeCollectorConfiguration as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     # Bounded limit.
     if args.limit < 1 or args.limit > MAX_RECORDS:
@@ -182,9 +216,13 @@ def main(argv: list[str] | None = None) -> int:
             missing.append("--allow-live")
         if not args.confirm_production_db:
             missing.append("--confirm-production-db")
-        # Manual-only: a production write MUST name the exact source trade.
-        if args.source_trade_id is None:
-            missing.append("--source-trade-id")
+        # Manual-only: a production write MUST name an exact target. Approval
+        # discovery (exact approval + strict --max-new-trades + canonical
+        # deduplication) is permitted INSTEAD of an exact source-trade-id.
+        if args.source_trade_id is None and args.approval_id is None:
+            missing.append("--source-trade-id OR --approval-id")
+        if args.approval_id is not None and (args.max_new_trades or 1) > 1:
+            missing.append("--max-new-trades 1 (approval-driven discovery is exactly-one)")
         # Production writes are ALWAYS exactly one selected BUY. The operator
         # must supply --limit 1 explicitly; the default (MAX_RECORDS) is
         # rejected and is never silently coerced.
@@ -221,12 +259,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
+    # Effective accepted-row bound: approval-driven discovery uses the strict
+    # --max-new-trades (default 1); otherwise the operator --limit.
+    effective_limit = (args.max_new_trades if args.approval_id is not None
+                       else args.limit) or 1
+
     # ── dry-run (default): no DB, no backup, no write ──
     if not args.write:
         report = result.report()
         report["mode"] = "dry-run"
         report["production_db"] = str(PRODUCTION_DB_PATH) if is_prod else args.db_path
         report["limit"] = args.limit
+        report["approval_id"] = args.approval_id
+        report["approval_category"] = approval_category
         report["requested_source_trade_id"] = args.source_trade_id
         report["fetched_count"] = result.raw_records
         report["accepted_count"] = len(result.accepted_rows)
@@ -243,12 +288,11 @@ def main(argv: list[str] | None = None) -> int:
     from polycopy.runtime.locks import operational_job_lock  # noqa: E402
 
     backup_meta: Optional[dict[str, Any]] = None
-    writable_opened = False
     try:
         with operational_job_lock("collect", timeout=args.lock_timeout):
-            # Bounded accepted rows (never exceed --limit). In production this
-            # is exactly one selected BUY (gate enforced --limit 1 above).
-            accepted = result.accepted_rows[: args.limit]
+            # Bounded accepted rows (never exceed effective limit). In production
+            # this is exactly one selected BUY (gate enforced --limit 1 above).
+            accepted = result.accepted_rows[: effective_limit]
 
             # ── production safety: verify backup BEFORE writable open ──
             if is_prod:
@@ -293,7 +337,6 @@ def main(argv: list[str] | None = None) -> int:
             # ONLY NOW open the production DB writable (or temp DB).
             db = Database(Path(args.db_path))
             db.connect()
-            writable_opened = True
             try:
                 # Existing-row enrichment (PR68 Checkpoint E) for the selected id.
                 enriched_status = "n/a"
@@ -336,6 +379,8 @@ def main(argv: list[str] | None = None) -> int:
     report["mode"] = "write"
     report["production_db"] = str(PRODUCTION_DB_PATH) if is_prod else args.db_path
     report["limit"] = args.limit
+    report["approval_id"] = args.approval_id
+    report["approval_category"] = approval_category
     report["requested_source_trade_id"] = args.source_trade_id
     report["fetched_count"] = result.raw_records
     report["accepted_count"] = len(accepted)

@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Optional
 
 from polycopy.scoring.category_wallet_score_v1 import CategoryWalletScoreInputV1
@@ -72,6 +73,12 @@ class WalletEvidence:
     realized_pnl: Optional[float]
     win_rate: Optional[float]
     profit_factor: Optional[float]
+    sharpe_ratio: Optional[float]
+    max_drawdown: Optional[float]
+    info_score: Optional[float]
+    trade_intervals_std: Optional[float]
+    largest_winner_share: Optional[float]
+    top_3_concentration: Optional[float]
     active_trading_days: int
     distinct_events: int
     distinct_markets: int
@@ -89,6 +96,12 @@ class WalletEvidence:
             "trade_count": self.resolved_buy_trades,
             "win_rate": self.win_rate,
             "profit_factor": self.profit_factor,
+            "info_score": self.info_score,
+            "trade_intervals_std": self.trade_intervals_std,
+            "largest_winner_share": self.largest_winner_share,
+            "top_3_concentration": self.top_3_concentration,
+            "sharpe_ratio": self.sharpe_ratio,
+            "max_drawdown": self.max_drawdown,
             "sample_fraction": 0.0,
             "category_trade_count": None,
             "category_distinct_markets": None,
@@ -106,6 +119,12 @@ class WalletEvidence:
             "trade_count": self.resolved_buy_trades,
             "win_rate": self.win_rate,
             "profit_factor": self.profit_factor,
+            "info_score": self.info_score,
+            "trade_intervals_std": self.trade_intervals_std,
+            "largest_winner_share": self.largest_winner_share,
+            "top_3_concentration": self.top_3_concentration,
+            "sharpe_ratio": self.sharpe_ratio,
+            "max_drawdown": self.max_drawdown,
             "sample_fraction": 0.0,
             "category_trade_count": self.total_buy_trades,
             "category_distinct_markets": self.distinct_markets,
@@ -249,11 +268,85 @@ def _aggregate(db: Any, wallet_id: str, cutoff_timestamp: Optional[str], categor
     if missing_events:
         reasons.append("missing_event_identity")
     source_ts = _timestamp_max(rows)
+    # Honest risk statistics from the real resolved P&L series (per-trade
+    # returns). These are required by the frozen guard contract (Rule 1b:
+    # sharpe_ratio / max_drawdown must be present). Computed only when every
+    # resolved trade has a realized_pnl; otherwise left None (incomplete).
+    sharpe_ratio: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    if complete_pnl:
+        returns = [float(r["realized_pnl"]) for r in complete_pnl]
+        n = len(returns)
+        if n >= 2:
+            mean = sum(returns) / n
+            var = sum((x - mean) ** 2 for x in returns) / (n - 1)
+            std = var ** 0.5
+            if std > 0:
+                sharpe_ratio = (mean / std) * (n ** 0.5)
+            # Running peak-to-trough drawdown on the cumulative P&L curve.
+            peak = 0.0
+            trough = 0.0
+            max_dd = 0.0
+            cum = 0.0
+            for r in returns:
+                cum += r
+                peak = max(peak, cum)
+                trough = cum - peak
+                max_dd = min(max_dd, trough)
+            max_drawdown = abs(max_dd)
+    # Information & price-improvement quality: fraction of resolved trades
+    # carrying complete, canonical PR66 metadata (event identity + taxonomy
+    # label). This is the honest "information score" the frozen formula
+    # weights at 30% — it rewards wallets whose trades carry trustworthy
+    # provenance rather than anonymized blobs. Computed only when there is
+    # at least one resolved trade.
+    info_score: Optional[float] = None
+    if resolved:
+        complete = 0
+        for row in resolved:
+            md = _metadata(row.get("metadata_json"))
+            ident = _event_identity(md)
+            label = classify_category_taxonomy(md).category_label
+            if ident is not None and label is not None:
+                complete += 1
+        info_score = complete / len(resolved)
+    # Chronological consistency: std dev (seconds) of inter-trade intervals
+    # across BUY activity. None when fewer than two timestamps exist.
+    trade_intervals_std: Optional[float] = None
+    if len(timestamps) >= 2:
+        try:
+            ts_sorted = sorted(
+                datetime.fromisoformat(t.replace("Z", "+00:00")) for t in timestamps
+            )
+            deltas = [
+                (ts_sorted[i + 1] - ts_sorted[i]).total_seconds()
+                for i in range(len(ts_sorted) - 1)
+            ]
+            if len(deltas) >= 2:
+                m = sum(deltas) / len(deltas)
+                v = sum((d - m) ** 2 for d in deltas) / (len(deltas) - 1)
+                trade_intervals_std = v ** 0.5
+        except (ValueError, TypeError):
+            trade_intervals_std = None
+    # Concentration: largest single winner share and top-3 winner share of
+    # total winner realized P&L. None when there are no winning trades.
+    largest_winner_share: Optional[float] = None
+    top_3_concentration: Optional[float] = None
+    if wins:
+        winner_pnls = sorted((float(row["realized_pnl"]) for row in wins), reverse=True)
+        total_winner = sum(winner_pnls)
+        if total_winner > 0:
+            largest_winner_share = winner_pnls[0] / total_winner
+            top_3 = sum(winner_pnls[:3])
+            top_3_concentration = top_3 / total_winner
     return WalletEvidence(
         wallet_id=wallet_id, category_label=category_label, total_buy_trades=len(buy_rows),
         resolved_buy_trades=len(resolved), resolved_markets=len({str(row.get("market_source_id")) for row in resolved if row.get("market_source_id")}),
         winning_buy_trades=len(wins), losing_buy_trades=len(losses), realized_pnl=pnl,
         win_rate=(len(wins) / len(resolved)) if resolved else None, profit_factor=profit_factor,
+        sharpe_ratio=sharpe_ratio, max_drawdown=max_drawdown,
+        info_score=info_score, trade_intervals_std=trade_intervals_std,
+        largest_winner_share=largest_winner_share, top_3_concentration=top_3_concentration,
         active_trading_days=len(days), distinct_events=len({event for event in events if event}),
         distinct_markets=len({str(row.get("market_source_id")) for row in buy_rows if row.get("market_source_id")}),
         unresolved_buy_trades=len(unresolved), missing_event_identity_count=missing_events,
@@ -302,9 +395,49 @@ def _existing_id(db: Any, table: str, where: str, params: tuple[Any, ...]) -> Op
     return int(row["id"]) if row is not None else None
 
 
+def _dominant_category_label(
+    db: Any, wallet_id: str, cutoff_timestamp: Optional[str]
+) -> Optional[str]:
+    """Return the dominant usable PR66 category label across a wallet's trades.
+
+    Used to attach honest category-resolution evidence to the global wallet
+    decision (the frozen guard contract requires ``category_resolved_markets``
+    to be populated on the global row). Only explicit taxonomy evidence from
+    ``source_trades.metadata_json`` is consulted — never titles or inference.
+    """
+    rows = _canonical_rows(db, wallet_id, cutoff_timestamp)
+    counts: dict[str, int] = {}
+    for row in rows:
+        classification = classify_category_taxonomy(_metadata(row.get("metadata_json")))
+        if classification.status == CATEGORY_TAXONOMY_USABLE and classification.category_label:
+            counts[classification.category_label] = counts.get(classification.category_label, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
 def resolve_wallet_score_v1(db: Any, wallet_id: str, *, cutoff_timestamp: Optional[str], persist: bool, now: Any) -> ScoreResolution:
     evidence = aggregate_wallet_evidence(db, wallet_id, cutoff_timestamp=cutoff_timestamp)
-    result = compute_wallet_score_v1(input=build_wallet_score_input_v1(evidence), now=now)
+    # The global wallet decision must also carry category resolution evidence
+    # (frozen guard contract: a wallet decision with category_resolved_markets
+    # IS NULL is forced INCOMPLETE with no_resolved_market_evidence). We classify
+    # the wallet's taxonomy and aggregate the category evidence honestly from the
+    # same persisted source_trades — no fabrication, no threshold change.
+    input_kwargs = evidence.wallet_formula_kwargs()
+    cat_label = _dominant_category_label(db, wallet_id, cutoff_timestamp)
+    if cat_label is not None:
+        cat_evidence = aggregate_category_evidence(db, wallet_id, cat_label, cutoff_timestamp=cutoff_timestamp)
+        ckw = cat_evidence.category_formula_kwargs()
+        input_kwargs["category_resolved_markets"] = ckw.get("category_resolved_markets")
+        input_kwargs["category_distinct_events"] = ckw.get("category_distinct_events")
+        input_kwargs["category_active_days"] = ckw.get("category_active_days")
+        input_kwargs["category_trade_count"] = ckw.get("category_trade_count")
+        input_kwargs["category_distinct_markets"] = ckw.get("category_distinct_markets")
+    from polycopy.scoring.wallet_score_v1 import WalletScoreInputV1
+    result = compute_wallet_score_v1(
+        input=WalletScoreInputV1(wallet_id=evidence.wallet_id, **input_kwargs),
+        now=now,
+    )
     idem = generate_idempotency_key(formula_name="wallet_score", formula_version=result.formula_version, wallet_id=wallet_id, source_data_timestamp=evidence.source_data_timestamp, extra_params={"evidence_fingerprint": evidence.evidence_fingerprint, "contract": AGGREGATION_CONTRACT_VERSION})
     existing = _existing_id(db, "wallet_score_decisions", "wallet_id=? AND formula_name='wallet_score' AND formula_version=? AND idempotency_key=?", (wallet_id, result.formula_version, idem))
     if existing is not None:

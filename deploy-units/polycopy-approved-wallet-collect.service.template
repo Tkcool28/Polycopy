@@ -1,6 +1,6 @@
 # Review-only template. Do not install, start, or enable during this PR.
 [Unit]
-Description=Polycopy approved-wallet BUY-only canonical collector
+Description=Polycopy approved-wallet BUY-only canonical collector (approval-driven)
 After=network-online.target polycopy-api.service
 Wants=network-online.target
 
@@ -8,8 +8,13 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/root/Polycopy
 EnvironmentFile=/root/Polycopy/.env
+Environment=PYTHONUNBUFFERED=1
 Environment=POLYCOPY_MAX_RSS_MB=512
-ExecStart=/root/mlb-ev-model-lab/.venv/bin/python3 /root/Polycopy/scripts/collect_approved_wallet_trades.py --write
+# Bounded, approval-driven discovery. An explicit --approval-id is required; the
+# wallet is resolved from specialist_approvals (never a hardcoded address).
+# --write --allow-live --confirm-production-db are mandatory for any write; the
+# collector enforces this triple gate (PR68).
+ExecStart=/root/Polycopy/.venv/bin/python /root/Polycopy/scripts/collect_approved_wallet_trades.py --approval-id REPLACE_APPROVAL_ID --max-new-trades 1 --write --allow-live --confirm-production-db
 TimeoutStartSec=300
 Restart=no
 NoNewPrivileges=true
