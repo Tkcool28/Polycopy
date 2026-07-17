@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -35,7 +34,12 @@ for _cand in (REPO_ROOT / "src", REPO_ROOT / "scripts", REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from polycopy.db.database import Database  # noqa: E402
+from evidence_db import (  # noqa: E402
+    DbConn,
+    open_readonly,
+    open_writable,
+    require_write_gates,
+)
 
 PRODUCTION_DB_PATH = (REPO_ROOT / "data" / "polycopy.db").resolve()
 
@@ -46,37 +50,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _is_production_db(db_path: str) -> bool:
-    try:
-        return Path(db_path).resolve() == PRODUCTION_DB_PATH
-    except OSError:
-        return False
-
-
-def _require_write(args: argparse.Namespace) -> bool:
-    if args.dry_run or not args.write:
-        return False
-    if _is_production_db(args.db_path) and not (
-        args.write and args.confirm_production_db and args.allow_live
-    ):
-        print(
-            "error: production write requires --write --allow-live "
-            "--confirm-production-db",
-            file=sys.stderr,
-        )
-        return False
-    return True
-
-
-def _production_refused(args: argparse.Namespace) -> bool:
-    return (
-        args.write
-        and _is_production_db(args.db_path)
-        and not (args.confirm_production_db and args.allow_live)
-    )
-
-
-def _distinct_unresolved(db: Database, args: argparse.Namespace) -> list[str]:
+def _distinct_unresolved(db: DbConn, args: argparse.Namespace) -> list[str]:
     clauses = ["resolution_status IS NULL OR resolution_status != 'resolved'"]
     params: list = []
     if args.market_source_id:
@@ -115,7 +89,7 @@ def _parse_resolution(market: dict) -> tuple[Optional[str], Optional[str]]:
     return status or "unresolved", None
 
 
-def _run(db: Database, get_market: Callable[[str], Optional[dict]],
+def _run(db: DbConn, get_market: Callable[[str], Optional[dict]],
          args: argparse.Namespace, do_write: bool) -> dict:
     markets = _distinct_unresolved(db, args)
     counts = {
@@ -194,15 +168,16 @@ def main(argv=None, *, get_market=None) -> int:
     if args.limit_markets > _MAX_MARKETS:
         print(f"error: --limit-markets exceeds bound {_MAX_MARKETS}", file=sys.stderr)
         return 2
-    if _production_refused(args):
+    # Fail-closed write gate (3 gates required on production paths).
+    do_write = require_write_gates(args, db_path=args.db_path)
+    if args.write and not do_write:
         print(
-            "error: production write refused without --allow-live "
+            "error: production write requires --write --allow-live "
             "--confirm-production-db",
             file=sys.stderr,
         )
         return 2
-    do_write = _require_write(args)
-    db = Database(Path(args.db_path)).connect()
+    db = open_writable(args.db_path, args) if do_write else open_readonly(args.db_path)
     try:
         counts = _run(db, get_market or (lambda cid: None), args, do_write)
     finally:

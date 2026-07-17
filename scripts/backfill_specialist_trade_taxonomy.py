@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,13 +31,17 @@ for _cand in (REPO_ROOT / "src", REPO_ROOT / "scripts", REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     merge_canonical_metadata,
     MERGE_FILLED,
     MERGE_UNCHANGED,
     MERGE_CONFLICT,
-    MERGE_UNAVAILABLE,
+)
+from evidence_db import (  # noqa: E402
+    DbConn,
+    open_readonly,
+    open_writable,
+    require_write_gates,
 )
 
 PRODUCTION_DB_PATH = (REPO_ROOT / "data" / "polycopy.db").resolve()
@@ -52,37 +55,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _is_production_db(db_path: str) -> bool:
-    try:
-        return Path(db_path).resolve() == PRODUCTION_DB_PATH
-    except OSError:
-        return False
-
-
-def _require_write(args: argparse.Namespace) -> bool:
-    if args.dry_run or not args.write:
-        return False
-    if _is_production_db(args.db_path) and not (
-        args.write and args.confirm_production_db and args.allow_live
-    ):
-        print(
-            "error: production write requires --write --allow-live "
-            "--confirm-production-db",
-            file=sys.stderr,
-        )
-        return False
-    return True
-
-
-def _production_refused(args: argparse.Namespace) -> bool:
-    return (
-        args.write
-        and _is_production_db(args.db_path)
-        and not (args.confirm_production_db and args.allow_live)
-    )
-
-
-def _select_trades(db: Database, args: argparse.Namespace) -> list[dict]:
+def _select_trades(db: DbConn, args: argparse.Namespace) -> list[dict]:
     """Return non-sample BUY source_trades per the selectors, ordered
     deterministically by source_trade_id."""
     clauses = ["side = 'BUY'", "is_sample = 0", "lower(source_trade_id) LIKE 'polymarket:%'"]
@@ -114,7 +87,7 @@ def _select_trades(db: Database, args: argparse.Namespace) -> list[dict]:
     return [dict(r) for r in db.conn.execute(sql, params).fetchall()]
 
 
-def _gamma_resolver_factory(db: Database):
+def _gamma_resolver_factory(db: DbConn):
     """Resolve a condition_id to a market dict from local source_trades
     metadata, or None. For backfill we prefer a trusted Gamma lookup, but
     the shared merge needs a Mapping with conditionId/category/tags/events.
@@ -147,7 +120,7 @@ def _gamma_resolver_factory(db: Database):
     return _resolve
 
 
-def _write_provenance(db: Database, internal_id: str, status: str,
+def _write_provenance(db: DbConn, internal_id: str, status: str,
                       reason_codes: list[str], gamma_market) -> bool:
     """Write an idempotent provenance row. Returns True if a NEW row was
     inserted (skips if one already exists for this trade from a prior
@@ -174,7 +147,7 @@ def _write_provenance(db: Database, internal_id: str, status: str,
     return cur.rowcount > 0
 
 
-def _run(db: Database, args: argparse.Namespace, do_write: bool) -> dict:
+def _run(db: DbConn, args: argparse.Namespace, do_write: bool) -> dict:
     trades = _select_trades(db, args)
     resolver = _gamma_resolver_factory(db)
     counts = {
@@ -233,15 +206,16 @@ def main(argv=None) -> int:
     if args.limit > _MAX_LIMIT:
         print(f"error: --limit exceeds bound {_MAX_LIMIT}", file=sys.stderr)
         return 2
-    if _production_refused(args):
+    # Fail-closed write gate (3 gates required on production paths).
+    do_write = require_write_gates(args, db_path=args.db_path)
+    if args.write and not do_write:
         print(
-            "error: production write refused without --allow-live "
+            "error: production write requires --write --allow-live "
             "--confirm-production-db",
             file=sys.stderr,
         )
         return 2
-    do_write = _require_write(args)
-    db = Database(Path(args.db_path)).connect()
+    db = open_writable(args.db_path, args) if do_write else open_readonly(args.db_path)
     try:
         counts = _run(db, args, do_write)
     finally:

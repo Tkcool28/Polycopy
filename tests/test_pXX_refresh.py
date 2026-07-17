@@ -21,6 +21,7 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
         sys.path.insert(0, p)
 
 import refresh_specialist_market_truth as refresh  # noqa: E402
+from polycopy.db.database import Database  # noqa: E402
 
 
 def _tmp():
@@ -28,8 +29,10 @@ def _tmp():
 
 
 def _open():
+    # Tests may create a fresh v21 schema for setup (the CLIs themselves use
+    # the shared evidence_db helper, never Database().connect()).
     p = _tmp()
-    return refresh.Database(p).connect(), p
+    return Database(p).connect(), p
 
 
 def _seed_wallet(db, wid="uuid-w", address="0xgood0000000000000000000000000000refr"):

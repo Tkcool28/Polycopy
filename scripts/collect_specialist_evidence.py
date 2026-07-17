@@ -25,13 +25,15 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from polycopy.db.database import Database  # noqa: E402
-from polycopy.ingestion import ingest_pipeline  # noqa: E402
 from polycopy.ingestion.specialist_evidence_collector import (  # noqa: E402
     EvidenceCollectorConfig,
     collect_evidence,
 )
-from evidence_production_guard import is_production_db, require_write  # noqa: E402
+from evidence_db import (  # noqa: E402
+    open_readonly,
+    open_writable,
+    require_write_gates,
+)
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 
@@ -99,15 +101,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
 
-    if is_production_db(args.db_path):
-        if args.op if False else False:
-            pass
-    if not require_write(args):
-        print("error: production write requires --write --confirm-production-db",
-              file=sys.stderr)
+    # Collection persists source trades; require the full three-gate set on
+    # production paths. Dry-run (default) opens read-only.
+    if not require_write_gates(args, db_path=args.db_path):
+        print(
+            "error: production write requires --write --allow-live "
+            "--confirm-production-db",
+            file=sys.stderr,
+        )
         return 2
-
-    db = Database(Path(args.db_path)).connect()
+    db = open_writable(args.db_path, args) if args.write else open_readonly(args.db_path)
     try:
         result = asyncio.run(_run(db, args))
     finally:

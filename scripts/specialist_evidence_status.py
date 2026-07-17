@@ -35,10 +35,11 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from polycopy.db.database import Database  # noqa: E402
+from evidence_db import open_readonly, DbConn  # noqa: E402
+
+PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     CATEGORY_TAXONOMY_PARTIAL,
-    CATEGORY_TAXONOMY_UNAVAILABLE,
     CATEGORY_TAXONOMY_USABLE,
     WalletVerdict,
     aggregate_category_evidence,
@@ -95,7 +96,7 @@ def _metadata(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _count(db: Database, table: str) -> int:
+def _count(db: DbConn, table: str) -> int:
     try:
         return int(db.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"])
     except Exception:
@@ -118,7 +119,7 @@ def _distance_to_gates(evidence: Any, gates: dict[str, int]) -> dict[str, Any]:
     return out
 
 
-def _supported_categories(db: Database, wallet_id: str) -> list[str]:
+def _supported_categories(db: DbConn, wallet_id: str) -> list[str]:
     wallet = db.fetchone(
         "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
     )
@@ -137,7 +138,7 @@ def _supported_categories(db: Database, wallet_id: str) -> list[str]:
     return sorted(labels.keys())
 
 
-def _latest_wallet_verdict(db: Database, wallet_id: str) -> Optional[dict[str, Any]]:
+def _latest_wallet_verdict(db: DbConn, wallet_id: str) -> Optional[dict[str, Any]]:
     row = db.fetchone(
         "SELECT verdict, final_score, id FROM wallet_score_decisions "
         "WHERE wallet_id=? ORDER BY id DESC LIMIT 1",
@@ -152,7 +153,7 @@ def _latest_wallet_verdict(db: Database, wallet_id: str) -> Optional[dict[str, A
     }
 
 
-def _best_category_decision(db: Database, wallet_id: str) -> Optional[dict[str, Any]]:
+def _best_category_decision(db: DbConn, wallet_id: str) -> Optional[dict[str, Any]]:
     row = db.fetchone(
         "SELECT category_label, verdict, final_score, id FROM "
         "category_wallet_score_decisions WHERE wallet_id=? "
@@ -169,7 +170,7 @@ def _best_category_decision(db: Database, wallet_id: str) -> Optional[dict[str, 
     }
 
 
-def _taxonomy_completeness(db: Database, wallet_id: str) -> dict[str, Any]:
+def _taxonomy_completeness(db: DbConn, wallet_id: str) -> dict[str, Any]:
     wallet = db.fetchone(
         "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
     )
@@ -191,7 +192,7 @@ def _taxonomy_completeness(db: Database, wallet_id: str) -> dict[str, Any]:
     return {"buy_count": buy, "complete_count": complete, "pct": round(pct, 2)}
 
 
-def _integrity_ok(db: Database) -> tuple[bool, list[str]]:
+def _integrity_ok(db: DbConn) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     try:
         ic = db.fetchone("PRAGMA integrity_check")
@@ -208,7 +209,7 @@ def _integrity_ok(db: Database) -> tuple[bool, list[str]]:
     return (len(reasons) == 0, reasons)
 
 
-def _stale_market_refresh_count(db: Database) -> int:
+def _stale_market_refresh_count(db: DbConn) -> int:
     """Count market refresh-state rows that are stuck (error or unresolved)."""
     rows = db.fetchall(
         "SELECT last_status, last_error, attempt_count FROM specialist_market_refresh_state"
@@ -221,9 +222,8 @@ def _stale_market_refresh_count(db: Database) -> int:
     return stale
 
 
-def build_wallet_status(db: Database, wallet_id: str, watch: dict[str, Any]) -> dict[str, Any]:
+def build_wallet_status(db: DbConn, wallet_id: str, watch: dict[str, Any]) -> dict[str, Any]:
     """Compute the per-wallet readiness record (read-only)."""
-    now = datetime.now(timezone.utc)
     cutoff = None
     wallet_ev = aggregate_wallet_evidence(db, wallet_id, cutoff_timestamp=cutoff)
     supported = _supported_categories(db, wallet_id)
@@ -316,7 +316,7 @@ def build_wallet_status(db: Database, wallet_id: str, watch: dict[str, Any]) -> 
     }
 
 
-def _has_taxonomy_partial(db: Database, wallet_id: str) -> bool:
+def _has_taxonomy_partial(db: DbConn, wallet_id: str) -> bool:
     wallet = db.fetchone(
         "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
     )
@@ -334,7 +334,7 @@ def _has_taxonomy_partial(db: Database, wallet_id: str) -> bool:
     return False
 
 
-def build_status(db: Database) -> dict[str, Any]:
+def build_status(db: DbConn) -> dict[str, Any]:
     watches = db.fetchall(
         "SELECT w.id, w.wallet_id, w.status, w.last_collection_at, "
         "COALESCE(wl.is_sample, 0) AS is_sample "
@@ -375,12 +375,12 @@ def build_status(db: Database) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Read-only specialist-evidence readiness monitor")
-    p.add_argument("--db-path", default=str((_REPO_ROOT / "data" / "polycopy.db").resolve()))
+    p.add_argument("--db-path", default=str(PRODUCTION_DB_PATH))
     p.add_argument("--wallet-id", help="Restrict report to one watched wallet")
     p.add_argument("--json", action="store_true", help="Emit pure JSON")
     args = p.parse_args(argv)
 
-    db = Database(Path(args.db_path)).connect()
+    db = open_readonly(args.db_path)
     try:
         report = build_status(db)
         if args.wallet_id is not None:

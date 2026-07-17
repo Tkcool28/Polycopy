@@ -35,16 +35,18 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from polycopy.db.database import Database  # noqa: E402
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     CATEGORY_TAXONOMY_USABLE,
-    WalletVerdict,
     classify_category_taxonomy,
-    normalize_category_label,
     resolve_category_score_v1,
     resolve_wallet_score_v1,
 )
-from evidence_production_guard import is_production_db, require_write  # noqa: E402
+from evidence_db import (  # noqa: E402
+    DbConn,
+    open_readonly,
+    open_writable,
+    require_write_gates,
+)
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 
@@ -72,7 +74,7 @@ def _metadata(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _supported_category_labels(db: Database, wallet_id: str) -> list[str]:
+def _supported_category_labels(db: DbConn, wallet_id: str) -> list[str]:
     """Return the distinct usable PR66 taxonomy labels across a wallet's trades.
 
     Only explicit ``metadata_json['taxonomy']['raw_category']`` evidence is
@@ -98,14 +100,14 @@ def _supported_category_labels(db: Database, wallet_id: str) -> list[str]:
     return sorted(labels.keys())
 
 
-def _count(db: Database, table: str) -> int:
+def _count(db: DbConn, table: str) -> int:
     try:
         return int(db.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"])
     except Exception:
         return 0
 
 
-def _wallet_verdict(db: Database, wallet_id: str, *, now: datetime) -> Optional[str]:
+def _wallet_verdict(db: DbConn, wallet_id: str, *, now: datetime) -> Optional[str]:
     row = db.fetchone(
         "SELECT verdict FROM wallet_score_decisions "
         "WHERE wallet_id=? ORDER BY id DESC LIMIT 1",
@@ -114,7 +116,7 @@ def _wallet_verdict(db: Database, wallet_id: str, *, now: datetime) -> Optional[
     return str(row["verdict"]) if row is not None else None
 
 
-def _best_category(db: Database, wallet_id: str, *, now: datetime) -> Optional[dict[str, Any]]:
+def _best_category(db: DbConn, wallet_id: str, *, now: datetime) -> Optional[dict[str, Any]]:
     rows = db.fetchall(
         "SELECT category_label, verdict, final_score FROM "
         "category_wallet_score_decisions WHERE wallet_id=? "
@@ -132,7 +134,7 @@ def _best_category(db: Database, wallet_id: str, *, now: datetime) -> Optional[d
 
 
 def evaluate_wallet(
-    db: Database,
+    db: DbConn,
     wallet_id: str,
     *,
     now: datetime,
@@ -187,7 +189,7 @@ def evaluate_wallet(
     }
 
 
-def _iter_active_watch_wallets(db: Database) -> list[tuple[str, str]]:
+def _iter_active_watch_wallets(db: DbConn) -> list[tuple[str, str]]:
     """Return list of (wallet_id, watch_id) for active watches."""
     rows = db.fetchall(
         "SELECT id, wallet_id FROM specialist_evidence_watchlist "
@@ -211,22 +213,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-live", action="store_true")
     args = p.parse_args(argv)
 
-    # Production guard: refuse both resolved production paths.
-    if is_production_db(args.db_path):
-        if not (getattr(args, "write", False) and getattr(args, "confirm_production_db", False)):
-            print(
-                "error: production database refused — rescoring the production DB "
-                "requires --write --confirm-production-db",
-                file=sys.stderr,
-            )
-            return 2
+    # Production guard: write ops require the full three-gate set.
+    if not require_write_gates(args, db_path=args.db_path):
+        print(
+            "error: production database write requires "
+            "--write --allow-live --confirm-production-db",
+            file=sys.stderr,
+        )
+        return 2
+    persist = bool(getattr(args, "write", False))
 
-    write = require_write(args) and bool(getattr(args, "write", False))
-    # We never write to production without the explicit gate (already guarded above);
-    # require_write lets dry-run through but we only persist when --write is set.
-    persist = write
-
-    db = Database(Path(args.db_path)).connect()
+    db = open_writable(args.db_path, args) if persist else open_readonly(args.db_path)
     try:
         now = datetime.now(timezone.utc)
         before_forbidden = {t: _count(db, t) for t in _FORBIDDEN_EXECUTION_TABLES}

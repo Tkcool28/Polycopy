@@ -23,18 +23,17 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion import specialist_evidence_watchlist as wl  # noqa: E402
-from evidence_production_guard import is_production_db, require_write  # noqa: E402
+from evidence_db import (  # noqa: E402
+    open_readonly,
+    open_writable,
+    require_write_gates,
+)
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 
 
-def _cmd_add(db: Database, args: argparse.Namespace) -> int:
-    if not require_write(args):
-        print("error: production write requires --write --confirm-production-db",
-              file=sys.stderr)
-        return 2
+def _cmd_add(db, args: argparse.Namespace) -> int:
     try:
         wid = wl.add_watch(
             db, wallet_id=args.wallet_id, source=args.source, reason=args.reason,
@@ -47,37 +46,25 @@ def _cmd_add(db: Database, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_pause(db: Database, args: argparse.Namespace) -> int:
-    if not require_write(args):
-        print("error: production write requires --write --confirm-production-db",
-              file=sys.stderr)
-        return 2
+def _cmd_pause(db, args: argparse.Namespace) -> int:
     ok = wl.pause_watch(db, args.watch_id)
     print(f"{'paused' if ok else 'no-op'} watch_id={args.watch_id}")
     return 0 if ok else 1
 
 
-def _cmd_resume(db: Database, args: argparse.Namespace) -> int:
-    if not require_write(args):
-        print("error: production write requires --write --confirm-production-db",
-              file=sys.stderr)
-        return 2
+def _cmd_resume(db, args: argparse.Namespace) -> int:
     ok = wl.resume_watch(db, args.watch_id)
     print(f"{'resumed' if ok else 'no-op'} watch_id={args.watch_id}")
     return 0 if ok else 1
 
 
-def _cmd_retire(db: Database, args: argparse.Namespace) -> int:
-    if not require_write(args):
-        print("error: production write requires --write --confirm-production-db",
-              file=sys.stderr)
-        return 2
+def _cmd_retire(db, args: argparse.Namespace) -> int:
     ok = wl.retire_watch(db, args.watch_id)
     print(f"{'retired' if ok else 'no-op'} watch_id={args.watch_id}")
     return 0 if ok else 1
 
 
-def _cmd_list(db: Database, args: argparse.Namespace) -> int:
+def _cmd_list(db, args: argparse.Namespace) -> int:
     rows = wl.list_watches(db, status=args.status)
     if args.json:
         print(json.dumps(rows, indent=1))
@@ -90,7 +77,7 @@ def _cmd_list(db: Database, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_inspect(db: Database, args: argparse.Namespace) -> int:
+def _cmd_inspect(db, args: argparse.Namespace) -> int:
     r = wl.inspect_watch(db, args.watch_id)
     if r is None:
         print("error: unknown watch_id", file=sys.stderr)
@@ -112,6 +99,8 @@ def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--dry-run", action="store_true")
     common.add_argument("--write", action="store_true")
+    common.add_argument("--allow-live", action="store_true",
+                        help="Authorize network/Gamma access for this write")
     common.add_argument("--confirm-production-db", action="store_true")
 
     a = sub.add_parser("add", parents=[common], help="Add an active watch")
@@ -136,14 +125,16 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
 
-    # Defensive double-check: never open production without the explicit gate.
-    if is_production_db(args.db_path) and args.op in ("add", "pause", "resume", "retire"):
-        if not (getattr(args, "write", False) and getattr(args, "confirm_production_db", False)):
-            print("error: production write requires --write --confirm-production-db",
-                  file=sys.stderr)
+    # Write ops (add/pause/resume/retire) require the production gates.
+    write_ops = {"add", "pause", "resume", "retire"}
+    if args.op in write_ops:
+        if not require_write_gates(args, db_path=args.db_path):
+            print("error: production write requires --write --allow-live "
+                  "--confirm-production-db", file=sys.stderr)
             return 2
-
-    db = Database(Path(args.db_path)).connect()
+        db = open_writable(args.db_path, args)
+    else:
+        db = open_readonly(args.db_path)
     try:
         if args.op == "add":
             return _cmd_add(db, args)
