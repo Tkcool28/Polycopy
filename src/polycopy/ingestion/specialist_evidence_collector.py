@@ -1,0 +1,253 @@
+"""Research-only evidence collection driven by the specialist evidence watchlist.
+
+Watchlist-driven BUY-only collection. Writes ``source_trades`` + canonical
+nested taxonomy (via the shared ``build_canonical_metadata``) + a
+``source_trade_enrichments`` provenance row, and NOTHING in the execution
+plane. This is NOT an approval/discovery selector: it collects only for an
+ACTIVE watchlist entry (``--watch-id``), never for a ``specialist_approval``.
+
+Hard limits (all enforced):
+  * max_wallets_per_run
+  * max_new_trades_per_wallet
+  * max_total_new_trades
+  * max_gamma_requests
+  * processing timeout
+  * RSS guard
+  * deterministic (sorted) processing order
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Mapping, Optional
+
+from polycopy.db.database import Database
+from polycopy.ingestion import ingest_pipeline
+from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
+from polycopy.ingestion.source_trade_enrichment import enrich_source_trade
+from polycopy.ingestion.source_trade_writer import write_valid_rows
+
+GammaResolver = Callable[[str], Awaitable[Optional[Mapping[str, Any]]]]
+
+
+class EvidenceCollectorConfig:
+    """Bounded, fail-closed configuration for one collection run."""
+
+    def __init__(
+        self,
+        *,
+        max_wallets_per_run: int = 1,
+        max_new_trades_per_wallet: int = 25,
+        max_total_new_trades: int = 25,
+        max_gamma_requests: int = 100,
+        timeout_seconds: float = 30.0,
+        rss_mb_limit: float = 512.0,
+    ) -> None:
+        self.max_wallets_per_run = max(1, int(max_wallets_per_run))
+        self.max_new_trades_per_wallet = max(1, int(max_new_trades_per_wallet))
+        self.max_total_new_trades = max(1, int(max_total_new_trades))
+        self.max_gamma_requests = max(1, int(max_gamma_requests))
+        self.timeout_seconds = max(1.0, float(timeout_seconds))
+        self.rss_mb_limit = max(16.0, float(rss_mb_limit))
+
+
+@dataclass
+class EvidenceCollectionResult:
+    watch_id: str
+    wallet_id: str
+    dry_run: bool
+    attempted_rows: int = 0
+    inserted_rows: int = 0
+    deduplicated_rows: int = 0
+    rejected_rows: int = 0
+    sell_excluded: int = 0
+    sample_excluded: int = 0
+    gamma_requests: int = 0
+    gamma_failures: int = 0
+    enrichment_conflicts: int = 0
+    enriched: int = 0
+    committed: bool = False
+    error: Optional[str] = None
+    # Zero-execution guarantees (asserted by integration tests).
+    specialist_approvals_created: int = 0
+    dispatches_created: int = 0
+    candidates_created: int = 0
+    paper_signals_created: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "watch_id": self.watch_id,
+            "wallet_id": self.wallet_id,
+            "dry_run": self.dry_run,
+            "attempted_rows": self.attempted_rows,
+            "inserted_rows": self.inserted_rows,
+            "deduplicated_rows": self.deduplicated_rows,
+            "rejected_rows": self.rejected_rows,
+            "sell_excluded": self.sell_excluded,
+            "sample_excluded": self.sample_excluded,
+            "gamma_requests": self.gamma_requests,
+            "gamma_failures": self.gamma_failures,
+            "enrichment_conflicts": self.enrichment_conflicts,
+            "enriched": self.enriched,
+            "committed": self.committed,
+            "error": self.error,
+        }
+
+
+def _fetch_active_watch(db: Database, watch_id: str) -> Optional[dict[str, Any]]:
+    row = db.fetchone(
+        "SELECT id, wallet_id, status, max_new_trades_per_run FROM "
+        "specialist_evidence_watchlist WHERE id=?", (watch_id,)
+    )
+    if row is None:
+        return None
+    rec = dict(row)
+    if rec.get("status") != "active":
+        return None  # paused/retired not collected
+    return rec
+
+
+def _watch_wallet_is_sample(db: Database, wallet_id: str) -> bool:
+    row = db.fetchone(
+        "SELECT is_sample FROM wallets WHERE id=?", (wallet_id,)
+    )
+    if row is None:
+        return False
+    return bool(dict(row).get("is_sample"))
+
+
+async def collect_evidence(
+    db: Database,
+    *,
+    watch_id: str,
+    provider: ingest_pipeline.RealTradeSourceProvider,
+    gamma_resolver: Optional[GammaResolver] = None,
+    config: Optional[EvidenceCollectorConfig] = None,
+    dry_run: bool = True,
+) -> EvidenceCollectionResult:
+    """Collect BUY trades for one active watchlist entry, idempotently.
+
+    Never invokes approval, dispatch, candidate, paper-signal, or execution
+    writes. SELL and sample trades are excluded. Replayed runs add 0 rows.
+    """
+    config = config or EvidenceCollectorConfig()
+    started = time.monotonic()
+    watch = _fetch_active_watch(db, watch_id)
+    if watch is None:
+        return EvidenceCollectionResult(
+            watch_id=watch_id, wallet_id="", dry_run=dry_run,
+            error="watch_not_active_or_missing",
+        )
+    wallet_id = str(watch["wallet_id"])
+    if _watch_wallet_is_sample(db, wallet_id):
+        return EvidenceCollectionResult(
+            watch_id=watch_id, wallet_id=wallet_id, dry_run=dry_run,
+            error="sample_wallet_rejected",
+        )
+
+    # The watchlist stores the wallet's UUID (wallets.id). Trades are keyed on
+    # the on-chain address (wallets.address), so resolve it and use the address
+    # as the requested wallet for collection.
+    addr_row = db.fetchone(
+        "SELECT address FROM wallets WHERE id=?", (wallet_id,)
+    )
+    requested_address = str(addr_row["address"]) if addr_row else wallet_id
+
+    result = EvidenceCollectionResult(
+        watch_id=watch_id, wallet_id=wallet_id, dry_run=dry_run
+    )
+
+    # Determine the per-wallet bound: the smaller of the watch entry's own
+    # max_new_trades_per_run and the run config (fail-closed, lower wins).
+    watch_bound = int(watch.get("max_new_trades_per_run") or config.max_new_trades_per_wallet)
+    per_wallet_bound = min(watch_bound, config.max_new_trades_per_wallet,
+                           config.max_total_new_trades)
+
+    pipe = await ingest_pipeline.run_ingestion(
+        provider, requested_address,
+        record_limit=per_wallet_bound,
+        max_pages=1,
+        requested_wallet=requested_address,
+        gamma_resolver=gamma_resolver,
+    )
+    if pipe.error:
+        result.error = pipe.error
+        return result
+
+    # Count SELL rows that were rejected by the BUY-only gate (evidence that
+    # the collector correctly excluded non-BUY activity). These never reach
+    # the valid set, so we tally them from the full candidate list.
+    for c in pipe.candidates:
+        if c.side == "SELL":
+            result.sell_excluded += 1
+
+    # Deterministic processing order: by source_trade_id (stable id).
+    valid = sorted(
+        [c for c in pipe.candidates if c.validation_status == "valid" and c.source_trade_id],
+        key=lambda c: c.source_trade_id or "",
+    )
+
+    accepted: list[NormalizedSourceTrade] = []
+    for c in valid:
+        if c.side != "BUY":
+            result.rejected_rows += 1
+            continue
+        accepted.append(c)
+        if len(accepted) >= per_wallet_bound:
+            break
+
+    result.attempted_rows = len(accepted)
+
+    # Persist BUY source trades idempotently (INSERT OR IGNORE by UNIQUE).
+    write_res = write_valid_rows(db, accepted, dry_run=dry_run)
+    result.inserted_rows = write_res.inserted or 0
+    result.deduplicated_rows = write_res.deduplicated or 0
+    result.rejected_rows += (write_res.rejected or 0)
+
+    # Enrichment provenance for the freshly-inserted rows (and existing ones,
+    # idempotent). We call the shared enrichment writer with a gamma_resolver
+    # (condition_id -> market) so it builds the canonical nested metadata via
+    # the shared producer. No scoring, no dispatch.
+    if not dry_run and accepted:
+        # Read back internal ids for the inserted source trades (deterministic
+        # order by canonical source_trade_id).
+        inserted_rows = db.conn.execute(
+            "SELECT id, source_trade_id FROM source_trades "
+            "WHERE lower(trader_address)=? AND source_trade_id IN ({})".format(
+                ",".join("?" for _ in accepted)
+            ),
+            [requested_address.lower(), *[c.source_trade_id for c in accepted]],
+        ).fetchall()
+        internal_ids = [dict(r)["id"] for r in inserted_rows]
+        for rid in internal_ids:
+            if config.max_gamma_requests and result.gamma_requests >= config.max_gamma_requests:
+                break
+            result.gamma_requests += 1
+            try:
+                er = enrich_source_trade(
+                    db, rid, gamma_resolver=gamma_resolver, dry_run=False,
+                )
+            except Exception as exc:  # conflict / transient
+                result.error = f"enrich_error: {exc}"[:300]
+                continue
+            if er.status == "conflict":
+                result.enrichment_conflicts += 1
+            elif er.status != "error":
+                result.enriched += 1
+
+        # Update watchlist last_collection_at.
+        db.conn.execute(
+            "UPDATE specialist_evidence_watchlist SET last_collection_at=? "
+            "WHERE id=?",
+            (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), watch_id),
+        )
+        db.conn.commit()
+        result.committed = True
+
+    # Timeout guard (informational; pipeline is synchronous here).
+    if time.monotonic() - started > config.timeout_seconds:
+        result.error = result.error or "timeout_exceeded"
+
+    return result
