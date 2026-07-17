@@ -272,22 +272,23 @@ def _current_exposure(db: Any, wallet_id: str, market_source_id: Optional[str]) 
     """Compute persisted current specialist paper exposure (fail-closed: uses DB)."""
     per_wallet = float(db.fetchone(
         "SELECT COALESCE(SUM(quantity * avg_entry_price),0.0) AS e "
-        "FROM paper_positions WHERE wallet_id=? "
-        "AND NOT EXISTS (SELECT 1 FROM paper_position_settlements WHERE position_id=id)",
+        "FROM paper_positions AS p WHERE wallet_id=? "
+        "AND NOT EXISTS (SELECT 1 FROM paper_position_settlements AS s WHERE s.position_id = p.id)",
         (wallet_id,),
     )["e"])
     per_market = 0.0
     if market_source_id:
         per_market = float(db.fetchone(
             "SELECT COALESCE(SUM(quantity * avg_entry_price),0.0) AS e "
-            "FROM paper_positions WHERE wallet_id=? AND market_id=? "
-            "AND NOT EXISTS (SELECT 1 FROM paper_position_settlements WHERE position_id=id)",
+            "FROM paper_positions AS p WHERE wallet_id=? AND market_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM paper_position_settlements AS s WHERE s.position_id = p.id)",
             (wallet_id, market_source_id),
         )["e"])
     global_exp = float(db.fetchone(
         "SELECT COALESCE(SUM(quantity * avg_entry_price),0.0) AS e "
-        "FROM paper_positions WHERE NOT EXISTS "
-        "(SELECT 1 FROM paper_position_settlements WHERE position_id=id)",
+        "FROM paper_positions AS p "
+        "WHERE NOT EXISTS "
+        "(SELECT 1 FROM paper_position_settlements AS s WHERE s.position_id = p.id)",
     )["e"])
     return {"per_wallet": per_wallet, "per_market": per_market, "global": global_exp}
 
@@ -297,30 +298,44 @@ def _persist_risk_decision(
     candidate_id, snapshot_id, decision, reason_codes, requested_quantity,
     requested_price, estimated_fill_price, estimated_slippage, exposure_before,
     configured_limits, kill_switch_state, paper_mode, evidence_timestamp, runtime,
-    now,
+    authorization_id=None, now=None,
 ) -> str:
+    now = now or _utcnow()
     risk_decision_id = str(uuid.uuid4())
+    execution_attempt_id = str(uuid.uuid4())
     # A blocked/no-authorization risk decision may legitimately lack an active
     # approval; normalize the sentinel to NULL so the nullable FK column is valid.
     if specialist_approval_id in (None, "-1", -1):
         specialist_approval_id = None
+    # Immutable attempt number: 1-based sequence per signal, never overwritten.
+    # Deterministic: max existing attempt_number + 1.
+    max_row = db.fetchone(
+        "SELECT MAX(attempt_number) AS m FROM execution_risk_decisions "
+        "WHERE paper_signal_decision_id=?",
+        (paper_signal_decision_id,),
+    )
+    attempt_number = (int(max_row["m"]) + 1) if max_row and max_row["m"] is not None else 1
     db.execute(
         """INSERT INTO execution_risk_decisions (
-               risk_decision_id, paper_signal_decision_id, specialist_approval_id, source_trade_id,
+               execution_attempt_id, risk_decision_id, paper_signal_decision_id,
+               specialist_approval_id, authorization_id, source_trade_id,
                candidate_id, snapshot_id, decision, reason_codes,
                requested_quantity, requested_price, estimated_fill_price,
                estimated_slippage, market_exposure_before, wallet_exposure_before,
                portfolio_exposure_before, configured_limits_json, kill_switch_state,
-               paper_mode, evidence_timestamp, evaluated_at, policy_version)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               paper_mode, evidence_timestamp, evaluated_at, policy_version,
+               attempt_number)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            risk_decision_id, paper_signal_decision_id, specialist_approval_id, source_trade_id,
+            execution_attempt_id, risk_decision_id, paper_signal_decision_id,
+            specialist_approval_id, authorization_id, source_trade_id,
             candidate_id, snapshot_id, decision, json.dumps(reason_codes),
             requested_quantity, requested_price, estimated_fill_price,
             estimated_slippage, exposure_before.get("per_market"),
             exposure_before.get("per_wallet"), exposure_before.get("global"),
             json.dumps(configured_limits), kill_switch_state, paper_mode,
             evidence_timestamp, now.isoformat(), runtime.policy_version,
+            attempt_number,
         ),
     )
     return risk_decision_id
@@ -410,6 +425,10 @@ def consume_eligible_signal(
         elif int(ap["enabled"]) != 1 or ap["revoked_at"] is not None:
             reasons.append("approval_disabled_or_revoked")
 
+    # The authorization used for this evaluation attempt (NULL when no active
+    # authorization exists, e.g. a fail-closed block before the gate).
+    authz_id = auth["authorization_id"] if auth is not None else None
+
     # ---- 4. Copyability eligible ---------------------------------------- #
     tc = db.fetchone(
         "SELECT id, verdict FROM trade_copyability_decisions WHERE candidate_id=? "
@@ -426,10 +445,11 @@ def consume_eligible_signal(
     # (the canonical public identity is source_trades.source_trade_id; the loader
     # resolves the row by the internal id per paper_signal.py contract).
     st = db.fetchone(
-        "SELECT id, side, market_source_id, resolution_status FROM source_trades "
+        "SELECT id, side, market_source_id, resolution_status, outcome FROM source_trades "
         "WHERE id=?",
         (source_trade_id,),
     )
+    source_outcome: Optional[str] = None
     if st is None:
         reasons.append("source_trade_missing")
         market_source_id = None
@@ -439,6 +459,14 @@ def consume_eligible_signal(
         st_d = dict(st)
         if str(st["side"] or "").upper() != "BUY":
             reasons.append("source_trade_not_buy")
+        # Outcome provenance: thread the canonical source-trade outcome (already
+        # persisted by the source-trade loader) into the paper order/position.
+        # Do NOT infer from the market title and do NOT default to "Yes".
+        # `st` is a sqlite3.Row (no .get); use the dict-normalized `st_d`.
+        source_outcome = st_d.get("outcome")
+        if source_outcome is None or str(source_outcome).strip() == "":
+            # Fail closed: unresolvable outcome → blocked, no order.
+            reasons.append("outcome_unresolvable")
 
     # ---- 6. Snapshot / depth evidence fresh ----------------------------- #
     fresh, fresh_reason = _is_snapshot_fresh(db, snapshot_id, runtime.snapshot_max_age_seconds, now)
@@ -544,7 +572,7 @@ def consume_eligible_signal(
             estimated_slippage=None, exposure_before=exposure_before,
             configured_limits=limits, kill_switch_state=runtime.kill_switch_engaged,
             paper_mode=runtime.broker_mode, evidence_timestamp=None, runtime=runtime,
-            now=now)
+            authorization_id=authz_id, now=now)
         result.risk_decision_id = rid
         result.rejection_reasons = reasons
         return result
@@ -562,7 +590,7 @@ def consume_eligible_signal(
             estimated_slippage=None, exposure_before=exposure_before,
             configured_limits=limits, kill_switch_state=runtime.kill_switch_engaged,
             paper_mode=runtime.broker_mode, evidence_timestamp=None, runtime=runtime,
-            now=now)
+            authorization_id=authz_id, now=now)
         result.risk_decision_id = rid
         return result
 
@@ -582,7 +610,8 @@ def consume_eligible_signal(
             estimated_fill_price=quote.expected_price, estimated_slippage=quote.slippage,
             exposure_before=exposure_before, configured_limits=limits,
             kill_switch_state=runtime.kill_switch_engaged, paper_mode=runtime.broker_mode,
-            evidence_timestamp=now.isoformat(), runtime=runtime, now=now)
+            evidence_timestamp=now.isoformat(), runtime=runtime,
+            authorization_id=authz_id, now=now)
         result.risk_decision_id = rid
         result.rejection_reasons = ["depth_insufficient_for_full_fill"]
         return result
@@ -614,7 +643,7 @@ def consume_eligible_signal(
             estimated_slippage=quote.slippage, exposure_before=exposure_before,
             configured_limits=limits, kill_switch_state=runtime.kill_switch_engaged,
             paper_mode=runtime.broker_mode, evidence_timestamp=now.isoformat(), runtime=runtime,
-            now=now)
+            authorization_id=authz_id, now=now)
         result.risk_decision_id = rid
         result.rejection_reasons = limit_breaches
         return result
@@ -629,7 +658,7 @@ def consume_eligible_signal(
         estimated_slippage=quote.slippage, exposure_before=exposure_before,
         configured_limits=limits, kill_switch_state=runtime.kill_switch_engaged,
         paper_mode=runtime.broker_mode, evidence_timestamp=now.isoformat(), runtime=runtime,
-        now=now)
+        authorization_id=authz_id, now=now)
 
     order_id = str(uuid.uuid4())
     filled_at = now.isoformat()
@@ -643,12 +672,12 @@ def consume_eligible_signal(
                    execution_risk_decision_id, source_wallet_id, wallet_id, market_id,
                    side, outcome, quantity, price, requested_quantity, requested_price,
                    status, fill_model_version, policy_version, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?, 'BUY', 'Yes', ?,?,?,?, 'filled', 'fill_model_v1', ?, ?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?, 'BUY', ?, ?,?,?,?, 'filled', 'fill_model_v1', ?, ?)""",
             (
                 order_id, paper_signal_decision_id, approval_id,
                 source_trade_id, candidate_id, snapshot_id,
                 int(tc["id"]) if tc else None, rid, wallet_id, wallet_id, market_source_id,
-                requested_qty, requested_price, requested_qty, requested_price,
+                source_outcome, requested_qty, requested_price, requested_qty, requested_price,
                 runtime.policy_version, now.isoformat(),
             ),
         )
@@ -673,7 +702,7 @@ def consume_eligible_signal(
                    paper_signal_decision_id, execution_risk_decision_id, opened_at, updated_at)
                VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)""",
             (
-                position_id, market_source_id, wallet_id, "Yes", requested_qty,
+                position_id, market_source_id, wallet_id, source_outcome, requested_qty,
                 quote.expected_price, quote.expected_price, wallet_id, source_trade_id,
                 candidate_id, order_id, fill_id, paper_signal_decision_id, rid,
                 filled_at, now.isoformat(),
@@ -816,11 +845,39 @@ def settle_specialist_position(
         (position_id,),
     )
     if existing:
+        # Normalize both outcomes to a canonical YES/NO form (case-insensitive,
+        # per §13k) before comparing, so a re-settlement with equivalent text
+        # is treated as a replay rather than a conflict.
+        def _norm(o: object) -> Optional[str]:
+            if o is None:
+                return None
+            s = str(o).strip().upper()
+            if s in ("YES", "Y", "WIN", "WON"):
+                return "YES"
+            if s in ("NO", "N", "LOSS", "LOST"):
+                return "NO"
+            return s
+
+        incoming = _norm(resolution_outcome)
+        persisted = _norm(existing["resolution_outcome"])
+        if incoming == persisted:
+            # Same outcome (possibly from a different evidence source) →
+            # equivalent replay. Return the existing settlement unchanged; do
+            # NOT create a second row or mutate realized P&L.
+            return SettlementOutcome(
+                position_id=position_id, settlement_id=int(existing["id"]),
+                status="already_settled", is_winner=bool(existing["is_winner"]),
+                payout=float(existing["payout"]), realized_pnl=float(existing["realized_pnl"]),
+                reason="already_settled",
+            )
+        # Divergent outcome → conflicting settlement evidence. Surface the
+        # conflict with the EXISTING settlement's payout/P&L; never overwrite
+        # the prior authoritative result and never insert a new row.
         return SettlementOutcome(
             position_id=position_id, settlement_id=int(existing["id"]),
-            status="already_settled", is_winner=bool(existing["is_winner"]),
+            status="conflict", is_winner=bool(existing["is_winner"]),
             payout=float(existing["payout"]), realized_pnl=float(existing["realized_pnl"]),
-            reason="already_settled",
+            reason=f"conflicting_resolution:{incoming}!={persisted}",
         )
     from uuid import UUID
     from polycopy.risk.settlement import SettlementEngine, SettlementEvidence

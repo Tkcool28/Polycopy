@@ -462,9 +462,13 @@ def test_conflicting_settlement_blocked(tmp_path: Path):
                                   ask_price=0.55, evidence_source="test")
     _so1 = settle_specialist_position(db, res.position_id, resolution_outcome="YES",
                                       evidence_source="test")
-    # Different resolution evidence (NO) must not create a second settlement.
+    # Different resolution evidence (NO) must not create a second settlement;
+    # it must be surfaced as a CONFLICT carrying the existing settlement's
+    # payout/P&L (the prior authoritative result is never overwritten).
     so2 = settle_specialist_position(db, res.position_id, resolution_outcome="NO",
                                      evidence_source="conflict")
-    assert so2.status == "already_settled"
+    assert so2.status == "conflict"
+    assert so2.settlement_id == _so1.settlement_id
+    assert so2.realized_pnl == _so1.realized_pnl
     assert db.fetchone("SELECT COUNT(*) AS c FROM paper_position_settlements")["c"] == 1
     db.close()

@@ -302,6 +302,14 @@ class Database:
         "idx_astd_source_trade",
         "idx_astd_status",
     )
+    # v20 — retryable blocked execution. The rebuilt execution_risk_decisions
+    # table keeps its name, so discriminate on the new indexes that only v20
+    # adds (idx_execution_risk_authz, idx_execution_risk_attempt). Otherwise a
+    # DB at v19 metadata would be bumped to v20 without applying the rebuild.
+    _REQUIRED_V20_OBJECTS: tuple[str, ...] = (
+        "idx_execution_risk_authz",
+        "idx_execution_risk_attempt",
+    )
 
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
@@ -346,6 +354,9 @@ class Database:
             if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         for obj in self._REQUIRED_V19_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        for obj in self._REQUIRED_V20_OBJECTS:
             if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         return True

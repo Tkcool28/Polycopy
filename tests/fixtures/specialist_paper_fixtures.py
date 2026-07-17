@@ -193,7 +193,7 @@ def seed_resolved_evidence(db: Any, *, wallet: str = FIXED_WALLET,
 
 
 def make_target_trade(side: str = "BUY", *, with_taxonomy: bool = True,
-                      resolved: Optional[bool] = None) -> dict[str, Any]:
+                      resolved: Optional[bool] = None, outcome: str = "Yes") -> dict[str, Any]:
     """Build the dict for the ONE trade the collector will ingest as the target."""
     cond = "0x" + "f" * 64  # valid 0x-prefixed 64-hex condition id
     meta = (
@@ -207,7 +207,7 @@ def make_target_trade(side: str = "BUY", *, with_taxonomy: bool = True,
         "source_trade_id": f"poly.market:{cond}:target",
         "market_source_id": cond,
         "side": side,
-        "outcome": "Yes",
+        "outcome": outcome,
         "quantity": 10.0,
         "price": 0.4,
         "trader_address": FIXED_WALLET,
