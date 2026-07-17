@@ -1,0 +1,19 @@
+# ============================================================================
+# REVIEW-ONLY TIMER TEMPLATE — DISABLED BY DEFAULT.
+#
+# This timer is intentionally shipped WITHOUT an [Install] section, so it
+# cannot be `systemctl enable`-d until a separate, explicitly approved
+# deployment step adds one (or installs it with an explicit WantedBy).
+#
+# Do NOT add WantedBy=timers.target here as part of this PR. Scheduling is
+# a post-merge, human-approved operation.
+# ============================================================================
+[Unit]
+Description=Timer for Polycopy specialist-evidence rescoring (REVIEW-ONLY, disabled)
+
+[Timer]
+OnBootSec=25min
+OnUnitActiveSec=6h
+AccuracySec=10min
+Persistent=false
+Unit=polycopy-specialist-evidence-rescore.service

@@ -1,0 +1,56 @@
+# ============================================================================
+# REVIEW-ONLY — NOT ENABLED.
+# Requires explicit --write --allow-live --confirm-production-db gates.
+#
+# This unit runs the research-plane evidence collector in DRY-RUN mode by
+# default. It NEVER references private keys or live execution credentials,
+# and it never passes --write / --allow-live / --confirm-production-db.
+#
+# Installation / enabling / scheduling are separate, explicitly approved
+# post-merge operations. Do NOT `systemctl enable` this file as-is.
+#
+# To make this unit actually persist writes you would need to (a) add
+# --write --allow-live --confirm-production-db, (b) add ReadWritePaths for
+# the data directory, and (c) relax ProtectSystem — all gated behind the
+# human approval workflow. None of that is done here.
+# ============================================================================
+[Unit]
+Description=Polycopy specialist-evidence collector (REVIEW-ONLY, dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/workspaces/polycopy-evidence-v21
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYCOPY_MAX_RSS_MB=512
+# Review-only: dry-run by default, no write/allow-live/confirm flags, no
+# credential env file. Replace REPLACE_WATCH_ID with a watchlist entry id
+# before any non-review invocation.
+ExecStart=/root/workspaces/polycopy-evidence-v21/.venv/bin/python /root/workspaces/polycopy-evidence-v21/scripts/collect_specialist_evidence.py --watch-id REPLACE_WATCH_ID --dry-run --max-new-trades-per-wallet 25 --max-total-new-trades 25 --max-gamma-requests 100
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=no
+# --- Explicit bounds / RSS guard ---
+MemoryMax=512M
+TasksMax=32
+# --- Hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ExecPaths=/root/workspaces/polycopy-evidence-v21/.venv/bin /usr/bin /bin
+NoExecPaths=/tmp /var/tmp /root/workspaces/polycopy-evidence-v21/data
+StandardOutput=journal
+StandardError=journal
