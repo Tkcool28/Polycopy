@@ -22,13 +22,19 @@ Design invariants
 * Immutable identity/economic columns (side, outcome, price, quantity,
   timestamp, token_id, market_source_id, source_trade_id) are never written by
   this module.
-* Gamma markets are accepted as ``collections.abc.Mapping`` (the plan's
-  ``FakeMarket`` protocol: ``category``, ``tags``, ``events``, ``series``).
+* Gamma markets are accepted as ``collections.abc.Mapping``. Trusted token
+  membership is read from the real Gamma ``clobTokenIds`` field (JSON-encoded
+  list string OR bare list) via the proven repository-wide
+  ``parse_clob_token_ids`` contract — never a synthetic token dict.
 * ``metadata_version`` is stamped on EVERY merge output (filled, unchanged, and
-  preserved-existing shapes) so downstream consumers can detect drift.
+  preserved-existing shapes) so downstream consumers can detect drift. An
+  existing non-empty version that differs from the canonical ``"1"`` is a
+  version conflict (never silently rewritten).
 * Conflicts are fail-closed: any non-empty, differing value across the
   taxonomy / event / series namespaces blocks the merge (status ``conflict``);
-  the caller must NOT overwrite.
+  the caller must NOT overwrite. Malformed / non-object existing metadata is
+  likewise blocked (status ``unavailable``); the caller must preserve the
+  original DB value (see ``merge_canonical_metadata`` return contract).
 """
 
 from __future__ import annotations
@@ -37,6 +43,7 @@ import json
 from collections.abc import Mapping
 from typing import Any, Optional
 
+from polycopy.adapters.polymarket import parse_clob_token_ids
 from polycopy.taxonomy.official_polymarket import (
     TAXONOMY_USABLE,
     OfficialPolymarketTaxonomyResolverV1,
@@ -132,14 +139,23 @@ def _as_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
 
 
-def _parse_metadata(existing_json: Optional[str]) -> dict[str, Any]:
+def _parse_metadata(existing_json: Optional[str]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Parse ``existing_json`` with fail-closed validation.
+
+    Returns ``(parsed_dict, error_reason)``. ``parsed_dict`` is ``None`` and
+    ``error_reason`` is set when the stored value is malformed JSON or a
+    non-object top level. Empty / ``None`` input is valid and yields ``({}, None)``
+    (an empty-but-valid existing row that may be safely filled).
+    """
     if not existing_json:
-        return {}
+        return {}, None
     try:
         parsed = json.loads(existing_json)
     except (json.JSONDecodeError, TypeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        return None, "existing_metadata_malformed_json"
+    if not isinstance(parsed, dict):
+        return None, "existing_metadata_not_object"
+    return parsed, None
 
 
 def _ensure_version(meta: dict[str, Any]) -> dict[str, Any]:
@@ -147,6 +163,20 @@ def _ensure_version(meta: dict[str, Any]) -> dict[str, Any]:
     out = dict(meta)
     out["metadata_version"] = METADATA_VERSION
     return out
+
+
+def _preserve_opt(existing_json: Optional[str]) -> dict[str, Any]:
+    """Return the original stored value when it cannot be parsed.
+
+    Callers pass this on ``unavailable``/``conflict`` so they can preserve the
+    DB row verbatim. If the stored value is a string (even malformed), it is
+    returned as-is; otherwise an empty dict is returned.
+    """
+    if isinstance(existing_json, str):
+        return existing_json  # type: ignore[return-value]
+    if existing_json is None:
+        return {}
+    return existing_json  # type: ignore[return-value]
 
 
 def build_canonical_metadata(
@@ -190,19 +220,20 @@ def _gamma_condition_id(gamma_market: Optional[Mapping[str, Any]]) -> Optional[s
     return str(cid).lower() if cid is not None else None
 
 
-def _gamma_token_ids(gamma_market: Optional[Mapping[str, Any]]) -> set[str]:
-    """Return the lower-cased token ids that belong to this Gamma condition."""
+def _gamma_token_ids(gamma_market: Optional[Mapping[str, Any]]) -> list[str]:
+    """Return the token ids that belong to this Gamma condition.
+
+    Uses the proven repository-wide ``parse_clob_token_ids`` contract, which
+    accepts Gamma ``clobTokenIds`` as a JSON-encoded list string OR a bare
+    list, and returns ``[]`` for missing/malformed/empty evidence. Tokens are
+    normalized to lower-case for case-insensitive membership checks.
+    """
     if not gamma_market:
-        return set()
-    owned: set[str] = set()
-    tokens = gamma_market.get("tokens")
-    if isinstance(tokens, list):
-        for tok in tokens:
-            if isinstance(tok, Mapping):
-                tid = tok.get("tokenId") or tok.get("token_id")
-                if tid:
-                    owned.add(str(tid).lower())
-    return owned
+        return []
+    # parse_clob_token_ids reads ``clobTokenIds`` from the passed mapping; it
+    # tolerates the field being absent or shaped unlike a list (returns []).
+    tokens = parse_clob_token_ids(dict(gamma_market))
+    return [str(t).lower() for t in tokens if t]
 
 
 def merge_canonical_metadata(
@@ -216,6 +247,15 @@ def merge_canonical_metadata(
 
     Returns ``(new_metadata, status, reason_codes)``.
 
+    RETURN CONTRACT (callers MUST honor this to preserve the original DB row):
+
+      * status ``unavailable`` or ``conflict`` -> ``new_metadata`` is the
+        ORIGINAL parsed existing object (or the raw ``existing_json`` string
+        when it could not be parsed). Callers MUST NOT overwrite the stored
+        row on these statuses — the original value is returned untouched.
+      * status ``filled`` -> ``new_metadata`` is the merged object (byte-stable).
+      * status ``unchanged`` -> ``new_metadata`` equals the original.
+
     Rules:
       * Fills only canonical namespaces (``taxonomy``, ``event``, ``series``).
       * Preserves unrelated existing metadata (e.g. ``foo=bar``).
@@ -223,18 +263,36 @@ def merge_canonical_metadata(
       * SOLE authority for canonical taxonomy is the trusted Gamma market.
       * ``condition_id`` must EXACTLY match the Gamma market's condition id;
         mismatch -> ``unavailable`` (fail closed).
-      * If the trade carries a ``token_id``, it must belong to the matched
-        Gamma condition; explicit mismatch -> ``unavailable`` (fail closed).
+      * If the trade carries a ``token_id``, it MUST belong to the matched
+        Gamma condition per the real Gamma ``clobTokenIds`` list:
+          - missing/malformed/empty Gamma token evidence -> ``unavailable``
+            with ``token_membership_unavailable``
+          - token absent from the parsed list -> ``unavailable`` with
+            ``token_id_not_in_condition``
+          - a duplicate/ambiguous occurrence -> ``unavailable`` with
+            ``token_membership_ambiguous``
+          - exactly one matching token proceeds.
+      * Malformed / non-object existing metadata -> ``unavailable`` (blocked);
+        the caller preserves the original DB value.
       * Missing Gamma taxonomy -> ``unavailable`` (no error, no overwrite).
+      * ``metadata_version`` conflict: an existing non-empty version that
+        differs from ``"1"`` blocks as ``version_conflict`` (never rewritten).
       * Any non-empty, differing value across taxonomy / event / series ->
         ``conflict`` (existing value preserved; caller must NOT overwrite).
       * Empty/missing existing fields are FILLABLE (filled from Gamma).
+      * Incoming None/empty Gamma fields are absence of evidence: an existing
+        populated value is PRESERVED (not a conflict).
       * ``metadata_version`` is stamped on every returned shape.
 
     ``condition_id`` is the source_trade's ``market_source_id`` (the trusted
     Gamma condition id). The provided Gamma market MUST match it.
     """
-    existing = _parse_metadata(existing_json)
+    # --- Fail-closed parse of the existing stored value. --------------------
+    existing, parse_err = _parse_metadata(existing_json)
+    if parse_err is not None:
+        # Return the RAW original value so the caller can preserve it verbatim.
+        return _preserve_opt(existing_json), MERGE_UNAVAILABLE, [parse_err]
+
     reason_codes: list[str] = []
 
     if gamma_market is None:
@@ -247,12 +305,26 @@ def merge_canonical_metadata(
         reason_codes.append("condition_id_mismatch")
         return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
 
-    # Token ownership: a trade's token_id must belong to the matched condition.
+    # --- Token ownership via the REAL Gamma token contract. ----------------
     if token_id:
         owned = _gamma_token_ids(gamma_market)
-        if owned and str(token_id).lower() not in owned:
+        if not owned:
+            reason_codes.append("token_membership_unavailable")
+            return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
+        match_count = sum(1 for t in owned if t == str(token_id).lower())
+        if match_count == 0:
             reason_codes.append("token_id_not_in_condition")
             return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
+        if match_count > 1:
+            reason_codes.append("token_membership_ambiguous")
+            return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
+
+    # --- metadata_version conflict (before building the merge). ------------
+    existing_version = existing.get("metadata_version")
+    if existing_version not in (None, "", METADATA_VERSION):
+        reason_codes.append("version_conflict")
+        # Preserve the original (do NOT rewrite version "2" -> "1").
+        return dict(existing), MERGE_CONFLICT, reason_codes
 
     new = build_canonical_metadata({}, gamma_market)
     new_taxonomy = new.get("taxonomy") or {}
@@ -270,11 +342,22 @@ def merge_canonical_metadata(
         existing_ns = existing.get(ns)
         new_ns = new[ns]
         if not isinstance(existing_ns, dict):
-            merged[ns] = new_ns
-            changed = True
+            # empty / None existing namespace -> fillable;
+            # a NON-EMPTY non-dict existing namespace -> conflict.
+            if existing_ns is None or (isinstance(existing_ns, (str, list, tuple, set, dict)) and not existing_ns):
+                merged[ns] = new_ns
+                changed = True
+            else:
+                conflict = True
+                reason_codes.append(f"{ns}_not_dict_conflict")
             continue
         merged_ns = dict(existing_ns)
         for k, v in new_ns.items():
+            if v is None or v == "" or (isinstance(v, (list, tuple, set, dict)) and not v):
+                # incoming Gamma field is absence of evidence (None, empty
+                # string, or empty collection): preserve an existing populated
+                # value; never a conflict and never a fill.
+                continue
             if k not in existing_ns:
                 # missing key in existing -> fillable
                 merged_ns[k] = v
@@ -300,8 +383,14 @@ def merge_canonical_metadata(
                     # existing is empty/None -> fillable from Gamma
                     merged_ns[k] = v
                     changed = True
+                elif not isinstance(ev, (str, int, float, bool)) or not isinstance(
+                    v, (str, int, float, bool)
+                ):
+                    # a non-empty namespace field of the wrong type -> conflict
+                    conflict = True
+                    reason_codes.append(f"{ns}_{k}_type_conflict")
                 else:
-                    # both non-empty and differing -> block (fail closed)
+                    # both non-empty scalars and differing -> block (fail closed)
                     conflict = True
                     reason_codes.append(f"{ns}_{k}_conflict")
         if changed and not conflict:

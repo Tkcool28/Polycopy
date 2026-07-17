@@ -64,7 +64,10 @@ def _insert_trade(db, tid, condition, token=None, metadata=None, side="BUY"):
 GCOND = "0x" + "a" * 64
 GTOK = "0x" + "a" * 64
 GAMMA = {
-    "conditionId": GCOND, "tokenId": GTOK, "category": "Politics",
+    "conditionId": GCOND,
+    # ACTUAL Gamma shape: clobTokenIds as a JSON-encoded list string.
+    "clobTokenIds": json.dumps([GTOK, "0xf" + "0" * 63]),
+    "category": "Politics",
     "tags": ["election"],
     "events": [{"id": "e1", "slug": "us", "ticker": "US"}],
     "series": [], "question": "Who wins?", "slug": "us-election",

@@ -77,9 +77,14 @@ GTOK = "0x" + "e" * 64
 
 def _fake_resolver(_cid):
     return {
-        "conditionId": COND, "tokenId": GTOK, "category": "Politics",
-        "tags": ["election"], "events": [{"id": "e1", "slug": "us"}],
-        "series": [], "question": "Q", "slug": "us",
+        "conditionId": COND,
+        # ACTUAL Gamma shape: clobTokenIds as a JSON-encoded list string.
+        "clobTokenIds": json.dumps([GTOK, "0xf" + "0" * 63]),
+        "category": "Politics",
+        "tags": ["election"],
+        "events": [{"id": "e1", "slug": "us"}],
+        "series": [],
+        "question": "Q", "slug": "us",
         "outcomes": ["Yes", "No"], "outcomePrices": ["0.4", "0.6"],
     }
 

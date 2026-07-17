@@ -25,7 +25,11 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from polycopy.db.database import Database
 from polycopy.ingestion import ingest_pipeline
-from polycopy.ingestion.canonical_metadata import merge_canonical_metadata
+from polycopy.ingestion.canonical_metadata import (
+    MERGE_FILLED,
+    MERGE_UNCHANGED,
+    merge_canonical_metadata,
+)
 from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
 from polycopy.ingestion.source_trade_enrichment import enrich_source_trade
 from polycopy.ingestion.source_trade_writer import write_valid_rows
@@ -267,10 +271,11 @@ async def collect_evidence(
                         condition_id=rdict["market_source_id"] or "",
                         token_id=rdict.get("token_id"),
                     )
-                    db.conn.execute(
-                        "UPDATE source_trades SET metadata_json=? WHERE id=?",
-                        (json.dumps(new_meta, sort_keys=True), rid),
-                    )
+                    if _st in (MERGE_FILLED, MERGE_UNCHANGED):
+                        db.conn.execute(
+                            "UPDATE source_trades SET metadata_json=? WHERE id=?",
+                            (json.dumps(new_meta, sort_keys=True), rid),
+                        )
 
         # Update watchlist last_collection_at.
         db.conn.execute(
