@@ -49,26 +49,22 @@ def _make_db(tmp_path: Path) -> Database:
 
 def _full_chain(db: Database, *, outcome: str = "Yes"):
     aid = create_approval_for_target(db)
-    trade = make_target_trade(outcome="Yes")  # bridge accepts a Yes trade
+    # Build the target trade with the EXACT canonical outcome. The bridge now
+    # accepts both binary outcomes (Yes/No) through the real dispatch path, so
+    # a BUY-No trade hydrates to the No outcome honestly — no post-dispatch
+    # outcome mutation is performed or tolerated.
+    trade = make_target_trade(outcome=outcome)
     ing = ingest_target_trade(db, trade=trade)
+    target_stid = trade["source_trade_id"]
+    target_iid = ing["source_trade_internal_id"]
     deps = bridge_dependencies()
     res = dispatch_one(
-        db, approval_id=aid, source_trade_internal_id=ing["source_trade_internal_id"],
+        db, approval_id=aid, source_trade_internal_id=target_iid,
         gamma_resolver=deps.gamma.get_market, clob_provider=deps.clob, dry_run=False,
     )
     db.commit()
-    # The execution spine threads the *persisted* source-trade outcome into the
-    # paper order/position. To prove a "No" outcome is carried honestly (and not
-    # hardcoded "Yes"), flip the source trade's persisted outcome to the desired
-    # value. The bridge's candidate/signal decision is unaffected (it already
-    # produced a signal); only the downstream execution provenance is exercised.
-    if outcome != "Yes":
-        db.execute(
-            "UPDATE source_trades SET outcome=? WHERE id=?",
-            (outcome, ing["source_trade_internal_id"]),
-        )
-        db.commit()
-    return aid, res
+    assert res.status == "execution_pending", (res.status, res.reason_codes)
+    return aid, res, target_stid, target_iid
 
 
 def _authorize(db: Database, aid, disp):
@@ -108,7 +104,7 @@ def _risk_rows(db: Database, psd: int) -> list[dict]:
 # --------------------------------------------------------------------------- #
 def test_no_outcome_lifecycle(tmp_path):
     db = _make_db(tmp_path)
-    aid, disp = _full_chain(db, outcome="No")
+    aid, disp, _stid, _iid = _full_chain(db, outcome="No")
     _authorize(db, aid, disp)
     ex = _execute(db, disp)
     assert ex.status == "executed", ex.rejection_reasons
@@ -140,7 +136,7 @@ def test_no_outcome_lifecycle(tmp_path):
 
 def test_yes_outcome_still_works(tmp_path):
     db = _make_db(tmp_path)
-    aid, disp = _full_chain(db, outcome="Yes")
+    aid, disp, _stid, _iid = _full_chain(db, outcome="Yes")
     _authorize(db, aid, disp)
     ex = _execute(db, disp)
     assert ex.status == "executed", ex.rejection_reasons
@@ -159,12 +155,103 @@ def test_yes_outcome_still_works(tmp_path):
     assert so.status == "settled" and so.is_winner is True
 
 
+def test_buy_no_true_end_to_end(tmp_path):
+    """Real full-pipeline BUY-No: approved specialist -> canonical source trade
+    side=BUY outcome=No -> enrichment -> durable dispatch -> bridge candidate
+    -> wallet/category/copyability decisions -> paper signal -> execution auth
+    -> paper order outcome=No -> paper position outcome=No -> settlement NO=win.
+
+    No post-dispatch outcome mutation. Asserts the exact artifact counts.
+    """
+    db = _make_db(tmp_path)
+    aid, disp, _stid, _iid = _full_chain(db, outcome="No")
+    assert disp.paper_signal_verdict == "copy_candidate"
+    psd = disp.paper_signal_decision_id
+
+    # ── Required counts after dispatch + bridge (target trade scoped) ──
+    assert _count(db, "source_trades", f"id='{_iid}'") == 1
+    assert _count(db, "source_trade_enrichments") == 1
+    assert _count(db, "approved_specialist_trade_dispatches") == 1
+    assert _count(db, "copy_candidates") == 1
+    assert _count(db, "candidate_price_snapshots") == 1
+    assert _count(db, "wallet_score_decisions") == 1
+    assert _count(db, "category_wallet_score_decisions") == 1
+    assert _count(db, "trade_copyability_decisions") == 1
+    assert _count(db, "paper_signal_decisions") == 1
+
+    auth_id = _authorize(db, aid, disp)
+    assert auth_id is not None
+
+    ex = _execute(db, disp)
+    assert ex.status == "executed", ex.rejection_reasons
+    assert ex.position_id is not None
+    psd = disp.paper_signal_decision_id
+    # The authorization's pre-execution risk decision is created at execution.
+    assert _count(db, "execution_risk_decisions",
+                  f"paper_signal_decision_id={psd}") == 1
+    assert _count(db, "paper_fills") == 1
+    assert _count(db, "paper_positions", f"paper_signal_decision_id={psd}") == 1
+    assert _count(db, "paper_position_lots",
+                  f"position_id='{ex.position_id}'") == 1
+
+    # ── Outcome provenance carried honestly through the spine ──
+    order = db.fetchone(
+        "SELECT outcome FROM paper_orders WHERE paper_signal_decision_id=?", (psd,))
+    pos = db.fetchone(
+        "SELECT outcome FROM paper_positions WHERE paper_signal_decision_id=?", (psd,))
+    assert order["outcome"] == "No", "paper order must carry source-trade No"
+    assert pos["outcome"] == "No", "paper position must carry source-trade No"
+
+    # ── Settlement NO = win for a No position ──
+    so = settle_specialist_position(
+        db, ex.position_id, resolution_outcome="No", evidence_source="authoritative")
+    db.commit()
+    assert so.status == "settled", so
+    assert so.is_winner is True, "No position resolved NO must win"
+    assert so.realized_pnl is not None and so.realized_pnl > 0
+    assert _count(db, "paper_position_settlements",
+                  f"position_id='{ex.position_id}'") == 1
+
+    # ── Settlement YES = LOSS for a No position (no second row) ──
+    so2 = settle_specialist_position(
+        db, ex.position_id, resolution_outcome="Yes", evidence_source="authoritative")
+    assert so2.status == "conflict", "No position cannot flip to YES"
+    assert so2.realized_pnl == so.realized_pnl, "conflict must preserve original P&L"
+    assert _count(db, "paper_position_settlements",
+                  f"position_id='{ex.position_id}'") == 1
+
+
+def test_buy_no_replay_no_duplicates(tmp_path):
+    """Replaying the same BUY-No source trade must not duplicate any artifact."""
+    db = _make_db(tmp_path)
+    aid, disp, _stid, _iid = _full_chain(db, outcome="No")
+    _authorize(db, aid, disp)
+    first = _execute(db, disp)
+    assert first.status == "executed", first.rejection_reasons
+    psd = disp.paper_signal_decision_id
+
+    # Replay the SAME BUY-No source trade -> idempotent, no new artifacts.
+    deps = bridge_dependencies()
+    replay_disp = dispatch_one(
+        db, approval_id=aid, source_trade_internal_id=_iid,
+        gamma_resolver=deps.gamma.get_market, clob_provider=deps.clob, dry_run=False,
+    )
+    assert replay_disp.status == "execution_pending"
+    replay = _execute(db, replay_disp)
+    assert replay.status == "already_executed"
+    assert _count(db, "paper_orders", f"paper_signal_decision_id={psd}") == 1
+    assert _count(db, "paper_positions", f"paper_signal_decision_id={psd}") == 1
+    assert _count(db, "paper_fills") == 1
+    assert _count(db, "copy_candidates") == 1
+    assert _count(db, "source_trades", f"id='{_iid}'") == 1
+
+
 # --------------------------------------------------------------------------- #
 # Fix 2 — retryable blocked execution                                          #
 # --------------------------------------------------------------------------- #
 def test_blocked_risk_retry_succeeds(tmp_path):
     db = _make_db(tmp_path)
-    aid, disp = _full_chain(db)
+    aid, disp, _stid, _iid = _full_chain(db)
     auth_id = _authorize(db, aid, disp)
     psd = disp.paper_signal_decision_id
 
@@ -196,7 +283,7 @@ def test_blocked_risk_retry_succeeds(tmp_path):
 
 def test_stale_snapshot_retry_succeeds(tmp_path):
     db = _make_db(tmp_path)
-    aid, disp = _full_chain(db)
+    aid, disp, _stid, _iid = _full_chain(db)
     _authorize(db, aid, disp)
     psd = disp.paper_signal_decision_id
     snap_id = db.fetchone(
@@ -230,7 +317,7 @@ def test_stale_snapshot_retry_succeeds(tmp_path):
 # Fix 3 — settlement conflict detection                                        #
 # --------------------------------------------------------------------------- #
 def _run_lifecycle_to_position(db, outcome: str = "Yes"):
-    aid, disp = _full_chain(db, outcome=outcome)
+    aid, disp, _stid, _iid = _full_chain(db, outcome=outcome)
     _authorize(db, aid, disp)
     ex = _execute(db, disp)
     assert ex.status == "executed", ex.rejection_reasons
@@ -317,7 +404,7 @@ def test_v20_migration_preserves_risk_decisions(tmp_path):
     db_path = tmp_path / "mig.db"
     db = Database(db_path).connect()
     seed_resolved_evidence(db)
-    aid, disp = _full_chain(db)
+    aid, disp, _stid, _iid = _full_chain(db)
     _authorize(db, aid, disp)
     psd = disp.paper_signal_decision_id
     cand_id = disp.candidate_id

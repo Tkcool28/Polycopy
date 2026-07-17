@@ -40,6 +40,32 @@ MAX_LIMIT = 10
 # PR25A: bounded evidence capture; this is deliberately the existing frozen
 # depth-normalization limit rather than a bridge-specific widening.
 BRIDGE_MAX_DEPTH_LEVELS_PER_SIDE = DEFAULT_MAX_LEVELS_PER_SIDE
+
+# Canonical binary-outcome vocabulary. Polymarket binary markets resolve to
+# exactly one of these two labels; the bridge must carry the EXACT canonical
+# source-trade outcome and must fail closed for anything else (blank, missing,
+# ambiguous, or unsupported). Normalization is case-insensitive to the
+# canonical "Yes"/"No" label (consistent with settlement's YES/NO handling).
+SUPPORTED_BINARY_OUTCOMES = frozenset({"Yes", "No"})
+
+
+def normalize_binary_outcome(label: Any) -> str | None:
+    """Return the canonical binary outcome label or ``None`` if unsupported.
+
+    Accepts the source-trade shapes ("Yes"/"No"/"YES"/"NO") and maps them to the
+    canonical title-case label. Returns ``None`` for blank, missing, or any
+    non-binary outcome so callers fail closed rather than inventing a label.
+    """
+    if label is None:
+        return None
+    normalized = str(label).strip().title()
+    if normalized in SUPPORTED_BINARY_OUTCOMES:
+        return normalized
+    # Tolerate upper-case evidence forms (YES/NO) without manufacturing a value.
+    up = str(label).strip().upper()
+    if up in ("YES", "NO"):
+        return "Yes" if up == "YES" else "No"
+    return None
 ALLOWED_WRITE_TABLES = frozenset(
     {
         "wallets",
@@ -221,6 +247,12 @@ def _hydrate(
     )
     if not condition or not token or not label:
         return None, None, "missing_condition_token_or_outcome"
+    # Fail closed for blank/unsupported/missing outcome vocabulary before any
+    # Gamma/CLOB work. The bridge carries the EXACT canonical source-trade
+    # outcome; it never manufactures or substitutes a different label.
+    canonical = normalize_binary_outcome(label)
+    if canonical is None:
+        return None, None, "unsupported_outcome"
     if market is None:
         try:
             market = _await(gamma.get_market(condition))
@@ -237,7 +269,10 @@ def _hydrate(
     ]
     if len(matches) != 1:
         return None, None, "outcome_missing" if not matches else "outcome_ambiguous"
-    if str(getattr(matches[0], "label", "")) != label:
+    # The matched market outcome's canonical label must agree with the
+    # canonical source-trade outcome. Both supported binary outcomes pass here
+    # when the market is a real binary market (distinct Yes/No tokens).
+    if normalize_binary_outcome(getattr(matches[0], "label", "")) != canonical:
         return None, None, "outcome_label_conflict"
     return market, matches[0], None
 

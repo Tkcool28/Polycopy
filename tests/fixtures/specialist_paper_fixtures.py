@@ -47,11 +47,18 @@ def _iso(days_ago: int) -> str:
 # Deterministic external stubs (no live HTTP)                                  #
 # --------------------------------------------------------------------------- #
 class _FakeOutcome:
-    def __init__(self, token_id: str) -> None:
+    def __init__(self, token_id: str, label: str = "Yes") -> None:
         self.clob_token_id = token_id
-        self.label = "Yes"
+        self.label = label
         self.price = 0.5
         self.volume = 100.0
+
+
+# Canonical "No" outcome token for the binary fixture market. Distinct from the
+# "Yes" token (the condition id) so a real BUY-No trade hydrates to the No
+# outcome and a real BUY-Yes trade hydrates to the Yes outcome — exactly as a
+# production Polymarket binary market exposes two tokens.
+BUY_NO_TOKEN = "0x" + "e" * 64
 
 
 import collections.abc  # noqa: E402
@@ -73,7 +80,10 @@ class _FakeMarket(collections.abc.Mapping):
         self.end_date = datetime.now(timezone.utc) + timedelta(days=10)
         self.fetched_at = datetime.now(timezone.utc)
         self.is_sample = False
-        self.outcomes = [_FakeOutcome(token_id)]
+        self.outcomes = [
+            _FakeOutcome(token_id, label="Yes"),
+            _FakeOutcome(BUY_NO_TOKEN, label="No"),
+        ]
         # Trusted PR66 taxonomy/event provenance as a real Gamma market carries.
         self.category = "politics"
         self.tags = ["politics"]
@@ -196,6 +206,10 @@ def make_target_trade(side: str = "BUY", *, with_taxonomy: bool = True,
                       resolved: Optional[bool] = None, outcome: str = "Yes") -> dict[str, Any]:
     """Build the dict for the ONE trade the collector will ingest as the target."""
     cond = "0x" + "f" * 64  # valid 0x-prefixed 64-hex condition id
+    # Use the market's No token for a No outcome so the bridge hydrates it to
+    # the No outcome (binary market has distinct Yes/No tokens). Yes uses the
+    # condition-id token.
+    token_id = BUY_NO_TOKEN if outcome == "No" else cond
     meta = (
         {"taxonomy": {"raw_category": SPECIALIST_CATEGORY},
          "event": {"id": "evttarget", "slug": "event-target"}}
@@ -213,7 +227,7 @@ def make_target_trade(side: str = "BUY", *, with_taxonomy: bool = True,
         "trader_address": FIXED_WALLET,
         "timestamp": _iso(2),
         "is_sample": 0,
-        "token_id": "0x" + "f" * 64,  # valid 0x-prefixed 64-hex token id
+        "token_id": token_id,  # valid 0x-prefixed 64-hex token id (No token for No outcome)
         "metadata_json": json.dumps(meta),
     }
     if resolved is not None:

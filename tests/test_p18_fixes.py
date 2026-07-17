@@ -14,10 +14,6 @@ from polycopy.api.app import app
 
 MARKET_ID = "00000000-0000-0000-0000-000000000001"
 WALLET_ID = "00000000-0000-0000-0000-000000000002"
-# Was hardcoded "2026-06-28T12:00:00+00:00"; now dynamic so seeded orders
-# never expire past order_preview_max_age_seconds once wall-clock passes
-# that hardcoded value.
-NOW = datetime.now(timezone.utc).isoformat()
 
 
 def _reset_app_state(monkeypatch, tmp_path):
@@ -57,14 +53,21 @@ def _reset_app_state(monkeypatch, tmp_path):
 
 def _seed_pending_order(order_id: str, *, market_id: str = MARKET_ID, status: str = "pending") -> None:
     from polycopy.db.database import get_database
+    # Compute the seed timestamp at CALL time, not at module import. The approve
+    # endpoint enforces staleness_seconds (120s) and order_preview_max_age_seconds
+    # (3600s) against the order's created_at. In a long full-suite run the import-
+    # frozen NOW would already be expired by the time these tests execute, causing
+    # spurious 409 / "skip" decision failures. Seeding relative to the execution
+    # moment keeps the order fresh regardless of suite duration or collection order.
+    now_iso = datetime.now(timezone.utc).isoformat()
     db = get_database()
     db.execute(
         "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, ?, ?)",
-        (WALLET_ID, "0xtest", "test", 0, NOW),
+        (WALLET_ID, "0xtest", "test", 0, now_iso),
     )
     db.execute(
         "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
-        (market_id, "m1", "test", "Test Q", NOW, 0),
+        (market_id, "m1", "test", "Test Q", now_iso, 0),
     )
     db.execute(
         """
@@ -73,7 +76,7 @@ def _seed_pending_order(order_id: str, *, market_id: str = MARKET_ID, status: st
              status, filled_quantity, created_at, updated_at, is_sample)
         VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 10.0, 0.65, ?, 0.0, ?, ?, 0)
         """,
-        (order_id, market_id, WALLET_ID, status, NOW, NOW),
+        (order_id, market_id, WALLET_ID, status, now_iso, now_iso),
     )
     db.conn.commit()
 
