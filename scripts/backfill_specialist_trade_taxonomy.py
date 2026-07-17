@@ -80,6 +80,7 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MERGE_UNAVAILABLE,
     merge_canonical_metadata,
 )
+from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     CATEGORY_TAXONOMY_PARTIAL,
     CATEGORY_TAXONOMY_USABLE,
@@ -93,8 +94,16 @@ from evidence_db import (  # noqa: E402
     require_write_gates,
 )
 
-# Canonical source column value for Polymarket.
-POLYMARKET_SOURCE = "polymarket"
+# Canonical approved-wallet ingestion source (the authoritative writer used by
+# source_trade_writer / ingest_real_source_trades / approved-wallet bridge).
+# We accept this value plus other repository-PROVEN Polymarket source_trades
+# writers — exact values only, never fuzzy matching or id prefixes.
+#   * "polymarket_data_api_trades_user" -> SOURCE_NAME (canonical approved wallet)
+#   * "polymarket_clob"                 -> collect_smart_money_data._persist_trade
+# A bare "polymarket" literal is NOT a proven source_trades writer value here
+# (it is used for the markets/raw_snapshots tables), so it is intentionally
+# excluded unless future repository evidence proves otherwise.
+POLYMARKET_SOURCES = frozenset({SOURCE_NAME, "polymarket_clob"})
 
 PRODUCTION_DB_PATH = (REPO_ROOT / "data" / "polycopy.db").resolve()
 
@@ -192,12 +201,14 @@ def _select_trades(
     """
     # Polymarket-only is enforced on the canonical source column, not merely an
     # id prefix (a non-Polymarket row with a polymarket-looking id is excluded).
+    # Only repository-PROVEN Polymarket source_trades writer values are accepted.
+    placeholders = ", ".join("?" for _ in POLYMARKET_SOURCES)
     clauses = [
         "side = 'BUY'",
         "is_sample = 0",
-        "source = ?",
+        f"source IN ({placeholders})",
     ]
-    params: list[Any] = [POLYMARKET_SOURCE]
+    params: list[Any] = list(POLYMARKET_SOURCES)
     if args.source_trade_id:
         clauses.append("id = ?")
         params.append(args.source_trade_id)
@@ -302,6 +313,7 @@ def _build_evidence(
     gamma: Optional[dict[str, Any]],
     merge_status: str,
     gamma_result: GammaResult,
+    merge_reasons: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Build the honest current provenance payload (no scoring authority)."""
     # canonical_meta may be the raw preserved value (a malformed string) on
@@ -311,13 +323,19 @@ def _build_evidence(
         classification = classify_category_taxonomy(safe_meta)
     except Exception:
         classification = None
-    normalized_category = (
-        classification.category_label
-        if (classification is not None
-            and str(classification.status) == CATEGORY_TAXONOMY_USABLE
-            and classification.category_label)
-        else None
+    # normalized_category may be populated ONLY when the merge is filled/unchanged
+    # AND the canonical taxonomy classification is usable. On conflict/unavailable
+    # it MUST remain NULL (we never claim a usable normalized taxonomy).
+    usable = (
+        classification is not None
+        and str(classification.status) == CATEGORY_TAXONOMY_USABLE
+        and classification.category_label
     )
+    if merge_status in (MERGE_FILLED, MERGE_UNCHANGED) and usable:
+        normalized_category = classification.category_label
+    else:
+        normalized_category = None
+
     # High-level status vocabulary for source_trade_enrichments.status.
     # A provider/network error takes precedence over an (unavailable) merge
     # result so it is never conflated with an ordinary gamma_missing.
@@ -332,15 +350,26 @@ def _build_evidence(
     else:
         status = "incomplete"
 
+    # market_slug only from a non-empty authoritative Gamma "slug" field.
+    # Never fall back to question/title text.
     slug = None
     if gamma is not None:
-        slug = gamma.get("slug") or gamma.get("question")
+        raw_slug = gamma.get("slug")
+        if isinstance(raw_slug, str) and raw_slug.strip():
+            slug = raw_slug
 
     # token_id from the SOURCE TRADE, never from Gamma's clobTokenIds.
     token_id = trade.get("token_id")
     condition_id = trade.get("market_source_id") or ""
 
-    reason_codes = [f"merge:{merge_status}", f"gamma:{gamma_result.state}"]
+    # Persist the EXACT merge reason codes (do not discard them), alongside the
+    # merge status, gamma state, and any provider-specific reason.
+    reason_codes: list[str] = []
+    for r in (merge_reasons or []):
+        if r and r not in reason_codes:
+            reason_codes.append(r)
+    reason_codes.append(f"merge:{merge_status}")
+    reason_codes.append(f"gamma:{gamma_result.state}")
     if gamma_result.state == "provider_error":
         reason_codes.append("provider_error")
     if gamma_result.reason:
@@ -467,7 +496,7 @@ async def _run_async(
         gamma_result = gamma_by_cid.get(cid, GammaResult("not_found"))
         gamma = gamma_result.market if gamma_result.state == "found" else None
 
-        new_meta, merge_status, _reasons = merge_canonical_metadata(
+        new_meta, merge_status, merge_reasons = merge_canonical_metadata(
             t["metadata_json"], gamma,
             condition_id=t["market_source_id"] or "", token_id=t.get("token_id"),
         )
@@ -498,7 +527,8 @@ async def _run_async(
                     (json.dumps(new_meta, sort_keys=True), t["id"]),
                 )
             # Build honest provenance from canonical + source-trade values.
-            ev = _build_evidence(t, new_meta, gamma, merge_status, gamma_result)
+            ev = _build_evidence(t, new_meta, gamma, merge_status, gamma_result,
+                                 merge_reasons=merge_reasons)
             changed, _is_new = _write_provenance(db, t, ev, merge_status)
             if changed:
                 counts["written"] += 1

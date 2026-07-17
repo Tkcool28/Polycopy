@@ -37,8 +37,16 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     merge_canonical_metadata,
     MERGE_FILLED,
 )
+from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
 
 CLI = "backfill_specialist_trade_taxonomy"
+
+# Repository-PROVEN Polymarket source_trades writer values (exact, no prefixes).
+CANON_SOURCE = SOURCE_NAME                      # "polymarket_data_api_trades_user"
+ALT_POLY_SOURCE = "polymarket_clob"             # collect_smart_money_data._persist_trade
+# A bare "polymarket" literal is NOT a proven source_trades writer here, so it
+# must be excluded (used only for markets/raw_snapshots tables).
+UNSUPPORTED_SOURCE = "polymarket"
 
 WADDR = "0x" + "a" * 40
 WUUID = "uuid-wallet-1"
@@ -116,14 +124,14 @@ def _seed_watch(db, wid=WUUID, watch_id=WATCH_ID, status="active"):
 
 
 def _insert_trade(db, tid, condition, token=None, metadata=None, side="BUY",
-                  sample=0, source="polymarket", address=WADDR):
+                  sample=0, source=CANON_SOURCE, address=WADDR):
     db.conn.execute(
         "INSERT INTO source_trades("
-        "id, source, source_trade_id, market_source_id, side, "
+        "id, source, source_trade_id, market_source_id, token_id, side, "
         "outcome, quantity, price, trader_address, timestamp, is_sample, "
         "metadata_json) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, source, tid, condition, side, "Yes", 10.0, 0.40, address,
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (tid, source, tid, condition, token, side, "Yes", 10.0, 0.40, address,
          "2026-02-01T00:00:00Z", sample,
          json.dumps(metadata or {}, sort_keys=True)),
     )
@@ -613,26 +621,39 @@ def test_real_cli_bare_list_clobtokenids_orchestration():
 
 
 def test_production_refusal_absolute_path_before_db_open():
-    calls = {"open_readonly": 0, "get_market_raw": 0}
+    calls = {"open_readonly": 0, "open_writable": 0, "make_adapter": 0,
+             "get_market_raw": 0}
     prod_abs = str(ROOT / "data" / "polycopy.db")
 
-    def _no_open(*a, **k):
+    def _no_open_readonly(*a, **k):
         calls["open_readonly"] += 1
         raise AssertionError("open_readonly must not run before refusal")
 
-    with mock.patch("evidence_db.open_readonly", side_effect=_no_open), \
+    def _no_open_writable(*a, **k):
+        calls["open_writable"] += 1
+        raise AssertionError("open_writable must not run before refusal")
+
+    def _no_make_adapter(*a, **k):
+        calls["make_adapter"] += 1
+        raise AssertionError("_make_adapter must not run before refusal")
+
+    import importlib
+
+    mod = importlib.import_module(CLI)
+    with mock.patch.object(mod, "open_readonly", side_effect=_no_open_readonly), \
+         mock.patch.object(mod, "open_writable", side_effect=_no_open_writable), \
+         mock.patch.object(mod, "_make_adapter", side_effect=_no_make_adapter), \
          mock.patch(
              "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
              new=lambda self, mid: (_ for _ in ()).throw(
                  AssertionError("no network"))):
-        import importlib
-
-        mod = importlib.import_module(CLI)
         rc = mod.main(
             ["--db-path", prod_abs, "--write", "--source-trade-id", "polymarket:x"]
         )
     assert rc != 0, "production write without gate must be refused"
     assert calls["open_readonly"] == 0, "DB must not open before refusal"
+    assert calls["open_writable"] == 0, "writable DB must not open before refusal"
+    assert calls["make_adapter"] == 0, "adapter must not be built before refusal"
     assert calls["get_market_raw"] == 0, "provider must not be called before refusal"
 
 
@@ -893,6 +914,218 @@ def test_per_trade_rollback_on_provenance_failure():
         "metadata change must roll back when provenance fails"
     # No enrichment row leaked from the failed trade.
     assert _enrich(db, "polymarket:t1") is None
+    db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FINAL S3 SOURCE/P provenance corrections
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_canonical_approved_wallet_row_selected_and_backfilled():
+    # A row with the canonical approved-wallet source
+    # "polymarket_data_api_trades_user" MUST be selected and enriched.
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "poly:t1", GCOND, GTOK_A, {}, source=CANON_SOURCE)
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "poly:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    m = _meta(db, "poly:t1")
+    assert m["taxonomy"]["raw_category"] == "Politics", m
+    row = _enrich(db, "poly:t1")
+    assert row is not None, "canonical source row must be enriched"
+    db.close()
+
+
+def test_alternate_proven_polymarket_clob_source_selected():
+    # A legitimate legacy repository writer value ("polymarket_clob") must also
+    # be selected and backfilled.
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "poly:t2", GCOND, GTOK_A, {}, source=ALT_POLY_SOURCE)
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "poly:t2", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "poly:t2")
+    assert row is not None, "polymarket_clob source row must be enriched"
+    db.close()
+
+
+def test_unsupported_polymarket_literal_source_excluded():
+    # A bare source="polymarket" literal is NOT a proven source_trades writer;
+    # even though its id looks Polymarket, it must be excluded. A legitimate
+    # canonical row seeded alongside must still be selected.
+    db, _ = _open()
+    _seed_wallet(db)
+    db.conn.execute(
+        "INSERT INTO source_trades("
+        "id, source, source_trade_id, market_source_id, side, "
+        "outcome, quantity, price, trader_address, timestamp, is_sample, "
+        "metadata_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("poly:lookalike", UNSUPPORTED_SOURCE, "polymarket:lookalike", GCOND,
+         "BUY", "Yes", 10.0, 0.40, WADDR, "2026-02-01T00:00:00Z", 0,
+         json.dumps({}, sort_keys=True)),
+    )
+    db.conn.commit()
+    _insert_trade(db, "poly:t1", GCOND, GTOK_A, {}, source=CANON_SOURCE)
+    base = str(db.db_path)
+    counter = {"n": 0}
+    rc = _run(base,
+              ["--wallet-id", WUUID, "--write", "--confirm-production-db"], counter)
+    assert rc == 0, rc
+    # Only the canonical row is enriched; the bare "polymarket" row excluded.
+    assert _enrich(db, "poly:t1") is not None
+    assert _enrich(db, "poly:lookalike") is None, \
+        "unsupported 'polymarket' source row must be excluded"
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM source_trade_enrichments"
+    ).fetchone()[0]
+    assert n == 1, n
+    db.close()
+
+
+def test_non_polymarket_source_with_polymarket_id_excluded():
+    # A non-Polymarket source row whose source_trade_id LOOKS like polymarket
+    # must be excluded (exact-source contract).
+    db, _ = _open()
+    _seed_wallet(db)
+    db.conn.execute(
+        "INSERT INTO source_trades("
+        "id, source, source_trade_id, market_source_id, side, "
+        "outcome, quantity, price, trader_address, timestamp, is_sample, "
+        "metadata_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("kalshi:t1", "kalshi", "polymarket:lookalike", GCOND, "BUY", "Yes",
+         10.0, 0.40, WADDR, "2026-02-01T00:00:00Z", 0,
+         json.dumps({}, sort_keys=True)),
+    )
+    db.conn.commit()
+    _insert_trade(db, "poly:t1", GCOND, GTOK_A, {}, source=CANON_SOURCE)
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--wallet-id", WUUID, "--write", "--confirm-production-db"],
+              {"n": 0})
+    assert rc == 0, rc
+    assert _enrich(db, "kalshi:t1") is None, \
+        "non-Polymarket row must be excluded"
+    assert _enrich(db, "poly:t1") is not None
+    db.close()
+
+
+def test_merge_reason_codes_persisted_exactly_unavailable():
+    # An unavailable merge (token not in condition) must preserve its exact
+    # reason code in reason_codes_json.
+    db, _ = _open()
+    _seed_wallet(db)
+    # Token GTOK_B does NOT belong to GCOND's clobTokenIds in the Gamma payload
+    # (GCOND has [GTOK_A, GTOK_B] -> actually belongs). Use a token not in it.
+    foreign_tok = "0x" + "9" * 64
+    _insert_trade(db, "poly:t1", GCOND, foreign_tok, {})
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "poly:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "poly:t1")
+    rc_json = json.loads(row["reason_codes_json"])
+    assert "token_id_not_in_condition" in rc_json, rc_json
+    assert "merge:unavailable" in rc_json, rc_json
+    db.close()
+
+
+def test_merge_conflict_reason_preserved_exactly():
+    # A conflict (existing Sports vs Gamma Politics) must preserve its exact
+    # conflict reason (version_conflict) and not claim a normalized category.
+    db, _ = _open()
+    _seed_wallet(db)
+    existing = {"taxonomy": {"raw_category": "Sports"}, "version": 1}
+    _insert_trade(db, "poly:t1", GCOND, GTOK_A,
+                  existing)
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "poly:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "poly:t1")
+    rc_json = json.loads(row["reason_codes_json"])
+    assert any("version_conflict" in c or "taxonomy_raw_category_conflict" in c
+               for c in rc_json), rc_json
+    assert "merge:conflict" in rc_json, rc_json
+    db.close()
+
+
+def test_conflict_normalized_category_is_null():
+    # When existing Sports conflicts with Gamma Politics, normalized_category
+    # MUST be NULL and taxonomy_status must be unavailable; reasons recorded.
+    db, _ = _open()
+    _seed_wallet(db)
+    existing = {"taxonomy": {"raw_category": "Sports"}, "version": 1}
+    _insert_trade(db, "poly:t1", GCOND, GTOK_A, existing)
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "poly:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "poly:t1")
+    assert row["normalized_category"] is None, \
+        "normalized_category must be NULL on conflict"
+    assert row["taxonomy_status"] == "unavailable", row
+    assert row["status"] == "conflict", row
+    rc_json = json.loads(row["reason_codes_json"])
+    assert any("version_conflict" in c or "taxonomy_raw_category_conflict" in c
+               for c in rc_json), rc_json
+    db.close()
+
+
+def test_slug_without_question_fallback():
+    # A Gamma payload with a question but NO slug must store market_slug=NULL
+    # (never fall back to question/title text).
+    db, _ = _open()
+    _seed_wallet(db)
+    cond = "0x" + "f" * 64
+    tok = "0x" + "f" * 64
+    GAMMA[cond] = {
+        "conditionId": cond,
+        "clobTokenIds": [tok, "0xf" + "0" * 63],
+        "category": "Politics",
+        "tags": ["x"],
+        "events": [{"id": "e1", "slug": "us"}],
+        "series": [],
+        "question": "Will this have a slug?",
+        # NO "slug" key on purpose
+        "outcomes": ["Yes", "No"],
+        "outcomePrices": ["0.5", "0.5"],
+    }
+    _insert_trade(db, "poly:t1", cond, tok, {})
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "poly:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "poly:t1")
+    assert row["market_slug"] is None, \
+        "market_slug must be NULL when Gamma has no slug (no question fallback)"
+    db.close()
+
+
+def test_slug_present_when_gamma_has_slug():
+    # When Gamma has a real slug, market_slug is persisted.
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "poly:t1", GCOND, GTOK_A, {})
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "poly:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "poly:t1")
+    assert row["market_slug"] == "us-election", row
     db.close()
 
 

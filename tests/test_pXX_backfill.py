@@ -29,8 +29,12 @@ from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     merge_canonical_metadata,
 )
+from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
 
 CLI = "backfill_specialist_trade_taxonomy"
+
+# Canonical approved-wallet source (the real repository writer value).
+CANON_SOURCE = SOURCE_NAME
 
 GCOND = "0x" + "a" * 64
 GTOK = "0x" + "a" * 64
@@ -84,14 +88,15 @@ def _seed_wallet(db, wid="uuid-w", address="0xgood000000000000000000000000000000
     db.conn.commit()
 
 
-def _insert_trade(db, tid, condition, token=None, metadata=None, side="BUY"):
+def _insert_trade(db, tid, condition, token=None, metadata=None, side="BUY",
+                  source=CANON_SOURCE):
     db.conn.execute(
         "INSERT INTO source_trades("
-        "id, source, source_trade_id, market_source_id, side, "
+        "id, source, source_trade_id, market_source_id, token_id, side, "
         "outcome, quantity, price, trader_address, timestamp, is_sample, "
         "metadata_json) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, "polymarket", tid, condition,
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (tid, source, tid, condition, token,
          side, "Yes", 10.0, 0.40,
          "0xgood0000000000000000000000000000000abc", "2026-02-01T00:00:00Z",
          0, json.dumps(metadata or {}, sort_keys=True)),
