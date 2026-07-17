@@ -116,6 +116,41 @@ async def _resolve(cond):
     return GAMMA_A if cond == COND_A else (GAMMA_B if cond == COND_B else None)
 
 
+class _RefreshProvider:
+    """Async get_market stub for the S4 refresh proof (no network)."""
+
+    def __init__(self, by_condition=None, errors=None):
+        self._cond = by_condition or {}
+        self._errors = errors or {}
+        self.calls = []
+
+    async def get_market(self, market_id):
+        self.calls.append(market_id)
+        if market_id in self._errors:
+            raise self._errors[market_id]
+        return self._cond.get(market_id)
+
+    async def aclose(self):
+        pass
+
+
+def _gamma_market(condition):
+    """Resolved Market where outcome 'Yes' (token A) wins."""
+    from datetime import datetime as _dt, timezone as _tz
+    from polycopy.domain.market import Market, MarketOutcome
+    tok = TOK_A if condition == COND_A else TOK_B
+    other = TOK_B if condition == COND_A else TOK_A
+    return Market(
+        source_id=condition, question="q",
+        outcomes=[
+            MarketOutcome(label="Yes", price=0.5, clob_token_id=tok),
+            MarketOutcome(label="No", price=0.5, clob_token_id=other),
+        ],
+        source="polymarket", active=False, closed=True, resolved=True,
+        resolution_outcome="Yes", fetched_at=_dt.now(_tz.utc),
+    )
+
+
 EXEC_TABLES = [
     "specialist_approvals",
     "approved_specialist_trade_dispatches",
@@ -172,9 +207,7 @@ def test_end_to_end_evidence_pipeline():
     refresh.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
          "--confirm-production-db", "--market-source-id", COND_A],
-        get_market=lambda cid: (
-            {"resolutionStatus": "resolved", "winner": TOK_A}
-            if cid == COND_A else None))
+        provider=_RefreshProvider(by_condition={COND_A: _gamma_market(COND_A)}))
     # 3) Rescore (frozen; honest incomplete without enough resolved evidence).
     ev.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
@@ -199,9 +232,12 @@ def test_end_to_end_evidence_pipeline():
         "SELECT COUNT(*) FROM source_trades WHERE json_extract(metadata_json,"
         "'$.taxonomy.raw_category') IS NOT NULL").fetchone()[0]
     assert tax == 2, tax
-    # Resolution refresh wrote onto source_trades (canonical truth).
+    # Resolution refresh wrote canonical settlement onto source_trades
+    # (status is the settlement verdict won/lost, never the bare 'resolved'
+    # token the old parallel parser produced).
     resolved = db.conn.execute(
-        "SELECT COUNT(*) FROM source_trades WHERE resolution_status='resolved'"
+        "SELECT COUNT(*) FROM source_trades "
+        "WHERE resolution_status IN ('won','lost')"
     ).fetchone()[0]
     assert resolved == 1, resolved
     # Rescore persisted honest decisions.
@@ -223,9 +259,7 @@ def test_end_to_end_evidence_pipeline():
     refresh.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
          "--confirm-production-db", "--market-source-id", COND_A],
-        get_market=lambda cid: (
-            {"resolutionStatus": "resolved", "winner": TOK_A}
-            if cid == COND_A else None))
+        provider=_RefreshProvider(by_condition={COND_A: _gamma_market(COND_A)}))
     ev.main(
         ["--db-path", str(db.db_path), "--write", "--allow-live",
          "--confirm-production-db", "--wallet-id", WID])

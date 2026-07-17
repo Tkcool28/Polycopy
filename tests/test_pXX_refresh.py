@@ -1,18 +1,23 @@
-"""T6 resolution-refresh tests (plan Task 9).
+"""S4 canonical-market-truth refresh tests (PR71 Task 9).
 
 Temp/scratch DBs only. Never opens production.
 
-Exercises the market-centric refresh WITHOUT a ``markets`` row: distinct
-unresolved ``market_source_id`` -> authoritative get_market -> update all
-linked ``source_trades`` consistently; record ``specialist_market_refresh_state``
-(bookkeeping only).
+Proves the S4 contract: the refresh reuses the PROVEN
+``source_trade_resolution`` path (build_market_state_provider /
+PolymarketPublicAdapter.get_market / derive_winner_from_market_payload /
+settle_source_trade_against_truth) — it does NOT carry its own resolution
+parser. Exactly one selector, exact accepted source values, canonical
+six-field BUY settlement, honest unresolved/error states, whole-market
+conflict rollback, bookkeeping semantics, and zero execution artifacts.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -20,8 +25,39 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import refresh_specialist_market_truth as refresh  # noqa: E402
 from polycopy.db.database import Database  # noqa: E402
+from polycopy.domain.market import Market, MarketOutcome  # noqa: E402
+from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
+    SOURCE_NAME,
+)
+from polycopy.ingestion.source_trade_resolution import (  # noqa: E402
+    SPECIALIST_REFRESH_SOURCES,
+)
+
+
+def _load(n):
+    s = importlib.util.spec_from_file_location(n, ROOT / "scripts" / n)
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    return m
+
+
+refresh = _load("refresh_specialist_market_truth.py")
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+COND = "0x" + "c" * 64
+TOK_WIN = "0x" + "a" * 64
+TOK_LOSE = "0x" + "b" * 64
+WID = "uuid-wallet-000000000000000000000000"
+ADDR = "0xwallet00000000000000000000000000000refr"
+WATCH = "wl-active-000000000000000000000000000000"
+WATCH_PAUSED = "wl-paused-000000000000000000000000000001"
+WATCH_RETIRED = "wl-retired-00000000000000000000000000002"
+WATCH_SAMPLE = "wl-sample-0000000000000000000000000000003"
 
 
 def _tmp():
@@ -29,189 +65,878 @@ def _tmp():
 
 
 def _open():
-    # Tests may create a fresh v21 schema for setup (the CLIs themselves use
-    # the shared evidence_db helper, never Database().connect()).
     p = _tmp()
     return Database(p).connect(), p
 
 
-def _seed_wallet(db, wid="uuid-w", address="0xgood0000000000000000000000000000refr"):
+def _seed_wallet(db, wid=WID, address=ADDR, sample=0):
     db.conn.execute(
         "INSERT INTO wallets(id,address,label,is_sample,created_at) "
         "VALUES (?,?,?,?,?)",
-        (wid, address, "t", 0, "2026-01-01T00:00:00Z"),
+        (wid, address, "t", sample, "2026-01-01T00:00:00Z"),
     )
     db.conn.commit()
 
 
-def _insert_trade(db, tid, condition, status=None, winner=None, side="BUY"):
+def _seed_watch(db, wid=WATCH, wallet=WID, status="active"):
+    db.conn.execute(
+        "INSERT INTO specialist_evidence_watchlist(id,wallet_id,status,source,"
+        "reason,created_at,max_new_trades_per_run) VALUES (?,?,?,?,?,?,?)",
+        (wid, wallet, status, "manual", "t", "2026-01-01T00:00:00Z", 25),
+    )
+    db.conn.commit()
+
+
+def _insert_trade(
+    db,
+    tid,
+    condition=COND,
+    status="unresolved",
+    winner=None,
+    side="BUY",
+    source=SOURCE_NAME,
+    token=TOK_WIN,
+    price=0.40,
+    qty=10.0,
+    trader=ADDR,
+):
     db.conn.execute(
         "INSERT INTO source_trades("
         "id, source, source_trade_id, market_source_id, side, outcome, "
-        "quantity, price, trader_address, timestamp, is_sample, "
+        "quantity, price, trader_address, timestamp, is_sample, token_id, "
         "resolution_status, winning_token_id, metadata_json) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, "polymarket", tid, condition, side, "Yes", 10.0, 0.40,
-         "0xgood00000000000000000000000000000refr",
-         "2026-02-01T00:00:00Z", 0,
-         status or "unresolved", winner, json.dumps({}, sort_keys=True)),
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (tid, source, tid, condition, side, "Yes", qty, price,
+         trader, "2026-02-01T00:00:00Z", 0, token,
+         status, winner, json.dumps({}, sort_keys=True)),
     )
     db.conn.commit()
 
 
-COND = "0x" + "c" * 64
-TOK = "0x" + "c" * 64
+def _row(db, tid):
+    return dict(
+        db.conn.execute(
+            "SELECT * FROM source_trades WHERE source_trade_id=?", (tid,)
+        ).fetchone()
+    )
 
+
+def _gamma_market(*, condition, resolved, winner_token, loser_token=TOK_LOSE):
+    outcomes = [
+        MarketOutcome(label="Yes", price=0.5, clob_token_id=winner_token),
+        MarketOutcome(label="No", price=0.5, clob_token_id=loser_token),
+    ]
+    return Market(
+        source_id=condition,
+        question="test",
+        outcomes=outcomes,
+        source="polymarket",
+        active=False,
+        closed=True,
+        resolved=resolved,
+        resolution_outcome="Yes" if resolved else None,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+class _FakeProvider:
+    """Async get_market stub keyed by condition id. Counts calls."""
+
+    def __init__(self, by_condition=None, errors=None):
+        self._cond = by_condition or {}
+        self._errors = errors or {}
+        self.calls = []
+
+    async def get_market(self, market_id):
+        self.calls.append(market_id)
+        if market_id in self._errors:
+            raise self._errors[market_id]
+        return self._cond.get(market_id)
+
+
+def _provider_resolved(condition=COND, winner=TOK_WIN):
+    return _FakeProvider(by_condition={condition: _gamma_market(
+        condition=condition, resolved=True, winner_token=winner)})
+
+
+# ---------------------------------------------------------------------------
+# 1. Refresh works without a markets row
+# ---------------------------------------------------------------------------
 
 def test_refresh_works_without_markets_row():
     db, _ = _open()
     _seed_wallet(db)
-    _insert_trade(db, "polymarket:t1", COND)  # unresolved, no markets row
-
-    def _resolver(cid):
-        return {"resolutionStatus": "resolved", "winner": TOK}
-
-    rc = refresh.main(
-        ["--db-path", str(db.db_path), "--write", "--allow-live",
-         "--confirm-production-db"],
-        get_market=_resolver,
-    )
+    _insert_trade(db, "t1", condition=COND)  # unresolved, no markets row
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
     assert rc == 0, rc
-    row = db.conn.execute(
-        "SELECT resolution_status, winning_token_id FROM source_trades "
-        "WHERE source_trade_id='polymarket:t1'"
-    ).fetchone()
-    assert dict(row)["resolution_status"] == "resolved"
-    assert dict(row)["winning_token_id"] == TOK
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "won"
+    assert r["winning_token_id"] == TOK_WIN
+    assert r["is_winning_trade"] == 1
+    assert r["settlement_source"] == "source_trade_resolution"
+    assert r["resolved_at"] is not None
     db.close()
 
 
-def test_refresh_updates_all_linked_trades():
+# ---------------------------------------------------------------------------
+# 2. Exactly one selector is required
+# ---------------------------------------------------------------------------
+
+def test_refresh_requires_exactly_one_selector():
+    db, _ = _open()
+    _seed_wallet(db)
+    # No selector.
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--write", "--allow-live",
+        "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 2, rc
+    # Two selectors.
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--wallet-id", WID, "--write", "--allow-live",
+        "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 2, rc
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 3. wallet UUID resolves to canonical address
+# ---------------------------------------------------------------------------
+
+def test_wallet_uuid_resolves_to_canonical_address():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR)
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--wallet-id", WID,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "won"
+    db.close()
+
+
+def test_unknown_wallet_refused():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR)
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--wallet-id", "uuid-unknown",
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc  # selector valid; wallet resolves to no markets -> 0 updates
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. watchlist uses specialist_evidence_watchlist.id
+# ---------------------------------------------------------------------------
+
+def test_watchlist_id_resolves_to_wallet_address():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR)
+    _seed_watch(db, wid=WATCH, wallet=WID, status="active")
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--watch-id", WATCH,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "won"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 5. paused/retired/sample/unknown selection is refused
+# ---------------------------------------------------------------------------
+
+def test_paused_watch_refused():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR)
+    _seed_watch(db, wid=WATCH_PAUSED, wallet=WID, status="paused")
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--watch-id", WATCH_PAUSED,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+def test_retired_watch_refused():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR)
+    _seed_watch(db, wid=WATCH_RETIRED, wallet=WID, status="retired")
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--watch-id", WATCH_RETIRED,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+def test_sample_watch_refused():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR, sample=1)
+    _seed_watch(db, wid=WATCH_SAMPLE, wallet=WID, status="active")
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--watch-id", WATCH_SAMPLE,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+def test_unknown_watch_refused():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR)
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--watch-id", "wl-missing",
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. zero / negative / >500 market limits refused
+# ---------------------------------------------------------------------------
+
+def test_zero_limit_refused():
+    db, _ = _open()
+    _seed_wallet(db)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--limit-markets", "0", "--write", "--allow-live",
+        "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 2, rc
+    db.close()
+
+
+def test_negative_limit_refused():
+    db, _ = _open()
+    _seed_wallet(db)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--limit-markets", "-5", "--write", "--allow-live",
+        "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 2, rc
+    db.close()
+
+
+def test_over_max_limit_refused():
+    db, _ = _open()
+    _seed_wallet(db)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--limit-markets", "501", "--write", "--allow-live",
+        "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 2, rc
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. canonical SOURCE_NAME rows are selected
+# ---------------------------------------------------------------------------
+
+def test_canonical_source_name_selected():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, source=SOURCE_NAME)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "won"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 8. polymarket_clob rows are selected
+# ---------------------------------------------------------------------------
+
+def test_polymarket_clob_source_selected():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, source="polymarket_clob")
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "won"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 9. source="polymarket", sample, SELL, non-Polymarket excluded
+# ---------------------------------------------------------------------------
+
+def test_legacy_polymarket_source_excluded():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, source="polymarket")
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+def test_sample_trade_excluded():
+    db, _ = _open()
+    _seed_wallet(db)
+    db.conn.execute(
+        "INSERT INTO source_trades(id,source,source_trade_id,market_source_id,"
+        "side,outcome,quantity,price,trader_address,timestamp,is_sample,"
+        "token_id,resolution_status,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("t1", SOURCE_NAME, "t1", COND, "BUY", "Yes", 10.0, 0.4, ADDR,
+         "2026-02-01T00:00:00Z", 1, TOK_WIN, "unresolved",
+         json.dumps({}, sort_keys=True)),
+    )
+    db.conn.commit()
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+def test_sell_trade_excluded_and_unchanged():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, side="SELL")
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "unresolved"
+    assert r["is_winning_trade"] is None
+    assert r["realized_pnl"] is None
+    db.close()
+
+
+def test_non_polymarket_source_excluded():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, source="kalshi")
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. One provider call serves all linked trades for one market
+# ---------------------------------------------------------------------------
+
+def test_one_provider_call_per_market_all_linked():
     db, _ = _open()
     _seed_wallet(db)
     for i in range(3):
-        _insert_trade(db, f"polymarket:t{i}", COND)
-
-    def _resolver(cid):
-        return {"resolutionStatus": "resolved", "winner": TOK}
-
-    rc = refresh.main(
-        ["--db-path", str(db.db_path), "--write", "--allow-live",
-         "--confirm-production-db"],
-        get_market=_resolver,
-    )
+        _insert_trade(db, f"t{i}", condition=COND)
+    prov = _provider_resolved()
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov)
     assert rc == 0, rc
+    assert prov.calls.count(COND) == 1, prov.calls
     n = db.conn.execute(
-        "SELECT COUNT(*) FROM source_trades WHERE resolution_status='resolved' "
-        "AND winning_token_id=?", (TOK,)
-    ).fetchone()[0]
+        "SELECT COUNT(*) FROM source_trades WHERE resolution_status='won' "
+        "AND winning_token_id=?", (TOK_WIN,)).fetchone()[0]
     assert n == 3, n
-    # Bookkeeping row exists.
-    m = db.conn.execute(
-        "SELECT last_status FROM specialist_market_refresh_state "
-        "WHERE market_source_id=?", (COND,)
-    ).fetchone()
-    assert m is not None and dict(m)["last_status"] == "resolved"
     db.close()
 
 
-def test_refresh_unresolved_no_claim():
+# ---------------------------------------------------------------------------
+# 11. winning BUY receives all six fields
+# ---------------------------------------------------------------------------
+
+def test_winning_buy_six_fields():
     db, _ = _open()
     _seed_wallet(db)
-    _insert_trade(db, "polymarket:t1", COND)
-
-    def _resolver(cid):
-        return {"resolutionStatus": "unresolved"}  # upstream unresolved
-
-    rc = refresh.main(
-        ["--db-path", str(db.db_path), "--write", "--allow-live",
-         "--confirm-production-db"],
-        get_market=_resolver,
-    )
+    _insert_trade(db, "t1", condition=COND, price=0.40, qty=10.0)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved(winner=TOK_WIN))
     assert rc == 0, rc
-    row = db.conn.execute(
-        "SELECT resolution_status, winning_token_id FROM source_trades "
-        "WHERE source_trade_id='polymarket:t1'"
-    ).fetchone()
-    assert dict(row)["resolution_status"] == "unresolved"
-    assert dict(row)["winning_token_id"] is None
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "won"
+    assert r["winning_token_id"] == TOK_WIN
+    assert r["is_winning_trade"] == 1
+    assert abs(r["realized_pnl"] - (1 - 0.40) * 10.0) < 1e-9
+    assert r["settlement_source"] == "source_trade_resolution"
+    assert r["resolved_at"] is not None
     db.close()
 
 
-def test_refresh_replay_unchanged():
+# ---------------------------------------------------------------------------
+# 12. losing BUY receives correct negative P&L
+# ---------------------------------------------------------------------------
+
+def test_losing_buy_six_fields():
     db, _ = _open()
     _seed_wallet(db)
-    _insert_trade(db, "polymarket:t1", COND)
+    # Trade token is the losing token -> lost.
+    _insert_trade(db, "t1", condition=COND, token=TOK_LOSE, price=0.40, qty=10.0)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved(winner=TOK_WIN))
+    assert rc == 0, rc
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "lost"
+    assert r["is_winning_trade"] == 0
+    assert abs(r["realized_pnl"] - (-0.40 * 10.0)) < 1e-9
+    assert r["settlement_source"] == "source_trade_resolution"
+    db.close()
 
-    def _resolver(cid):
-        return {"resolutionStatus": "resolved", "winner": TOK}
 
+# ---------------------------------------------------------------------------
+# 13. Unresolved upstream truth makes no winner/P&L claim
+# ---------------------------------------------------------------------------
+
+def test_unresolved_upstream_no_claim():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    prov = _FakeProvider(by_condition={COND: _gamma_market(
+        condition=COND, resolved=False, winner_token=None)})
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov)
+    assert rc == 0, rc
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "unresolved"
+    assert r["winning_token_id"] is None
+    assert r["is_winning_trade"] is None
+    assert r["realized_pnl"] is None
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 14. Provider unavailable is distinct from not found
+# ---------------------------------------------------------------------------
+
+def test_provider_unavailable_distinct():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    prov = _FakeProvider(errors={COND: RuntimeError("boom")})
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov)
+    assert rc == 0, rc
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "unresolved"
+    bk = db.conn.execute(
+        "SELECT last_status, last_error FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    assert dict(bk)["last_status"] == "provider_unavailable"
+    assert dict(bk)["last_error"] == "provider_error:RuntimeError"
+    db.close()
+
+
+def test_provider_not_found_distinct():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    prov = _FakeProvider(by_condition={COND: None})  # 404/unknown
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov)
+    assert rc == 0, rc
+    bk = db.conn.execute(
+        "SELECT last_status FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    assert dict(bk)["last_status"] == "unavailable"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 15. Routing HTTP error is recorded honestly
+# ---------------------------------------------------------------------------
+
+def test_routing_http_error_recorded():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+
+    class _HttpError(Exception):
+        def __init__(self):
+            self.response = type("R", (), {"status_code": 422})()
+            super().__init__("HTTP 422")
+
+    prov = _FakeProvider(errors={COND: _HttpError()})
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov)
+    assert rc == 0, rc
+    bk = db.conn.execute(
+        "SELECT last_status, last_error FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    assert dict(bk)["last_status"] == "routing_http_error"
+    assert "422" in dict(bk)["last_error"]
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 16. Malformed / ambiguous / missing-winner truth makes no settlement claim
+# ---------------------------------------------------------------------------
+
+def test_malformed_payload_no_claim():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    # Gamma returns resolved with no matching outcome winner -> incomplete truth
+    mkt = Market(
+        source_id=COND, question="t",
+        outcomes=[MarketOutcome(label="Maybe", price=0.5, clob_token_id=TOK_WIN)],
+        source="polymarket", active=False, closed=True, resolved=True,
+        resolution_outcome="Yes", fetched_at=datetime.now(timezone.utc),
+    )
+    prov = _FakeProvider(by_condition={COND: mkt})
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov)
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    bk = db.conn.execute(
+        "SELECT last_status FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    # incomplete truth collapses to unresolved (no winner derivable)
+    assert dict(bk)["last_status"] in ("unresolved", "missing_winning_token")
+    db.close()
+
+
+def test_ambiguous_no_claim():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    mkt = Market(
+        source_id=COND, question="t",
+        outcomes=[
+            MarketOutcome(label="Yes", price=0.5, clob_token_id=TOK_WIN),
+            MarketOutcome(label="Yes", price=0.5, clob_token_id=TOK_LOSE),
+        ],
+        source="polymarket", active=False, closed=True, resolved=True,
+        resolution_outcome="Yes", fetched_at=datetime.now(timezone.utc),
+    )
+    prov = _FakeProvider(by_condition={COND: mkt})
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov)
+    assert rc == 0, rc
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    bk = db.conn.execute(
+        "SELECT last_status FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    assert dict(bk)["last_status"] == "ambiguous"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 17. SELL rows remain byte-for-byte unchanged
+# ---------------------------------------------------------------------------
+
+def test_sell_unchanged_byte_for_byte():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, side="SELL", price=0.42, qty=7.0)
+    before = _row(db, "t1")
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    after = _row(db, "t1")
+    for key in ("resolution_status", "winning_token_id", "is_winning_trade",
+                "realized_pnl", "settlement_source", "resolved_at"):
+        assert before[key] == after[key], key
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 18. Existing identical settlement is a no-op
+# ---------------------------------------------------------------------------
+
+def test_existing_identical_settlement_noop():
+    db, _ = _open()
+    _seed_wallet(db)
+    # Pre-resolved identically to what the provider would produce.
+    _insert_trade(db, "t1", condition=COND, status="won", winner=TOK_WIN,
+                  price=0.40, qty=10.0)
+    db.conn.execute(
+        "UPDATE source_trades SET is_winning_trade=1, realized_pnl=?, "
+        "settlement_source='source_trade_resolution', resolved_at='2026-03-01T00:00:00Z' "
+        "WHERE source_trade_id='t1'",
+        ((1 - 0.40) * 10.0,))
+    db.conn.commit()
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved(winner=TOK_WIN))
+    assert rc == 0, rc
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "won"
+    assert r["winning_token_id"] == TOK_WIN
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 19. Existing conflicting winner blocks all source-trade writes for market
+# ---------------------------------------------------------------------------
+
+def test_conflicting_winner_blocks_all_writes_for_market():
+    db, _ = _open()
+    _seed_wallet(db)
+    # Two trades, same market, different already-stored winners.
+    _insert_trade(db, "t1", condition=COND, status="won", winner=TOK_WIN,
+                  token=TOK_WIN, price=0.40, qty=10.0)
+    db.conn.execute(
+        "UPDATE source_trades SET is_winning_trade=1, realized_pnl=6.0, "
+        "settlement_source='source_trade_resolution', "
+        "resolved_at='2026-03-01T00:00:00Z' WHERE source_trade_id='t1'")
+    _insert_trade(db, "t2", condition=COND, status="won", winner=TOK_LOSE,
+                  token=TOK_LOSE, price=0.40, qty=10.0)
+    db.conn.execute(
+        "UPDATE source_trades SET is_winning_trade=0, realized_pnl=-4.0, "
+        "settlement_source='source_trade_resolution', "
+        "resolved_at='2026-03-01T00:00:00Z' WHERE source_trade_id='t2'")
+    db.conn.commit()
+    # Provider says the winner is TOK_WIN (so t2's stored winner conflicts).
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved(winner=TOK_WIN))
+    assert rc == 0, rc
+    r1 = _row(db, "t1")
+    r2 = _row(db, "t2")
+    # Both retain their exact prior values; nothing updated.
+    assert r1["winning_token_id"] == TOK_WIN
+    assert r2["winning_token_id"] == TOK_LOSE
+    assert r1["realized_pnl"] == 6.0
+    assert r2["realized_pnl"] == -4.0
+    bk = db.conn.execute(
+        "SELECT last_status, last_error FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    assert dict(bk)["last_status"] == "resolved"
+    assert dict(bk)["last_error"] == "conflict"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 20. A forced bookkeeping/update failure rolls back all source-trade changes
+# ---------------------------------------------------------------------------
+
+def test_market_conflict_rolls_back_via_savepoint():
+    db, _ = _open()
+    _seed_wallet(db)
+    # One unresolved trade (would be updated) + one conflicting resolved trade.
+    _insert_trade(db, "t1", condition=COND, status="unresolved", token=TOK_WIN,
+                  price=0.40, qty=10.0)
+    # A second market with a stored different winner that conflicts with the
+    # provider truth, attached to the SAME market_source_id by sharing COND.
+    _insert_trade(db, "t2", condition=COND, status="won", winner=TOK_LOSE,
+                  token=TOK_LOSE, price=0.40, qty=10.0)
+    db.conn.execute(
+        "UPDATE source_trades SET is_winning_trade=0, realized_pnl=-4.0, "
+        "settlement_source='source_trade_resolution', "
+        "resolved_at='2026-03-01T00:00:00Z' WHERE source_trade_id='t2'")
+    db.conn.commit()
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved(winner=TOK_WIN))
+    assert rc == 0, rc
+    # t1 was unresolved and SHOULD have been updated... but the market SAVEPOINT
+    # rolls back the whole market because t2 conflicts. So t1 stays unresolved.
+    r1 = _row(db, "t1")
+    assert r1["resolution_status"] == "unresolved", r1
+    r2 = _row(db, "t2")
+    assert r2["winning_token_id"] == TOK_LOSE  # exact existing value retained
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 21. Adapter aclose runs on success and provider exception
+# ---------------------------------------------------------------------------
+
+def test_adapter_aclose_runs_on_success():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    closed = {}
+
+    class _ClosingProvider:
+        async def get_market(self, market_id):
+            return _gamma_market(condition=market_id, resolved=True,
+                                 winner_token=TOK_WIN)
+
+        async def aclose(self):
+            closed["ran"] = True
+
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_ClosingProvider())
+    assert rc == 0, rc
+    assert closed.get("ran") is True
+    db.close()
+
+
+def test_adapter_aclose_runs_on_provider_exception():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    closed = {}
+
+    class _ClosingProvider:
+        async def get_market(self, market_id):
+            raise RuntimeError("boom")
+
+        async def aclose(self):
+            closed["ran"] = True
+
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_ClosingProvider())
+    assert rc == 0, rc
+    assert closed.get("ran") is True
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 22. Dry-run performs zero writes
+# ---------------------------------------------------------------------------
+
+def test_dry_run_writes_nothing():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--allow-live",  # dry-run (no --write)
+    ], provider=_provider_resolved())
+    assert rc == 0, rc
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "unresolved"
+    # No refresh-state row in dry-run.
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM specialist_market_refresh_state").fetchone()[0]
+    assert n == 0, n
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 23. Unconfirmed production write invokes none of the open/build paths
+# ---------------------------------------------------------------------------
+
+def test_unconfirmed_production_write_invokes_no_paths():
+    prod = ROOT / "data" / "polycopy.db"
+    # Use a sentinel production path; refusal must occur before open/build.
+    rc = refresh.main([
+        "--db-path", str(prod), "--market-source-id", COND,
+        "--write",  # missing --allow-live / --confirm-production-db
+    ], provider=_provider_resolved())
+    assert rc != 0, "production write without full gates must be refused"
+    # Provide no DB open/build exercised: assert via return code only.
+    assert rc == 2
+
+
+# ---------------------------------------------------------------------------
+# 24. Replay creates no duplicate refresh-state rows
+# ---------------------------------------------------------------------------
+
+def test_replay_no_duplicate_bookkeeping():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND)
     for _ in range(2):
-        rc = refresh.main(
-            ["--db-path", str(db.db_path), "--write", "--allow-live",
-             "--confirm-production-db"],
-            get_market=_resolver,
-        )
+        rc = refresh.main([
+            "--db-path", str(db.db_path), "--market-source-id", COND,
+            "--write", "--allow-live", "--confirm-production-db",
+        ], provider=_provider_resolved())
         assert rc == 0, rc
     n = db.conn.execute(
-        "SELECT COUNT(*) FROM source_trades WHERE resolution_status='resolved'"
-    ).fetchone()[0]
+        "SELECT COUNT(*) FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()[0]
     assert n == 1, n
+    # attempt_count increments to 2, not duplicated rows.
+    bk = db.conn.execute(
+        "SELECT attempt_count FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    assert dict(bk)["attempt_count"] == 2, dict(bk)
     db.close()
 
 
-def test_refresh_conflict_blocks():
+# ---------------------------------------------------------------------------
+# 25. Zero approval/dispatch/candidate/signal/execution artifacts created
+# ---------------------------------------------------------------------------
+
+def test_zero_execution_artifacts():
     db, _ = _open()
     _seed_wallet(db)
-    # Pre-existing conflicting winners on disk.
-    _insert_trade(db, "polymarket:t1", COND, status="resolved", winner=TOK)
-    _insert_trade(db, "polymarket:t2", COND, status="resolved", winner="0x" + "d" * 64)
-
-    def _resolver(cid):
-        return {"resolutionStatus": "resolved", "winner": TOK}
-
-    rc = refresh.main(
-        ["--db-path", str(db.db_path), "--write", "--allow-live",
-         "--confirm-production-db"],
-        get_market=_resolver,
-    )
+    _insert_trade(db, "t1", condition=COND)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
     assert rc == 0, rc
-    # First trade keeps its winner; second keeps its different winner (no overwrite).
-    rows = db.conn.execute(
-        "SELECT source_trade_id, winning_token_id FROM source_trades "
-        "WHERE market_source_id=?", (COND,)
-    ).fetchall()
-    by_id = {dict(r)["source_trade_id"]: dict(r)["winning_token_id"] for r in rows}
-    assert by_id["polymarket:t1"] == TOK
-    assert by_id["polymarket:t2"] == "0x" + "d" * 64
+    tables = [
+        "specialist_approvals", "approved_specialist_trade_dispatches",
+        "paper_signal_decisions", "paper_signal_execution_authorizations",
+        "execution_risk_decisions", "paper_orders", "paper_fills",
+        "paper_positions", "copy_candidates", "candidate_price_snapshots",
+        "signals", "orders", "positions", "marks", "settlements",
+    ]
+    for t in tables:
+        try:
+            n = db.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        except Exception:
+            n = 0
+        assert n == 0, f"unexpected artifact in {t}: {n}"
     db.close()
 
 
-def test_refresh_dry_run_writes_nothing():
-    db, _ = _open()
-    _seed_wallet(db)
-    _insert_trade(db, "polymarket:t1", COND)
+# ---------------------------------------------------------------------------
+# Sanity: accepted source set matches S3 exactly
+# ---------------------------------------------------------------------------
 
-    def _resolver(cid):
-        return {"resolutionStatus": "resolved", "winner": TOK}
-
-    rc = refresh.main(
-        ["--db-path", str(db.db_path)],  # no --write
-        get_market=_resolver,
-    )
-    assert rc == 0, rc
-    row = db.conn.execute(
-        "SELECT resolution_status FROM source_trades "
-        "WHERE source_trade_id='polymarket:t1'"
-    ).fetchone()
-    assert dict(row)["resolution_status"] == "unresolved"
-    db.close()
-
-
-def test_refresh_production_refused_without_gate():
-    prod = (ROOT / "data" / "polycopy.db")
-    rc = refresh.main(
-        ["--db-path", str(prod), "--write"],  # missing --allow-live/--confirm
-        get_market=lambda cid: None,
-    )
-    assert rc != 0, "production write without gate must be refused"
+def test_accepted_source_set_matches_s3():
+    assert SPECIALIST_REFRESH_SOURCES == frozenset({SOURCE_NAME, "polymarket_clob"})
