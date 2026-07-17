@@ -405,9 +405,11 @@ def test_templates_have_bounds_timeouts_resources():
 def test_templates_execstart_script_exists():
     for name in SPECIALIST_TEMPLATES:
         text = (TEMPLATE_DIR / name).read_text()
-        m = re.search(r"ExecStart=(\S+)", text)
+        m = re.search(r"ExecStart=(\S+)\s+(\S+)", text)
         assert m, f"{name} missing ExecStart"
-        script = m.group(1)
+        # First token is the interpreter (production venv path, not in repo);
+        # second token is the script we must verify exists in this checkout.
+        script = m.group(2)
         rel = script.replace("/root/Polycopy/", "")
         local = _REPO / rel
         assert local.exists(), f"{name} ExecStart script missing: {local}"
