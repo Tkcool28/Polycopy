@@ -19,17 +19,24 @@ Hard limits (all enforced):
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from polycopy.db.database import Database
 from polycopy.ingestion import ingest_pipeline
+from polycopy.ingestion.canonical_metadata import merge_canonical_metadata
 from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
 from polycopy.ingestion.source_trade_enrichment import enrich_source_trade
 from polycopy.ingestion.source_trade_writer import write_valid_rows
 
 GammaResolver = Callable[[str], Awaitable[Optional[Mapping[str, Any]]]]
+
+
+async def _await_gamma(resolver: GammaResolver, condition_id: str):
+    """Await the async gamma resolver (it yields a Mapping or None)."""
+    return await resolver(condition_id)
 
 
 class EvidenceCollectorConfig:
@@ -236,6 +243,35 @@ async def collect_evidence(
                 result.enrichment_conflicts += 1
             elif er.status != "error":
                 result.enriched += 1
+                # Write the canonical nested taxonomy back onto
+                # source_trades.metadata_json. The frozen scorer reads
+                # metadata["taxonomy"]["raw_category"] from here, so the
+                # collected evidence must carry the canonical shape (not just
+                # the separate source_trade_enrichments row). Reuses the shared
+                # merge_canonical_metadata service -> byte-equivalent to
+                # backfill and collection.
+                row = db.fetchone(
+                    "SELECT metadata_json, market_source_id, token_id "
+                    "FROM source_trades WHERE id=?", (rid,))
+                if row is not None:
+                    rdict = dict(row)
+                    gamma = None
+                    if gamma_resolver is not None:
+                        try:
+                            gamma = await _await_gamma(
+                                gamma_resolver, rdict["market_source_id"])
+                        except Exception:
+                            gamma = None
+                    new_meta, _st, _rc = merge_canonical_metadata(
+                        rdict["metadata_json"],
+                        gamma,
+                        condition_id=rdict["market_source_id"] or "",
+                        token_id=rdict.get("token_id"),
+                    )
+                    db.conn.execute(
+                        "UPDATE source_trades SET metadata_json=? WHERE id=?",
+                        (json.dumps(new_meta, sort_keys=True), rid),
+                    )
 
         # Update watchlist last_collection_at.
         db.conn.execute(
