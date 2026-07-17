@@ -82,10 +82,12 @@ def test_merge_preserves_unrelated():
 
 
 def test_merge_unchanged():
+    # Re-merging a row that already equals the builder output must be UNCHANGED.
     existing = json.dumps(build_canonical_metadata({}, GAMMA), sort_keys=True)
     new_meta, status, rc = merge_canonical_metadata(existing, GAMMA, condition_id="0xcond1")
     assert status == MERGE_UNCHANGED
     assert new_meta["taxonomy"]["raw_category"] == "Politics"
+    assert "no_change" in rc
 
 
 def test_merge_conflict():
@@ -96,7 +98,7 @@ def test_merge_conflict():
     assert status == MERGE_CONFLICT
     # existing value preserved; no overwrite
     assert new_meta["taxonomy"]["raw_category"] == "Sports"
-    assert "taxonomy_conflict" in rc
+    assert any("conflict" in c for c in rc)
 
 
 def test_merge_condition_mismatch_unavailable():

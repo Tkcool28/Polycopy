@@ -16,12 +16,19 @@ Design invariants
 * The scorer-facing taxonomy lives ONLY in ``metadata["taxonomy"]["raw_category"]``.
   ``source_trade_enrichments.normalized_category`` is audit-only and is never a
   scoring authority.
-* We NEVER infer taxonomy from a market title or question text.
+* We NEVER infer taxonomy from a market title or question text, and we NEVER
+  read taxonomy from the raw trade row. The SOLE authority for canonical
+  taxonomy/event/series is the trusted Gamma market.
 * Immutable identity/economic columns (side, outcome, price, quantity,
   timestamp, token_id, market_source_id, source_trade_id) are never written by
   this module.
 * Gamma markets are accepted as ``collections.abc.Mapping`` (the plan's
   ``FakeMarket`` protocol: ``category``, ``tags``, ``events``, ``series``).
+* ``metadata_version`` is stamped on EVERY merge output (filled, unchanged, and
+  preserved-existing shapes) so downstream consumers can detect drift.
+* Conflicts are fail-closed: any non-empty, differing value across the
+  taxonomy / event / series namespaces blocks the merge (status ``conflict``);
+  the caller must NOT overwrite.
 """
 
 from __future__ import annotations
@@ -135,6 +142,13 @@ def _parse_metadata(existing_json: Optional[str]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _ensure_version(meta: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``meta`` guaranteed to carry ``metadata_version``."""
+    out = dict(meta)
+    out["metadata_version"] = METADATA_VERSION
+    return out
+
+
 def build_canonical_metadata(
     trade: Optional[Mapping[str, Any]],
     gamma_market: Optional[Mapping[str, Any]],
@@ -147,28 +161,22 @@ def build_canonical_metadata(
     byte-identical nested shape (``metadata_version``, ``event``, ``taxonomy``,
     ``series``). The scorer reads ``metadata["taxonomy"]["raw_category"]``.
 
+    SOLE AUTHORITY: the canonical taxonomy/event/series is derived ONLY from the
+    trusted Gamma market. The ``trade`` argument is accepted for call-site
+    compatibility but is NEVER used as a metadata source — we never read
+    taxonomy, title, or question text from the raw trade row.
+
     Returns the exact PR66 shape. Deterministic (``sort_keys``) so byte-equivalent
     across call sites. Never infers taxonomy from title/question text.
-
-    ``gamma_market`` may be any Mapping with Gamma-shaped keys (``category``,
-    ``tags``, ``events``, ``series``). If it is None/empty, canonical taxonomy
-    stays UNAVAILABLE honestly but the structure is still returned.
     """
-    trade_map = _mapping(trade)
     market = _mapping(gamma_market)
-    # Prefer explicit trade-level taxonomy when the upstream trade actually
-    # carries it (forward-compat); otherwise fall back to Gamma.
-    if any(trade_map.get(k) for k in ("event", "taxonomy", "series", "category", "tags")):
-        source = dict(trade_map)
-    else:
-        source = dict(market)
-        events = market.get("events")
-        if isinstance(events, list) and events:
-            source["event"] = events[0]
-        series = market.get("series")
-        if isinstance(series, list) and series:
-            source["series"] = series[0]
-    source = dict(source)
+    source = dict(market)
+    events = market.get("events")
+    if isinstance(events, list) and events:
+        source["event"] = events[0]
+    series = market.get("series")
+    if isinstance(series, list) and series:
+        source["series"] = series[0]
     source["category"] = _official_category_for_v1_metadata(
         OfficialPolymarketTaxonomyResolverV1().resolve(source)
     )
@@ -180,6 +188,21 @@ def _gamma_condition_id(gamma_market: Optional[Mapping[str, Any]]) -> Optional[s
         return None
     cid = gamma_market.get("conditionId") or gamma_market.get("id")
     return str(cid).lower() if cid is not None else None
+
+
+def _gamma_token_ids(gamma_market: Optional[Mapping[str, Any]]) -> set[str]:
+    """Return the lower-cased token ids that belong to this Gamma condition."""
+    if not gamma_market:
+        return set()
+    owned: set[str] = set()
+    tokens = gamma_market.get("tokens")
+    if isinstance(tokens, list):
+        for tok in tokens:
+            if isinstance(tok, Mapping):
+                tid = tok.get("tokenId") or tok.get("token_id")
+                if tid:
+                    owned.add(str(tid).lower())
+    return owned
 
 
 def merge_canonical_metadata(
@@ -197,11 +220,16 @@ def merge_canonical_metadata(
       * Fills only canonical namespaces (``taxonomy``, ``event``, ``series``).
       * Preserves unrelated existing metadata (e.g. ``foo=bar``).
       * Never touches identity/economic columns.
+      * SOLE authority for canonical taxonomy is the trusted Gamma market.
+      * ``condition_id`` must EXACTLY match the Gamma market's condition id;
+        mismatch -> ``unavailable`` (fail closed).
+      * If the trade carries a ``token_id``, it must belong to the matched
+        Gamma condition; explicit mismatch -> ``unavailable`` (fail closed).
       * Missing Gamma taxonomy -> ``unavailable`` (no error, no overwrite).
-      * Conflicting canonical field (different raw_category) -> ``conflict``
-        (existing value is preserved; caller must NOT overwrite).
-      * Unmatched ``condition_id`` vs Gamma market -> ``unavailable``.
-      * Missing Gamma -> ``unavailable``.
+      * Any non-empty, differing value across taxonomy / event / series ->
+        ``conflict`` (existing value preserved; caller must NOT overwrite).
+      * Empty/missing existing fields are FILLABLE (filled from Gamma).
+      * ``metadata_version`` is stamped on every returned shape.
 
     ``condition_id`` is the source_trade's ``market_source_id`` (the trusted
     Gamma condition id). The provided Gamma market MUST match it.
@@ -211,19 +239,26 @@ def merge_canonical_metadata(
 
     if gamma_market is None:
         reason_codes.append("gamma_missing")
-        return existing, MERGE_UNAVAILABLE, reason_codes
+        return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
 
     g_cid = _gamma_condition_id(gamma_market)
     req_cid = condition_id.lower() if condition_id else None
     if g_cid != req_cid:
         reason_codes.append("condition_id_mismatch")
-        return existing, MERGE_UNAVAILABLE, reason_codes
+        return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
+
+    # Token ownership: a trade's token_id must belong to the matched condition.
+    if token_id:
+        owned = _gamma_token_ids(gamma_market)
+        if owned and str(token_id).lower() not in owned:
+            reason_codes.append("token_id_not_in_condition")
+            return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
 
     new = build_canonical_metadata({}, gamma_market)
     new_taxonomy = new.get("taxonomy") or {}
     if not new_taxonomy.get("raw_category"):
         reason_codes.append("taxonomy_unavailable")
-        return existing, MERGE_UNAVAILABLE, reason_codes
+        return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
 
     merged = dict(existing)  # preserve unrelated metadata
     changed = False
@@ -233,32 +268,53 @@ def merge_canonical_metadata(
         if ns not in new:
             continue
         existing_ns = existing.get(ns)
+        new_ns = new[ns]
         if not isinstance(existing_ns, dict):
-            merged[ns] = new[ns]
+            merged[ns] = new_ns
             changed = True
             continue
         merged_ns = dict(existing_ns)
-        ns_changed = False
-        for k, v in new[ns].items():
+        for k, v in new_ns.items():
             if k not in existing_ns:
+                # missing key in existing -> fillable
                 merged_ns[k] = v
-                ns_changed = True
-            elif existing_ns[k] != v:
-                if ns == "taxonomy" and k == "raw_category":
-                    conflict = True
-                    reason_codes.append("taxonomy_conflict")
-                else:
+                changed = True
+            elif k == "tags":
+                # tags are an order-insensitive set: canonicalize both.
+                ev_set = set(existing_ns[k]) if isinstance(existing_ns[k], list) else set()
+                v_set = set(v) if isinstance(v, list) else set()
+                if ev_set == v_set:
+                    continue
+                if not ev_set:
                     merged_ns[k] = v
-                    ns_changed = True
-        if ns_changed:
+                    changed = True
+                else:
+                    conflict = True
+                    reason_codes.append("taxonomy_tags_conflict")
+            else:
+                ev = existing_ns[k]
+                if ev == v:
+                    # identical (incl. both None) -> no change
+                    continue
+                if ev is None or ev == "":
+                    # existing is empty/None -> fillable from Gamma
+                    merged_ns[k] = v
+                    changed = True
+                else:
+                    # both non-empty and differing -> block (fail closed)
+                    conflict = True
+                    reason_codes.append(f"{ns}_{k}_conflict")
+        if changed and not conflict:
             merged[ns] = merged_ns
-            changed = True
 
     if conflict:
-        return existing, MERGE_CONFLICT, reason_codes
+        return _ensure_version(existing), MERGE_CONFLICT, reason_codes
 
-    status = MERGE_FILLED if changed else MERGE_UNCHANGED
-    if status == MERGE_UNCHANGED:
-        reason_codes.append("no_change")
-    merged = json.loads(_as_json(merged))
-    return merged, status, reason_codes
+    if changed:
+        merged = json.loads(_as_json(merged))
+        merged["metadata_version"] = METADATA_VERSION
+        return merged, MERGE_FILLED, reason_codes
+
+    reason_codes.append("no_change")
+    out = _ensure_version(existing)
+    return out, MERGE_UNCHANGED, reason_codes
