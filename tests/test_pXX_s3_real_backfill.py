@@ -20,6 +20,7 @@ were issued, proving the de-duplication and real-provider contracts.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -560,6 +561,351 @@ def test_no_execution_plane_artifact_created():
     # Only source_trades + source_trade_enrichments may carry rows.
     assert _count(db, "source_trade_enrichments") >= 1
     db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW S3 narrow-correction proofs (PR71 pass)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _enrich(db, tid):
+    row = db.conn.execute(
+        "SELECT * FROM source_trade_enrichments WHERE source_trade_internal_id=?",
+        (tid,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _gamma_bare_list(cond, tok):
+    return {
+        "conditionId": cond,
+        "clobTokenIds": [tok, "0xf" + "0" * 63],  # bare list (not JSON string)
+        "category": "Sports",
+        "tags": ["nba"],
+        "events": [],
+        "series": [],
+        "question": "Who wins?",
+        "slug": "nba-final-bare",
+        "outcomes": ["Yes", "No"],
+        "outcomePrices": ["0.5", "0.5"],
+    }
+
+
+def test_real_cli_bare_list_clobtokenids_orchestration():
+    # The backfill CLI itself (not merge_canonical_metadata directly) must
+    # handle a Gamma payload whose clobTokenIds is a bare list.
+    db, _ = _open()
+    _seed_wallet(db)
+    cond = "0x" + "e" * 64
+    tok = "0x" + "e" * 64
+    GAMMA[cond] = _gamma_bare_list(cond, tok)
+    _insert_trade(db, "polymarket:t1", cond, tok, {})
+    counter = {"n": 0}
+    rc = _run(db.db_path,
+              ["--source-trade-id", "polymarket:t1", "--write",
+               "--confirm-production-db"], counter)
+    assert rc == 0, rc
+    m = _meta(db, "polymarket:t1")
+    assert m["taxonomy"]["raw_category"] == "Sports", m
+    # One Gamma call for the single condition id.
+    assert counter["n"] == 1, counter
+    db.close()
+
+
+def test_production_refusal_absolute_path_before_db_open():
+    calls = {"open_readonly": 0, "get_market_raw": 0}
+    prod_abs = str(ROOT / "data" / "polycopy.db")
+
+    def _no_open(*a, **k):
+        calls["open_readonly"] += 1
+        raise AssertionError("open_readonly must not run before refusal")
+
+    with mock.patch("evidence_db.open_readonly", side_effect=_no_open), \
+         mock.patch(
+             "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
+             new=lambda self, mid: (_ for _ in ()).throw(
+                 AssertionError("no network"))):
+        import importlib
+
+        mod = importlib.import_module(CLI)
+        rc = mod.main(
+            ["--db-path", prod_abs, "--write", "--source-trade-id", "polymarket:x"]
+        )
+    assert rc != 0, "production write without gate must be refused"
+    assert calls["open_readonly"] == 0, "DB must not open before refusal"
+    assert calls["get_market_raw"] == 0, "provider must not be called before refusal"
+
+
+# Keep a handle on the original open_readonly for the monkey patch above.
+_orig_open_readonly = None
+
+
+def test_production_refusal_relative_path():
+    # Repository-relative production path must also be refused before open.
+    with mock.patch(
+        "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
+        new=lambda self, mid: (_ for _ in ()).throw(AssertionError("no network")),
+    ):
+        import importlib
+
+        mod = importlib.import_module(CLI)
+        rc = mod.main(
+            ["--db-path", "data/polycopy.db", "--write",
+             "--source-trade-id", "polymarket:x"]
+        )
+    assert rc != 0, "relative production path write without gate must be refused"
+
+
+def test_production_refusal_symlink_to_production(tmp_path):
+    # A symlink resolving to the production path must be refused before open.
+    target = ROOT / "data" / "polycopy.db"
+    link = tmp_path / "link_polycopy.db"
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest_skip("symlink unsupported on this platform")
+    with mock.patch(
+        "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
+        new=lambda self, mid: (_ for _ in ()).throw(AssertionError("no network")),
+    ):
+        import importlib
+
+        mod = importlib.import_module(CLI)
+        rc = mod.main(
+            ["--db-path", str(link), "--write", "--source-trade-id", "polymarket:x"]
+        )
+    assert rc != 0, "symlink-to-production write without gate must be refused"
+
+
+def test_production_refusal_missing_each_gate():
+    # Each missing gate (independently) must refuse a production write.
+    base = ["--db-path", str(ROOT / "data" / "polycopy.db"),
+            "--source-trade-id", "polymarket:x"]
+    combos = [
+        ["--write"],                       # missing allow-live + confirm
+        ["--write", "--allow-live"],       # missing confirm
+        ["--write", "--confirm-production-db"],  # missing allow-live
+    ]
+    with mock.patch(
+        "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
+        new=lambda self, mid: (_ for _ in ()).throw(AssertionError("no network")),
+    ):
+        import importlib
+
+        mod = importlib.import_module(CLI)
+        for extra in combos:
+            rc = mod.main(base + extra)
+            assert rc != 0, f"must refuse with missing gate set {extra}"
+
+
+def test_production_refusal_nonexistent_alias(tmp_path):
+    # A production path that does not exist must still be refused (not crash
+    # with FileNotFoundError before the gate message).
+    fake = tmp_path / "polycopy.db"  # does not point at real production
+    with mock.patch(
+        "evidence_db.is_production_db", return_value=True
+    ), mock.patch(
+        "backfill_specialist_trade_taxonomy.is_production_db", return_value=True
+    ), mock.patch(
+        "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
+        new=lambda self, mid: (_ for _ in ()).throw(AssertionError("no network")),
+    ):
+        import importlib
+
+        mod = importlib.import_module(CLI)
+        rc = mod.main(
+            ["--db-path", str(fake), "--write", "--source-trade-id", "polymarket:x"]
+        )
+    assert rc != 0, "recognized production alias write without gate must be refused"
+
+
+def test_existing_enrichment_updated_not_ignored():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "polymarket:t1", GCOND, GTOK_A, {})
+    base = str(db.db_path)
+    # First run creates the current row.
+    rc = _run(base,
+              ["--source-trade-id", "polymarket:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    created_at_1 = _enrich(db, "polymarket:t1")["created_at"]
+    # Material change: pre-seed a DIFFERENT enrichment row (simulate collection
+    # path already created one with a distinct evidence hash), then re-run.
+    db.conn.execute(
+        "UPDATE source_trade_enrichments SET normalized_category='Old', "
+        "evidence_hash='oldhash', updated_at='2020-01-01T00:00:00Z' "
+        "WHERE source_trade_internal_id='polymarket:t1'"
+    )
+    db.conn.commit()
+    rc = _run(base,
+              ["--source-trade-id", "polymarket:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "polymarket:t1")
+    # Row is UPDATED (not a new/duplicate row); normalized_category reflects
+    # the fresh Gamma-derived taxonomy classification.
+    assert row["normalized_category"] == "politics", row
+    assert row["evidence_hash"] != "oldhash"
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM source_trade_enrichments "
+        "WHERE source_trade_internal_id='polymarket:t1'"
+    ).fetchone()[0]
+    assert n == 1, "must remain exactly one current row"
+    # created_at preserved across update.
+    assert row["created_at"] == created_at_1
+    db.close()
+
+
+def test_created_at_preserved_updated_at_changes_only_on_material_change():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "polymarket:t1", GCOND, GTOK_A, {})
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "polymarket:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    r1 = _enrich(db, "polymarket:t1")
+    updated_at_1 = r1["updated_at"]
+    created_at_1 = r1["created_at"]
+    # Identical replay: updated_at must NOT change (zero update).
+    rc = _run(base,
+              ["--source-trade-id", "polymarket:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    r2 = _enrich(db, "polymarket:t1")
+    assert r2["updated_at"] == updated_at_1, "identical replay must not update"
+    assert r2["created_at"] == created_at_1
+    db.close()
+
+
+def test_provider_exception_recorded_honestly():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "polymarket:t1", GCOND, GTOK_A, {})
+    base = str(db.db_path)
+
+    # Provider raises a network error -> recorded as provider_error, NOT
+    # ordinary gamma_missing/unavailable.
+    async def _boom(self, market_id):
+        raise RuntimeError("connection reset")
+
+    with mock.patch(
+        "polycopy.adapters.polymarket.PolymarketPublicAdapter.get_market_raw",
+        new=_boom,
+    ):
+        import importlib
+
+        mod = importlib.import_module(CLI)
+        rc = mod.main(
+            ["--db-path", base, "--allow-live", "--source-trade-id",
+             "polymarket:t1", "--write", "--confirm-production-db"]
+        )
+    assert rc == 0, rc
+    row = _enrich(db, "polymarket:t1")
+    assert row["status"] == "error", row
+    assert "provider_error" in json.loads(row["reason_codes_json"]), row
+    # Metadata is preserved (merge unavailable due to provider failure).
+    m = _meta(db, "polymarket:t1")
+    assert "taxonomy" not in m or not m.get("taxonomy", {}).get("raw_category")
+    db.close()
+
+
+def test_gamma_not_found_distinct_from_provider_error():
+    db, _ = _open()
+    _seed_wallet(db)
+    # Unknown condition -> Gamma returns None (not found), distinct reason.
+    _insert_trade(db, "polymarket:t1", "0x" + "b" * 64, "0x" + "b" * 64, {})
+    base = str(db.db_path)
+    rc = _run(base,
+              ["--source-trade-id", "polymarket:t1", "--write",
+               "--confirm-production-db"], {"n": 0})
+    assert rc == 0, rc
+    row = _enrich(db, "polymarket:t1")
+    assert row["status"] == "unavailable", row
+    rc_json = json.loads(row["reason_codes_json"])
+    assert "gamma:not_found" in rc_json, rc_json
+    assert not any("provider_error" in c for c in rc_json)
+    db.close()
+
+
+def test_source_column_excludes_non_polymarket_with_polymarket_id():
+    db, _ = _open()
+    _seed_wallet(db)
+    # A non-Polymarket source row whose source_trade_id LOOKS like polymarket.
+    db.conn.execute(
+        "INSERT INTO source_trades("
+        "id, source, source_trade_id, market_source_id, side, "
+        "outcome, quantity, price, trader_address, timestamp, is_sample, "
+        "metadata_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("kalshi:t1", "kalshi", "polymarket:lookalike", GCOND, "BUY", "Yes",
+         10.0, 0.40, WADDR, "2026-02-01T00:00:00Z", 0,
+         json.dumps({}, sort_keys=True)),
+    )
+    db.conn.commit()
+    # Also a legitimate Polymarket row.
+    _insert_trade(db, "polymarket:t1", GCOND, GTOK_A, {})
+    base = str(db.db_path)
+    counter = {"n": 0}
+    rc = _run(base,
+              ["--wallet-id", WUUID, "--write", "--confirm-production-db"],
+              counter)
+    assert rc == 0, rc
+    # Only the Polymarket row should be enriched; the kalshi lookalike excluded.
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM source_trade_enrichments"
+    ).fetchone()[0]
+    assert n == 1, n
+    row = _enrich(db, "polymarket:t1")
+    assert row is not None
+    assert _enrich(db, "kalshi:t1") is None, "non-Polymarket row must be excluded"
+    # The Polymarket row's metadata is the one filled.
+    m = _meta(db, "polymarket:t1")
+    assert m["taxonomy"]["raw_category"] == "Politics"
+    db.close()
+
+
+def test_per_trade_rollback_on_provenance_failure():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "polymarket:t1", GCOND, GTOK_A, {})
+    base = str(db.db_path)
+
+    # Force provenance to fail on the FIRST write attempt.
+    def _boom_prov(self, trade, ev, merge_status):
+        raise RuntimeError("provenance write failed")
+
+    import importlib
+
+    mod = importlib.import_module(CLI)
+    with mock.patch.object(mod, "_write_provenance", _boom_prov):
+        rc = mod.main(
+            ["--db-path", base, "--allow-live", "--source-trade-id",
+             "polymarket:t1", "--write", "--confirm-production-db"]
+        )
+    # The whole run aborts (fail-closed) when provenance fails.
+    assert rc != 0, "provenance failure must not silently succeed"
+    # Metadata must NOT remain changed (rolled back with provenance).
+    m = _meta(db, "polymarket:t1")
+    assert "taxonomy" not in m or not m.get("taxonomy", {}).get("raw_category"), \
+        "metadata change must roll back when provenance fails"
+    # No enrichment row leaked from the failed trade.
+    assert _enrich(db, "polymarket:t1") is None
+    db.close()
+
+
+def backfill_specialist_trade_taxonomy_module():
+    import importlib
+
+    return importlib.import_module(CLI)
+
+
+def pytest_skip(msg):
+    import pytest
+
+    pytest.skip(msg)
 
 
 if __name__ == "__main__":

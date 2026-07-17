@@ -10,8 +10,8 @@ Writes ONLY:
 
   * ``source_trades.metadata_json`` — safe merge (fills missing, leaves
     unchanged when equivalent, BLOCKS on conflict, leaves unavailable).
-  * a provenance row in ``source_trade_enrichments`` (audit-only; never a
-    second scoring authority).
+  * one CURRENT provenance row in ``source_trade_enrichments`` (audit-only;
+    never a second scoring authority), keyed by ``source_trade_internal_id``.
 
 It never writes scoring decisions, approvals, dispatches, candidates, signals,
 authorizations, risk, orders, fills, positions, marks, or settlements. The
@@ -21,16 +21,21 @@ Hard contracts (all enforced, fail-closed)
 ------------------------------------------
 * REAL GAMMA PATH: ``get_market_raw`` is the only market source. No second
   implementation, no behavior change to the adapter.
+* PRODUCTION REFUSAL ORDERING: for a recognized production path, a requested
+  write missing ANY of --write / --allow-live / --confirm-production-db is
+  refused with exit 2 BEFORE checking file existence, opening read-only,
+  reading schema, resolving selectors, making a network request, or opening
+  writable.
 * EXACT SELECTORS (write mode requires EXACTLY ONE of):
     --source-trade-id  -> source_trades.id
     --wallet-id        -> wallets.id, resolved to wallets.address
-    --watch-id         -> specialist_evidence_watchlist.id, resolved to
-                          wallet_id -> wallets.address
+    --watch-id         -> specialist_evidence_watchlist.id -> wallet_id -> address
   sample / paused / retired selections are refused; a missing selector and
   multiple selectors are both refused.
 * BOUNDS:
     * 1 <= --limit <= _MAX_LIMIT (hard maximum).
-    * BUY only, is_sample = 0 only, Polymarket source only.
+    * BUY only, is_sample = 0 only, Polymarket source only (filtered on the
+      canonical ``source`` column value 'polymarket', not merely the id prefix).
     * deterministic ordering (ORDER BY source_trade_id).
     * at most ONE Gamma request per distinct market_source_id/condition ID.
     * --allow-live is required for any public network read.
@@ -40,19 +45,22 @@ Hard contracts (all enforced, fail-closed)
   market_source_id, exact token_id). Persist metadata_json ONLY when status is
   ``filled`` or ``unchanged``. On ``unavailable`` / ``conflict`` do NOT
   serialize/inspect/overwrite the merge output as a dict.
-* ATOMICITY / IDEMPOTENCY: canonical metadata update + its enrichment
-  provenance commit together per trade. Replay with equivalent evidence
-  creates no duplicate enrichment row, makes no metadata change, preserves
-  created_at, and leaves no decision/execution artifact.
+* ATOMICITY / IDEMPOTENCY: each trade's metadata update + its current
+  enrichment provenance commit together inside a per-trade SAVEPOINT. A replay
+  with equivalent evidence creates no duplicate enrichment row, makes no
+  metadata change, preserves created_at, and leaves no decision/execution
+  artifact.
 
 Production guard (PR68): writes require ALL of --write --allow-live
---confirm-production-db. Default is dry-run / refusal.
+--confirm-production-db on a recognized production path. Default is dry-run /
+refusal.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -72,12 +80,21 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MERGE_UNAVAILABLE,
     merge_canonical_metadata,
 )
+from polycopy.scoring.wallet_evidence import (  # noqa: E402
+    CATEGORY_TAXONOMY_PARTIAL,
+    CATEGORY_TAXONOMY_USABLE,
+    classify_category_taxonomy,
+)
 from evidence_db import (  # noqa: E402
     DbConn,
+    is_production_db,
     open_readonly,
     open_writable,
     require_write_gates,
 )
+
+# Canonical source column value for Polymarket.
+POLYMARKET_SOURCE = "polymarket"
 
 PRODUCTION_DB_PATH = (REPO_ROOT / "data" / "polycopy.db").resolve()
 
@@ -87,16 +104,25 @@ _MAX_LIMIT = 500
 # Real Gamma base URLs (read-only public endpoints, no auth/order placement).
 _GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 
-_STATUS_TO_ENRICHMENT = {
-    MERGE_FILLED: "complete",
-    MERGE_UNCHANGED: "complete",
-    MERGE_CONFLICT: "conflict",
-    MERGE_UNAVAILABLE: "unavailable",
-}
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ── Gamma resolution result (distinguish not-found from provider error) ──────
+
+
+class GammaResult:
+    """Outcome of resolving one condition id from the real Gamma provider."""
+
+    __slots__ = ("state", "market", "reason")
+
+    def __init__(self, state: str, market: Optional[dict[str, Any]] = None,
+                 reason: Optional[str] = None) -> None:
+        # state: found | not_found | provider_error | ambiguous | malformed
+        self.state = state
+        self.market = market
+        self.reason = reason
 
 
 # ── Selector resolution (fail-closed) ────────────────────────────────────────
@@ -159,16 +185,19 @@ def _select_trades(
     """Return non-sample BUY Polymarket source_trades per the selector.
 
     Deterministic ordering by source_trade_id. Bounds: BUY only, is_sample=0,
-    Polymarket source only, limited to ``args.limit``. ``address_filter`` is
-    the resolved ``lower(trader_address)`` for wallet/watch selectors, or None
-    for a --source-trade-id selection (keyed by id instead).
+    Polymarket source only (canonical ``source`` column), limited to
+    ``args.limit``. ``address_filter`` is the resolved ``lower(trader_address)``
+    for wallet/watch selectors, or None for a --source-trade-id selection
+    (keyed by id instead).
     """
+    # Polymarket-only is enforced on the canonical source column, not merely an
+    # id prefix (a non-Polymarket row with a polymarket-looking id is excluded).
     clauses = [
         "side = 'BUY'",
         "is_sample = 0",
-        "lower(source_trade_id) LIKE 'polymarket:%'",
+        "source = ?",
     ]
-    params: list[Any] = []
+    params: list[Any] = [POLYMARKET_SOURCE]
     if args.source_trade_id:
         clauses.append("id = ?")
         params.append(args.source_trade_id)
@@ -177,7 +206,7 @@ def _select_trades(
         clauses.append("lower(trader_address) = ?")
         params.append(address_filter or "")
     sql = (
-        "SELECT id, source_trade_id, market_source_id, token_id, "
+        "SELECT id, source, source_trade_id, market_source_id, token_id, "
         "trader_address, metadata_json FROM source_trades "
         "WHERE " + " AND ".join(clauses) + " ORDER BY source_trade_id LIMIT ?"
     )
@@ -196,85 +225,208 @@ def _make_adapter() -> PolymarketPublicAdapter:
     )
 
 
-async def _resolve_gamma_market(
+async def _resolve_gamma_one(
     adapter: PolymarketPublicAdapter, condition_id: str
-) -> Optional[dict[str, Any]]:
-    """Fetch the authoritative raw Gamma market for one condition id.
+) -> GammaResult:
+    """Resolve one condition id through the REAL get_market_raw route.
 
-    Uses ONLY ``PolymarketPublicAdapter.get_market_raw`` (the canonical
-    condition-ID route). Returns the raw dict (with ``clobTokenIds``) or None
-    when not found / ambiguous / network-failed.
+    Distinguishes:
+      * found            -> authoritative Gamma dict returned
+      * not_found        -> 404 / no exact match (honest "gamma_missing")
+      * provider_error    -> HTTP/network error (NOT conflated with not_found)
+      * ambiguous        -> provider returned multiple exact matches
+      * malformed        -> provider returned an unexpected payload shape
     """
     try:
-        return await adapter.get_market_raw(condition_id)
-    except Exception:
-        return None
+        market = await adapter.get_market_raw(condition_id)
+    except ValueError as exc:
+        msg = str(exc)
+        if "ambiguous" in msg:
+            return GammaResult("ambiguous", reason=msg)
+        return GammaResult("malformed", reason=msg)
+    except Exception as exc:  # HTTP / network / client failure
+        return GammaResult("provider_error", reason=f"{type(exc).__name__}: {exc}")
+    if market is None:
+        return GammaResult("not_found")
+    return GammaResult("found", market=market)
 
 
 async def _resolve_gamma_batch(
     adapter: PolymarketPublicAdapter, condition_ids: list[str]
-) -> dict[str, Optional[dict[str, Any]]]:
+) -> dict[str, GammaResult]:
     """Resolve each distinct condition id at most ONCE.
 
-    Returns a mapping ``{condition_id_lower: raw_gamma_market_or_None}``. The
-    loop awaits every distinct id; identical condition ids are served from a
-    single request (de-duplicated before the loop), so multiple trades
-    sharing a condition id incur exactly one Gamma request.
+    Returns a mapping ``{condition_id_lower: GammaResult}``. Identical
+    condition ids are served from a single request (de-duplicated before the
+    loop), so multiple trades sharing a condition id incur exactly one Gamma
+    request.
     """
-    out: dict[str, Optional[dict[str, Any]]] = {}
+    out: dict[str, GammaResult] = {}
     seen: set[str] = set()
     for cid in condition_ids:
         key = (cid or "").lower()
         if not key or key in seen:
             continue
         seen.add(key)
-        out[key] = await _resolve_gamma_market(adapter, cid)
+        out[key] = await _resolve_gamma_one(adapter, cid)
     return out
 
 
-# ── Provenance (idempotent, honest, audit-only) ──────────────────────────────
+# ── Provenance (one current row per trade; honest; audit-only) ───────────────
+
+
+def _taxonomy_status(canonical_meta: dict[str, Any], merge_status: str) -> str:
+    """Map to the enrichment table's taxonomy_status vocabulary.
+
+    usable / partial / unavailable — derived from the canonical nested metadata
+    classification, never claimed unless safe. For conflicts/unavailable we do
+    not assert a usable label.
+    """
+    if merge_status in (MERGE_CONFLICT, MERGE_UNAVAILABLE):
+        return "unavailable"
+    try:
+        cls = classify_category_taxonomy(canonical_meta)
+    except Exception:
+        return "unavailable"
+    status = str(cls.status)
+    if status == CATEGORY_TAXONOMY_USABLE and cls.category_label:
+        return "usable"
+    if status == CATEGORY_TAXONOMY_PARTIAL:
+        return "partial"
+    return "unavailable"
+
+
+def _build_evidence(
+    trade: dict[str, Any],
+    canonical_meta: dict[str, Any],
+    gamma: Optional[dict[str, Any]],
+    merge_status: str,
+    gamma_result: GammaResult,
+) -> dict[str, Any]:
+    """Build the honest current provenance payload (no scoring authority)."""
+    # canonical_meta may be the raw preserved value (a malformed string) on
+    # unavailable/conflict; only classify a real dict.
+    safe_meta = canonical_meta if isinstance(canonical_meta, dict) else {}
+    try:
+        classification = classify_category_taxonomy(safe_meta)
+    except Exception:
+        classification = None
+    normalized_category = (
+        classification.category_label
+        if (classification is not None
+            and str(classification.status) == CATEGORY_TAXONOMY_USABLE
+            and classification.category_label)
+        else None
+    )
+    # High-level status vocabulary for source_trade_enrichments.status.
+    # A provider/network error takes precedence over an (unavailable) merge
+    # result so it is never conflated with an ordinary gamma_missing.
+    if gamma_result.state == "provider_error":
+        status = "error"
+    elif merge_status == MERGE_CONFLICT:
+        status = "conflict"
+    elif merge_status == MERGE_UNAVAILABLE:
+        status = "unavailable"
+    elif normalized_category:
+        status = "complete"
+    else:
+        status = "incomplete"
+
+    slug = None
+    if gamma is not None:
+        slug = gamma.get("slug") or gamma.get("question")
+
+    # token_id from the SOURCE TRADE, never from Gamma's clobTokenIds.
+    token_id = trade.get("token_id")
+    condition_id = trade.get("market_source_id") or ""
+
+    reason_codes = [f"merge:{merge_status}", f"gamma:{gamma_result.state}"]
+    if gamma_result.state == "provider_error":
+        reason_codes.append("provider_error")
+    if gamma_result.reason:
+        reason_codes.append(gamma_result.reason)
+
+    return {
+        "status": status,
+        "token_id": token_id,
+        "condition_id": condition_id,
+        "market_id": condition_id,
+        "market_slug": slug,
+        "normalized_category": normalized_category,
+        "taxonomy_status": _taxonomy_status(safe_meta, merge_status),
+        "gamma_source": "gamma_market_raw" if gamma is not None else None,
+        "evidence_source": "backfill",
+        "reason_codes": reason_codes,
+    }
+
+
+def _evidence_hash(ev: dict[str, Any]) -> str:
+    canonical = json.dumps(ev, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _write_provenance(
     db: DbConn,
-    internal_id: str,
-    status: str,
-    reason_codes: list[str],
-    gamma_market: Optional[dict[str, Any]],
-) -> bool:
-    """Write an idempotent provenance row (no second scoring authority).
+    trade: dict[str, Any],
+    ev: dict[str, Any],
+    merge_status: str,
+) -> tuple[bool, bool]:
+    """Upsert the single CURRENT provenance row keyed by source_trade_internal_id.
 
-    The enrichment row is keyed by ``(internal_id)`` via a deterministic
-    ``enrichment_id`` derived from the trade id so a replay with equivalent
-    evidence writes the SAME id (``INSERT OR IGNORE`` -> 0 rows on replay).
-    Returns True iff a NEW row was inserted.
-
-    Honest provenance: status, taxonomy_status, gamma_source, reason codes and
-    fetched_at are recorded; normalized_category is recorded only as the
-    audit-only classification (never a scoring authority — the scorer reads
-    ``source_trades.metadata_json['taxonomy']['raw_category']``).
+    Returns ``(changed, is_new)``:
+      * insert when absent (created_at = now)
+      * update current provenance when evidence materially changes
+        (evidence_hash differs) — preserves created_at, updates updated_at
+      * equivalent replay performs no write (changed = False)
+      * never creates a duplicate row (UNIQUE(source_trade_internal_id))
+      * never silently ignores newer conflict/unavailable evidence
+    Does NOT mutate enrichment_id to bypass uniqueness.
     """
-    enrichment_id = f"bk:{internal_id}"
-    g_cid = (gamma_market or {}).get("conditionId")
-    g_tok = (gamma_market or {}).get("tokenId") or (gamma_market or {}).get("token_id")
-    g_slug = (gamma_market or {}).get("slug") or (gamma_market or {}).get("question")
-    category = (gamma_market or {}).get("category")
-    cur = db.conn.execute(
-        "INSERT OR IGNORE INTO source_trade_enrichments "
-        "(enrichment_id, source_trade_internal_id, status, token_id, "
-        "condition_id, market_slug, normalized_category, taxonomy_status, "
-        "evidence_source, gamma_source, reason_codes_json, fetched_at, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    internal_id = trade["id"]
+    now = _now()
+    ev_hash = _evidence_hash(ev)
+    existing = db.fetchone(
+        "SELECT enrichment_id, evidence_hash, created_at FROM "
+        "source_trade_enrichments WHERE source_trade_internal_id=?",
+        (internal_id,),
+    )
+    if existing is None:
+        enrichment_id = f"bk:{internal_id}"
+        db.conn.execute(
+            "INSERT INTO source_trade_enrichments ("
+            "enrichment_id, source_trade_internal_id, status, token_id, "
+            "condition_id, market_id, market_slug, normalized_category, "
+            "taxonomy_status, evidence_source, gamma_source, evidence_hash, "
+            "reason_codes_json, fetched_at, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                enrichment_id, internal_id, ev["status"], ev["token_id"],
+                ev["condition_id"], ev["market_id"], ev["market_slug"],
+                ev["normalized_category"], ev["taxonomy_status"],
+                ev["evidence_source"], ev["gamma_source"], ev_hash,
+                json.dumps(ev["reason_codes"], sort_keys=True), now, now, now,
+            ),
+        )
+        return True, True
+
+    # Existing current row: only update when evidence materially changed.
+    if existing["evidence_hash"] == ev_hash:
+        return False, False
+    db.conn.execute(
+        "UPDATE source_trade_enrichments SET "
+        "status=?, token_id=?, condition_id=?, market_id=?, market_slug=?, "
+        "normalized_category=?, taxonomy_status=?, evidence_source=?, "
+        "gamma_source=?, evidence_hash=?, reason_codes_json=?, "
+        "fetched_at=?, updated_at=? WHERE source_trade_internal_id=?",
         (
-            enrichment_id, internal_id,
-            _STATUS_TO_ENRICHMENT.get(status, "unavailable"),
-            g_tok, g_cid, g_slug, category,
-            status, "backfill",
-            "gamma_market_raw" if gamma_market is not None else None,
-            json.dumps(reason_codes, sort_keys=True), _now(), _now(), _now(),
+            ev["status"], ev["token_id"], ev["condition_id"], ev["market_id"],
+            ev["market_slug"], ev["normalized_category"], ev["taxonomy_status"],
+            ev["evidence_source"], ev["gamma_source"], ev_hash,
+            json.dumps(ev["reason_codes"], sort_keys=True), now, now,
+            internal_id,
         ),
     )
-    return cur.rowcount > 0
+    return True, False
 
 
 # ── Run ──────────────────────────────────────────────────────────────────────
@@ -293,60 +445,69 @@ async def _run_async(
         "unchanged": 0,
         "conflict": 0,
         "unavailable": 0,
+        "provider_error": 0,
         "written": 0,
     }
     if not trades:
         return counts
 
-    # Real Gamma: resolve each distinct condition id at most once. A real
-    # adapter is always constructed because --allow-live already gates any
-    # public read (dry-run performs bounded public reads; write performs them
-    # and then writes).
+    # Real Gamma: resolve each distinct condition id at most once.
     adapter = _make_adapter()
     condition_ids = [t["market_source_id"] for t in trades]
-    gamma_by_cid = await _resolve_gamma_batch(adapter, condition_ids)
     try:
-        await adapter.aclose()
-    except Exception:
-        pass
+        gamma_by_cid = await _resolve_gamma_batch(adapter, condition_ids)
+    finally:
+        try:
+            await adapter.aclose()
+        except Exception:
+            pass
 
     for t in trades:
         cid = (t.get("market_source_id") or "").lower()
-        gamma = gamma_by_cid.get(cid)
-        new_meta, status, reasons = merge_canonical_metadata(
+        gamma_result = gamma_by_cid.get(cid, GammaResult("not_found"))
+        gamma = gamma_result.market if gamma_result.state == "found" else None
+
+        new_meta, merge_status, _reasons = merge_canonical_metadata(
             t["metadata_json"], gamma,
             condition_id=t["market_source_id"] or "", token_id=t.get("token_id"),
         )
-        if status == MERGE_FILLED:
+        if merge_status == MERGE_FILLED:
             counts["filled"] += 1
-        elif status == MERGE_UNCHANGED:
+        elif merge_status == MERGE_UNCHANGED:
             counts["unchanged"] += 1
-        elif status == MERGE_CONFLICT:
+        elif merge_status == MERGE_CONFLICT:
             counts["conflict"] += 1
         else:
             counts["unavailable"] += 1
+        if gamma_result.state == "provider_error":
+            counts["provider_error"] += 1
 
         if not do_write:
             # Dry-run: zero DB writes, but bounded public reads already happened.
             continue
 
-        if status in (MERGE_FILLED, MERGE_UNCHANGED):
-            # Persist only on filled/unchanged. The merge output is a valid
-            # dict here by contract; serialize and overwrite metadata_json.
-            db.conn.execute(
-                "UPDATE source_trades SET metadata_json = ? WHERE id = ?",
-                (json.dumps(new_meta, sort_keys=True), t["id"]),
-            )
-            if _write_provenance(db, t["id"], status, reasons, gamma):
+        # Per-trade atomic SAVEPOINT: metadata + current provenance commit
+        # together; a provenance failure rolls back the metadata change too.
+        db.conn.execute("SAVEPOINT s3_backfill")
+        try:
+            if merge_status in (MERGE_FILLED, MERGE_UNCHANGED):
+                # Persist only on filled/unchanged. The merge output is a valid
+                # dict here by contract; serialize and overwrite metadata_json.
+                db.conn.execute(
+                    "UPDATE source_trades SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(new_meta, sort_keys=True), t["id"]),
+                )
+            # Build honest provenance from canonical + source-trade values.
+            ev = _build_evidence(t, new_meta, gamma, merge_status, gamma_result)
+            changed, _is_new = _write_provenance(db, t, ev, merge_status)
+            if changed:
                 counts["written"] += 1
-        else:
-            # unavailable / conflict: do NOT serialize, inspect, or overwrite
-            # the merge output. Record honest provenance only.
-            if _write_provenance(db, t["id"], status, reasons, gamma):
-                counts["written"] += 1
+            db.conn.execute("RELEASE SAVEPOINT s3_backfill")
+        except Exception:
+            db.conn.execute("ROLLBACK TO SAVEPOINT s3_backfill")
+            db.conn.execute("RELEASE SAVEPOINT s3_backfill")
+            raise
 
-    if do_write:
-        db.conn.commit()
     return counts
 
 
@@ -381,7 +542,19 @@ def main(argv=None) -> int:
         )
         return 2
 
-    # Fail-closed selector resolution (open read-only first).
+    # PRODUCTION REFUSAL ORDERING: for a recognized production path, refuse a
+    # requested write missing ANY gate BEFORE opening SQLite, reading schema,
+    # resolving selectors, or touching the network.
+    if args.write and is_production_db(args.db_path):
+        if not require_write_gates(args, db_path=args.db_path):
+            print(
+                "error: production write refused — requires --write "
+                "--allow-live --confirm-production-db",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Fail-closed selector resolution (open read-only first; not a write).
     db_ro = open_readonly(args.db_path)
     try:
         address_filter, sel_err = _resolve_selector(db_ro, args)
@@ -411,6 +584,9 @@ def main(argv=None) -> int:
     db = open_writable(args.db_path, args) if do_write else open_readonly(args.db_path)
     try:
         counts = asyncio.run(_run_async(db, args, do_write, address_filter))
+    except Exception as exc:  # fail-closed: never crash with a raw traceback
+        print(f"error: backfill failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     finally:
         db.close()
 
