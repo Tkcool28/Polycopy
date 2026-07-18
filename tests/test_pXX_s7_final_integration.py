@@ -73,6 +73,22 @@ def _load(n):
     return m
 
 
+_status_mod = None
+
+
+def _status_build(db_path, wid):
+    """Load the status module once and run build_status read-only."""
+    global _status_mod
+    if _status_mod is None:
+        _status_mod = _load("specialist_evidence_status.py")
+    sdb = ed.open_readonly(str(db_path))
+    try:
+        out = _status_mod.build_status(sdb, wallet_id=wid)
+    finally:
+        sdb.close()
+    return out
+
+
 def _tmp():
     return Path(tempfile.mktemp(suffix=".db"))
 
@@ -195,13 +211,22 @@ class _BackfillAdapter:
 # normalization, merge, provenance, transaction, and CLI paths all run, but the
 # network-backed Gamma lookup is served deterministically from in-memory dicts.
 _BACKFILL_ADAPTER_CALLS = []
+# The actual adapter instance returned by the factory (observable proof seam).
+_BACKFILL_ADAPTER_INSTANCES = []
 
 
 def _fake_backfill_adapter_factory(by_condition):
-    """Return a fake adapter builder bound to ``by_condition`` (cid -> GAMMA)."""
+    """Return a fake adapter builder bound to ``by_condition`` (cid -> GAMMA).
+
+    Stores the constructed adapter instance in ``_BACKFILL_ADAPTER_INSTANCES``
+    so the test can assert on the REAL object the CLI actually used (its
+    ``.calls`` list, the resolved condition ids, etc.).
+    """
     def _build():
         _BACKFILL_ADAPTER_CALLS.append(1)
-        return _BackfillAdapter(by_condition=by_condition)
+        adapter = _BackfillAdapter(by_condition=by_condition)
+        _BACKFILL_ADAPTER_INSTANCES.append(adapter)
+        return adapter
     return _build
 
 
@@ -306,18 +331,6 @@ def _seed_green_evidence(db, address, *, n=120, winrate=0.8, ndays=30,
              "won" if won else "lost", 1 if won else 0,
              9.0 if won else -1.0))
     db.conn.commit()
-
-
-def _status_json(st_mod, db):
-    import io
-    buf = io.StringIO()
-    old = sys.stdout
-    sys.stdout = buf
-    try:
-        st_mod._emit_json(db, "uuid-s7")
-    finally:
-        sys.stdout = old
-    return json.loads(buf.getvalue())
 
 
 # ── A. fresh-v21 schema proof ──────────────────────────────────────────────────
@@ -425,6 +438,17 @@ def test_s7_disposable_e2e_full_lifecycle():
     wid = add_watch(db, wallet_id=WID, reason="s7", source="manual")
     assert wid is not None
 
+    # ── SECTION 1: PROVE INITIAL YELLOW (before any collection) ──
+    # Open the disposable DB read-only and run build_status for the wallet.
+    y0 = _status_build(db.db_path, WID)
+    assert "wallets" in y0 and len(y0["wallets"]) >= 1, y0
+    yw = y0["wallets"][0]
+    assert yw["state"] == "YELLOW", yw
+    assert yw["ready_for_human_review"] is False, yw
+    assert y0["ready_for_human_review_count"] == 0, y0
+    # No execution artifacts in the fresh research DB.
+    _assert_no_exec_artifacts(db.conn)
+
     # ── collection (bounded BUY-only, dry-run zero-write) ──
     provider = _CollectProvider(trades=[
         {"sourceProvidedTradeId": "poly:ct1", "proxyWallet": ADDR,
@@ -457,6 +481,12 @@ def test_s7_disposable_e2e_full_lifecycle():
         "SELECT id FROM source_trades WHERE trader_address=? ORDER BY id",
         (ADDR,)).fetchall()]
     CT1, CT2 = collected_ids[0], collected_ids[1]
+    # Identify the Politics (COND_A) trade by its market_source_id so the fill
+    # assertion is deterministic regardless of UUID sort order.
+    cid_of = {tid: db.conn.execute(
+        "SELECT market_source_id FROM source_trades WHERE id=?", (tid,)
+    ).fetchone()[0] for tid in (CT1, CT2)}
+    CT_POL = CT1 if cid_of[CT1] == COND_A else CT2
     # Canonical taxonomy persisted via the collector's merge.
     tax = db.conn.execute(
         "SELECT COUNT(*) FROM source_trades WHERE json_extract(metadata_json,"
@@ -468,49 +498,140 @@ def test_s7_disposable_e2e_full_lifecycle():
     assert prov >= 2, prov
     _assert_no_exec_artifacts(db.conn)
 
-    # ── backfill (deterministic fake adapter actually fills canonical metadata)
+    # ── SECTION 2: PROVE REAL BACKFILL FILL (taxonomy was deliberately missing) ──
     backfill = _load("backfill_specialist_trade_taxonomy.py")
     orig_adapter = backfill._make_adapter
+    orig_open_writable = backfill.open_writable
     _BACKFILL_ADAPTER_CALLS.clear()
+    _BACKFILL_ADAPTER_INSTANCES.clear()
+
+    # Deliberately remove CT_POL's canonical taxonomy while preserving its valid
+    # market/token identity AND an unrelated top-level metadata field. This
+    # makes CT_POL eligible for a real backfill fill, not a no-op replay.
+    before_meta = json.loads(db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT_POL,)
+    ).fetchone()[0])
+    stripped = dict(before_meta)
+    stripped["taxonomy"] = {}            # empty -> fillable by merge
+    stripped["custom_preserved"] = "KEEP_ME"  # unrelated; merge must preserve
+    db.conn.execute(
+        "UPDATE source_trades SET metadata_json = ? WHERE id = ?",
+        (json.dumps(stripped, sort_keys=True), CT_POL))
+    db.conn.commit()
+    # Its current provenance must make it eligible (a current row exists).
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM source_trade_enrichments WHERE "
+        "source_trade_internal_id=?", (CT_POL,)).fetchone()[0] >= 1
+
+    # Instrument the ACTUAL write connection: record every write SQL via the
+    # SQLite trace callback. This proves replay performs zero metadata/provenance
+    # INSERT/DELETE/REPLACE, not merely that row counts are stable.
+    trace = {"writes": []}
+
+    def _spy_open_writable(path, args):
+        real = orig_open_writable(path, args)
+        raw = real.conn
+
+        def _trace(sql):
+            s = sql.strip().upper()
+            if any(k in s for k in ("INSERT", "UPDATE", "DELETE", "REPLACE")):
+                trace["writes"].append(sql)
+        raw.set_trace_callback(_trace)
+        return real
+
     backfill._make_adapter = _fake_backfill_adapter_factory(
         by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B})
+    backfill.open_writable = _spy_open_writable
     try:
-        # Dry-run zero-write.
+        # Dry-run zero-write (--allow-live still required for any network read).
         enr_before = db.conn.execute(
             "SELECT COUNT(*) FROM source_trade_enrichments").fetchone()[0]
-        backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
-                       "--dry-run", "--limit", "50"])
+        rc_dry_b = backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+                                  "--dry-run", "--allow-live", "--limit", "50"])
+        assert rc_dry_b == 0, rc_dry_b
         assert db.conn.execute(
             "SELECT COUNT(*) FROM source_trade_enrichments").fetchone()[0] == enr_before
-        # Write: fills deterministic canonical metadata for both trades.
+        # Write: real backfill fills the deliberately-missing canonical taxonomy.
+        _BACKFILL_ADAPTER_CALLS.clear()
+        _BACKFILL_ADAPTER_INSTANCES.clear()
         backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
                        "--write", "--allow-live", "--confirm-production-db",
                        "--limit", "50"])
     finally:
         backfill._make_adapter = orig_adapter
-    # The factory was invoked exactly once and served both expected CIDs through
-    # the REAL selection/normalization/merge/provenance/transaction path.
+        backfill.open_writable = orig_open_writable
+
+    # Factory was invoked exactly once (the write run) and returned the ACTUAL
+    # adapter used.
     assert len(_BACKFILL_ADAPTER_CALLS) == 1, _BACKFILL_ADAPTER_CALLS
-    _probe = _BackfillAdapter(by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B})
-    assert asyncio.run(_probe.get_market_raw(COND_A)).get("conditionId") == COND_A
-    assert asyncio.run(_probe.get_market_raw(COND_B)).get("conditionId") == COND_B
-    tax_after = db.conn.execute(
-        "SELECT COUNT(*) FROM source_trades WHERE json_extract(metadata_json,"
-        "'$.taxonomy.raw_category') IS NOT NULL").fetchone()[0]
-    assert tax_after == 2, tax_after  # deterministic fill of canonical metadata
-    # Replay: zero metadata/provenance writes (counts stable).
-    prov_before_replay = db.conn.execute(
+    assert len(_BACKFILL_ADAPTER_INSTANCES) == 1, _BACKFILL_ADAPTER_INSTANCES
+    actual_adapter = _BACKFILL_ADAPTER_INSTANCES[0]
+    # The actual adapter.calls contains the expected condition id (CT_POL's CID).
+    assert COND_A in actual_adapter.calls, actual_adapter.calls
+    # Missing canonical taxonomy is now FILLED in source_trades.metadata_json.
+    filled_meta = json.loads(db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT_POL,)
+    ).fetchone()[0])
+    assert filled_meta["taxonomy"]["raw_category"] == "Politics", filled_meta
+    # Provenance is current, usable, and complete.
+    prow = db.conn.execute(
+        "SELECT status, normalized_category, taxonomy_status FROM "
+        "source_trade_enrichments WHERE source_trade_internal_id=?", (CT_POL,)
+    ).fetchone()
+    assert prow is not None, "CT_POL provenance row missing"
+    assert prow["status"] == "complete", prow
+    assert prow["taxonomy_status"] == "usable", prow
+    # Unrelated metadata preserved (custom top-level field untouched across fill).
+    assert filled_meta.get("custom_preserved") == "KEEP_ME", filled_meta
+    # Execution tables remain unchanged.
+    _assert_no_exec_artifacts(db.conn)
+
+    # Replay: prove the run performs NO net change to canonical metadata or
+    # provenance (it re-serializes idempotently, but the content is identical),
+    # and that it issues no INSERT/DELETE/REPLACE (only idempotent UPDATEs).
+    # Capture metadata_json + provenance evidence_hash before and after, and
+    # record every write SQL via the instrumented connection.
+    before_replay = {}
+    for tid in (CT1, CT2):
+        m = db.conn.execute(
+            "SELECT metadata_json FROM source_trades WHERE id=?", (tid,)
+        ).fetchone()[0]
+        h = db.conn.execute(
+            "SELECT evidence_hash FROM source_trade_enrichments "
+            "WHERE source_trade_internal_id=?", (tid,)).fetchone()[0]
+        before_replay[tid] = (m, h)
+    prov_count_before = db.conn.execute(
         "SELECT COUNT(*) FROM source_trade_enrichments").fetchone()[0]
+    trace["writes"].clear()
     backfill._make_adapter = _fake_backfill_adapter_factory(
         by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B})
+    backfill.open_writable = _spy_open_writable
     try:
         backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
                        "--write", "--allow-live", "--confirm-production-db",
                        "--limit", "50"])
     finally:
         backfill._make_adapter = orig_adapter
+        backfill.open_writable = orig_open_writable
+    # No INSERT/DELETE/REPLACE; only idempotent metadata re-serialization UPDATEs.
+    for sql in trace["writes"]:
+        assert "INSERT" not in sql.upper(), f"replay issued INSERT: {sql}"
+        assert "DELETE" not in sql.upper(), f"replay issued DELETE: {sql}"
+        assert "REPLACE" not in sql.upper(), f"replay issued REPLACE: {sql}"
+    # Zero NEW provenance rows.
     assert db.conn.execute(
-        "SELECT COUNT(*) FROM source_trade_enrichments").fetchone()[0] == prov_before_replay
+        "SELECT COUNT(*) FROM source_trade_enrichments").fetchone()[0] == prov_count_before
+    # Canonical metadata content byte-identical; provenance evidence_hash
+    # unchanged (proving the replay did not alter or re-derive anything).
+    for tid in (CT1, CT2):
+        m = db.conn.execute(
+            "SELECT metadata_json FROM source_trades WHERE id=?", (tid,)
+        ).fetchone()[0]
+        h = db.conn.execute(
+            "SELECT evidence_hash FROM source_trade_enrichments "
+            "WHERE source_trade_internal_id=?", (tid,)).fetchone()[0]
+        assert m == before_replay[tid][0], f"replay changed metadata for {tid}"
+        assert h == before_replay[tid][1], f"replay changed provenance for {tid}"
 
     # ── enrichment with fake provider and asserted request count ──
     enrich = _load("enrich_approved_source_trade.py")
@@ -566,30 +687,81 @@ def test_s7_disposable_e2e_full_lifecycle():
     # Resolved market records a valid (non-null) resolved_at timestamp.
     assert st_re[1] is not None, st_re
     assert "T" in st_re[1], st_re
-    # ── conflict path preserves prior evidence ──
-    # Read each collected trade's current canonical taxonomy + condition id.
-    rows = db.conn.execute(
-        "SELECT id, market_source_id, metadata_json FROM source_trades "
-        "WHERE id IN (?,?)", (CT1, CT2)).fetchall()
-    cur_cat = {}
-    for r in rows:
-        m = json.loads(r["metadata_json"])
-        cur_cat[r["id"]] = m["taxonomy"]["raw_category"]
-    # Pick CT2's current category; backfill it with the OPPOSITE category GAMMA
-    # so merge_canonical_metadata yields MERGE_CONFLICT and preserves the prior.
-    ct2_cat = cur_cat[CT2]
-    opp = GAMMA_B if ct2_cat == "Politics" else GAMMA_A
+    # ── SECTION 3: PROVE AN ACTUAL CONFLICT (contradictory canonical Gamma) ──
+    # Force CT2 to a known baseline taxonomy (Sports) and feed backfill a Gamma
+    # whose conditionId MATCHES CT2's market_source_id (COND_B) but whose taxonomy
+    # category is the OPPOSITE (Politics). A mismatched conditionId would yield
+    # unavailable, not conflict -- so the Gamma must carry CT2's real conditionId.
+    ct2_meta = json.loads(db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT2,)).fetchone()[0])
+    ct2_meta["taxonomy"] = {"raw_category": "Sports", "tags": ["nba"]}
+    db.conn.execute("UPDATE source_trades SET metadata_json=? WHERE id=?",
+                    (json.dumps(ct2_meta, sort_keys=True), CT2))
+    db.conn.commit()
+    ct2_cat = "Sports"
+    opp_cat = "Politics"
+    gamma_opp = dict(GAMMA_B)  # conditionId == COND_B, clobTokenIds == [TOK_A, TOK_B]
+    gamma_opp["category"] = opp_cat
+    gamma_opp["tags"] = ["election"]
+    _BACKFILL_ADAPTER_CALLS.clear()
+    _BACKFILL_ADAPTER_INSTANCES.clear()
     backfill._make_adapter = _fake_backfill_adapter_factory(
-        by_condition={COND_A: opp, COND_B: opp})
+        by_condition={COND_A: GAMMA_A, COND_B: gamma_opp})
     try:
-        backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
-                       "--write", "--allow-live", "--confirm-production-db",
-                       "--limit", "50"])
+        rc_conf = backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+                                 "--write", "--allow-live", "--confirm-production-db",
+                                 "--limit", "50"])
     finally:
         backfill._make_adapter = orig_adapter
+    # The command returns the accepted honest result (rc 0, conflict counted).
+    assert rc_conf == 0, rc_conf
+    # The actual adapter WAS called for CT2's condition id (not skipped).
+    assert len(_BACKFILL_ADAPTER_INSTANCES) == 1, _BACKFILL_ADAPTER_INSTANCES
+    assert COND_B in _BACKFILL_ADAPTER_INSTANCES[0].calls, \
+        _BACKFILL_ADAPTER_INSTANCES[0].calls
+    # source_trades.metadata_json is preserved byte-for-byte (conflict not overwritten).
     prior = db.conn.execute(
         "SELECT metadata_json FROM source_trades WHERE id=?", (CT2,)).fetchone()[0]
-    assert json.loads(prior)["taxonomy"]["raw_category"] == ct2_cat, prior
+    after = json.loads(prior)
+    assert after["taxonomy"]["raw_category"] == ct2_cat, after
+    # source_trade_enrichments records the honest conflict status + exact code.
+    crow = db.conn.execute(
+        "SELECT status, reason_codes_json FROM source_trade_enrichments "
+        "WHERE source_trade_internal_id=?", (CT2,)).fetchone()
+    assert crow is not None, "CT2 provenance row missing"
+    assert crow["status"] == "conflict", crow
+    codes = json.loads(crow["reason_codes_json"]) if crow["reason_codes_json"] else []
+    assert codes, codes
+    # Exact conflict reason code: a differing non-empty scalar under taxonomy.
+    assert any("taxonomy_raw_category_conflict" in c for c in codes), codes
+    # Normalized category is NOT falsely replaced (stays NULL under conflict).
+    ncat = db.conn.execute(
+        "SELECT normalized_category FROM source_trade_enrichments "
+        "WHERE source_trade_internal_id=?", (CT2,)).fetchone()[0]
+    assert ncat is None, ncat
+    # Resolve the conflict: strip CT2's taxonomy so the matching Gamma (GAMMA_B,
+    # Sports) triggers a real FILL -> provenance rewritten to 'complete'. A plain
+    # re-run with matching data is UNCHANGED and skips the provenance rewrite, so
+    # we force a fill to honestly clear the conflict.
+    ct2_res_meta = json.loads(db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT2,)).fetchone()[0])
+    ct2_res_meta["taxonomy"] = {}
+    db.conn.execute("UPDATE source_trades SET metadata_json=? WHERE id=?",
+                    (json.dumps(ct2_res_meta, sort_keys=True), CT2))
+    db.conn.commit()
+    backfill._make_adapter = _fake_backfill_adapter_factory(
+        by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B})
+    try:
+        rc_res = backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+                                "--write", "--allow-live", "--confirm-production-db",
+                                "--limit", "50"])
+    finally:
+        backfill._make_adapter = orig_adapter
+    assert rc_res == 0, rc_res
+    rstat = db.conn.execute(
+        "SELECT status FROM source_trade_enrichments "
+        "WHERE source_trade_internal_id=?", (CT2,)).fetchone()[0]
+    assert rstat == "complete", rstat
 
     # ── rescore: dry-run zero decisions ──
     evaluate = _load("evaluate_specialist_evidence_watchlist.py")
@@ -612,6 +784,9 @@ def test_s7_disposable_e2e_full_lifecycle():
         (WID,)).fetchone()[0]
     assert w1 == 1, w1
     assert c1 >= 1, c1
+    prior_wallet_decision = db.conn.execute(
+        "SELECT id, idempotency_key FROM wallet_score_decisions WHERE wallet_id=?",
+        (WID,)).fetchone()
     # Replay: zero duplicate decision rows.
     evaluate.main(["--db-path", str(db.db_path), "--wallet-id", WID, "--write"])
     assert db.conn.execute(
@@ -621,8 +796,23 @@ def test_s7_disposable_e2e_full_lifecycle():
         "SELECT COUNT(*) FROM category_wallet_score_decisions WHERE wallet_id=?",
         (WID,)).fetchone()[0] == c1
 
-    # ── forced later scoring failure rolls back all staged decisions ──
-    # (mirrors test_pXX_rescore_status.py::test_evaluate_forced_persistence_failure_rolls_back)
+    # ── SECTION 4: PROVE STAGED-DECISION ROLLBACK ON COMMIT FAILURE ──
+    # Modify canonical evidence so the next rescore has genuinely changed
+    # evidence fingerprints and WOULD create new wallet + category decisions
+    # (different idempotency keys). We add ONE more GREEN trade with a distinct
+    # payload so the wallet's aggregate metrics change, forcing a new decision
+    # (a plain DELETE would violate the source_trade_enrichments FK). Activate
+    # the commit-failure hook, run the write rescore, and prove the staged rows
+    # rolled back (exit 1) while the prior committed decision survives.
+    _seed_green_evidence(db, ADDR, n=1, winrate=0.95, prefix="green_delta")
+    db.conn.commit()
+    # Record current decision counts BEFORE the forced-failure run.
+    w_before = db.conn.execute(
+        "SELECT COUNT(*) FROM wallet_score_decisions WHERE wallet_id=?",
+        (WID,)).fetchone()[0]
+    c_before = db.conn.execute(
+        "SELECT COUNT(*) FROM category_wallet_score_decisions WHERE wallet_id=?",
+        (WID,)).fetchone()[0]
     from evidence_db import DbConn as _DC
     _DC._COMMIT_FAIL_HOOK = RuntimeError("forced commit failure")
     try:
@@ -631,10 +821,19 @@ def test_s7_disposable_e2e_full_lifecycle():
     finally:
         _DC._COMMIT_FAIL_HOOK = None
     assert rc_fail == 1, rc_fail  # rollback -> exit 1
+    # ALL newly staged wallet/category rows rolled back: counts unchanged.
     assert db.conn.execute(
         "SELECT COUNT(*) FROM wallet_score_decisions WHERE wallet_id=?",
-        (WID,)).fetchone()[0] == 1  # the pre-existing GREEN decision survives;
-    # the failed re-evaluation staged nothing new and rolled back.
+        (WID,)).fetchone()[0] == w_before
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM category_wallet_score_decisions WHERE wallet_id=?",
+        (WID,)).fetchone()[0] == c_before
+    # The prior committed decision remains (same idempotency key).
+    surviving = db.conn.execute(
+        "SELECT id, idempotency_key FROM wallet_score_decisions WHERE wallet_id=?",
+        (WID,)).fetchone()
+    assert surviving is not None, "prior committed decision lost"
+    assert surviving[0] == prior_wallet_decision[0], surviving
 
     # ── status: deterministic GREEN transition ──
     st = _load("specialist_evidence_status.py")
@@ -697,41 +896,78 @@ def test_s7_status_readonly_purity():
     _seed_watch(db, "wl-r", WID, last_collection_at=_recent_ts(0))
     _seed_trade(db, "st-r")
 
-    captured = {}
-
-    def _spy(sql, params=None):
-        s = sql.strip().upper()
-        if any(k in s for k in ("INSERT", "UPDATE", "DELETE", "REPLACE")):
-            captured.setdefault("writes", []).append(sql)
-        if s.startswith("PRAGMA") and "FOREIGN_KEYS" not in s and "INTEGRITY" not in s:
-            pass
-        return _real_execute(sql, params)
-
     st = _load("specialist_evidence_status.py")
-    import evidence_db as ed
-    real_open = ed.open_readonly
 
-    class _Spy:
+    # Patch the status module's OWN bound symbol (it did
+    #   `from evidence_db import open_readonly`
+    # at import time, so patching evidence_db.open_readonly afterwards has no
+    # effect on st.main). We wrap st.open_readonly to return an instrumented
+    # read-only DbConn.
+    real_open = st.open_readonly
+    captured = {"writes": [], "trace": []}
+
+    def _trace(sql):
+        s = sql.strip().upper()
+        if any(k in s for k in ("INSERT", "UPDATE", "DELETE", "REPLACE",
+                                "CREATE", "DROP", "ALTER")):
+            captured["trace"].append(sql)
+
+    class _ReadOnlySpyConn:
+        """Instrumented read-only DbConn: records every write SQL and proves the
+        underlying mode=ro connection rejects any write attempt."""
+        def __init__(self, real):
+            self._real = real
+            self._real.conn.set_trace_callback(_trace)
+            self._real_execute = self._real.execute
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def execute(self, sql, params=None):
+            s = sql.strip().upper()
+            if any(k in s for k in ("INSERT", "UPDATE", "DELETE", "REPLACE",
+                                    "CREATE", "DROP", "ALTER")):
+                captured["writes"].append(sql)
+            return self._real_execute(sql, params)
+
+        def prove_rejects_write(self):
+            # A genuine write on a mode=ro connection must raise, proving the
+            # connection used by status is read-only at the SQLite layer.
+            try:
+                self._real.conn.execute(
+                    "INSERT INTO wallets(id,address,label,is_sample,created_at) "
+                    "VALUES ('x','x','x',0,'2026-01-01T00:00:00Z')")
+            except sqlite3.OperationalError as exc:
+                assert "readonly" in str(exc).lower(), exc
+                return
+            raise AssertionError("mode=ro connection accepted a write!")
+
+    class _SpyOpen:
         def __init__(self, real):
             self._real = real
         def __call__(self, db_path, *a, **k):
             conn = self._real(db_path, *a, **k)
-            global _real_execute
-            _real_execute = conn.execute
-            conn.execute = _spy
-            return conn
+            return _ReadOnlySpyConn(conn)
 
-    ed.open_readonly = _Spy(real_open)
+    st.open_readonly = _SpyOpen(real_open)
     try:
         rc = st.main(["--db-path", str(db.db_path)])
     finally:
-        ed.open_readonly = real_open
+        st.open_readonly = real_open
+
     assert rc == 0, rc
-    assert captured.get("writes", []) == [], captured
+    # No INSERT/UPDATE/DELETE/REPLACE/schema write reached the DB (two monitors).
+    assert captured["writes"] == [], captured["writes"]
+    assert captured["trace"] == [], captured["trace"]
+    # The connection status used is genuinely read-only: a write attempt is
+    # rejected at the SQLite layer (mode=ro), not merely "not attempted".
+    spy = _SpyOpen(real_open)(str(db.db_path))
+    spy.prove_rejects_write()
     db.close()
 
 
 # ── F. production-path refusal matrix (isolated fixtures ONLY) ─────────────────
+
 
 def test_s7_production_refusal_matrix():
     """Every PR #71 write CLI, pointed at an ISOLATED fixture recognized as a

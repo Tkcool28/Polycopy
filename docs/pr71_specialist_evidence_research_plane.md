@@ -216,13 +216,15 @@ and asserts exact behavior at every stage:
 
 | Stage | What the test proves (deterministically) |
 |-------|-------------------------------------------|
-| Initial state | Fresh wallet/watch → `YELLOW` (no evidence). |
-| Collection | 2 BUY-only trades inserted via fake provider; taxonomy + provenance written atomically. |
-| Backfill | Fake Gamma adapter (patched `_make_adapter`, invoked exactly once, serves both CIDs) fills canonical metadata via the REAL selection/normalization/merge/provenance/transaction path; conflict path preserves prior taxonomy (no overwrite). |
+| Initial YELLOW | Immediately after `add_watch` and **before** any collection: open the disposable DB read-only, run `build_status`, assert `state == "YELLOW"`, `ready_for_human_review is False`, top-level `ready_for_human_review_count == 0`, and zero execution artifacts. |
+| Collection | 2 BUY-only trades inserted via fake provider; canonical taxonomy + provenance written atomically. |
+| Backfill FILL (real) | One eligible collected trade's canonical taxonomy is **deliberately removed** (preserving valid CID/token + an unrelated field); the named `_make_adapter` factory stores the **actual** adapter instance used by the CLI. After the write: factory invoked exactly once; `actual_adapter.calls` contains the expected condition id; `metadata_json["taxonomy"]["raw_category"]` is now filled; provenance `status=complete`/usable; unrelated field preserved; execution tables unchanged. Replay proves the canonical metadata is **byte-identical** and the provenance `evidence_hash` is unchanged, and issues **no INSERT/DELETE/REPLACE** (only idempotent re-serialization UPDATEs). |
+| Backfill CONFLICT (real) | A trade is made genuinely eligible for a conflicting backfill by feeding contradictory canonical Gamma (matching `conditionId`, opposite `raw_category`). Asserted: actual adapter called for that trade's condition id (not skipped); `source_trades.metadata_json` preserved byte-for-byte; `source_trade_enrichments.status == "conflict"` with exact reason code `taxonomy_raw_category_conflict`; normalized category NOT falsely replaced (stays NULL). Conflict is then honestly resolved so the wallet can reach GREEN. |
 | Enrichment | Fake resolver called exactly once; upserts the single current provenance row (`status=complete`, usable category); replay issues one more request and writes **zero** new rows. |
 | Refresh | Unresolved market → `last_status=unresolved`, `resolved_at` NULL (no fabricated winner); resolved market → `resolved_at` set (non-null). |
-| Rescore | Dry-run writes 0 decisions; GREEN write + replay is idempotent (1 decision row); a forced commit failure rolls back all staged decisions (exit 1, prior decision survives). |
-| Status | Deterministic `GREEN`→`copy_candidate` transition; an injected `conflict` enrichment row flips the wallet to `RED`, `ready_for_human_review=false`, `ready_count=0`. |
+| Rescore rollback (observable) | Dry-run writes 0 decisions; GREEN write + replay idempotent (1 decision row). A genuinely **new** decision (changed evidence fingerprint) is staged, then a forced commit-failure hook makes the write rescore exit 1; **all** newly staged wallet/category rows are rolled back and the prior committed decision survives. |
+| Status GREEN/RED | Deterministic `GREEN`→`copy_candidate` transition; an injected current `conflict` enrichment row flips the wallet to `RED`, `ready_for_human_review=false`, `ready_count=0`. |
+| Status read-only purity | `specialist_evidence_status.open_readonly` (the module's bound symbol) is patched to return an instrumented `mode=ro` `DbConn`. Proven: zero INSERT/UPDATE/DELETE/REPLACE/CREATE/DROP/ALTER SQL, and a write attempt is **rejected** by the SQLite layer (`attempt to write a readonly database`) — not merely "not attempted". |
 | Execution-plane isolation | All 13 execution-plane tables have **zero** deltas across the whole lifecycle. |
 
 The fake providers are injected via the production-accepted seams
@@ -232,10 +234,10 @@ refusal test (`test_s7_production_refusal_matrix`) builds its own isolated temp
 fixture and patches the gate seams to prove every write CLI exits 2 **before**
 opening any DB; it never touches the repo's real `data/polycopy.db`.
 
-Base-vs-head: the focused PR #71 suite and all remaining tests are green with
-**zero PR-caused failures**. The full repository suite shows one identical,
-proven base/environment-dependent failure (`test_p24o`) that is not in the PR
-diff and fails identically on `main`.
+The S7 lifecycle test (`test_s7_disposable_e2e_full_lifecycle`) is one of 8 S7
+tests in `tests/test_pXX_s7_final_integration.py`; all 8 pass. The full
+repository suite and the focused PR #71 suite are re-verified at PR validation
+(see exact-head CI / PR body) with **zero PR-caused failures**.
 
 ---
 
