@@ -1,0 +1,57 @@
+# ============================================================================
+# REVIEW-ONLY — NOT ENABLED.
+# Requires explicit --write --allow-live --confirm-production-db gates.
+#
+# This unit runs the canonical rescoring orchestration in DRY-RUN mode by
+# default. It NEVER creates a specialist_approval and NEVER references
+# private keys or live execution credentials. No --write / --allow-live /
+# --confirm-production-db is passed.
+#
+# Installation / enabling / scheduling are separate, explicitly approved
+# post-merge operations. Do NOT `systemctl enable` this file as-is.
+#
+# To persist rescore decisions you would need (a) --write
+# --allow-live --confirm-production-db, (b) ReadWritePaths for the data
+# directory, and (c) relaxation of ProtectSystem — all gated behind human
+# approval. None of that is done here.
+# ============================================================================
+[Unit]
+Description=Polycopy specialist-evidence rescoring orchestration (REVIEW-ONLY, dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/workspaces/polycopy-evidence-v21
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYCOPY_MAX_RSS_MB=512
+# Review-only: dry-run by default, no write/allow-live/confirm flags, no
+# credential env file. Rescoring persists honest incomplete/copy_candidate
+# rows only; it never auto-approves.
+ExecStart=/root/workspaces/polycopy-evidence-v21/.venv/bin/python /root/workspaces/polycopy-evidence-v21/scripts/evaluate_specialist_evidence_watchlist.py --dry-run
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=no
+# --- Explicit bounds / RSS guard ---
+MemoryMax=512M
+TasksMax=32
+# --- Hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ExecPaths=/root/workspaces/polycopy-evidence-v21/.venv/bin /usr/bin /bin
+NoExecPaths=/tmp /var/tmp /root/workspaces/polycopy-evidence-v21/data
+StandardOutput=journal
+StandardError=journal

@@ -453,10 +453,11 @@ def test_v20_migration_preserves_risk_decisions(tmp_path):
     db.commit()
     db.close()
 
-    # Reopen -> migrate v19 -> v20.
+    # Reopen -> migrate v19 -> v21 (v21 adds the research-plane tables; the
+    # released schema version is now 21).
     db2 = Database(tmp_path / "mig.db").connect()
     version = db2.fetchone("SELECT value FROM _meta WHERE key='schema_version'")["value"]
-    assert int(version) == 20, f"expected schema 20 after migration, got {version}"
+    assert int(version) == 21, f"expected schema 21 after migration, got {version}"
 
     # Risk row preserved, with new attempt identity columns populated.
     row = db2.fetchone("SELECT * FROM execution_risk_decisions WHERE risk_decision_id=?", (rid,))

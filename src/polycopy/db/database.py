@@ -310,6 +310,39 @@ class Database:
         "idx_execution_risk_authz",
         "idx_execution_risk_attempt",
     )
+    # v21 — canonical specialist evidence accumulation. Includes the PR #70
+    # (v18/v19) tables inline so a *fresh* v21 DB is complete (the v13
+    # short-circuit does not list them). Discriminating objects: the two new
+    # research-plane tables plus the v18/v19 indexes that only those
+    # migrations add.
+    _REQUIRED_V21_OBJECTS: tuple[str, ...] = (
+        "specialist_approvals",
+        "paper_signal_execution_authorizations",
+        "execution_risk_decisions",
+        "paper_orders",
+        "paper_fills",
+        "paper_positions",
+        "paper_position_lots",
+        "paper_position_marks",
+        "paper_position_settlements",
+        "source_trade_enrichments",
+        "approved_specialist_trade_dispatches",
+        "specialist_evidence_watchlist",
+        "specialist_market_refresh_state",
+        "ux_specialist_approvals_active",
+        "idx_paper_signal_exec_authz_signal",
+        "idx_execution_risk_signal",
+        "idx_execution_risk_attempt",
+        "idx_paper_orders_signal",
+        "idx_paper_fills_order",
+        "idx_paper_positions_order",
+        "idx_paper_position_marks_position",
+        "idx_paper_position_settlements_position",
+        "idx_source_trade_enrichments_internal",
+        "idx_astd_approval",
+        "ux_evidence_watchlist_active",
+        "idx_market_refresh_next",
+    )
 
     # Indexes this PR adds to ``_V13_DDL``. They are created as a
     # post-reconciliation step when the rest of the v13 schema is
@@ -357,6 +390,9 @@ class Database:
             if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         for obj in self._REQUIRED_V20_OBJECTS:
+            if not (self._table_exists(obj) or self._index_exists(obj)):
+                return False
+        for obj in self._REQUIRED_V21_OBJECTS:
             if not (self._table_exists(obj) or self._index_exists(obj)):
                 return False
         return True

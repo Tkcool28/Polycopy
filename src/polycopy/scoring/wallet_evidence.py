@@ -416,7 +416,7 @@ def _dominant_category_label(
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
-def resolve_wallet_score_v1(db: Any, wallet_id: str, *, cutoff_timestamp: Optional[str], persist: bool, now: Any) -> ScoreResolution:
+def resolve_wallet_score_v1(db: Any, wallet_id: str, *, cutoff_timestamp: Optional[str], persist: bool, now: Any, persist_commit: bool = True) -> ScoreResolution:
     evidence = aggregate_wallet_evidence(db, wallet_id, cutoff_timestamp=cutoff_timestamp)
     # The global wallet decision must also carry category resolution evidence
     # (frozen guard contract: a wallet decision with category_resolved_markets
@@ -444,11 +444,11 @@ def resolve_wallet_score_v1(db: Any, wallet_id: str, *, cutoff_timestamp: Option
         return ScoreResolution(result, existing, "wallet_score", result.formula_version, evidence.evidence_fingerprint, evidence.source_data_timestamp, tuple((*evidence.missing_reasons, *result.missing_essentials)), "complete" if result.verdict != WalletVerdict.INCOMPLETE else "incomplete", reused=True, persisted=True)
     if not persist:
         return ScoreResolution(result, None, "wallet_score", result.formula_version, evidence.evidence_fingerprint, evidence.source_data_timestamp, tuple((*evidence.missing_reasons, *result.missing_essentials)), "complete" if result.verdict != WalletVerdict.INCOMPLETE else "incomplete", would_create=True)
-    decision_id = persist_wallet_score_v1(db, wallet_id, result, idempotency_key=idem, source_data_timestamp=evidence.source_data_timestamp)
+    decision_id = persist_wallet_score_v1(db, wallet_id, result, idempotency_key=idem, source_data_timestamp=evidence.source_data_timestamp, commit=persist_commit)
     return ScoreResolution(result, decision_id, "wallet_score", result.formula_version, evidence.evidence_fingerprint, evidence.source_data_timestamp, tuple((*evidence.missing_reasons, *result.missing_essentials)), "complete" if result.verdict != WalletVerdict.INCOMPLETE else "incomplete", created=True, persisted=True)
 
 
-def resolve_category_score_v1(db: Any, wallet_id: str, taxonomy: TaxonomyClassification, *, cutoff_timestamp: Optional[str], persist: bool, now: Any) -> ScoreResolution:
+def resolve_category_score_v1(db: Any, wallet_id: str, taxonomy: TaxonomyClassification, *, cutoff_timestamp: Optional[str], persist: bool, now: Any, persist_commit: bool = True) -> ScoreResolution:
     if taxonomy.status != CATEGORY_TAXONOMY_USABLE or taxonomy.category_label is None:
         return ScoreResolution(None, None, "category_wallet_score", "1", None, None, (taxonomy.reason or "category_taxonomy_unavailable",), "not_applicable")
     evidence = aggregate_category_evidence(db, wallet_id, taxonomy.category_label, cutoff_timestamp=cutoff_timestamp)
@@ -471,7 +471,7 @@ def resolve_category_score_v1(db: Any, wallet_id: str, taxonomy: TaxonomyClassif
         return ScoreResolution(result, existing, "category_wallet_score", result.formula_version, evidence.evidence_fingerprint, evidence.source_data_timestamp, missing, status, reused=True, persisted=True)
     if not persist:
         return ScoreResolution(result, None, "category_wallet_score", result.formula_version, evidence.evidence_fingerprint, evidence.source_data_timestamp, missing, status, would_create=True)
-    decision_id = persist_category_score_v1(db, wallet_id, taxonomy.category_label, result, idempotency_key=idem, source_data_timestamp=evidence.source_data_timestamp)
+    decision_id = persist_category_score_v1(db, wallet_id, taxonomy.category_label, result, idempotency_key=idem, source_data_timestamp=evidence.source_data_timestamp, commit=persist_commit)
     return ScoreResolution(result, decision_id, "category_wallet_score", result.formula_version, evidence.evidence_fingerprint, evidence.source_data_timestamp, missing, status, created=True, persisted=True)
 
 

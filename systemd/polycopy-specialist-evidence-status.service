@@ -1,0 +1,48 @@
+# ============================================================================
+# REVIEW-ONLY — NOT ENABLED.
+#
+# Read-only per-wallet readiness / safety monitor. It performs NO writes
+# and NEVER references private keys or live execution credentials. It is
+# safe to run as-is; it only proves the execution plane is unchanged.
+#
+# Installation / enabling / scheduling are separate, explicitly approved
+# post-merge operations. Do NOT `systemctl enable` this file as-is.
+# ============================================================================
+[Unit]
+Description=Polycopy specialist-evidence readiness/status monitor (REVIEW-ONLY, read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/workspaces/polycopy-evidence-v21
+Environment=PYTHONUNBUFFERED=1
+# Read-only monitor: no write flags, no credential env file. It explicitly
+# proves specialist_approvals / paper_* counts are unchanged vs baseline.
+ExecStart=/root/workspaces/polycopy-evidence-v21/.venv/bin/python /root/workspaces/polycopy-evidence-v21/scripts/specialist_evidence_status.py --json
+TimeoutStartSec=120
+TimeoutStopSec=30
+Restart=no
+# --- Explicit bounds / RSS guard ---
+MemoryMax=256M
+TasksMax=16
+# --- Hardening ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ExecPaths=/root/workspaces/polycopy-evidence-v21/.venv/bin /usr/bin /bin
+NoExecPaths=/tmp /var/tmp /root/workspaces/polycopy-evidence-v21/data
+StandardOutput=journal
+StandardError=journal

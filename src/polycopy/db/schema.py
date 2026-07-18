@@ -42,8 +42,8 @@ natively idempotent in SQLite.
 
 from __future__ import annotations
 
-# ── Schema version ──────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 20
+# ── Version 21: canonical specialist evidence accumulation ──────────────
+SCHEMA_VERSION = 21
 
 # Import v10 schema changes
 from polycopy.db.schema_v10 import _V10_DDL  # noqa: E402
@@ -97,6 +97,11 @@ from polycopy.db.schema_v19 import _V19_DDL  # noqa: E402
 # (execution_attempt_id, authorization_id, attempt_number). Preserves existing
 # risk-decision IDs and the paper_orders FK into risk_decision_id.
 from polycopy.db.schema_v20 import _V20_DDL  # noqa: E402
+# v21 — Canonical Specialist Evidence Accumulation (research plane). Adds the
+# research-only watchlist + market-refresh state, and inlines the PR #70
+# (v18/v19) tables so a fresh v21 DB is self-sufficient (see
+# schema_v21.py for the fresh-DB completeness rationale).
+from polycopy.db.schema_v21 import _V21_DDL  # noqa: E402
 
 
 def _build_idempotent_add_column_sql(table: str, column: str, type_sql: str) -> str:
@@ -838,6 +843,7 @@ MIGRATIONS: dict[int, list[str]] = {
     18: _V18_DDL,
     19: _V19_DDL,
     20: _V20_DDL,
+    21: _V21_DDL,
 }
 
 # Current DDL is the latest migration
