@@ -18,6 +18,7 @@ import json
 import sys
 import tempfile
 import asyncio
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1153,6 +1154,52 @@ def test_artifact_counts_report_real_existing_count():
     n = db.conn.execute(
         "SELECT COUNT(*) FROM specialist_approvals").fetchone()[0]
     assert n == 1, n
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 29b. A genuinely absent optional table reports zero (not an error)
+# ---------------------------------------------------------------------------
+
+def test_missing_artifact_table_reports_zero():
+    db, _ = _open()
+    _seed_wallet(db)
+    # No artifact tables are seeded beyond the v21 base. Force a table that is
+    # guaranteed absent by monkeypatching the tuple to a known-missing name.
+    real = refresh._FORBIDDEN_ARTIFACT_TABLES
+    try:
+        refresh._FORBIDDEN_ARTIFACT_TABLES = ("zzz_no_such_artifact_table_xyz",)
+        counts = refresh._count_artifacts(db)
+    finally:
+        refresh._FORBIDDEN_ARTIFACT_TABLES = real
+    # Absent table -> zero, no exception.
+    assert counts == {"zzz_no_such_artifact_table_xyz": 0}, counts
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 29c. A non-"no such table" error propagates (never masked as zero)
+# ---------------------------------------------------------------------------
+
+def test_artifact_count_error_propagates_not_zero():
+    db, _ = _open()
+    _seed_wallet(db)
+    # Make the COUNT(*) query on a PRESENT table fail with a non-absence error.
+    # We corrupt the column name so SQLite raises "no such column" (a real
+    # programming/schema error that must NOT be swallowed as zero).
+    import sqlite3
+
+    real_fetchone = db.fetchone
+
+    def _boom(sql, params=None):
+        if sql.strip().upper().startswith("SELECT COUNT(*)"):
+            raise sqlite3.OperationalError("no such column: bogus_col")
+        return real_fetchone(sql, params)
+
+    db.fetchone = _boom
+    # specialty_approvals present; its COUNT(*) will raise.
+    with pytest.raises(sqlite3.OperationalError):
+        refresh._count_artifacts(db)
     db.close()
 
 

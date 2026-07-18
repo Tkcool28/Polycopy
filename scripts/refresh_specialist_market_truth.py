@@ -114,15 +114,32 @@ def _resolve_wallet_address(db: DbConn, wallet_id: str) -> Optional[str]:
 
 
 def _count_artifacts(db: DbConn) -> dict[str, int]:
+    """Count rows in each forbidden artifact table.
+
+    Fail-closed contract: a genuinely absent optional table reports zero. Any
+    other error from the COUNT(*) query (schema drift, permission, SQL mistake,
+    connection trouble) MUST propagate — it is never masked as zero, because a
+    silent zero would let an artifact-creation regression slip through as a
+    "clean" report.
+
+    The table names come only from the fixed internal tuple
+    ``_FORBIDDEN_ARTIFACT_TABLES`` (never untrusted input), so interpolation in
+    the COUNT(*) is safe. Existence is decided by a direct sqlite_master lookup.
+    """
     out = {}
     for t in _FORBIDDEN_ARTIFACT_TABLES:
-        try:
-            row = db.fetchone(f"SELECT COUNT(*) AS c FROM {t}")
-            out[t] = int(row["c"]) if row is not None else 0
-        except Exception:
-            # Table genuinely absent (valid) -> zero; never mask a programming
-            # error as zero. Re-raise anything that is not "no such table".
+        exists = db.fetchone(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (t,),
+        )
+        if exists is None:
+            # Table genuinely absent (valid for an optional artifact table).
             out[t] = 0
+            continue
+        # Table present: COUNT(*) with no try/except. Any real error (schema,
+        # permission, SQL, connection) raises and is NOT swallowed as zero.
+        row = db.fetchone(f"SELECT COUNT(*) AS c FROM {t}")
+        out[t] = int(row["c"]) if row is not None else 0
     return out
 
 
