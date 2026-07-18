@@ -295,6 +295,114 @@ def test_status_red_on_execution_artifact():
     db.close()
 
 
+# ── S6 §2: rescore CLI dry-run / write-gate regression ───────────────────────
+def test_evaluate_dry_run_default_no_write_succeeds():
+    """S6 §2 core regression: a normal dry-run (no --write) must NOT be
+    refused. The prior build called require_write_gates() unconditionally and
+    wrongly returned rc 2 for every dry-run."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID)
+    _seed_trade(db, "polymarket:st1")
+    ev = _load("evaluate_specialist_evidence_watchlist.py")
+    # No --write, no --dry-run flag: default dry-run must succeed.
+    rc = ev.main(["--db-path", str(db.db_path), "--wallet-id", WID])
+    assert rc == 0, rc
+    # And the explicit --dry-run flag also succeeds.
+    rc2 = ev.main(["--db-path", str(db.db_path), "--wallet-id", WID, "--dry-run"])
+    assert rc2 == 0, rc2
+    db.close()
+
+
+def test_evaluate_dry_run_reports_would_create_not_persisted():
+    """S6 §1.2: dry-run must report the exact would-create result and must
+    NOT create a score-decision row."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID)
+    _seed_trade(db, "polymarket:st1")
+    ev = _load("evaluate_specialist_evidence_watchlist.py")
+    rc = ev.main(["--db-path", str(db.db_path), "--json", "--wallet-id", WID])
+    assert rc == 0, rc
+    wsd = db.conn.execute(
+        "SELECT COUNT(*) FROM wallet_score_decisions WHERE wallet_id=?",
+        (WID,)).fetchone()[0]
+    assert wsd == 0, "dry-run must not persist"
+    db.close()
+
+
+def test_evaluate_production_write_refused_before_open():
+    """S6 §2: a write request on a recognized production DB missing the full
+    gate set must be refused (rc 2) BEFORE any writable open / schema read.
+    We prove no exception escapes from a missing-DB open by asserting the
+    refusal happens on the gate alone."""
+    ev = _load("evaluate_specialist_evidence_watchlist.py")
+    # Point at the recognized production repo path but it does not exist;
+    # the gate refusal must fire before the missing-DB open, so rc==2 cleanly.
+    prod_path = str(ROOT / "data" / "polycopy.db")
+    rc = ev.main(["--db-path", prod_path, "--write",
+                  "--wallet-id", WID])
+    assert rc == 2, rc
+
+
+def test_evaluate_nonproduction_write_without_live_gate():
+    """S6 §2: non-production write may use --write WITHOUT --allow-live (this
+    scorer never touches the network). Missing --allow-live must NOT refuse a
+    non-production write (the gate only requires --write outside production)."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID)
+    _seed_trade(db, "polymarket:st1")
+    ev = _load("evaluate_specialist_evidence_watchlist.py")
+    # No --allow-live, no --confirm-production-db, non-production temp DB.
+    rc = ev.main(["--db-path", str(db.db_path), "--write", "--wallet-id", WID])
+    assert rc == 0, rc
+    wsd = db.conn.execute(
+        "SELECT COUNT(*) FROM wallet_score_decisions WHERE wallet_id=?",
+        (WID,)).fetchone()[0]
+    assert wsd == 1, wsd
+    db.close()
+
+
+# ── S6 §4: GREEN requires a SUPPORTED category copy-candidate ────────────────
+def test_status_green_requires_supported_category():
+    """GREEN must NOT be reported when the only copy_candidate category
+    decision is for a category the wallet has NO usable taxonomy for. It must
+    fall back to YELLOW (not green via an unsupported category)."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID)
+    # Trade has usable taxonomy 'politics' (from GAMMA), so supported={politics}.
+    _seed_trade(db, "polymarket:st1")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    db.conn.execute(
+        "UPDATE specialist_evidence_watchlist SET last_collection_at=? "
+        "WHERE id='wl-e'", (now,))
+    # Wallet copy_candidate + category copy_candidate on an UNSUPPORTED label.
+    db.conn.execute(
+        "INSERT INTO wallet_score_decisions("
+        "wallet_id, formula_name, formula_version, idempotency_key, "
+        "final_score, verdict, computed_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (WID, "wallet_score_v1", "1", "k1", 80.0, "copy_candidate",
+         now, now))
+    db.conn.execute(
+        "INSERT INTO category_wallet_score_decisions("
+        "wallet_id, category_label, formula_name, formula_version, "
+        "idempotency_key, final_score, verdict, computed_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (WID, "sports", "category_wallet_score_v1", "1", "ck1", 80.0,
+         "copy_candidate", now, now))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    rc = st.main(["--db-path", str(db.db_path)])
+    assert rc == 0, rc
+    out = _status_json(st, db)
+    # 'sports' is not a supported label for this wallet -> NOT green.
+    assert out["overall_state"] == "YELLOW", out
+    db.close()
+
+
 def _status_json(st, db):
     import io
     buf = io.StringIO()

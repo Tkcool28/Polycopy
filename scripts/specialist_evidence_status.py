@@ -153,21 +153,28 @@ def _latest_wallet_verdict(db: DbConn, wallet_id: str) -> Optional[dict[str, Any
     }
 
 
-def _best_category_decision(db: DbConn, wallet_id: str) -> Optional[dict[str, Any]]:
-    row = db.fetchone(
+def _best_category_decision(db: DbConn, wallet_id: str, supported: list[str]) -> Optional[dict[str, Any]]:
+    # GREEN requires a copy-candidate on a SUPPORTED category (one whose
+    # usable taxonomy label actually exists in the wallet's source_trades).
+    # Only consider decisions whose category_label is in the supported set.
+    if not supported:
+        return None
+    rows = db.fetchall(
         "SELECT category_label, verdict, final_score, id FROM "
         "category_wallet_score_decisions WHERE wallet_id=? "
-        "ORDER BY final_score DESC, id DESC LIMIT 1",
+        "ORDER BY final_score DESC, id DESC",
         (wallet_id,),
     )
-    if row is None:
-        return None
-    return {
-        "category_label": str(row["category_label"]),
-        "verdict": str(row["verdict"]),
-        "final_score": row["final_score"],
-        "decision_id": int(row["id"]),
-    }
+    for row in rows:
+        label = str(row["category_label"])
+        if label in supported:
+            return {
+                "category_label": label,
+                "verdict": str(row["verdict"]),
+                "final_score": row["final_score"],
+                "decision_id": int(row["id"]),
+            }
+    return None
 
 
 def _taxonomy_completeness(db: DbConn, wallet_id: str) -> dict[str, Any]:
@@ -239,7 +246,7 @@ def build_wallet_status(db: DbConn, wallet_id: str, watch: dict[str, Any]) -> di
         )
 
     wallet_verdict = _latest_wallet_verdict(db, wallet_id)
-    category_decision = _best_category_decision(db, wallet_id)
+    category_decision = _best_category_decision(db, wallet_id, supported)
 
     wallet_gate_distance = _distance_to_gates(wallet_ev, WALLET_GATES)
     category_gate_distance = (

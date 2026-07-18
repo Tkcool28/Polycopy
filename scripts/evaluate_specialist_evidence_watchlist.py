@@ -43,6 +43,7 @@ from polycopy.scoring.wallet_evidence import (  # noqa: E402
 )
 from evidence_db import (  # noqa: E402
     DbConn,
+    is_production_db,
     open_readonly,
     open_writable,
     require_write_gates,
@@ -157,6 +158,8 @@ def evaluate_wallet(
         if wallet_res.result is not None
         else "incomplete"
     )
+    wallet_would_create = bool(wallet_res.would_create)
+    wallet_current = (not write) and wallet_res.decision_id is not None
 
     categories: list[dict[str, Any]] = []
     supported = _supported_category_labels(db, wallet_id)
@@ -176,6 +179,8 @@ def evaluate_wallet(
             "status": cat_res.status,
             "created": cat_res.created,
             "reused": cat_res.reused,
+            "would_create": bool(cat_res.would_create),
+            "current": (not write) and cat_res.decision_id is not None,
         })
 
     return {
@@ -184,6 +189,8 @@ def evaluate_wallet(
         "wallet_decision_id": wallet_decision_id,
         "wallet_decision_created": wallet_res.created,
         "wallet_decision_reused": wallet_res.reused,
+        "wallet_decision_would_create": wallet_would_create,
+        "wallet_decision_current": wallet_current,
         "supported_categories": supported,
         "category_decisions": categories,
     }
@@ -213,15 +220,27 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--allow-live", action="store_true")
     args = p.parse_args(argv)
 
-    # Production guard: write ops require the full three-gate set.
-    if not require_write_gates(args, db_path=args.db_path):
-        print(
-            "error: production database write requires "
-            "--write --allow-live --confirm-production-db",
-            file=sys.stderr,
-        )
+    # Dry-run is the DEFAULT. A write is only authorized when explicitly
+    # requested AND the production-safety gates pass. The production refusal
+    # MUST happen BEFORE any DB open / selector lookup / schema read / writable
+    # open — so a missing gate cannot fall through into an open at all.
+    #
+    # Key contract (S6 §2): require_write_gates() returns False for a normal
+    # dry-run (no --write), which is CORRECT and must NOT be treated as a
+    # refusal. Only an explicit write request that fails the gates is refused.
+    persist = bool(getattr(args, "write", False)) and not bool(
+        getattr(args, "dry_run", False)
+    )
+    if persist and not require_write_gates(args, db_path=args.db_path):
+        if is_production_db(args.db_path):
+            msg = (
+                "error: production database write requires "
+                "--write --allow-live --confirm-production-db"
+            )
+        else:
+            msg = "error: write requires --write"
+        print(msg, file=sys.stderr)
         return 2
-    persist = bool(getattr(args, "write", False))
 
     db = open_writable(args.db_path, args) if persist else open_readonly(args.db_path)
     try:
@@ -240,6 +259,15 @@ def main(argv: list[str] | None = None) -> int:
         for wallet_id, watch_id in watches:
             rec = evaluate_wallet(db, wallet_id, now=now, write=persist)
             rec["watch_id"] = watch_id
+            # Honest decision intent (S6 §1.2 / §2): never write in dry-run.
+            if persist:
+                rec["decision_intent"] = "would_persist"
+            elif rec.get("wallet_decision_current"):
+                rec["decision_intent"] = "current"  # existing compatible decision reused
+            elif rec.get("wallet_decision_would_create"):
+                rec["decision_intent"] = "would_create"
+            else:
+                rec["decision_intent"] = "none"
             results.append(rec)
 
         after_forbidden = {t: _count(db, t) for t in _FORBIDDEN_EXECUTION_TABLES}
@@ -269,7 +297,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(
                     f"wallet={rec['wallet_id']} watch={rec['watch_id']} "
-                    f"verdict={rec['wallet_verdict']} categories=[{cats}]"
+                    f"verdict={rec['wallet_verdict']} "
+                    f"intent={rec['decision_intent']} categories=[{cats}]"
                 )
             print(f"mode={report['mode']} wallets_evaluated={len(results)}")
         return 0
