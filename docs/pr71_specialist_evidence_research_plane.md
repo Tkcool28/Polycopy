@@ -207,7 +207,39 @@ deployment PR. Any such unit must:
 
 ---
 
-## 13. Explicit non-actions (this PR does NOT)
+## 13. S7 deterministic integration proof (honest coverage)
+
+`tests/test_pXX_s7_final_integration.py::test_s7_disposable_e2e_full_lifecycle`
+proves the entire research pipeline **end to end** against a disposable temp DB
+(no real network, no production path touched). It uses injected fake providers
+and asserts exact behavior at every stage:
+
+| Stage | What the test proves (deterministically) |
+|-------|-------------------------------------------|
+| Initial state | Fresh wallet/watch → `YELLOW` (no evidence). |
+| Collection | 2 BUY-only trades inserted via fake provider; taxonomy + provenance written atomically. |
+| Backfill | Fake Gamma adapter (patched `_make_adapter`, invoked exactly once, serves both CIDs) fills canonical metadata via the REAL selection/normalization/merge/provenance/transaction path; conflict path preserves prior taxonomy (no overwrite). |
+| Enrichment | Fake resolver called exactly once; upserts the single current provenance row (`status=complete`, usable category); replay issues one more request and writes **zero** new rows. |
+| Refresh | Unresolved market → `last_status=unresolved`, `resolved_at` NULL (no fabricated winner); resolved market → `resolved_at` set (non-null). |
+| Rescore | Dry-run writes 0 decisions; GREEN write + replay is idempotent (1 decision row); a forced commit failure rolls back all staged decisions (exit 1, prior decision survives). |
+| Status | Deterministic `GREEN`→`copy_candidate` transition; an injected `conflict` enrichment row flips the wallet to `RED`, `ready_for_human_review=false`, `ready_count=0`. |
+| Execution-plane isolation | All 13 execution-plane tables have **zero** deltas across the whole lifecycle. |
+
+The fake providers are injected via the production-accepted seams
+(`backfill._make_adapter`, `enrich_source_trade(gamma_resolver=...)`,
+`refresh.main(provider=...)`) — **no production code path is bypassed**. The
+refusal test (`test_s7_production_refusal_matrix`) builds its own isolated temp
+fixture and patches the gate seams to prove every write CLI exits 2 **before**
+opening any DB; it never touches the repo's real `data/polycopy.db`.
+
+Base-vs-head: the focused PR #71 suite and all remaining tests are green with
+**zero PR-caused failures**. The full repository suite shows one identical,
+proven base/environment-dependent failure (`test_p24o`) that is not in the PR
+diff and fails identically on `main`.
+
+---
+
+## 14. Explicit non-actions (this PR does NOT)
 
 - Does not introduce schema v22.
 - Does not change frozen scoring formulas, weights, thresholds, verdicts,
