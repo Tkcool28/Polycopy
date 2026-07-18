@@ -85,7 +85,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from polycopy.adapters.polymarket import PolymarketPublicAdapter
 from polycopy.domain.market import Market
@@ -831,23 +831,41 @@ async def resolve_selected_markets(
     apply: bool,
     report: ResolveReport,
     settlement_source: str = "source_trade_resolution",
+    bookkeeping_writer: Optional[Callable[[Any, "MarketRefreshOutcome"], None]] = None,
 ) -> list[MarketRefreshOutcome]:
     """Settle one selected batch of distinct markets using the proven path.
 
     For each market: call the proven ``get_market`` once, derive a single
     winner truth, then compute each linked BUY row's settlement through
-    ``settle_source_trade_against_truth``. Atomicity (whole-market SAVEPOINT,
-    conflict isolation) is the caller's responsibility for DB writes — but the
-    conflict decision itself is computed here and returned so the caller can
-    either commit or roll back the whole market.
+    ``settle_source_trade_against_truth``.
+
+    ATOMICITY (per market)
+    ----------------------
+    When ``apply`` is True and a ``bookkeeping_writer`` is supplied, the
+    source-trade settlement UPDATEs and that market's bookkeeping upsert are
+    performed inside ONE SAVEPOINT so they commit or roll back together. On
+    any exception during the source updates OR the bookkeeping write, the
+    SAVEPOINT is rolled back, leaving every source-trade row and the
+    refresh-state row for that market unchanged. The CLI passes a writer that
+    performs the specialist_market_refresh_state upsert; the helper owns the
+    SAVEPOINT boundary, so the two writes can never land in separate
+    transactions.
+
+    Conflict isolation
+    ------------------
+    A material conflict with an already-resolved row is detected before any
+    write. On conflict the (already-rolled-back) SAVEPOINT still receives the
+    conflict bookkeeping row so the conflict is recorded honestly, then it is
+    released/committed. No source-trade row is ever modified on conflict.
+
+    ``bookkeeping_writer(db, outcome)`` is only invoked under the SAVEPOINT
+    when ``apply`` is True. When ``apply`` is False (dry-run) no writes of any
+    kind occur and ``noop``/``conflict`` are still computed honestly. The
+    provider must be supplied (the CLI requires ``--allow-live`` even for
+    dry-run); when ``None`` every market is reported ``unavailable``.
 
     Returns one :class:`MarketRefreshOutcome` per selected market (idempotent
-    re-runs do not duplicate). ``apply`` controls whether updates are written;
-    when ``False`` (dry-run) nothing is mutated and ``noop``/``conflict`` are
-    still computed honestly.
-
-    The provider must be supplied (the CLI requires ``--allow-live`` even for
-    dry-run); when ``None`` every market is reported ``unavailable``.
+    re-runs do not duplicate).
     """
     outcomes: list[MarketRefreshOutcome] = []
     truth_cache: dict[str, _ProviderOutcome] = {}
@@ -862,6 +880,7 @@ async def resolve_selected_markets(
             mkt_out.last_error = "no_live_provider"
             report.unavailable += 1
             outcomes.append(mkt_out)
+            # Dry-run / unavailable: no bookkeeping write.
             continue
 
         if cid not in truth_cache:
@@ -906,35 +925,43 @@ async def resolve_selected_markets(
                         report.conflicts += 1
                         mkt_out.conflict = True
                         conflict = True
+
             if conflict:
-                # Retain exact existing source-trade values; no writes for this
-                # market. The caller rolls back the SAVEPOINT if it attempted.
+                # Retain exact existing source-trade values; bookkeeping records
+                # the conflict. Any partial source update is rolled back.
                 mkt_out.last_error = "conflict"
+                if apply and bookkeeping_writer is not None:
+                    _with_savepoint(
+                        db,
+                        mkt_out,
+                        source_updates=None,
+                        bookkeeping_writer=bookkeeping_writer,
+                    )
                 outcomes.append(mkt_out)
                 continue
+
             if apply:
-                for row, settlement in settlements:
-                    if (row["resolution_status"] or "unresolved") == "unresolved":
-                        db.execute(
-                            "UPDATE source_trades SET "
-                            "resolution_status=?, resolved_at=?, winning_token_id=?, "
-                            "is_winning_trade=?, realized_pnl=?, settlement_source=? "
-                            "WHERE id=?",
-                            (
-                                settlement.resolution_status,
-                                settlement.resolved_at,
-                                settlement.winning_token_id,
-                                settlement.is_winning_trade,
-                                settlement.realized_pnl,
-                                settlement.settlement_source,
-                                row["id"],
-                            ),
-                        )
-                        mkt_out.updated += 1
-                        report.updated += 1
+                # Perform source-trade UPDATEs and the bookkeeping upsert inside
+                # ONE SAVEPOINT so they commit or roll back as a unit.
+                _with_savepoint(
+                    db,
+                    mkt_out,
+                    source_updates=[
+                        (row["id"], settlement)
+                        for (row, settlement) in settlements
+                        if (row["resolution_status"] or "unresolved") == "unresolved"
+                    ],
+                    bookkeeping_writer=bookkeeping_writer,
+                )
+                mkt_out.updated = sum(
+                    1
+                    for (row, _s) in settlements
+                    if (row["resolution_status"] or "unresolved") == "unresolved"
+                )
+                report.updated += mkt_out.updated
             else:
                 # Dry-run: count would-be updates without writing.
-                for row, settlement in settlements:
+                for row, _s in settlements:
                     if (row["resolution_status"] or "unresolved") == "unresolved":
                         report.would_update += 1
             outcomes.append(mkt_out)
@@ -962,6 +989,63 @@ async def resolve_selected_markets(
         elif outcome.state == _MISSING_WINNING_TOKEN:
             report.missing_winning_token += 1
             mkt_out.last_error = "missing_winning_token"
+        if apply and bookkeeping_writer is not None:
+            # Bookkeeping only (no source-trade change) — write directly under
+            # the outer connection so it commits with any prior market's
+            # savepoint release.
+            try:
+                bookkeeping_writer(db, mkt_out)
+            except Exception:
+                # A bookkeeping failure must not strand partial source writes
+                # from a prior market; those already released their savepoints,
+                # so rolling back the whole connection is correct.
+                db.conn.rollback()
+                raise
         outcomes.append(mkt_out)
 
     return outcomes
+
+
+def _with_savepoint(
+    db: Any,
+    outcome: "MarketRefreshOutcome",
+    *,
+    source_updates: Optional[list[tuple[Any, Any]]],
+    bookkeeping_writer: Optional[Callable[[Any, "MarketRefreshOutcome"], None]],
+) -> None:
+    """Execute source-trade updates and bookkeeping under one SAVEPOINT.
+
+    Either ``source_updates`` (resolved, non-conflicting) or ``None`` (conflict
+    case — no source update) is supplied. On ANY exception (source UPDATE
+    failure OR bookkeeping write failure) the SAVEPOINT is rolled back and
+    released, leaving the market's source-trade rows and refresh-state row
+    unchanged. The exception is re-raised so the caller can fail closed.
+    """
+    conn = db.conn
+    conn.execute("SAVEPOINT specialist_refresh_market")
+    try:
+        if source_updates:
+            for row_id, settlement in source_updates:
+                conn.execute(
+                    "UPDATE source_trades SET "
+                    "resolution_status=?, resolved_at=?, winning_token_id=?, "
+                    "is_winning_trade=?, realized_pnl=?, settlement_source=? "
+                    "WHERE id=?",
+                    (
+                        settlement.resolution_status,
+                        settlement.resolved_at,
+                        settlement.winning_token_id,
+                        settlement.is_winning_trade,
+                        settlement.realized_pnl,
+                        settlement.settlement_source,
+                        row_id,
+                    ),
+                )
+        if bookkeeping_writer is not None:
+            bookkeeping_writer(db, outcome)
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT specialist_refresh_market")
+        conn.execute("RELEASE SAVEPOINT specialist_refresh_market")
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT specialist_refresh_market")

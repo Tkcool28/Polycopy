@@ -17,6 +17,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -67,6 +68,13 @@ def _tmp():
 def _open():
     p = _tmp()
     return Database(p).connect(), p
+
+
+def _temp_v21_db():
+    """Create a fresh v21 DB and return its Path (for production-gate tests)."""
+    p = _tmp()
+    Database(p).connect().close()
+    return p
 
 
 def _seed_wallet(db, wid=WID, address=ADDR, sample=0):
@@ -229,7 +237,20 @@ def test_unknown_wallet_refused():
         "--db-path", str(db.db_path), "--wallet-id", "uuid-unknown",
         "--write", "--allow-live", "--confirm-production-db",
     ], provider=_provider_resolved())
-    assert rc == 0, rc  # selector valid; wallet resolves to no markets -> 0 updates
+    assert rc == 2, rc  # unknown wallet refused before any open/provider/network
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+def test_sample_wallet_refused():
+    db, _ = _open()
+    _seed_wallet(db, wid=WID, address=ADDR, sample=1)
+    _insert_trade(db, "t1", condition=COND, trader=ADDR)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--wallet-id", WID,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=_provider_resolved())
+    assert rc == 2, rc  # sample wallet refused (never silently settled)
     assert _row(db, "t1")["resolution_status"] == "unresolved"
     db.close()
 
@@ -265,7 +286,7 @@ def test_paused_watch_refused():
         "--db-path", str(db.db_path), "--watch-id", WATCH_PAUSED,
         "--write", "--allow-live", "--confirm-production-db",
     ], provider=_provider_resolved())
-    assert rc == 0, rc
+    assert rc == 2, rc
     assert _row(db, "t1")["resolution_status"] == "unresolved"
     db.close()
 
@@ -279,7 +300,7 @@ def test_retired_watch_refused():
         "--db-path", str(db.db_path), "--watch-id", WATCH_RETIRED,
         "--write", "--allow-live", "--confirm-production-db",
     ], provider=_provider_resolved())
-    assert rc == 0, rc
+    assert rc == 2, rc
     assert _row(db, "t1")["resolution_status"] == "unresolved"
     db.close()
 
@@ -293,7 +314,7 @@ def test_sample_watch_refused():
         "--db-path", str(db.db_path), "--watch-id", WATCH_SAMPLE,
         "--write", "--allow-live", "--confirm-production-db",
     ], provider=_provider_resolved())
-    assert rc == 0, rc
+    assert rc == 2, rc
     assert _row(db, "t1")["resolution_status"] == "unresolved"
     db.close()
 
@@ -306,7 +327,7 @@ def test_unknown_watch_refused():
         "--db-path", str(db.db_path), "--watch-id", "wl-missing",
         "--write", "--allow-live", "--confirm-production-db",
     ], provider=_provider_resolved())
-    assert rc == 0, rc
+    assert rc == 2, rc
     assert _row(db, "t1")["resolution_status"] == "unresolved"
     db.close()
 
@@ -932,6 +953,312 @@ def test_zero_execution_artifacts():
             n = 0
         assert n == 0, f"unexpected artifact in {t}: {n}"
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# 26. Bookkeeping failure after source updates rolls back the settlement
+# ---------------------------------------------------------------------------
+
+def test_bookkeeping_failure_rolls_back_source_settlement():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, price=0.40, qty=10.0)
+    # A provider that settles successfully, but whose bookkeeping writer fails.
+    class _BoomBookkeeping:
+        def __init__(self, provider, error):
+            self._provider = provider
+            self._error = error
+            self.calls = 0
+
+        def __call__(self, db_conn, outcome):
+            self.calls += 1
+            raise self._error
+
+    prov = _provider_resolved(winner=TOK_WIN)
+    boom = RuntimeError("bookkeeping-boom")
+    writer = _BoomBookkeeping(prov, boom)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov, bookkeeping_writer=writer)
+    # Fail closed: controlled nonzero result.
+    assert rc != 0, "bookkeeping failure must not return success"
+    # All six settlement columns remain unchanged (rolled back).
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "unresolved", r
+    assert r["winning_token_id"] is None
+    assert r["is_winning_trade"] is None
+    assert r["realized_pnl"] is None
+    assert r["settlement_source"] is None
+    assert r["resolved_at"] is None
+    # No refresh-state row was committed.
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM specialist_market_refresh_state").fetchone()[0]
+    assert n == 0, n
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 27. Mid-market source-update failure rolls back the first update too
+# ---------------------------------------------------------------------------
+
+def test_mid_update_failure_rolls_back_first_update():
+    db, _ = _open()
+    _seed_wallet(db)
+    # Two linked BUY rows; force the SECOND UPDATE to fail after the first.
+    _insert_trade(db, "t1", condition=COND, price=0.40, qty=10.0)
+    _insert_trade(db, "t2", condition=COND, price=0.40, qty=10.0)
+    prov = _provider_resolved(winner=TOK_WIN)
+
+    class _FailingBookkeeping:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, db_conn, outcome):
+            self.calls += 1  # never reached because source update fails first
+
+    class _FailingConn:
+        """Wrap sqlite3 conn; make the 2nd UPDATE fail, 1st succeeds."""
+
+        def __init__(self, real):
+            self._real = real
+            self._updates = 0
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def execute(self, sql, params=None):
+            if sql.strip().upper().startswith("UPDATE SOURCE_TRADES"):
+                self._updates += 1
+                if self._updates == 2:
+                    raise RuntimeError("second-update-boom")
+            return self._real.execute(sql, params if params is not None else [])
+
+    failing = _FailingConn(db.conn)
+    writer = _FailingBookkeeping()
+
+    class _FailingDb:
+        """DbConn-like: real read methods, failing conn for UPDATEs."""
+        conn = failing
+
+        def execute(self, sql, params=None):
+            return db.conn.execute(sql, params)
+
+        def fetchone(self, sql, params=None):
+            return db.conn.execute(sql, params).fetchone()
+
+        def fetchall(self, sql, params=None):
+            return db.conn.execute(sql, params).fetchall()
+
+    failing_db = _FailingDb()
+    # Patch resolve_selected_markets' savepoint path by injecting the failing db.
+    # main() opens its own db; instead drive the helper directly under the
+    # failing connection so the SAVEPOINT rollback is exercised truthfully.
+    from polycopy.ingestion.source_trade_resolution import (
+        resolve_selected_markets, ResolveReport,
+    )
+    report = ResolveReport(dry_run=False, live_read_performed=True)
+    try:
+        asyncio.run(resolve_selected_markets(
+            failing_db,
+            markets=[COND],
+            provider=prov,
+            apply=True,
+            report=report,
+            bookkeeping_writer=writer,
+        ))
+        assert False, "expected RuntimeError from 2nd update"
+    except RuntimeError as e:
+        assert "second-update-boom" in str(e), e
+    # The first UPDATE must also be rolled back to the SAVEPOINT.
+    r1 = db.conn.execute(
+        "SELECT resolution_status FROM source_trades WHERE id='t1'").fetchone()
+    r2 = db.conn.execute(
+        "SELECT resolution_status FROM source_trades WHERE id='t2'").fetchone()
+    assert r1[0] == "unresolved", r1
+    assert r2[0] == "unresolved", r2
+    # No partial bookkeeping row exists.
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM specialist_market_refresh_state").fetchone()[0]
+    assert n == 0, n
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 28. Source updates and bookkeeping commit together (no separate txn)
+# ---------------------------------------------------------------------------
+
+def test_source_and_bookkeeping_commit_together():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, price=0.40, qty=10.0)
+    written = {}
+
+    def _spy_bookkeeping(db_conn, outcome):
+        written["called"] = True
+        refresh._upsert_bookkeeping(db_conn, outcome)  # also perform the real upsert
+
+    prov = _provider_resolved(winner=TOK_WIN)
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=prov, bookkeeping_writer=_spy_bookkeeping)
+    assert rc == 0, rc
+    assert written.get("called") is True
+    r = _row(db, "t1")
+    assert r["resolution_status"] == "won"
+    assert r["winning_token_id"] == TOK_WIN
+    # Bookkeeping row exists AND matches the committed source settlement.
+    bk = db.conn.execute(
+        "SELECT last_status FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,)).fetchone()
+    assert dict(bk)["last_status"] == "resolved"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 29. Artifact counts report the real existing count (no silent zero)
+# ---------------------------------------------------------------------------
+
+def test_artifact_counts_report_real_existing_count():
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1", condition=COND, price=0.40, qty=10.0)
+    # Seed a pre-existing FORBIDDEN artifact row so the count is non-zero.
+    db.conn.execute(
+        "INSERT INTO specialist_approvals(approval_id, wallet_address, "
+        "specialist_category, formula_name, formula_version, reviewer, "
+        "approved_at, created_at, updated_at) VALUES ("
+        "'ap-1', ?, 'macro', 'f', 'v1', 'tester', "
+        "'2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z')",
+        (ADDR,))
+    db.conn.commit()
+    prov = _provider_resolved(winner=TOK_WIN)
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = refresh.main([
+            "--db-path", str(db.db_path), "--market-source-id", COND,
+            "--json", "--write", "--allow-live", "--confirm-production-db",
+        ], provider=prov)
+    assert rc == 0, rc
+    report = json.loads(buf.getvalue())
+    # artifact_counts reports the ACTUAL existing count (1), not a silent 0.
+    assert report["artifact_counts"].get("specialist_approvals") == 1, report
+    # artifact_delta remains zero after S4 (no new artifact created).
+    assert report["artifact_delta"] == {}, report
+    # Observational proof: the forbidden table still has exactly 1 row and S4
+    # added none.
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM specialist_approvals").fetchone()[0]
+    assert n == 1, n
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# 30. Production dry-run is allowed read-only with --allow-live
+# ---------------------------------------------------------------------------
+
+def test_production_dry_run_allowed_readonly():
+    # Safely patched production-path target (a temp v21 DB, but we exercise the
+    # production-gate CODE path by monkeypatching is_production_db to True).
+    import refresh_specialist_market_truth as _m
+    real_is_prod = _m.is_production_db
+    tmp = _temp_v21_db()
+    _m.is_production_db = lambda p: True  # treat tmp as production for the gate
+    try:
+        opened = {"writable": 0, "readonly": 0}
+        real_open_w = _m.open_writable
+        real_open_r = _m.open_readonly
+
+        def _fake_w(path, args=None):
+            opened["writable"] += 1
+            return real_open_w(path, args)
+
+        def _fake_r(path):
+            opened["readonly"] += 1
+            return real_open_r(path)
+
+        _m.open_writable = _fake_w
+        _m.open_readonly = _fake_r
+        try:
+            rc = _m.main([
+                "--db-path", str(tmp), "--market-source-id", COND,
+                "--allow-live",  # dry-run, no --write
+            ], provider=_provider_resolved())
+            assert rc == 0, rc
+            # Read-only used, writable NOT used.
+            assert opened["readonly"] == 1, opened
+            assert opened["writable"] == 0, opened
+        finally:
+            _m.open_writable = real_open_w
+            _m.open_readonly = real_open_r
+    finally:
+        _m.is_production_db = real_is_prod
+        tmp.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 31. Unconfirmed production write touches no DB/provider symbol
+# ---------------------------------------------------------------------------
+
+def test_unconfirmed_production_write_touches_no_symbols():
+    import refresh_specialist_market_truth as _m
+    real_is_prod = _m.is_production_db
+    tmp = _temp_v21_db()
+    _m.is_production_db = lambda p: True  # production path
+    try:
+        calls = {"open_readonly": 0, "open_writable": 0,
+                 "build_market_state_provider": 0}
+        real_or = _m.open_readonly
+        real_ow = _m.open_writable
+        real_b = _m.build_market_state_provider
+
+        def _or(path):
+            calls["open_readonly"] += 1
+            return real_or(path)
+
+        def _ow(path, args=None):
+            calls["open_writable"] += 1
+            return real_ow(path, args)
+
+        def _b():
+            calls["build_market_state_provider"] += 1
+            return real_b()
+
+        _m.open_readonly = _or
+        _m.open_writable = _ow
+        _m.build_market_state_provider = _b
+        # Also patch selector resolution to prove it does not run.
+        real_validate = _m._validate_selector_readonly
+        calls["_validate_selector_readonly"] = 0
+
+        def _validate(args):
+            calls["_validate_selector_readonly"] += 1
+            return real_validate(args)
+
+        _m._validate_selector_readonly = _validate
+        try:
+            rc = _m.main([
+                "--db-path", str(tmp), "--market-source-id", COND,
+                "--write",  # missing --allow-live / --confirm-production-db
+            ], provider=_provider_resolved())
+            assert rc != 0, "production write without full gates refused"
+            assert rc == 2, rc
+            # None of these symbols ran.
+            assert calls["open_readonly"] == 0, calls
+            assert calls["open_writable"] == 0, calls
+            assert calls["build_market_state_provider"] == 0, calls
+            assert calls["_validate_selector_readonly"] == 0, calls
+        finally:
+            _m.open_readonly = real_or
+            _m.open_writable = real_ow
+            _m.build_market_state_provider = real_b
+            _m._validate_selector_readonly = real_validate
+    finally:
+        _m.is_production_db = real_is_prod
+        tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

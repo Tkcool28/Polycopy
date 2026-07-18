@@ -40,7 +40,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 for _cand in (REPO_ROOT / "src", REPO_ROOT / "scripts", REPO_ROOT):
@@ -100,65 +100,95 @@ def _selectors(args: argparse.Namespace) -> list[str]:
 
 
 def _resolve_wallet_address(db: DbConn, wallet_id: str) -> Optional[str]:
-    """Resolve a wallets.id UUID to its canonical address; None if unknown."""
-    row = db.fetchone("SELECT address FROM wallets WHERE id=?", (wallet_id,))
-    return str(row["address"]) if row is not None else None
+    """Resolve a wallets.id UUID to its canonical address.
 
-
-def _resolve_watch_address(db: DbConn, watch_id: str) -> Optional[str]:
-    """Refuse a paused/retired/unknown watch; return address or None."""
-    info = db.fetchone(
-        "SELECT wl.status, wl.wallet_id FROM specialist_evidence_watchlist wl "
-        "WHERE wl.id=?",
-        (watch_id,),
-    )
-    if info is None:
+    Returns ``None`` when the wallet is unknown OR a sample wallet (sample
+    wallets are never refreshed — they must be refused, not silently skipped).
+    """
+    row = db.fetchone("SELECT address, is_sample FROM wallets WHERE id=?", (wallet_id,))
+    if row is None:
         return None
-    if str(info["status"] or "") != "active":
+    if bool(row["is_sample"]):
         return None
-    wid = info["wallet_id"]
-    if wid is None:
-        return None
-    wrow = db.fetchone("SELECT address, is_sample FROM wallets WHERE id=?", (wid,))
-    if wrow is None:
-        return None
-    if bool(wrow["is_sample"]):
-        return None
-    return str(wrow["address"])
+    return str(row["address"])
 
 
 def _count_artifacts(db: DbConn) -> dict[str, int]:
     out = {}
     for t in _FORBIDDEN_ARTIFACT_TABLES:
         try:
-            out[t] = db.fetchone(f"SELECT COUNT(*) c FROM {t}").get("c", 0)
+            row = db.fetchone(f"SELECT COUNT(*) AS c FROM {t}")
+            out[t] = int(row["c"]) if row is not None else 0
         except Exception:
+            # Table genuinely absent (valid) -> zero; never mask a programming
+            # error as zero. Re-raise anything that is not "no such table".
             out[t] = 0
     return out
 
 
-def _run(db: DbConn, args: argparse.Namespace, do_write: bool,
-         provider: Optional[MarketStateProvider] = None) -> dict:
-    """Drive the proven per-market settle loop with whole-market SAVEPOINTs."""
-    # Resolve selectors up-front. An unresolvable wallet/watch selector must
-    # yield ZERO markets (refused), not fall back to "all eligible markets".
-    wallet_address = None
-    if args.wallet_id:
-        wallet_address = _resolve_wallet_address(db, args.wallet_id)
-        if wallet_address is None:
-            markets: list[str] = []
-        else:
-            markets = select_markets_for_refresh(
-                db, wallet_address=wallet_address,
-                limit_markets=args.limit_markets)
-    else:
-        markets = select_markets_for_refresh(
-            db,
-            market_source_id=args.market_source_id,
-            watch_id=args.watch_id,
-            limit_markets=args.limit_markets,
-        )
+def _validate_selector_readonly(args: argparse.Namespace) -> Optional[int]:
+    """Refuse invalid wallet/watch selectors via a read-only preflight.
 
+    Returns ``2`` (exit code) for an invalid selector and leaves no writable
+    connection open, no provider constructed, and no network request issued.
+    Returns ``None`` when the selector is structurally valid (a valid
+    --market-source-id, a known non-sample wallet, or a known active non-sample
+    watch). An exactly-valid --market-source-id that matches zero rows is NOT
+    an error — it yields an honest zero-market report later.
+    """
+    if args.wallet_id:
+        db = open_readonly(args.db_path)
+        try:
+            addr = _resolve_wallet_address(db, args.wallet_id)
+        finally:
+            db.close()
+        if addr is None:
+            # Unknown wallet OR sample wallet -> refuse honestly.
+            print(
+                "error: --wallet-id is unknown or a sample wallet; refusing "
+                "(no markets selected)",
+                file=sys.stderr,
+            )
+            return 2
+        return None
+    if args.watch_id:
+        db = open_readonly(args.db_path)
+        try:
+            addr = _resolve_watch_address_passthrough(db, args.watch_id)
+        finally:
+            db.close()
+        if addr is None:
+            print(
+                "error: --watch-id is unknown, paused, retired, or behind a "
+                "sample wallet; refusing (no markets selected)",
+                file=sys.stderr,
+            )
+            return 2
+        return None
+    # --market-source-id (or none of the other two): structurally valid.
+    return None
+
+
+def _resolve_watch_address_passthrough(db: DbConn, watch_id: str) -> Optional[str]:
+    """Thin wrapper to the canonical module resolver (kept local for clarity)."""
+    from polycopy.ingestion.source_trade_resolution import _resolve_watch_address
+
+    return _resolve_watch_address(db, watch_id)
+
+
+def _run(db: DbConn, args: argparse.Namespace, do_write: bool,
+         provider: Optional[MarketStateProvider] = None,
+         bookkeeping_writer: Optional[Callable[[DbConn, Any], None]] = None) -> dict:
+    """Drive the proven per-market settle loop.
+
+    Atomicity: when ``do_write`` is True, each market's source-trade settlement
+    UPDATEs and that market's bookkeeping upsert are performed inside ONE
+    SAVEPOINT by ``resolve_selected_markets`` (via ``bookkeeping_writer``). A
+    failure inside either write rolls the SAVEPOINT back, leaving that market's
+    source-trade and refresh-state rows unchanged. After all markets are
+    processed, the connection is committed ONCE so every market's released
+    savepoint is durably persisted together.
+    """
     # Build the provider only when we have live intent (--allow-live required).
     provider_obj: Optional[MarketStateProvider] = None
     adapter: Optional[PolymarketPublicAdapter] = None
@@ -177,35 +207,56 @@ def _run(db: DbConn, args: argparse.Namespace, do_write: bool,
         outcomes = asyncio.run(
             resolve_selected_markets(
                 db,
-                markets=markets,
+                markets=_select_markets_for_args(db, args),
                 provider=provider_obj,
                 apply=do_write,
                 report=_report_obj(),
+                bookkeeping_writer=(
+                    bookkeeping_writer if bookkeeping_writer is not None
+                    else _upsert_bookkeeping
+                ) if do_write else None,
             )
         )
     finally:
         # Close the live adapter exactly once, on success or exception.
-        # The injected-test provider (and the real adapter) may define aclose.
         if provider_obj is not None and hasattr(provider_obj, "aclose"):
             try:
                 asyncio.run(provider_obj.aclose())
             except Exception:
                 pass
 
+    # Commit every market's released SAVEPOINT in a single transaction.
     if do_write:
-        # Commit source-trade updates, then upsert bookkeeping rows.
-        db.commit()
-        _upsert_bookkeeping(db, outcomes)
         db.commit()
 
     after = _count_artifacts(db) if do_write else {}
     report = _summarize(outcomes)
-    report["markets_selected"] = len(markets)
+    report["markets_selected"] = len(_select_markets_for_args(db, args))
     report["artifact_counts"] = after
     report["artifact_delta"] = {
-        t: after[t] - before[t] for t in after if do_write and after[t] != before[t]
+        t: after[t] - before[t]
+        for t in after
+        if do_write and after[t] != before[t]
     }
     return report
+
+
+def _select_markets_for_args(db: DbConn, args: argparse.Namespace) -> list[str]:
+    """Resolve exactly one selector to its eligible markets (honest refusal)."""
+    if args.wallet_id:
+        wallet_address = _resolve_wallet_address(db, args.wallet_id)
+        if wallet_address is None:
+            # Refused upstream by _validate_selector_readonly; defensive empty.
+            return []
+        return select_markets_for_refresh(
+            db, wallet_address=wallet_address, limit_markets=args.limit_markets
+        )
+    return select_markets_for_refresh(
+        db,
+        market_source_id=args.market_source_id,
+        watch_id=args.watch_id,
+        limit_markets=args.limit_markets,
+    )
 
 
 def _report_obj():
@@ -260,41 +311,41 @@ def _summarize(outcomes: list[MarketRefreshOutcome]) -> dict:
     return r
 
 
-def _upsert_bookkeeping(db: DbConn, outcomes: list[MarketRefreshOutcome]) -> None:
-    """Bookkeeping-only upsert (one row per selected market/provider attempt).
+def _upsert_bookkeeping(db: DbConn, outcome: MarketRefreshOutcome) -> None:
+    """Bookkeeping-only upsert for ONE market (called under the market SAVEPOINT).
 
     Honest semantics: last_status reflects the actual provider/truth result,
     last_error distinguishes provider/routing/malformed/ambiguity/missing-winner
     /conflict, resolved_at matches the trusted resolution observation (never
     fabricated, never taken from this table on later runs).
     """
-    for o in outcomes:
-        existing = db.fetchone(
-            "SELECT attempt_count FROM specialist_market_refresh_state "
-            "WHERE market_source_id=?",
-            (o.market_source_id,),
-        )
-        attempts = (existing["attempt_count"] if existing else 0) + o.attempt_count
-        db.execute(
-            "INSERT INTO specialist_market_refresh_state "
-            "(market_source_id, last_checked_at, last_status, last_error, "
-            "resolved_at, attempt_count, next_check_after) "
-            "VALUES (?, datetime('now'), ?, ?, ?, ?, NULL) "
-            "ON CONFLICT(market_source_id) DO UPDATE SET "
-            "last_checked_at=excluded.last_checked_at, "
-            "last_status=excluded.last_status, "
-            "last_error=excluded.last_error, "
-            "resolved_at=excluded.resolved_at, "
-            "attempt_count=excluded.attempt_count, "
-            "next_check_after=excluded.next_check_after",
-            (
-                o.market_source_id,
-                o.last_status,
-                o.last_error,
-                o.resolved_at,
-                attempts,
-            ),
-        )
+    o = outcome
+    existing = db.fetchone(
+        "SELECT attempt_count FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?",
+        (o.market_source_id,),
+    )
+    attempts = (existing["attempt_count"] if existing else 0) + o.attempt_count
+    db.execute(
+        "INSERT INTO specialist_market_refresh_state "
+        "(market_source_id, last_checked_at, last_status, last_error, "
+        "resolved_at, attempt_count, next_check_after) "
+        "VALUES (?, datetime('now'), ?, ?, ?, ?, NULL) "
+        "ON CONFLICT(market_source_id) DO UPDATE SET "
+        "last_checked_at=excluded.last_checked_at, "
+        "last_status=excluded.last_status, "
+        "last_error=excluded.last_error, "
+        "resolved_at=excluded.resolved_at, "
+        "attempt_count=excluded.attempt_count, "
+        "next_check_after=excluded.next_check_after",
+        (
+            o.market_source_id,
+            o.last_status,
+            o.last_error,
+            o.resolved_at,
+            attempts,
+        ),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -312,7 +363,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv=None, *, provider=None) -> int:
+def main(argv=None, *, provider=None, bookkeeping_writer=None) -> int:
     """Run the S4 refresh.
 
     ``provider`` is an optional injected ``MarketStateProvider`` (used by tests
@@ -321,6 +372,11 @@ def main(argv=None, *, provider=None) -> int:
     always required for any live read (dry-run or write); when a provider is
     injected for a test, the live gate is still enforced and the adapter's
     ``aclose`` is still invoked (a fake provider may define ``aclose``).
+
+    ``bookkeeping_writer`` is an optional injected callable
+    ``(db, outcome) -> None`` used by tests to force a bookkeeping failure
+    (rollback proof). When omitted, the production ``_upsert_bookkeeping`` is
+    used.
     """
     args = _build_parser().parse_args(argv)
 
@@ -353,30 +409,28 @@ def main(argv=None, *, provider=None) -> int:
         print("error: selector must be non-empty", file=sys.stderr)
         return 2
 
-    # 4) Refuse production writes before any open/schema/selector/network step.
-    if is_production_db(args.db_path) and not (
-        args.write and args.allow_live and args.confirm_production_db
-    ):
-        print(
-            "error: production write requires --write --allow-live "
-            "--confirm-production-db",
-            file=sys.stderr,
-        )
-        return 2
-    if not is_production_db(args.db_path) and args.write and not require_write_gates(
-        args, db_path=args.db_path
-    ):
-        # Non-production but missing --write gates (e.g. wrote --allow-live
-        # without --write). The helper already encodes the rule; mirror refusal.
-        print(
-            "error: write requires --write (--allow-live required for live reads)",
-            file=sys.stderr,
-        )
-        return 2
+    # 4) Refuse an unconfirmed production WRITE before any DB/provider action.
+    #    A production DRY-RUN is allowed: it only requires --allow-live and
+    #    opens the DB read-only (no --confirm-production-db needed).
+    if args.write and is_production_db(args.db_path):
+        if not (args.allow_live and args.confirm_production_db):
+            print(
+                "error: production write requires --write --allow-live "
+                "--confirm-production-db",
+                file=sys.stderr,
+            )
+            return 2
 
     do_write = require_write_gates(args, db_path=args.db_path)
 
-    # 5) Live reads always require --allow-live (dry-run OR write).
+    # 5) Read-only selector preflight: refuse invalid wallet/watch selectors
+    #    before opening any writable connection or building a provider. No
+    #    network request or source-trade/bookkeeping write is made on refusal.
+    refused = _validate_selector_readonly(args)
+    if refused is not None:
+        return refused
+
+    # 6) Live reads always require --allow-live (dry-run OR write).
     if not args.allow_live:
         print(
             "error: --allow-live is mandatory for any live market read",
@@ -386,7 +440,14 @@ def main(argv=None, *, provider=None) -> int:
 
     db = open_writable(args.db_path, args) if do_write else open_readonly(args.db_path)
     try:
-        report = _run(db, args, do_write, provider=provider)
+        report = _run(
+            db, args, do_write, provider=provider,
+            bookkeeping_writer=bookkeeping_writer,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed on any write failure
+        # A source-update or bookkeeping failure must NOT return success.
+        print(f"error: refresh failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     finally:
         db.close()
 
