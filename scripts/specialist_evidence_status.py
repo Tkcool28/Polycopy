@@ -45,6 +45,7 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
 from evidence_db import (  # noqa: E402
     DbConn,
     FORBIDDEN_EXECUTION_TABLES,
+    REQUIRED_SCHEMA_VERSION,
     open_readonly,
 )
 
@@ -203,39 +204,51 @@ def _taxonomy_completeness(db: DbConn, wallet_id: str) -> dict[str, Any]:
     }
 
 
-def _read_meta_schema_version(db: DbConn) -> Optional[int]:
-    """Read schema_version from the validated _meta row (None if absent)."""
-    try:
-        row = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
-    except Exception:
-        return None
+def _read_meta_schema_version(db: DbConn) -> int:
+    """Read schema_version from the validated _meta row.
+
+    Raises (fail-closed) on a missing row or malformed value so the caller can
+    exit 1 rather than silently reporting None. A query error propagates
+    naturally (also exit 1).
+    """
+    row = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
     if row is None:
-        return None
+        raise RuntimeError("schema_version row missing from _meta")
     try:
         return int(row[0])
     except (TypeError, ValueError):
-        return None
+        raise RuntimeError(f"malformed schema_version value: {row[0]!r}")
 
 
 def _integrity_ok(db: DbConn) -> tuple[bool, list[str]]:
+    """Run PRAGMA integrity/FK checks ONCE.
+
+    A check that FAILS TO EXECUTE (raises) propagates to the caller so the
+    report fails closed (exit 1). An actual integrity/FK FINDING is returned as
+    a reportable reason (RED, exit 0) — those are ordinary findings, not
+    execution failures (S6 §3).
+    """
     reasons: list[str] = []
-    try:
-        ic = db.fetchone("PRAGMA integrity_check")
-        if ic is None or str(ic[0]) != "ok":
-            reasons.append("integrity_check_not_ok")
-    except Exception:
-        reasons.append("integrity_check_error")
-    try:
-        fk = db.fetchall("PRAGMA foreign_key_check")
-        if fk:
-            reasons.append("foreign_key_violation")
-    except Exception:
-        reasons.append("foreign_key_check_error")
+    ic = db.fetchone("PRAGMA integrity_check")
+    if ic is None or str(ic[0]) != "ok":
+        reasons.append("integrity_check_not_ok")
+    fk = db.fetchall("PRAGMA foreign_key_check")
+    if fk:
+        reasons.append("foreign_key_violation")
     return (len(reasons) == 0, reasons)
 
 
-def _global_execution_counts(db: DbConn) -> tuple[dict[str, int], dict[str, str]]:
-    """Run execution-plane counts ONCE, fail-closed. Returns (counts, errors)."""
+def _global_execution_counts(db: DbConn) -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
+    """Run execution-plane counts ONCE (baseline), fail-closed.
+
+    Returns (baseline_counts, {}, errors). The DELTA is captured later in
+    ``build_status`` (after the cohort is evaluated) so we can detect any
+    research-evidence run that mutates the execution plane (S6 §4).
+
+    A count ERROR propagates as an error entry (fail-closed -> exit 1). A
+    stable, pre-existing non-zero count is NOT an error here — it is reported as
+    an informational baseline and only becomes RED if it CHANGES during the run.
+    """
     counts: dict[str, int] = {}
     errors: dict[str, str] = {}
     for t in _EXECUTION_PLANE_TABLES:
@@ -243,7 +256,26 @@ def _global_execution_counts(db: DbConn) -> tuple[dict[str, int], dict[str, str]
             counts[t] = _count_forbidden(db, t)
         except Exception as exc:
             errors[t] = str(exc)
-    return counts, errors
+    return counts, {}, errors
+
+
+def _execution_delta(
+    baseline: dict[str, int], after: dict[str, int]
+) -> dict[str, int]:
+    """Return per-table delta (after - baseline) for changed tables only."""
+    delta: dict[str, int] = {}
+    for t in list(baseline.keys()) + list(after.keys()):
+        d = after.get(t, 0) - baseline.get(t, 0)
+        if d != 0:
+            delta[t] = d
+    return delta
+
+
+def _validate_execution_baseline(
+    baseline: dict[str, int],
+) -> tuple[bool, list[str]]:
+    """Validate the baseline was captured cleanly (no error). Returns reasons."""
+    return (len(baseline) == len(_EXECUTION_PLANE_TABLES), [])
 
 
 # ── Taxonomy / resolution conflict detection (current provenance only) ────────
@@ -383,6 +415,7 @@ def _refresh_freshness(
         status = row["last_status"]
         last_checked = _parse_ts(row["last_checked_at"])
         next_after = _parse_ts(row["next_check_after"])
+        resolved_at = _parse_ts(row["resolved_at"])
         # Malformed timestamp -> explicit RED reason (distinct from missing).
         if row["last_checked_at"] and last_checked is None:
             reasons.append(f"refresh_malformed_timestamp:market={msid}:field=last_checked_at")
@@ -394,6 +427,12 @@ def _refresh_freshness(
             detail["current_failed"] += 1
             detail["conflict_market_ids"].append(msid)
             continue
+        # Malformed resolved_at -> explicit RED (terminal authority is unreadable).
+        if row["resolved_at"] and resolved_at is None:
+            reasons.append(f"refresh_malformed_timestamp:market={msid}:field=resolved_at")
+            detail["current_failed"] += 1
+            detail["conflict_market_ids"].append(msid)
+            continue
         # Current-state authority: an explicit failed/error/conflict status REDs.
         # A lingering last_error on a recovered row does NOT reintroduce RED.
         if status in ("conflict", "failed", "error"):
@@ -401,12 +440,27 @@ def _refresh_freshness(
             detail["current_failed"] += 1
             detail["conflict_market_ids"].append(msid)
             continue
+        # TERMINAL resolution (S6 §2): a market with authoritative final
+        # resolution (resolved/complete) AND a valid resolved_at is terminal. It
+        # must NOT become RED merely because last_checked_at ages past the
+        # refresh threshold — the resolution is final. A resolved status WITH a
+        # missing resolved_at is NOT treated as terminal (defined explicitly):
+        # it only escapes RED if it is also recent; an aged resolved-without-
+        # resolved_at row falls through to the overdue check below.
+        if status in ("resolved", "complete"):
+            if resolved_at is not None:
+                detail["recovered"] += 1
+                continue
+            # resolved/complete but no resolved_at: terminal bypass requires the
+            # timestamp; without it we fall through to staleness (aged -> RED).
         # Overdue last_checked_at / next_check_after beyond policy -> RED.
         overdue = False
         if last_checked is not None and (now - last_checked) > timedelta(hours=stale_after_hours):
             overdue = True
         if next_after is not None and now > next_after + timedelta(hours=stale_after_hours):
             overdue = True
+        # A terminal resolved/complete row (valid resolved_at) that is merely
+        # aged is NOT overdue (handled above). For all other statuses:
         if status in ("unresolved", "stale") or overdue:
             if status == "unresolved" and not overdue:
                 # Recent unresolved is healthy/informational (not an error).
@@ -528,14 +582,15 @@ def build_wallet_status(
     if bool(watch.get("is_sample")):
         reasons.append("sample_wallet_in_cohort")
 
-    # Execution-plane artifacts -> RED (fail-closed on count errors).
-    exec_counts = global_health["execution_artifact_counts"]
+    # Execution-plane artifacts are reported at the GLOBAL level as
+    # informational baseline/delta (S6 §4). A STABLE, pre-existing nonzero count
+    # does NOT by itself RED a wallet — only an execution-plane COUNT DELTA
+    # during the run (detected in build_status) does. Count errors already
+    # fail-closed earlier (exec_errors -> exit 1). So no per-wallet
+    # unexpected_execution_artifact reason is raised here.
     exec_errors = global_health["execution_artifact_errors"]
     if exec_errors:
         reasons.append("execution_artifact_count_error")
-    unexpected = {t: n for t, n in exec_counts.items() if n > 0}
-    if unexpected:
-        reasons.append("unexpected_execution_artifact")
 
     # Integrity / FK (from one-shot global health).
     reasons.extend(global_health["integrity_reasons"])
@@ -637,6 +692,19 @@ def build_wallet_status(
     }
 
 
+def _dedupe_cohort(active_rows):
+    """Deterministically dedupe active rows by wallet_id, choosing the LOWEST
+    active watch id (S6 §1). Paused/retired rows must never win simply because
+    they sort first — callers pass ONLY active rows here."""
+    by_wallet: dict[str, dict] = {}
+    for row in active_rows:
+        wid = str(row["wallet_id"])
+        cur = by_wallet.get(wid)
+        if cur is None or str(row["id"]) < str(cur["id"]):
+            by_wallet[wid] = row
+    return list(by_wallet.values())
+
+
 def build_status(
     db: DbConn, *,
     wallet_id: Optional[str] = None,
@@ -644,38 +712,33 @@ def build_status(
     refresh_stale_after_hours: int = DEFAULT_REFRESH_STALE_AFTER_HOURS,
 ) -> dict[str, Any]:
     # One-shot global health (S6 §12) — run each expensive check ONCE.
+    # Integrity / schema are FAIL-CLOSED: a query error or schema mismatch
+    # raises and is caught by main() -> exit 1.
     ok, integrity_reasons = _integrity_ok(db)
-    exec_counts, exec_errors = _global_execution_counts(db)
+    exec_baseline, _, exec_errors = _global_execution_counts(db)
     schema_version = _read_meta_schema_version(db)
+    if schema_version != REQUIRED_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"schema version mismatch: required exactly {REQUIRED_SCHEMA_VERSION}, "
+            f"found {schema_version}"
+        )
     global_health = {
         "integrity_ok": ok,
         "integrity_reasons": integrity_reasons,
-        "execution_artifact_counts": exec_counts,
+        "execution_artifact_counts": exec_baseline,
         "execution_artifact_errors": exec_errors,
         "schema_version": schema_version,
     }
+    # Any execution-plane count ERROR makes the report untrustworthy ->
+    # fail closed (exit 1), never a silent zero (S6 §4.5).
     if exec_errors:
-        # Fail closed: cannot produce a trustworthy report.
-        return {
-            "generated_at": _utcnow().isoformat(),
-            "overall_state": "RED",
-            "schema_version": global_health.get("schema_version"),
-            "watched_count": 0,
-            "ready_for_human_review_count": 0,
-            "active_watch_count": 0,
-            "paused_watch_count": 0,
-            "retired_watch_count": 0,
-            "global_integrity": {"ok": ok, "reasons": integrity_reasons},
-            "execution_artifact_counts": exec_counts,
-            "execution_artifact_errors": exec_errors,
-            "wallets": [],
-            "fail_closed": "execution_artifact_count_error",
-        }
+        raise RuntimeError(
+            f"execution_artifact_count_error: {', '.join(sorted(exec_errors))}"
+        )
 
-    # Cohort: active / paused / retired watches. Paused/retired are
-    # informational only; they never drive GREEN/YELLOW/RED.
-    # Explicit column selection (S6 §4): wallet_row_id + is_sample come from the
-    # wallets join, never a COALESCE-as-existence signal.
+    # Cohort query: retain RAW active/paused/retired WATCH ROW counts for
+    # informational fields; the readiness cohort is built separately from
+    # deduplicated active rows (S6 §1).
     raw = db.fetchall(
         "SELECT w.id, w.wallet_id, w.status, w.last_collection_at, "
         "wl.id AS wallet_row_id, wl.is_sample AS is_sample "
@@ -685,7 +748,9 @@ def build_status(
     )
 
     # Explicit --wallet-id validation BEFORE evaluating (S6 §4):
-    #   unknown wallet / no active watch / sample wallet -> exit 2.
+    #   unknown wallet / no active watch / sample wallet / not-watched -> exit 2.
+    # Wallet existence and sample status are read from explicit columns, NOT
+    # from watch-row ordering (an older paused/retired row must not win).
     if wallet_id is not None:
         matched = [r for r in raw if str(r["wallet_id"]) == wallet_id]
         if not matched:
@@ -699,18 +764,22 @@ def build_status(
                 "paused_watch_count": 0,
                 "retired_watch_count": 0,
                 "global_integrity": {"ok": ok, "reasons": integrity_reasons},
-                "execution_artifact_counts": exec_counts,
+                "execution_artifact_baseline_counts": exec_baseline,
+                "execution_artifact_counts": exec_baseline,
+                "execution_artifact_delta": {},
                 "execution_artifact_errors": exec_errors,
                 "wallets": [],
                 "selector_error": "unknown_or_unwatched_wallet",
             }
-        # Determine existence + sample status from explicit columns.
-        row0 = matched[0]
-        if row0["wallet_row_id"] is None:
+        # Wallet existence + sample status from explicit columns (NOT matched[0]).
+        matched_active = [r for r in matched if r["status"] == "active"]
+        # Choose the lowest active watch id deterministically.
+        chosen = min(matched_active, key=lambda r: str(r["id"])) if matched_active else matched[0]
+        if chosen["wallet_row_id"] is None:
             sel_err = "missing_wallet_record"
-        elif bool(row0["is_sample"]):
+        elif bool(chosen["is_sample"]):
             sel_err = "sample_wallet"
-        elif row0["status"] != "active":
+        elif chosen["status"] != "active":
             sel_err = "not_watched"
         else:
             sel_err = None
@@ -725,23 +794,23 @@ def build_status(
                 "paused_watch_count": 0,
                 "retired_watch_count": 0,
                 "global_integrity": {"ok": ok, "reasons": integrity_reasons},
-                "execution_artifact_counts": exec_counts,
+                "execution_artifact_baseline_counts": exec_baseline,
+                "execution_artifact_counts": exec_baseline,
+                "execution_artifact_delta": {},
                 "execution_artifact_errors": exec_errors,
                 "wallets": [],
                 "selector_error": sel_err,
             }
+        raw = [chosen]
 
-    # When --wallet-id is given and valid, filter the cohort read-only BEFORE
-    # evaluating and recompute all counts.
-    if wallet_id is not None:
-        raw = [r for r in raw if str(r["wallet_id"]) == wallet_id]
-
+    # Readiness cohort: active rows deduplicated by wallet_id (lowest active id).
     active_rows = [r for r in raw if r["status"] == "active"]
     paused_rows = [r for r in raw if r["status"] == "paused"]
     retired_rows = [r for r in raw if r["status"] == "retired"]
+    cohort = _dedupe_cohort(active_rows)
 
     per_wallet: list[dict[str, Any]] = []
-    for row in active_rows:
+    for row in cohort:
         watch: dict[str, Any] = dict(row)
         # Explicit missing-wallet detection (S6 §4): wallet_row_id IS NULL.
         if row["wallet_row_id"] is None:
@@ -769,9 +838,25 @@ def build_status(
 
     ready_count = sum(1 for r in per_wallet if r["ready_for_human_review"])
 
+    # Execution-artifact DELTA semantics (S6 §4): recapture counts after the
+    # cohort is evaluated. A nonzero delta proves the run mutated the execution
+    # plane -> RED with the exact changed table. A stable nonzero baseline stays
+    # visible/informational and does NOT by itself RED each wallet.
+    exec_after, _, exec_errors2 = _global_execution_counts(db)
+    delta = _execution_delta(exec_baseline, exec_after)
+    exec_counts_final = exec_after
+    exec_errors_final = {**exec_errors, **exec_errors2}
+    delta_red_tables = [t for t, d in delta.items() if d != 0]
+
+    if delta_red_tables:
+        for w in per_wallet:
+            for t in delta_red_tables:
+                w["red_reasons"].append(f"execution_artifact_delta:{t}:delta={delta[t]}")
+        overall_state = "RED"
+
     return {
         "generated_at": _utcnow().isoformat(),
-        "schema_version": global_health.get("schema_version"),
+        "schema_version": schema_version,
         "overall_state": overall_state,
         "watched_count": len(per_wallet),
         "ready_for_human_review_count": ready_count,
@@ -779,7 +864,10 @@ def build_status(
         "paused_watch_count": len(paused_rows),
         "retired_watch_count": len(retired_rows),
         "global_integrity": {"ok": ok, "reasons": integrity_reasons},
-        "execution_artifact_counts": exec_counts,
+        "execution_artifact_baseline_counts": exec_baseline,
+        "execution_artifact_counts": exec_counts_final,
+        "execution_artifact_delta": delta,
+        "execution_artifact_errors": exec_errors_final,
         "wallets": per_wallet,
     }
 
@@ -815,6 +903,7 @@ def main(argv: list[str] | None = None) -> int:
                 collector_stale_after_hours=args.collector_stale_after_hours,
                 refresh_stale_after_hours=args.refresh_stale_after_hours,
             )
+            globals()["_LAST_REPORT"] = report  # for test introspection of the exact run
         except Exception as exc:  # build/schema failure -> controlled exit 1
             print(f"error: failed to build status report: {exc!r}", file=sys.stderr)
             return 1

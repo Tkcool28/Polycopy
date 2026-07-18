@@ -1233,6 +1233,237 @@ def test_status_current_failed_error_conflict_red():
         db.close()
 
 
+def test_status_terminal_resolved_aged_not_red():
+    """S6 §2: a resolved market checked 72+ h ago stays non-RED (terminal)."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, resolved_at, "
+        "attempt_count) VALUES (?,?,?,?,?)",
+        ("st1", _recent_ts(72), "resolved", _recent_ts(72), 1))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert not any(r.startswith("refresh") for r in w["red_reasons"]), w
+    db.close()
+
+
+def test_status_terminal_resolved_with_old_error_not_red():
+    """S6 §2: resolved market retains old last_error and stays non-RED."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, last_error, "
+        "resolved_at, attempt_count) VALUES (?,?,?,?,?,?)",
+        ("st1", _recent_ts(0), "resolved", "ancient conflict", _recent_ts(0), 3))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert not any(r.startswith("refresh") for r in w["red_reasons"]), w
+    db.close()
+
+
+def test_status_resolved_without_resolved_at_aged_red():
+    """S6 §2: resolved status BUT missing resolved_at, aged -> falls through
+    to staleness and is RED (terminal bypass requires the timestamp)."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, attempt_count) "
+        "VALUES (?,?,?,?)",
+        ("st1", _recent_ts(72), "resolved", 1))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert any("refresh_overdue" in r for r in w["red_reasons"]), w
+    db.close()
+
+
+def test_status_malformed_resolved_at_red():
+    """S6 §2: present malformed resolved_at -> explicit RED (terminal
+    authority unreadable)."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, resolved_at, "
+        "attempt_count) VALUES (?,?,?,?,?)",
+        ("st1", _recent_ts(0), "resolved", "not-a-timestamp", 1))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert any("malformed_timestamp" in r for r in w["red_reasons"]), w
+    db.close()
+
+
+def test_status_integrity_finding_red_exit0():
+    """S6 §3: an actual integrity_check / FK finding -> ordinary RED, exit 0."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    st = _load("specialist_evidence_status.py")
+    DbConn = st.DbConn
+    orig_fetchone = DbConn.fetchone
+    def _trap(self, sql, params=None):
+        if "integrity_check" in str(sql):
+            # Return a non-ok row -> ordinary RED finding.
+            class _R:
+                def __getitem__(self, i):
+                    return "not_ok"
+            return _R()
+        return orig_fetchone(self, sql, params)
+    DbConn.fetchone = _trap
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        DbConn.fetchone = orig_fetchone
+    assert rc == 0, rc
+    out = st._LAST_REPORT  # exact (patched) run; do not re-run main
+    assert out["overall_state"] == "RED", out
+    assert ("integrity_check_not_ok" in out["global_integrity"]["reasons"]
+            or any("integrity_check_not_ok" in r
+                   for w in out["wallets"] for r in w["red_reasons"])), out
+    db.close()
+
+
+def test_status_integrity_query_error_exit1():
+    """S6 §3: integrity_check QUERY raising -> fail_closed, exit 1."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    st = _load("specialist_evidence_status.py")
+    DbConn = st.DbConn
+    orig_fetchone = DbConn.fetchone
+    def _trap(self, sql, params=None):
+        if "integrity_check" in str(sql):
+            raise sqlite3.OperationalError("injected integrity failure")
+        return orig_fetchone(self, sql, params)
+    DbConn.fetchone = _trap
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        DbConn.fetchone = orig_fetchone
+    assert rc == 1, rc
+    db.close()
+
+
+def test_status_schema_version_mismatch_exit1():
+    """S6 §3: schema_version != 21 in _meta -> fail_closed, exit 1."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    st = _load("specialist_evidence_status.py")
+    orig = st._read_meta_schema_version
+    st._read_meta_schema_version = lambda db: 20
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        st._read_meta_schema_version = orig
+    assert rc == 1, rc
+    db.close()
+
+
+def test_status_schema_version_missing_exit1():
+    """S6 §3: missing schema_version row -> fail_closed, exit 1."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    st = _load("specialist_evidence_status.py")
+    orig = st._read_meta_schema_version
+    st._read_meta_schema_version = lambda db: (_ for _ in ()).throw(
+        RuntimeError("schema_version row missing from _meta"))
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        st._read_meta_schema_version = orig
+    assert rc == 1, rc
+    db.close()
+
+
+def test_status_stable_preexisting_artifact_baseline_not_red():
+    """S6 §4: stable preexisting copy_candidate rows do NOT force RED; counts
+    stay visible; delta is zero; report still executes zero writes."""
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
+    db, _ = _open()
+    _seed_wallet(db, "uuid-g", "0x" + "g" * 40)
+    _seed_watch(db, "wl-g", "uuid-g", last_collection_at=_recent_ts(0))
+    _seed_green_evidence(db, "uuid-g", "0x" + "g" * 40)
+    # Preexisting legitimate execution-plane rows (NOT created by S6).
+    db.conn.execute(
+        "INSERT INTO specialist_approvals("
+        "approval_id, wallet_address, specialist_category, formula_name, "
+        "formula_version, reviewer, approved_at, created_at, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("ap1", "0x" + "g" * 40, "politics", "f1", "v1", "t",
+         "2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z", "2026-02-01T00:00:00Z"))
+    db.conn.commit()
+    orig = st.open_readonly
+    st.open_readonly = _instrumented_readonly
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        st.open_readonly = orig
+    assert rc == 0, rc
+    out = st._LAST_REPORT  # exact (patched) run; do not re-run main
+    assert out["execution_artifact_baseline_counts"]["specialist_approvals"] == 1, out
+    assert out["execution_artifact_counts"]["specialist_approvals"] == 1, out
+    assert out["execution_artifact_delta"] == {}, out
+    assert out["wallets"][0]["state"] == "GREEN", out
+    assert _LAST_SPY._writes == [], _LAST_SPY._writes
+    db.close()
+
+
+def test_status_execution_delta_produces_red():
+    """S6 §4: an injected count delta during the run -> RED with exact table."""
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
+    db, _ = _open()
+    _seed_wallet(db, "uuid-g", "0x" + "g" * 40)
+    _seed_watch(db, "wl-g", "uuid-g", last_collection_at=_recent_ts(0))
+    _seed_green_evidence(db, "uuid-g", "0x" + "g" * 40)
+    # Baseline 0; after-eval capture sees 1 -> delta on copy_candidates.
+    orig = st._global_execution_counts
+    state = {"n": 0}
+    def _two_phase(db):
+        state["n"] += 1
+        if state["n"] == 1:
+            return ({k: 0 for k in FORBIDDEN_EXECUTION_TABLES}, {}, {})
+        return ({k: (1 if k == "copy_candidates" else 0)
+                 for k in FORBIDDEN_EXECUTION_TABLES}, {}, {})
+    st._global_execution_counts = _two_phase
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        st._global_execution_counts = orig
+    assert rc == 0, rc
+    out = st._LAST_REPORT  # exact (patched) run; do not re-run main
+    assert out["overall_state"] == "RED", out
+    assert out["execution_artifact_delta"].get("copy_candidates") == 1, out
+    assert any("execution_artifact_delta:copy_candidates" in r
+               for w in out["wallets"] for r in w["red_reasons"]), out
+    db.close()
+
+
 def test_status_explicit_sample_selector_exits_2():
     """S6 §4: explicit --wallet-id on a SAMPLE wallet -> exit 2."""
     db, _ = _open()
@@ -1245,24 +1476,50 @@ def test_status_explicit_sample_selector_exits_2():
 
 
 def test_status_duplicate_active_watch_dedup_lowest_id():
-    """S6 §4: cohort is deterministic and evaluates each wallet once, choosing
-    the lowest/stable watch id. (The DB enforces one ACTIVE watch per wallet
-    via a partial unique index, so the CLI's dedup is defensive; we assert the
-    cohort ordering is stable by wallet_id then watch id.)"""
+    """S6 §1B: one wallet with two synthetic ACTIVE rows -> evaluate once,
+    lowest active watch id selected, watched_count==1, ready count not dup'd.
+
+    The schema normally blocks duplicate active rows via a partial unique
+    index, so we drop it in a disposable test DB to exercise the pure dedup.
+    """
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
     db, _ = _open()
-    # Two distinct watched wallets, both active.
-    _seed_wallet(db, "uuid-a", "0x" + "a" * 40)
-    _seed_watch(db, "wl-zzz", "uuid-a")  # higher id, should sort after
-    _seed_wallet(db, "uuid-b", "0x" + "b" * 40)
-    _seed_watch(db, "wl-aaa", "uuid-b")  # lower id
-    _seed_trade(db, "polymarket:st1")
-    st = _load("specialist_evidence_status.py")
+    # Drop the partial unique index that enforces one-active-per-wallet.
+    db.conn.execute("DROP INDEX IF EXISTS ux_evidence_watchlist_active")
+    db.conn.commit()
+    _seed_wallet(db, WID, ADDR)
+    # Two synthetic active rows; lower id should win.
+    _seed_watch(db, "wl-bbb", WID)  # higher id
+    _seed_watch(db, "wl-aaa", WID)  # lower id -> chosen
+    _seed_green_evidence(db, WID, ADDR)
     out = _status_json(st, db)
-    # Exactly two wallet records, evaluated once each, ordered by wallet id.
-    assert len(out["wallets"]) == 2, out
-    ids = [w["wallet_id"] for w in out["wallets"]]
-    assert ids == ["uuid-a", "uuid-b"], ids
-    assert out["wallets"][0]["watch_id"] == "wl-zzz", out
+    # Exactly one wallet record (deduplicated), chosen lowest active id.
+    assert len(out["wallets"]) == 1, out
+    assert out["wallets"][0]["watch_id"] == "wl-aaa", out
+    assert out["watched_count"] == 1, out
+    # Ready count is per-wallet, not per-raw-active-row.
+    assert out["ready_for_human_review_count"] <= 1, out
+    db.close()
+
+
+def test_status_paused_row_lower_id_active_chosen():
+    """S6 §1A: one wallet with a paused row ID lower than its active row.
+
+    Selector must still succeed and choose the ACTIVE row (never matched[0]
+    which could be the paused row sorting first)."""
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    # Paused row with LOWER id than the active row.
+    _seed_watch(db, "wl-paused-lower", WID, status="paused")
+    _seed_watch(db, "wl-active-higher", WID, status="active",
+                last_collection_at=_recent_ts(0))
+    _seed_green_evidence(db, WID, ADDR)
+    out = _status_json(st, db)
+    assert len(out["wallets"]) == 1, out
+    assert out["wallets"][0]["watch_id"] == "wl-active-higher", out
     db.close()
 
 
