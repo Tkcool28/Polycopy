@@ -200,6 +200,7 @@ class EnrichmentResult:
     metadata_changed: bool = False
     operational_error: bool = False
     provider_error: bool = False
+    selection_error: bool = False
     error_message: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -212,6 +213,7 @@ class EnrichmentResult:
             "metadata_changed": self.metadata_changed,
             "operational_error": self.operational_error,
             "provider_error": self.provider_error,
+            "selection_error": self.selection_error,
             "reason_codes": self.reason_codes,
             "evidence": self.evidence,
             "error_message": self.error_message,
@@ -262,6 +264,7 @@ def enrich_source_trade(
             created=False,
             updated=False,
             reason_codes=[SOURCE_TRADE_NOT_FOUND],
+            selection_error=True,
             error_message="source_trade_internal_id not found",
         )
 
@@ -275,6 +278,7 @@ def enrich_source_trade(
             created=False,
             updated=False,
             reason_codes=[eligibility.reason or SOURCE_NOT_SUPPORTED],
+            selection_error=True,
             error_message=f"eligibility refused: {eligibility.reason}",
         )
 
@@ -290,10 +294,11 @@ def enrich_source_trade(
         )
 
     # A Gamma provider error is an operational (hard) failure: it remains
-    # distinguishable from ordinary not-found, persists an audit row (so it is
-    # transactionally durable), but the CLI must return nonzero because the
-    # evidence could not be resolved. status stays "error" for
-    # dispatcher-blocking/audit semantics; provider_error flags the hard case.
+    # distinguishable from ordinary not-found, and the library can create an
+    # audit row in the caller-owned transaction. The CLI rolls the transaction
+    # back and returns exit 1, so the audit row is NOT durably persisted by
+    # this CLI. status stays "error" for dispatcher-blocking/audit semantics;
+    # provider_error flags the hard case.
     if gamma_state == GAMMA_PROVIDER_ERROR:
         payload = build_provenance_payload(
             source_trade=row,

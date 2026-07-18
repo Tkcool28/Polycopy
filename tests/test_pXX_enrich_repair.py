@@ -34,9 +34,12 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
 )
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
 from polycopy.ingestion.source_trade_enrichment import (  # noqa: E402
+    MISSING_MARKET_IDENTITY,
+    SAMPLE_TRADE_REFUSED,
     SELL_NOT_SUPPORTED,
     SOURCE_NOT_SUPPORTED,
     SOURCE_TRADE_NOT_FOUND,
+    STATUS_ERROR,
     enrich_source_trade,
     get_enrichment,
 )
@@ -81,6 +84,14 @@ def _tmp():
 def _open():
     p = _tmp()
     return Database(p).connect(), p
+
+
+class _NoCloseDb(Database):
+    """Database whose close() is a no-op, so the CLI's open->close->reopen
+    dance keeps a single connected instance for the test."""
+
+    def close(self):
+        return None
 
 
 def _seed_wallet(db, wid="uuid-e", address="0xenrich000000000000000000000000000abc"):
@@ -954,21 +965,273 @@ def test_cli_persistence_failure_nonzero():
 # ── 3c. CLI: provider error -> exit nonzero, structured status retained ────
 def test_cli_provider_error_nonzero():
     import scripts.enrich_approved_source_trade as cli
-    import polycopy.ingestion.source_trade_enrichment as ste
 
-    db, _ = _open()
+    db = _NoCloseDb(_tmp()).connect()
     _seed_wallet(db)
     _seed_trade(db, "polymarket:st1", COND, {})
 
-    def _boom_resolver(_cid):
-        raise RuntimeError("network down")
+    # Make the CLI's adapter raise so the real resolver hits a provider error.
+    def _make_boom_adapter():
+        class _Boom:
+            async def get_market_raw(self, cid):
+                raise RuntimeError("network down")
+
+            async def aclose(self):
+                pass
+
+        return _Boom()
+
+    orig_adapter = cli._make_adapter
+    cli._make_adapter = _make_boom_adapter
+    orig_cli_enrich = cli.enrich_source_trade
+    # CLI uses its own bound enrich_source_trade; leave it as the real one.
+    orig_ro, orig_rw = cli.open_readonly, cli.open_writable
+
+    def _ro(path):
+        return db
+
+    def _rw(path, args):
+        return db
+
+    cli.open_readonly = _ro
+    cli.open_writable = _rw
+    try:
+        rc = cli.main(
+            ["--source-trade-id", "polymarket:st1", "--write",
+             "--allow-live", "--db-path", str(_tmp())]
+        )
+    finally:
+        cli._make_adapter = orig_adapter
+        cli.open_readonly, cli.open_writable = orig_ro, orig_rw
+        cli.enrich_source_trade = orig_cli_enrich
+    db.close()
+    # Provider error is a hard failure -> nonzero exit (1).
+    assert rc not in (0, None), rc
+
+
+# ── 4a. invalid-selection reason codes set selection_error (typed flag) ─────
+def _selection_case(reason_code, *, side="BUY", source=CANON_SOURCE,
+                    is_sample=0, market_source_id=COND):
+    db, _ = _open()
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:st1", COND, {},
+                side=side, source=source,
+                is_sample=is_sample, market_source_id=market_source_id)
+    res = enrich_source_trade(db, "polymarket:st1", gamma_resolver=_fake_resolver)
+    db.close()
+    return res
+
+
+def test_selection_error_codes_flagged():
+    cases = {
+        SOURCE_TRADE_NOT_FOUND: lambda: (
+            enrich_source_trade(
+                Database(_tmp()).connect(), "polymarket:missing",
+                gamma_resolver=_fake_resolver,
+            )
+        ),
+        SOURCE_NOT_SUPPORTED: lambda: _selection_case(SOURCE_NOT_SUPPORTED,
+                                                       source="bogus_src"),
+        SELL_NOT_SUPPORTED: lambda: _selection_case(SELL_NOT_SUPPORTED,
+                                                     side="SELL"),
+        SAMPLE_TRADE_REFUSED: lambda: _selection_case(SAMPLE_TRADE_REFUSED,
+                                                       is_sample=1),
+        MISSING_MARKET_IDENTITY: lambda: _selection_case(
+            MISSING_MARKET_IDENTITY, market_source_id="  "),
+    }
+    for code, build in cases.items():
+        res = build()
+        assert res.status == STATUS_ERROR, (code, res)
+        assert res.reason_codes == [code], (code, res.reason_codes)
+        assert res.selection_error is True, (code, res)
+        assert res.operational_error is False, (code, res)
+        assert res.provider_error is False, (code, res)
+        assert res.created is False and res.updated is False, res
+        assert res.metadata_changed is False, res
+
+
+# ── 4b. selection_error is serialized in as_dict ────────────────────────────
+def test_selection_error_serialized():
+    db, _ = _open()
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:st1", COND, {}, side="SELL")
+    res = enrich_source_trade(db, "polymarket:st1", gamma_resolver=_fake_resolver)
+    db.close()
+    d = res.as_dict()
+    assert d["selection_error"] is True, d
+    assert d["operational_error"] is False, d
+    assert d["provider_error"] is False, d
+    assert d["status"] == STATUS_ERROR, d
+    assert d["reason_codes"] == [SELL_NOT_SUPPORTED], d
+
+
+# ── 4c. CLI: invalid-selection -> exit 2, no provider call, zero write ──────
+import pytest  # noqa: E402
+
+
+def _run_cli_invalid(reason_code, *, side="BUY", source=CANON_SOURCE,
+                     is_sample=0, market_source_id=COND, trade_id="polymarket:st1"):
+    import scripts.enrich_approved_source_trade as cli
+    from polycopy.db.database import Database
+
+    calls = {"commit": 0, "rollback": 0}
+
+    class _RecDb(Database):
+        def commit(self):
+            calls["commit"] += 1
+            return super().commit()
+
+        def close(self):
+            return None  # keep alive across CLI open->close->reopen
+
+    p = _tmp()
+    db = _RecDb(p).connect()
+    db.conn.set_trace_callback(
+        lambda sql: calls.__setitem__(
+            "rollback",
+            calls["rollback"] + (1 if "ROLLBACK" in sql.upper() else 0),
+        )
+    )
+    _seed_wallet(db)
+    _seed_trade(db, trade_id, COND, {},
+                side=side, source=source,
+                is_sample=is_sample, market_source_id=market_source_id)
+
+    provider_calls = {"n": 0, "adapter_closed": False, "built": False}
+
+    def _make_adapter():
+        provider_calls["built"] = True
+
+        class _Adapter:
+            async def get_market_raw(self, cid):
+                provider_calls["n"] += 1
+                return dict(GAMMA_PAYLOAD)
+
+            async def aclose(self):
+                provider_calls["adapter_closed"] = True
+
+        return _Adapter()
+
+    orig_adapter = cli._make_adapter
+    cli._make_adapter = _make_adapter
+    orig_ro, orig_rw = cli.open_readonly, cli.open_writable
+    cli.open_readonly = lambda path: db
+    cli.open_writable = lambda path, a: db
+    orig_enrich = cli.enrich_source_trade
+    cli.enrich_source_trade = enrich_source_trade
+    try:
+        rc = cli.main(
+            ["--source-trade-id", trade_id, "--write",
+             "--allow-live", "--db-path", str(_tmp())]
+        )
+    finally:
+        cli._make_adapter = orig_adapter
+        cli.open_readonly, cli.open_writable = orig_ro, orig_rw
+        cli.enrich_source_trade = orig_enrich
+    db.close()
+    return rc, calls, provider_calls, db
+
+
+@pytest.mark.parametrize("reason_code,kwargs", [
+    (SOURCE_NOT_SUPPORTED, dict(source="bogus_src")),
+    (SELL_NOT_SUPPORTED, dict(side="SELL")),
+    (SAMPLE_TRADE_REFUSED, dict(is_sample=1)),
+    (MISSING_MARKET_IDENTITY, dict(market_source_id="  ")),
+])
+def test_cli_invalid_selection_exit2_zero_write(reason_code, kwargs):
+    rc, calls, provider_calls, db = _run_cli_invalid(reason_code, **kwargs)
+    assert rc == 2, (reason_code, rc)
+    # No Gamma request occurred (eligibility is checked before the resolver).
+    assert provider_calls["n"] == 0, (reason_code, provider_calls)
+    # Zero enrichment rows written for the seeded trade.
+    ins = db.fetchone(
+        "SELECT COUNT(*) AS c FROM source_trade_enrichments "
+        "WHERE source_trade_internal_id=?", ("polymarket:st1",))
+    assert ins["c"] == 0, (reason_code, ins)
+    # metadata unchanged (seeded empty {}).
+    assert _metadata_of(db, "polymarket:st1") == {}, (reason_code, _metadata_of(db, "polymarket:st1"))
+    # Outer commit never called; a defensive rollback occurred.
+    assert calls["commit"] == 0, (reason_code, calls)
+    # Adapter, if built (--allow-live path), must be closed.
+    if provider_calls["built"]:
+        assert provider_calls["adapter_closed"] is True, (reason_code, provider_calls)
+
+
+def test_cli_unknown_id_exit2_zero_write():
+    import scripts.enrich_approved_source_trade as cli
+    from polycopy.db.database import Database
+
+    calls = {"commit": 0, "rollback": 0}
+
+    class _RecDb(Database):
+        def commit(self):
+            calls["commit"] += 1
+            return super().commit()
+
+        def close(self):
+            return None
+
+    p = _tmp()
+    db = _RecDb(p).connect()
+    db.conn.set_trace_callback(
+        lambda sql: calls.__setitem__(
+            "rollback",
+            calls["rollback"] + (1 if "ROLLBACK" in sql.upper() else 0),
+        )
+    )
+    # Seed a DIFFERENT id than the one requested, so the lookup genuinely misses.
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:present", COND, {})
+
+    provider_calls = {"n": 0, "adapter_closed": False, "built": False}
+
+    def _make_adapter():
+        provider_calls["built"] = True
+
+        class _Adapter:
+            async def get_market_raw(self, cid):
+                provider_calls["n"] += 1
+                return dict(GAMMA_PAYLOAD)
+
+            async def aclose(self):
+                provider_calls["adapter_closed"] = True
+
+        return _Adapter()
+
+    orig_adapter = cli._make_adapter
+    cli._make_adapter = _make_adapter
+    orig_ro, orig_rw = cli.open_readonly, cli.open_writable
+    cli.open_readonly = lambda path: db
+    cli.open_writable = lambda path, a: db
+    orig_enrich = cli.enrich_source_trade
+    cli.enrich_source_trade = enrich_source_trade
+    try:
+        rc = cli.main(
+            ["--source-trade-id", "polymarket:absent_id", "--write",
+             "--allow-live", "--db-path", str(_tmp())]
+        )
+    finally:
+        cli._make_adapter = orig_adapter
+        cli.open_readonly, cli.open_writable = orig_ro, orig_rw
+        cli.enrich_source_trade = orig_enrich
+    db.close()
+    assert rc == 2, rc
+    assert provider_calls["n"] == 0, provider_calls
+    assert calls["commit"] == 0, calls
+    if provider_calls["built"]:
+        assert provider_calls["adapter_closed"] is True, provider_calls
+
+
+# ── 4d. honest outcomes stay exit 0; provider/persistence stay exit 1 ───────
+def test_cli_honest_outcomes_exit0():
+    import scripts.enrich_approved_source_trade as cli
+    import polycopy.ingestion.source_trade_enrichment as ste
+
+    db = _NoCloseDb(_tmp()).connect()
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:st1", COND, {})
 
     orig_enrich = ste.enrich_source_trade
-
-    def _enrich(db_arg, st_id, **kw):
-        return orig_enrich(db, st_id, gamma_resolver=_boom_resolver, **kw)
-
-    ste.enrich_source_trade = _enrich
     orig_cli_enrich = cli.enrich_source_trade
     cli.enrich_source_trade = orig_enrich
 
@@ -992,5 +1255,46 @@ def test_cli_provider_error_nonzero():
         ste.enrich_source_trade = orig_enrich
         cli.enrich_source_trade = orig_cli_enrich
     db.close()
-    # Provider error is a hard failure -> nonzero exit.
-    assert rc not in (0, None), rc
+    # Honest complete enrichment -> exit 0.
+    assert rc == 0, rc
+
+
+def test_cli_equivalent_replay_still_zero_write_exit0():
+    import scripts.enrich_approved_source_trade as cli
+    import polycopy.ingestion.source_trade_enrichment as ste
+
+    db = _NoCloseDb(_tmp()).connect()
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:st1", COND, {})
+    orig_enrich = ste.enrich_source_trade
+    orig_cli_enrich = cli.enrich_source_trade
+    cli.enrich_source_trade = orig_enrich
+
+    orig_ro, orig_rw = cli.open_readonly, cli.open_writable
+
+    def _ro(path):
+        return db
+
+    def _rw(path, args):
+        return db
+
+    cli.open_readonly = _ro
+    cli.open_writable = _rw
+    try:
+        rc1 = cli.main(
+            ["--source-trade-id", "polymarket:st1", "--write",
+             "--allow-live", "--db-path", str(_tmp())]
+        )
+        rc2 = cli.main(
+            ["--source-trade-id", "polymarket:st1", "--write",
+             "--allow-live", "--db-path", str(_tmp())]
+        )
+    finally:
+        cli.open_readonly, cli.open_writable = orig_ro, orig_rw
+        ste.enrich_source_trade = orig_enrich
+        cli.enrich_source_trade = orig_cli_enrich
+    db.close()
+    assert rc1 == 0 and rc2 == 0, (rc1, rc2)
+    # Two passes; the second replay must have produced zero enrichment INSERT.
+    enr = get_enrichment(db, "polymarket:st1")
+    assert enr is not None

@@ -181,8 +181,9 @@ def main(argv: list[str] | None = None) -> int:
     # A persistence/operational failure (incl. a SAVEPOINT that rolled back)
     # must NOT be committed. The object returned, but the atomic operation did
     # not succeed, so we leave the transaction uncommitted and exit nonzero.
-    # A Gamma provider error is likewise a hard failure: the CLI exits nonzero
-    # even though an audit row may have been durably persisted.
+    # A Gamma provider error is likewise a hard failure: the CLI rolls the
+    # transaction back and returns exit 1, so the audit row created in the
+    # caller-owned transaction is NOT durably persisted by this CLI.
     if getattr(result, "operational_error", False) or getattr(result, "provider_error", False):
         db.conn.rollback()
         if adapter is not None:
@@ -194,6 +195,30 @@ def main(argv: list[str] | None = None) -> int:
         db.close()
         print(f"error: {result.error_message or result.status}", file=sys.stderr)
         return 1
+
+    # An invalid selection (unknown trade, unsupported source, SELL, sample
+    # trade, or missing market identity) is a controlled refusal: the library
+    # can create an audit row in the caller-owned transaction, but this CLI
+    # rolls the transaction back and returns exit 2. It must not be committed,
+    # and no provider request occurred (eligibility is checked before
+    # resolve_gamma_state). Use the explicit typed flag, not a generic status.
+    if getattr(result, "selection_error", False):
+        try:
+            db.conn.rollback()
+        except Exception:
+            pass
+        if adapter is not None:
+            try:
+                import asyncio
+                asyncio.run(adapter.aclose())
+            except Exception:
+                pass
+        db.close()
+        print(
+            f"error: invalid selection: {result.error_message or result.reason_codes}",
+            file=sys.stderr,
+        )
+        return 2
 
     # The canonical repair commits only after the atomic metadata+provenance
     # SAVEPOINT succeeded inside enrich_source_trade. For a real write we
