@@ -43,6 +43,27 @@ PRODUCTION_DB_REPO_RELATIVE = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 PRODUCTION_DB_ABSOLUTE = Path("/root/Polycopy/data/polycopy.db").resolve()
 
 
+# The research-evidence plane (rescoring / readiness) MUST never authorise
+# execution. These are the production + execution-plane tables whose row counts
+# must remain unchanged by any research-evidence operation. Any delta proves an
+# unexpected artifact and forces a rollback / RED.
+FORBIDDEN_EXECUTION_TABLES = (
+    "specialist_approvals",
+    "approved_specialist_trade_dispatches",
+    "copy_candidates",
+    "candidate_price_snapshots",
+    "paper_signal_decisions",
+    "paper_signal_execution_authorizations",
+    "execution_risk_decisions",
+    "paper_orders",
+    "paper_fills",
+    "paper_positions",
+    "paper_position_lots",
+    "paper_position_marks",
+    "paper_position_settlements",
+)
+
+
 class DbConn:
     """Minimal connection wrapper matching the ``Database`` method surface.
 
@@ -50,6 +71,11 @@ class DbConn:
     ``.execute(sql, params)``, ``.conn`` (the raw connection), ``.commit()``
     and ``.close()`` so legacy call sites keep working unchanged.
     """
+
+    # Test-only hook: when set (by a test), ``commit()`` raises this exception
+    # instead of committing. Enables atomicity/rollback proofs WITHOUT altering
+    # production code paths. Defaults to ``None`` (no interference).
+    _COMMIT_FAIL_HOOK: "Optional[BaseException]" = None
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
@@ -70,7 +96,24 @@ class DbConn:
         return cur.fetchall()
 
     def commit(self) -> None:
+        if self._COMMIT_FAIL_HOOK is not None:
+            raise self._COMMIT_FAIL_HOOK
         self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def count_table(self, table: str) -> int:
+        """COUNT(*) a table, PROPAGATING any SQL/schema/connection error.
+
+        A genuinely absent (optional) table raises ``sqlite3.OperationalError``
+        rather than returning 0 — callers that tolerate a missing optional
+        table must catch that themselves. This is the fail-closed count
+        contract used by the research-evidence CLIs: a missing table is never
+        silently reported as zero.
+        """
+        cur = self._conn.execute(f"SELECT COUNT(*) FROM {table}")
+        return int(cur.fetchone()[0])
 
     def close(self) -> None:
         self._conn.close()

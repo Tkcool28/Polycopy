@@ -415,13 +415,20 @@ def _insert_or_ignore_returning_id(
     params: tuple,
     existing_lookup_sql: str,
     existing_lookup_params: tuple,
+    commit: bool = True,
 ) -> int:
     """Execute INSERT OR IGNORE ... RETURNING id and return the row id.
 
-    On insert: drains the RETURNING cursor, commits, returns the new id.
+    On insert: drains the RETURNING cursor, optionally commits, returns the new id.
     On skip: drains the RETURNING cursor, then runs `existing_lookup_sql`
-    to find the existing row, drains that cursor too, commits, returns
+    to find the existing row, drains that cursor too, optionally commits, returns
     the existing id.
+
+    Caller-owned transactions: when ``commit=False`` the function does NOT call
+    ``db.conn.commit()`` — the caller owns the transaction and commits once
+    after every staged write (or rolls back on failure). The default
+    ``commit=True`` preserves the historical behaviour for every existing caller
+    that relies on an internal, per-row commit.
 
     Raises :class:`PersistenceError` when neither path produces a
     row id. Callers MUST NOT use ``int(cur.lastrowid or 0)`` to
@@ -431,8 +438,9 @@ def _insert_or_ignore_returning_id(
     cursor = db.execute(sql, params)
     inserted = cursor.fetchone()
     if inserted is not None:
-        # We just inserted. Commit and return.
-        db.conn.commit()
+        # We just inserted. Commit only when the caller wants it.
+        if commit:
+            db.conn.commit()
         # sqlite3.Row supports both index and key access.
         return int(inserted["id"] if "id" in inserted.keys() else inserted[0])
 
@@ -440,7 +448,8 @@ def _insert_or_ignore_returning_id(
     # table's actual UNIQUE columns.
     lookup_cursor = db.execute(existing_lookup_sql, existing_lookup_params)
     existing = lookup_cursor.fetchone()
-    db.conn.commit()
+    if commit:
+        db.conn.commit()
     if existing is None:
         # Defensive: this should not happen if the UNIQUE constraint
         # is enforced. Raise so the caller can surface the failure
@@ -463,6 +472,7 @@ def persist_wallet_score_v1(
     idempotency_key: Optional[str] = None,
     candidate_id: Optional[int] = None,
     source_data_timestamp: Optional[str] = None,
+    commit: bool = True,
 ) -> int:
     """Persist wallet score v1 decision to database (Phase 9).
 
@@ -578,6 +588,7 @@ def persist_wallet_score_v1(
         existing_lookup_params=(
             wallet_id, "wallet_score", result.formula_version, idempotency_key,
         ),
+        commit=commit,
     )
 
 
@@ -589,6 +600,7 @@ def persist_category_score_v1(
     *,
     idempotency_key: Optional[str] = None,
     source_data_timestamp: Optional[str] = None,
+    commit: bool = True,
 ) -> int:
     """Persist category wallet score v1 decision to database (Phase 2).
 
@@ -702,6 +714,7 @@ def persist_category_score_v1(
         existing_lookup_params=(
             wallet_id, category_label, "category_wallet_score", guarded.formula_version, idempotency_key,
         ),
+        commit=commit,
     )
 
 

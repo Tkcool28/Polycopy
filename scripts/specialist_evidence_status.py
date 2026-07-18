@@ -7,18 +7,25 @@ gates. This CLI is strictly READ-ONLY: it never writes, never creates an
 approval, dispatch, candidate, or execution artifact.
 
 States (per wallet, escalated to the worst across the cohort for the summary):
-  * GREEN  — a real (non-sample) watched wallet has BOTH a wallet decision
-             ``copy_candidate`` AND a category decision ``copy_candidate`` for
-             one of its supported categories. This means the evidence is ready
-             for HUMAN review — it is NOT an automatic approval.
-  * YELLOW — evidence is accumulating but no watched wallet is approvable yet
+  * GREEN  — a real (non-sample) watched wallet has BOTH a CURRENT wallet
+             resolution ``copy_candidate`` AND a CURRENT supported-category
+             resolution ``copy_candidate`` for one of its supported categories.
+             This means the evidence is ready for HUMAN review — it is NOT an
+             automatic approval.
+  * YELLOW — evidence is accumulating but no watched wallet is ready yet
              (e.g. incomplete / watchlist / skip, no RED reason).
-  * RED    — collector stale / sustained Gamma failures / taxonomy conflict /
-             resolution conflict / DB integrity or FK issue / sample wallet in
+  * RED    — collector stale / sustained resolution failure / taxonomy conflict
+             / resolution conflict / DB integrity or FK issue / sample wallet in
              cohort / unexpected approval / dispatch / execution artifact.
 
 The monitor MUST explicitly inspect and report counts of the execution-plane
 tables so an unexpected artifact surfaces as RED.
+
+Readiness is computed from CURRENT canonical evidence, not historical row
+ordering. ``resolve_wallet_score_v1`` / ``resolve_category_score_v1`` are called
+with ``persist=False`` so the monitor re-derives the current resolution on every
+run. A stale historical ``copy_candidate`` decision can therefore NEVER create
+GREEN on its own — the current evidence must still qualify.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,7 +42,7 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from evidence_db import open_readonly, DbConn  # noqa: E402
+from evidence_db import DbConn, FORBIDDEN_EXECUTION_TABLES, open_readonly  # noqa: E402
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
@@ -45,6 +52,8 @@ from polycopy.scoring.wallet_evidence import (  # noqa: E402
     aggregate_category_evidence,
     aggregate_wallet_evidence,
     classify_category_taxonomy,
+    resolve_category_score_v1,
+    resolve_wallet_score_v1,
 )
 from polycopy.scoring.wallet_score_v1 import (  # noqa: E402
     GLOBAL_MIN_ACTIVE_TRADING_DAYS,
@@ -59,20 +68,7 @@ from polycopy.scoring.category_wallet_score_v1 import (  # noqa: E402
 
 # Execution-plane (and approval/dispatch) tables whose row counts MUST be zero
 # in the research plane. Any non-zero count forces RED (unexpected artifact).
-_EXECUTION_PLANE_TABLES = (
-    "specialist_approvals",
-    "approved_specialist_trade_dispatches",
-    "copy_candidates",
-    "paper_signal_decisions",
-    "paper_signal_execution_authorizations",
-    "execution_risk_decisions",
-    "paper_orders",
-    "paper_fills",
-    "paper_positions",
-    "paper_position_lots",
-    "paper_position_marks",
-    "paper_position_settlements",
-)
+_EXECUTION_PLANE_TABLES = FORBIDDEN_EXECUTION_TABLES
 
 WALLET_GATES = {
     "resolved_markets": GLOBAL_MIN_RESOLVED_MARKETS,
@@ -85,6 +81,10 @@ CATEGORY_GATES = {
     "category_active_days": CATEGORY_MIN_ACTIVE_DAYS,
 }
 
+# Staleness policy defaults (S6 §10).
+DEFAULT_COLLECTOR_STALE_AFTER_HOURS = 3
+DEFAULT_REFRESH_STALE_AFTER_HOURS = 18
+
 
 def _metadata(value: Any) -> dict[str, Any]:
     if not isinstance(value, str) or not value.strip():
@@ -96,11 +96,35 @@ def _metadata(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _count(db: DbConn, table: str) -> int:
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
     try:
-        return int(db.fetchone(f"SELECT COUNT(*) AS n FROM {table}")["n"])
-    except Exception:
-        return 0
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def _count_forbidden(db: DbConn, table: str) -> int:
+    """COUNT(*) a forbidden table, PROPAGATING real errors (fail-closed).
+
+    A genuinely absent optional table is reported as 0 (the research plane may
+    not have created every execution table yet). Any other SQL/schema/connection
+    error propagates unchanged.
+    """
+    try:
+        return db.count_table(table)
+    except Exception as exc:  # pragma: no cover - defensive
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
 
 
 def _distance_to_gates(evidence: Any, gates: dict[str, int]) -> dict[str, Any]:
@@ -138,45 +162,6 @@ def _supported_categories(db: DbConn, wallet_id: str) -> list[str]:
     return sorted(labels.keys())
 
 
-def _latest_wallet_verdict(db: DbConn, wallet_id: str) -> Optional[dict[str, Any]]:
-    row = db.fetchone(
-        "SELECT verdict, final_score, id FROM wallet_score_decisions "
-        "WHERE wallet_id=? ORDER BY id DESC LIMIT 1",
-        (wallet_id,),
-    )
-    if row is None:
-        return None
-    return {
-        "verdict": str(row["verdict"]),
-        "final_score": row["final_score"],
-        "decision_id": int(row["id"]),
-    }
-
-
-def _best_category_decision(db: DbConn, wallet_id: str, supported: list[str]) -> Optional[dict[str, Any]]:
-    # GREEN requires a copy-candidate on a SUPPORTED category (one whose
-    # usable taxonomy label actually exists in the wallet's source_trades).
-    # Only consider decisions whose category_label is in the supported set.
-    if not supported:
-        return None
-    rows = db.fetchall(
-        "SELECT category_label, verdict, final_score, id FROM "
-        "category_wallet_score_decisions WHERE wallet_id=? "
-        "ORDER BY final_score DESC, id DESC",
-        (wallet_id,),
-    )
-    for row in rows:
-        label = str(row["category_label"])
-        if label in supported:
-            return {
-                "category_label": label,
-                "verdict": str(row["verdict"]),
-                "final_score": row["final_score"],
-                "decision_id": int(row["id"]),
-            }
-    return None
-
-
 def _taxonomy_completeness(db: DbConn, wallet_id: str) -> dict[str, Any]:
     wallet = db.fetchone(
         "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
@@ -190,13 +175,25 @@ def _taxonomy_completeness(db: DbConn, wallet_id: str) -> dict[str, Any]:
         (address,),
     )
     buy = len(rows)
-    complete = 0
+    usable = 0
+    partial = 0
+    unavailable = 0
     for row in rows:
         classification = classify_category_taxonomy(_metadata(row["metadata_json"]))
         if classification.status == CATEGORY_TAXONOMY_USABLE:
-            complete += 1
-    pct = (complete / buy * 100.0) if buy else 0.0
-    return {"buy_count": buy, "complete_count": complete, "pct": round(pct, 2)}
+            usable += 1
+        elif classification.status == CATEGORY_TAXONOMY_PARTIAL:
+            partial += 1
+        else:
+            unavailable += 1
+    pct = (usable / buy * 100.0) if buy else 0.0
+    return {
+        "buy_count": buy,
+        "usable_count": usable,
+        "partial_count": partial,
+        "unavailable_count": unavailable,
+        "pct": round(pct, 2),
+    }
 
 
 def _integrity_ok(db: DbConn) -> tuple[bool, list[str]]:
@@ -216,79 +213,332 @@ def _integrity_ok(db: DbConn) -> tuple[bool, list[str]]:
     return (len(reasons) == 0, reasons)
 
 
-def _stale_market_refresh_count(db: DbConn) -> int:
-    """Count market refresh-state rows that are stuck (error or unresolved)."""
-    rows = db.fetchall(
-        "SELECT last_status, last_error, attempt_count FROM specialist_market_refresh_state"
+def _global_execution_counts(db: DbConn) -> tuple[dict[str, int], dict[str, str]]:
+    """Run execution-plane counts ONCE, fail-closed. Returns (counts, errors)."""
+    counts: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    for t in _EXECUTION_PLANE_TABLES:
+        try:
+            counts[t] = _count_forbidden(db, t)
+        except Exception as exc:
+            errors[t] = str(exc)
+    return counts, errors
+
+
+# ── Taxonomy / resolution conflict detection (current provenance only) ────────
+
+def _taxonomy_conflict_reason(db: DbConn, wallet_id: str) -> Optional[str]:
+    """Return a RED taxonomy-conflict reason linked to THIS wallet's trades.
+
+    Only an explicit ``source_trade_enrichments.status='conflict'`` with a real
+    conflict reason code counts. Ordinary partial/unavailable taxonomy is NOT a
+    conflict (it is YELLOW evidence incompleteness, handled elsewhere).
+    """
+    wallet = db.fetchone(
+        "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
     )
-    stale = 0
+    if wallet is None:
+        return None
+    address = str(wallet["canonical_address"] or wallet["address"] or "").lower()
+    rows = db.fetchall(
+        "SELECT st.id AS source_trade_id, ste.status, ste.reason_codes_json "
+        "FROM source_trades st "
+        "LEFT JOIN source_trade_enrichments ste ON ste.source_trade_internal_id = st.id "
+        "WHERE lower(st.trader_address)=?",
+        (address,),
+    )
     for row in rows:
+        status = row["status"]
+        if status == "conflict":
+            return f"taxonomy_conflict:source_trade={row['source_trade_id']}"
+    return None
+
+
+def _wallet_resolution_conflict(db: DbConn, wallet_id: str) -> Optional[str]:
+    """Return a RED resolution-conflict reason scoped to THIS wallet's markets.
+
+    Looks for current failed/errored market refresh bookkeeping on markets that
+    actually belong to this wallet's source trades — never another wallet's.
+    """
+    wallet = db.fetchone(
+        "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
+    )
+    if wallet is None:
+        return None
+    address = str(wallet["canonical_address"] or wallet["address"] or "").lower()
+    market_rows = db.fetchall(
+        "SELECT DISTINCT market_source_id FROM source_trades "
+        "WHERE lower(trader_address)=? AND market_source_id IS NOT NULL",
+        (address,),
+    )
+    wallet_markets = {str(r["market_source_id"]) for r in market_rows}
+    if not wallet_markets:
+        return None
+
+    refresh_rows = db.fetchall(
+        "SELECT market_source_id, last_status, last_error, attempt_count, "
+        "last_checked_at, next_check_after FROM specialist_market_refresh_state"
+    )
+    for row in refresh_rows:
+        msid = str(row["market_source_id"])
+        if msid not in wallet_markets:
+            continue  # another wallet's market failure must not RED this wallet
         status = row["last_status"]
-        if row["last_error"] or status in ("error", "failed", "stale"):
-            stale += 1
-    return stale
+        if status in ("conflict", "failed", "error") or row["last_error"]:
+            return f"resolution_conflict:market={msid}:status={status}"
+    return None
 
 
-def build_wallet_status(db: DbConn, wallet_id: str, watch: dict[str, Any]) -> dict[str, Any]:
-    """Compute the per-wallet readiness record (read-only)."""
+def _collector_freshness(
+    watch: dict[str, Any], *,
+    stale_after_hours: int,
+) -> tuple[Optional[str], bool]:
+    """Return (red_reason_or_None, is_yellow). NEW watches with no collection
+    timestamp are YELLOW (not RED). An ancient timestamp or malformed value is
+    RED."""
+    last = watch.get("last_collection_at")
+    if not last:
+        # Never collected yet -> YELLOW (accumulating), not RED.
+        return None, True
+    ts = _parse_ts(last)
+    if ts is None:
+        # Malformed timestamp -> RED with explicit reason.
+        return "collector_timestamp_malformed", False
+    age = _utcnow() - ts
+    if age > timedelta(hours=stale_after_hours):
+        return "collector_stale", False
+    return None, False
+
+
+def _refresh_freshness(
+    db: DbConn, wallet_id: str, *,
+    stale_after_hours: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Wallet-scoped refresh freshness + conflicts.
+
+    Only the wallet's OWN market_source_ids are scoped. An unresolved market is
+    not an error. A current failed/overdue refresh is RED. A recovered (later
+    successful) status clears staleness. Another wallet's market failure is
+    ignored. Returns (red_reasons, detail_dict).
+    """
+    wallet = db.fetchone(
+        "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
+    )
+    reasons: list[str] = []
+    detail: dict[str, Any] = {
+        "scoped_markets": 0,
+        "current_failed": 0,
+        "current_overdue": 0,
+        "recovered": 0,
+        "unresolved_ok": 0,
+        "conflict_market_ids": [],
+    }
+    if wallet is None:
+        return reasons, detail
+    address = str(wallet["canonical_address"] or wallet["address"] or "").lower()
+    market_rows = db.fetchall(
+        "SELECT DISTINCT market_source_id FROM source_trades "
+        "WHERE lower(trader_address)=? AND market_source_id IS NOT NULL",
+        (address,),
+    )
+    wallet_markets = {str(r["market_source_id"]) for r in market_rows}
+    detail["scoped_markets"] = len(wallet_markets)
+    if not wallet_markets:
+        return reasons, detail
+
+    refresh_rows = db.fetchall(
+        "SELECT market_source_id, last_status, last_error, attempt_count, "
+        "last_checked_at, next_check_after, resolved_at FROM "
+        "specialist_market_refresh_state"
+    )
+    now = _utcnow()
+    for row in refresh_rows:
+        msid = str(row["market_source_id"])
+        if msid not in wallet_markets:
+            continue
+        status = row["last_status"]
+        last_checked = _parse_ts(row["last_checked_at"])
+        next_after = _parse_ts(row["next_check_after"])
+        # Current failed/error/conflict status -> RED.
+        if status in ("conflict", "failed", "error") or row["last_error"]:
+            reasons.append(f"refresh_current_failed:market={msid}")
+            detail["current_failed"] += 1
+            detail["conflict_market_ids"].append(msid)
+            continue
+        # Overdue last_checked_at / next_check_after beyond policy -> RED.
+        overdue = False
+        if last_checked is not None and (now - last_checked) > timedelta(hours=stale_after_hours):
+            overdue = True
+        if next_after is not None and now > next_after + timedelta(hours=stale_after_hours):
+            overdue = True
+        if status in ("unresolved", "stale") or overdue:
+            if status == "unresolved":
+                # Unresolved market is not an error on its own.
+                detail["unresolved_ok"] += 1
+                continue
+            reasons.append(f"refresh_overdue:market={msid}")
+            detail["current_overdue"] += 1
+            continue
+        # Otherwise (resolved / recent success) -> recovered / healthy.
+        if status in ("resolved", "ok", "success", "complete"):
+            detail["recovered"] += 1
+    return reasons, detail
+
+
+def _select_best_category(
+    category_results: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Deterministic best current category (S6 §8):
+
+      1. copy_candidate verdict first;
+      2. current final_score descending;
+      3. category label ascending.
+    """
+    candidates = [c for c in category_results if c.get("verdict") is not None]
+    if not candidates:
+        return None
+
+    def sort_key(c: dict[str, Any]):
+        # copy_candidate first, then higher score; label ASCENDING as the final
+        # deterministic tiebreak (S6 §8.3).
+        is_cc = 0 if c["verdict"] == WalletVerdict.COPY_CANDIDATE.value else 1
+        score = -(c.get("final_score") or 0.0)
+        return (is_cc, score, c["category_label"])
+
+    return sorted(candidates, key=sort_key)[0]
+
+
+def build_wallet_status(
+    db: DbConn,
+    wallet_id: str,
+    watch: dict[str, Any],
+    *,
+    global_health: dict[str, Any],
+    collector_stale_after_hours: int,
+    refresh_stale_after_hours: int,
+) -> dict[str, Any]:
+    """Compute the per-wallet readiness record (read-only, current evidence)."""
     cutoff = None
     wallet_ev = aggregate_wallet_evidence(db, wallet_id, cutoff_timestamp=cutoff)
     supported = _supported_categories(db, wallet_id)
     taxonomy = _taxonomy_completeness(db, wallet_id)
 
-    best_category_label: Optional[str] = None
-    best_category_ev: Optional[Any] = None
-    if supported:
-        # Best category by current resolved-markets evidence (deterministic).
-        best_category_label = supported[0]
-        best_category_ev = aggregate_category_evidence(
-            db, wallet_id, best_category_label, cutoff_timestamp=cutoff
+    supported_classifications: dict[str, Any] = {}
+    wallet = db.fetchone(
+        "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
+    )
+    if wallet is not None:
+        address = str(wallet["canonical_address"] or wallet["address"] or "").lower()
+        rows = db.fetchall(
+            "SELECT metadata_json FROM source_trades WHERE lower(trader_address)=?",
+            (address,),
         )
+        for row in rows:
+            classification = classify_category_taxonomy(_metadata(row["metadata_json"]))
+            if classification.status == CATEGORY_TAXONOMY_USABLE and classification.category_label:
+                supported_classifications.setdefault(classification.category_label, classification)
 
-    wallet_verdict = _latest_wallet_verdict(db, wallet_id)
-    category_decision = _best_category_decision(db, wallet_id, supported)
-
-    wallet_gate_distance = _distance_to_gates(wallet_ev, WALLET_GATES)
-    category_gate_distance = (
-        _distance_to_gates(best_category_ev, CATEGORY_GATES) if best_category_ev is not None else {}
+    # CURRENT wallet resolution (persist=False) — the single source of truth.
+    wallet_res = resolve_wallet_score_v1(
+        db, wallet_id, cutoff_timestamp=cutoff, persist=False, now=_utcnow()
+    )
+    wallet_result = wallet_res.result
+    wallet_verdict = (
+        wallet_result.verdict.value if wallet_result is not None else "incomplete"
     )
 
+    # CURRENT category resolutions (persist=False), every distinct usable
+    # category exactly once, in deterministic order.
+    category_results: list[dict[str, Any]] = []
+    for label in sorted(supported_classifications.keys()):
+        classification = supported_classifications[label]
+        cat_res = resolve_category_score_v1(
+            db, wallet_id, classification, cutoff_timestamp=cutoff,
+            persist=False, now=_utcnow(),
+        )
+        cat_result = cat_res.result
+        cat_ev = aggregate_category_evidence(
+            db, wallet_id, label, cutoff_timestamp=cutoff
+        ) if cat_result is not None else None
+        category_results.append({
+            "category_label": label,
+            "verdict": cat_result.verdict.value if cat_result is not None else "not_applicable",
+            "final_score": cat_result.score if cat_result is not None else None,
+            "status": cat_res.status,
+            "missing_reasons": list(cat_res.missing_reasons),
+            "evidence_fingerprint": cat_res.evidence_fingerprint,
+            "decision_id": cat_res.decision_id,  # set only when current-compatible
+            "formula_name": cat_res.formula_name,
+            "formula_version": cat_res.formula_version,
+            "source_data_timestamp": cat_res.source_data_timestamp,
+            "gate_distance": _distance_to_gates(cat_ev, CATEGORY_GATES) if cat_ev is not None else {},
+            "ready_for_human_review": (
+                cat_result is not None
+                and cat_result.verdict == WalletVerdict.COPY_CANDIDATE
+            ),
+        })
+
+    best_category = _select_best_category(category_results)
+
+    wallet_gate_distance = _distance_to_gates(wallet_ev, WALLET_GATES)
+
     reasons: list[str] = []
-    # Sample wallet in cohort -> RED.
+    # Sample wallet in cohort -> RED (should not happen; cohort excludes, but
+    # if an explicit --wallet-id is sample we still guard).
     if bool(watch.get("is_sample")):
         reasons.append("sample_wallet_in_cohort")
 
-    # Execution-plane artifacts -> RED.
-    exec_counts = {t: _count(db, t) for t in _EXECUTION_PLANE_TABLES}
+    # Execution-plane artifacts -> RED (fail-closed on count errors).
+    exec_counts = global_health["execution_artifact_counts"]
+    exec_errors = global_health["execution_artifact_errors"]
+    if exec_errors:
+        reasons.append("execution_artifact_count_error")
     unexpected = {t: n for t, n in exec_counts.items() if n > 0}
     if unexpected:
         reasons.append("unexpected_execution_artifact")
 
-    # Integrity / FK.
-    ok, integrity_reasons = _integrity_ok(db)
-    if not ok:
-        reasons.extend(integrity_reasons)
+    # Integrity / FK (from one-shot global health).
+    reasons.extend(global_health["integrity_reasons"])
 
-    # Collector stale: an active watch with no / ancient last_collection_at.
-    last_collection = watch.get("last_collection_at")
-    if watch.get("status") == "active" and not last_collection:
-        reasons.append("collector_stale")
+    # Missing wallet record behind an active watch -> RED.
+    if watch.get("missing_wallet_record"):
+        reasons.append("missing_wallet_record")
 
-    # Stale market refresh.
-    stale_refresh = _stale_market_refresh_count(db)
-    if stale_refresh > 0:
-        reasons.append("stale_market_refresh")
+    # Collector freshness.
+    coll_reason, coll_yellow = _collector_freshness(
+        watch, stale_after_hours=collector_stale_after_hours
+    )
+    if coll_reason:
+        reasons.append(coll_reason)
 
-    # Taxonomy / resolution conflict detection.
-    if taxonomy["buy_count"] > 0 and taxonomy["complete_count"] == 0 and _has_taxonomy_partial(db, wallet_id):
-        reasons.append("taxonomy_conflict")
+    # Refresh freshness (wallet-scoped).
+    refresh_reasons, refresh_detail = _refresh_freshness(
+        db, wallet_id, stale_after_hours=refresh_stale_after_hours
+    )
+    reasons.extend(refresh_reasons)
+
+    # Current-provenance conflicts.
+    tax_conflict = _taxonomy_conflict_reason(db, wallet_id)
+    if tax_conflict:
+        reasons.append(tax_conflict)
+    res_conflict = _wallet_resolution_conflict(db, wallet_id)
+    if res_conflict:
+        reasons.append(res_conflict)
+
+    # YELLOW evidence-incompleteness (ordinary partial/unavailable taxonomy).
+    yellow_reasons: list[str] = []
+    if taxonomy["partial_count"] > 0:
+        yellow_reasons.append("taxonomy_partial")
+    elif taxonomy["usable_count"] == 0 and taxonomy["buy_count"] > 0:
+        yellow_reasons.append("taxonomy_unavailable")
+    if coll_yellow and not coll_reason:
+        yellow_reasons.append("collector_not_yet_collected")
 
     # Determine state.
-    wv = wallet_verdict["verdict"] if wallet_verdict else None
-    cv = category_decision["verdict"] if category_decision else None
     is_green = (
-        wv == WalletVerdict.COPY_CANDIDATE.value
-        and cv == WalletVerdict.COPY_CANDIDATE.value
+        wallet_verdict == WalletVerdict.COPY_CANDIDATE.value
+        and best_category is not None
+        and best_category["verdict"] == WalletVerdict.COPY_CANDIDATE.value
     )
     if reasons:
         state = "RED"
@@ -300,82 +550,142 @@ def build_wallet_status(db: DbConn, wallet_id: str, watch: dict[str, Any]) -> di
     return {
         "wallet_id": wallet_id,
         "watch_id": watch.get("id"),
-        "status": watch.get("status"),
+        "watch_status": watch.get("status"),
         "state": state,
+        "ready_for_human_review": is_green,
         "red_reasons": reasons,
+        "yellow_reasons": yellow_reasons,
         "is_sample": bool(watch.get("is_sample")),
         "active_trading_days": wallet_ev.active_trading_days,
         "buy_count": wallet_ev.total_buy_trades,
         "distinct_markets": wallet_ev.distinct_markets,
         "distinct_events": wallet_ev.distinct_events,
         "resolved_markets": wallet_ev.resolved_markets,
-        "taxonomy_complete_count": taxonomy["complete_count"],
+        "taxonomy_complete_count": taxonomy["usable_count"],
+        "taxonomy_partial_count": taxonomy["partial_count"],
+        "taxonomy_unavailable_count": taxonomy["unavailable_count"],
         "taxonomy_completeness_pct": taxonomy["pct"],
         "supported_categories": supported,
-        "best_category": best_category_label,
-        "wallet_verdict": wv,
-        "best_category_verdict": cv,
+        "current_wallet_resolution": {
+            "verdict": wallet_verdict,
+            "final_score": wallet_result.score if wallet_result is not None else None,
+            "status": wallet_res.status,
+            "missing_reasons": list(wallet_res.missing_reasons),
+            "evidence_fingerprint": wallet_res.evidence_fingerprint,
+            "decision_id": wallet_res.decision_id,
+            "formula_name": wallet_res.formula_name,
+            "formula_version": wallet_res.formula_version,
+            "source_data_timestamp": wallet_res.source_data_timestamp,
+            "created": wallet_res.created,
+            "reused": wallet_res.reused,
+            "would_create": wallet_res.would_create,
+            "persisted": wallet_res.persisted,
+        },
         "wallet_gate_distance": wallet_gate_distance,
-        "category_gate_distance": category_gate_distance,
-        "last_collection_at": last_collection,
-        "stale_market_refresh_count": stale_refresh,
-        "execution_artifact_counts": exec_counts,
+        "current_category_results": category_results,
+        "selected_best_category": best_category,
+        "refresh_detail": refresh_detail,
+        "last_collection_at": watch.get("last_collection_at"),
+        "approval_created": False,
+        "dispatch_created": False,
+        "execution_authorized": False,
     }
 
 
-def _has_taxonomy_partial(db: DbConn, wallet_id: str) -> bool:
-    wallet = db.fetchone(
-        "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
-    )
-    if wallet is None:
-        return False
-    address = str(wallet["canonical_address"] or wallet["address"] or "").lower()
-    rows = db.fetchall(
-        "SELECT metadata_json FROM source_trades WHERE lower(trader_address)=?",
-        (address,),
-    )
-    for row in rows:
-        classification = classify_category_taxonomy(_metadata(row["metadata_json"]))
-        if classification.status == CATEGORY_TAXONOMY_PARTIAL:
-            return True
-    return False
+def build_status(
+    db: DbConn, *,
+    wallet_id: Optional[str] = None,
+    collector_stale_after_hours: int = DEFAULT_COLLECTOR_STALE_AFTER_HOURS,
+    refresh_stale_after_hours: int = DEFAULT_REFRESH_STALE_AFTER_HOURS,
+) -> dict[str, Any]:
+    # One-shot global health (S6 §12) — run each expensive check ONCE.
+    ok, integrity_reasons = _integrity_ok(db)
+    exec_counts, exec_errors = _global_execution_counts(db)
+    global_health = {
+        "integrity_ok": ok,
+        "integrity_reasons": integrity_reasons,
+        "execution_artifact_counts": exec_counts,
+        "execution_artifact_errors": exec_errors,
+    }
+    if exec_errors:
+        # Fail closed: cannot produce a trustworthy report.
+        return {
+            "generated_at": _utcnow().isoformat(),
+            "overall_state": "RED",
+            "schema_version": global_health.get("schema_version"),
+            "watched_count": 0,
+            "ready_for_human_review_count": 0,
+            "active_watch_count": 0,
+            "paused_watch_count": 0,
+            "retired_watch_count": 0,
+            "global_integrity": {"ok": ok, "reasons": integrity_reasons},
+            "execution_artifact_counts": exec_counts,
+            "execution_artifact_errors": exec_errors,
+            "wallets": [],
+            "fail_closed": "execution_artifact_count_error",
+        }
 
-
-def build_status(db: DbConn) -> dict[str, Any]:
-    watches = db.fetchall(
+    # Cohort: active / paused / retired watches. Paused/retired are
+    # informational only; they never drive GREEN/YELLOW/RED.
+    raw = db.fetchall(
         "SELECT w.id, w.wallet_id, w.status, w.last_collection_at, "
         "COALESCE(wl.is_sample, 0) AS is_sample "
         "FROM specialist_evidence_watchlist w "
         "LEFT JOIN wallets wl ON wl.id = w.wallet_id "
         "ORDER BY w.wallet_id, w.id"
     )
+
+    # When --wallet-id is given, filter the cohort read-only BEFORE evaluating
+    # and recompute all counts (never retain the unfiltered overall state).
+    if wallet_id is not None:
+        raw = [r for r in raw if str(r["wallet_id"]) == wallet_id]
+
+    active_rows = [r for r in raw if r["status"] == "active"]
+    paused_rows = [r for r in raw if r["status"] == "paused"]
+    retired_rows = [r for r in raw if r["status"] == "retired"]
+
     per_wallet: list[dict[str, Any]] = []
-    any_red = False
-    any_green = False
-    for row in watches:
-        rec = build_wallet_status(db, str(row["wallet_id"]), dict(row))
+    for row in active_rows:
+        watch: dict[str, Any] = dict(row)
+        # Missing wallet record behind an active watch -> RED.
+        if row["is_sample"] is None and db.fetchone(
+            "SELECT 1 FROM wallets WHERE id=?", (str(row["wallet_id"]),)
+        ) is None:
+            watch["missing_wallet_record"] = True
+        rec = build_wallet_status(
+            db, str(row["wallet_id"]), watch,
+            global_health=global_health,
+            collector_stale_after_hours=collector_stale_after_hours,
+            refresh_stale_after_hours=refresh_stale_after_hours,
+        )
         per_wallet.append(rec)
-        if rec["state"] == "RED":
-            any_red = True
-        elif rec["state"] == "GREEN":
-            any_green = True
+
+    # Paused/retired watches are informational counts only (cannot drive state).
+    any_red = any(r["state"] == "RED" for r in per_wallet)
+    any_green = any(r["state"] == "GREEN" for r in per_wallet)
 
     if not per_wallet:
-        # No cohort yet: nothing approvable, not an error.
-        overall_state = "YELLOW"
+        overall_state = "YELLOW"  # no active cohort yet: nothing approvable
     elif any_red:
         overall_state = "RED"
     elif any_green:
-        # At least one watched wallet is ready for human review and none is
-        # red -> surface GREEN (plan: GREEN = >=1 copy_candidate match).
         overall_state = "GREEN"
     else:
         overall_state = "YELLOW"
 
+    ready_count = sum(1 for r in per_wallet if r["ready_for_human_review"])
+
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _utcnow().isoformat(),
+        "schema_version": global_health.get("schema_version"),
         "overall_state": overall_state,
         "watched_count": len(per_wallet),
+        "ready_for_human_review_count": ready_count,
+        "active_watch_count": len(active_rows),
+        "paused_watch_count": len(paused_rows),
+        "retired_watch_count": len(retired_rows),
+        "global_integrity": {"ok": ok, "reasons": integrity_reasons},
+        "execution_artifact_counts": exec_counts,
         "wallets": per_wallet,
     }
 
@@ -385,27 +695,52 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--db-path", default=str(PRODUCTION_DB_PATH))
     p.add_argument("--wallet-id", help="Restrict report to one watched wallet")
     p.add_argument("--json", action="store_true", help="Emit pure JSON")
+    p.add_argument("--collector-stale-after-hours",
+                   type=int, default=DEFAULT_COLLECTOR_STALE_AFTER_HOURS)
+    p.add_argument("--refresh-stale-after-hours",
+                   type=int, default=DEFAULT_REFRESH_STALE_AFTER_HOURS)
     args = p.parse_args(argv)
 
     db = open_readonly(args.db_path)
     try:
-        report = build_status(db)
-        if args.wallet_id is not None:
-            report = {
-                **report,
-                "wallets": [w for w in report["wallets"] if w["wallet_id"] == args.wallet_id],
-            }
+        report = build_status(
+            db,
+            wallet_id=getattr(args, "wallet_id", None),
+            collector_stale_after_hours=args.collector_stale_after_hours,
+            refresh_stale_after_hours=args.refresh_stale_after_hours,
+        )
+        # Invalid selector: an explicit --wallet-id that matches no watched
+        # wallet (or a wallet with no active watch) cannot produce a report.
+        if getattr(args, "wallet_id", None) is not None:
+            matched = [
+                w for w in report.get("wallets", [])
+                if w.get("wallet_id") == args.wallet_id
+            ]
+            if not matched:
+                print(f"error: selector: no active watch for wallet "
+                      f"{args.wallet_id}", file=sys.stderr)
+                return 2
+        # Count/exec error -> report is untrustworthy -> exit 1.
+        if report.get("fail_closed") is not None:
+            print(f"error: {report['fail_closed']}", file=sys.stderr)
+            return 1
         if args.json:
             print(json.dumps(report, indent=1, default=str))
         else:
-            print(f"overall_state={report['overall_state']} watched={report['watched_count']}")
+            print(
+                f"overall_state={report['overall_state']} "
+                f"watched={report['watched_count']} "
+                f"ready={report['ready_for_human_review_count']}"
+            )
             for w in report["wallets"]:
+                best = w.get("selected_best_category") or {}
                 print(
                     f"  wallet={w['wallet_id']} state={w['state']} "
-                    f"wallet_verdict={w['wallet_verdict']} "
-                    f"best_category={w['best_category']} "
-                    f"category_verdict={w['best_category_verdict']}"
+                    f"wallet_verdict={w['current_wallet_resolution']['verdict']} "
+                    f"best_category={best.get('category_label')} "
+                    f"category_verdict={best.get('verdict')}"
                     + (f" reasons={w['red_reasons']}" if w["red_reasons"] else "")
+                    + (f" yellow={w['yellow_reasons']}" if w["yellow_reasons"] else "")
                 )
         return 0
     finally:
