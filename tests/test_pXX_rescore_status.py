@@ -1681,3 +1681,95 @@ def test_status_uses_readonly_open():
     assert seen.get("called") is True, seen
     assert seen.get("readonly") is True, seen
     dbg.close()
+
+
+def test_status_delta_applied_to_final_wallet_state():
+    """S6 EXEC-DELTA correction §1: a wallet that initially resolves GREEN
+    but whose post-evaluation artifact count changes must be flipped to RED with
+    ready_for_human_review=False, and the count recomputed AFTER the delta so
+    ready_for_human_review_count==0. Baseline/count/delta stay accurate."""
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
+    db, _ = _open()
+    _seed_wallet(db, "uuid-g", "0x" + "g" * 40)
+    _seed_watch(db, "wl-g", "uuid-g", last_collection_at=_recent_ts(0))
+    _seed_green_evidence(db, "uuid-g", "0x" + "g" * 40)
+    # Baseline 0; after-eval capture sees 1 -> delta on copy_candidates.
+    orig = st._global_execution_counts
+    state = {"n": 0}
+    def _two_phase(d):
+        state["n"] += 1
+        if state["n"] == 1:
+            return ({k: 0 for k in FORBIDDEN_EXECUTION_TABLES}, {}, {})
+        return ({k: (1 if k == "copy_candidates" else 0)
+                 for k in FORBIDDEN_EXECUTION_TABLES}, {}, {})
+    st._global_execution_counts = _two_phase
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        st._global_execution_counts = orig
+    assert rc == 0, rc
+    out = st._LAST_REPORT  # exact (patched) run; do not re-run main
+    # §1 proofs
+    assert out["overall_state"] == "RED", out
+    w = out["wallets"][0]
+    assert w["state"] == "RED", w
+    assert w["ready_for_human_review"] is False, w
+    assert out["ready_for_human_review_count"] == 0, out
+    assert any("execution_artifact_delta:copy_candidates" in r
+               for r in w["red_reasons"]), w
+    # Baseline / count / delta fields remain accurate.
+    assert out["execution_artifact_baseline_counts"]["copy_candidates"] == 0, out
+    assert out["execution_artifact_counts"]["copy_candidates"] == 1, out
+    assert out["execution_artifact_delta"].get("copy_candidates") == 1, out
+    db.close()
+
+
+def test_status_second_count_failure_exits_1():
+    """S6 EXEC-DELTA correction §2: baseline count succeeds but the same
+    table's SECOND count raises -> fail closed, CLI exit 1, no normal report,
+    zero SQL writes."""
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
+    db, _ = _open()
+    _seed_wallet(db, "uuid-g", "0x" + "g" * 40)
+    _seed_watch(db, "wl-g", "uuid-g", last_collection_at=_recent_ts(0))
+    _seed_green_evidence(db, "uuid-g", "0x" + "g" * 40)
+    # Count using a writable-but-instrumented connection to assert zero writes.
+    orig_open = st.open_readonly
+    spy = {}
+    def _spy_open(p):
+        real = orig_open(p)
+        class _Spy(DbConn):
+            _writes = []
+            def execute(self, sql, params=None):
+                if str(sql).strip().upper().startswith(
+                        ("INSERT", "UPDATE", "DELETE", "REPLACE")):
+                    self._writes.append(sql)
+                return super().execute(sql, params)
+        s = _Spy(real.conn)
+        spy["conn"] = s
+        return s
+    orig = st._global_execution_counts
+    calls = {"n": 0}
+    def _fail_second(d):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ({k: 0 for k in FORBIDDEN_EXECUTION_TABLES}, {}, {})
+        # second call: this table's count raises
+        raise RuntimeError("injected second count failure: copy_candidates")
+    st._global_execution_counts = _fail_second
+    st.open_readonly = _spy_open
+    st._LAST_REPORT = None  # clear any prior-test report
+    try:
+        rc = st.main(["--db-path", str(db.db_path)])
+    finally:
+        st._global_execution_counts = orig
+        st.open_readonly = orig_open
+    assert rc == 1, rc  # fail closed
+    # No normal report emitted (exception propagated before return).
+    assert st._LAST_REPORT is None, \
+        "expected no normal report after second-count failure"
+    # Zero writes on the actual connection used.
+    assert spy["conn"]._writes == [], spy["conn"]._writes
+    db.close()

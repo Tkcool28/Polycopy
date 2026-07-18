@@ -836,23 +836,46 @@ def build_status(
     else:
         overall_state = "YELLOW"
 
-    ready_count = sum(1 for r in per_wallet if r["ready_for_human_review"])
-
-    # Execution-artifact DELTA semantics (S6 §4): recapture counts after the
+    # Execution-artifact DELTA semantics (S6 §4): recapture counts AFTER the
     # cohort is evaluated. A nonzero delta proves the run mutated the execution
-    # plane -> RED with the exact changed table. A stable nonzero baseline stays
-    # visible/informational and does NOT by itself RED each wallet.
+    # plane. A stable nonzero baseline stays visible/informational and does NOT
+    # by itself RED each wallet.
     exec_after, _, exec_errors2 = _global_execution_counts(db)
+    # Defect 2: if the post-evaluation count FAILS, the delta is untrustworthy.
+    # Fail closed (raise -> main returns exit 1); never infer delta from a
+    # missing/default-zero value.
+    if exec_errors2:
+        raise RuntimeError(
+            "execution_artifact_second_count_error: "
+            + ", ".join(sorted(exec_errors2))
+        )
     delta = _execution_delta(exec_baseline, exec_after)
     exec_counts_final = exec_after
     exec_errors_final = {**exec_errors, **exec_errors2}
     delta_red_tables = [t for t, d in delta.items() if d != 0]
 
+    # Defect 1: apply the delta RED to every evaluated wallet BEFORE recomputing
+    # overall_state / ready counts. A delta mutation forces each wallet RED and
+    # ready_for_human_review=False, preserving the invariant
+    #   ready_for_human_review == (state == "GREEN").
     if delta_red_tables:
         for w in per_wallet:
             for t in delta_red_tables:
-                w["red_reasons"].append(f"execution_artifact_delta:{t}:delta={delta[t]}")
+                w["red_reasons"].append(
+                    f"execution_artifact_delta:{t}:delta={delta[t]}"
+                )
+            w["state"] = "RED"
+            w["ready_for_human_review"] = False
         overall_state = "RED"
+
+    # Recompute ready count ONLY after all global RED conditions are applied.
+    for w in per_wallet:
+        # Invariant enforcement: ready iff final state is GREEN.
+        if w["state"] != "GREEN":
+            w["ready_for_human_review"] = False
+        else:
+            w["ready_for_human_review"] = True
+    ready_count = sum(1 for r in per_wallet if r["ready_for_human_review"])
 
     return {
         "generated_at": _utcnow().isoformat(),
