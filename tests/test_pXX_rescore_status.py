@@ -25,6 +25,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,7 +39,10 @@ from polycopy.ingestion.canonical_metadata import build_canonical_metadata  # no
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     resolve_wallet_score_v1,
 )
-from evidence_db import DbConn, FORBIDDEN_EXECUTION_TABLES  # noqa: E402
+from evidence_db import DbConn, FORBIDDEN_EXECUTION_TABLES, open_readonly  # noqa: E402
+
+
+_LAST_SPY = None  # holds the most recent instrumented DbConn for §7 assertions
 
 
 def _load(name):
@@ -437,8 +441,8 @@ def test_evaluate_forbidden_delta_rollback():
     ev = _load("evaluate_specialist_evidence_watchlist.py")
     # Make the AFTER count of specialist_approvals read +1 vs the BEFORE count
     # (simulating a phantom approval created during the run). The second call
-    # to count_table is the AFTER snapshot.
-    orig = DbConn.count_table
+    # to count_table_optional is the AFTER snapshot.
+    orig = DbConn.count_table_optional
     calls = {"n": 0}
     def _inflated(self, table):
         calls["n"] += 1
@@ -446,11 +450,11 @@ def test_evaluate_forbidden_delta_rollback():
         if table == "specialist_approvals" and calls["n"] % 2 == 0:
             return base + 1  # AFTER sample shows a delta
         return base
-    DbConn.count_table = _inflated
+    DbConn.count_table_optional = _inflated
     try:
         rc = ev.main(["--db-path", str(db.db_path), "--write", "--wallet-id", WID])
     finally:
-        DbConn.count_table = orig
+        DbConn.count_table_optional = orig
     assert rc == 1, rc  # delta detected -> rollback, exit 1
     # No score decisions survived.
     assert db.conn.execute(
@@ -505,16 +509,16 @@ def test_evaluate_present_table_count_failure_propagates():
     ev = _load("evaluate_specialist_evidence_watchlist.py")
     # Poison the count path for a present table (specialist_approvals exists).
     # The rescore CLI opens a DbConn, so patch DbConn.count_table.
-    orig = DbConn.count_table
+    orig = DbConn.count_table_optional
     def _boom(self, table):
         if table == "specialist_approvals":
             raise sqlite3.OperationalError("injected count failure")
         return orig(self, table)
-    DbConn.count_table = _boom
+    DbConn.count_table_optional = _boom
     try:
         rc = ev.main(["--db-path", str(db.db_path), "--write", "--wallet-id", WID])
     finally:
-        DbConn.count_table = orig
+        DbConn.count_table_optional = orig
     assert rc == 1, rc
     db.close()
 
@@ -928,16 +932,16 @@ def test_status_present_table_count_error_not_zero():
     _seed_trade(db, "t-pol", meta={"taxonomy": {"raw_category": "Politics"},
                                    "event": {"id": "e1", "slug": "us"}})
     st = _load("specialist_evidence_status.py")
-    orig = DbConn.count_table
+    orig = DbConn.count_table_optional
     def _boom(self, table):
         if table == "specialist_approvals":
             raise sqlite3.OperationalError("injected")
         return orig(self, table)
-    DbConn.count_table = _boom
+    DbConn.count_table_optional = _boom
     try:
         rc = st.main(["--db-path", str(db.db_path)])
     finally:
-        DbConn.count_table = orig
+        DbConn.count_table_optional = orig
     # Count-error path fails the report closed -> not a silent zero. The CLI
     # returns RC 1 (untrustworthy report) rather than fabricating GREEN.
     assert rc == 1, rc
@@ -1078,3 +1082,345 @@ def test_e2e_canonical_dry_run_write_replay_status():
         n = db.conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         assert n == 0, f"unexpected artifact in {t}: {n}"
     db.close()
+
+
+# ── T9: S6 focused correctness corrections (§2–§7) ───────────────────────────
+
+def test_status_ready_flag_requires_green_and_red_downgrades():
+    """S6 §2: score_pair_candidate copy_candidate but a RED reason -> RED,
+    ready_for_human_review False, top-level ready count 0."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_green_evidence(db, WID, ADDR)  # both wallet + category copy_candidate
+    # Inject a RED reason via a current failed refresh on one of the wallet's
+    # canonical markets (green seed uses market_source_id='m0').
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, last_error, "
+        "attempt_count) VALUES (?,?,?,?,?)",
+        ("m0", _recent_ts(0), "failed", "boom", 5))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert w["state"] == "RED", out
+    assert w["ready_for_human_review"] is False, w
+    assert out["ready_for_human_review_count"] == 0, out
+    db.close()
+
+
+def test_status_recovered_success_retains_old_error():
+    """S6 §3: last_status='resolved' with a stale last_error -> not RED."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, last_error, "
+        "attempt_count, resolved_at) VALUES (?,?,?,?,?,?)",
+        ("st1", _recent_ts(0), "resolved", "ancient conflict", 3, _recent_ts(0)))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert "refresh_current_failed" not in w["red_reasons"], w
+    assert w["state"] != "RED", out
+    db.close()
+
+
+def test_status_recent_unresolved_healthy():
+    """S6 §3: recent unresolved market is informational, not an error."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, attempt_count) "
+        "VALUES (?,?,?,?)",
+        ("st1", _recent_ts(0), "unresolved", 1))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert "refresh_overdue" not in w["red_reasons"], w
+    assert "refresh_current_failed" not in w["red_reasons"], w
+    db.close()
+
+
+def test_status_overdue_unresolved_red():
+    """S6 §3: unresolved whose last_checked_at is overdue beyond policy -> RED."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, attempt_count) "
+        "VALUES (?,?,?,?)",
+        ("st1", _recent_ts(72), "unresolved", 1))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert any("refresh_overdue" in r for r in w["red_reasons"]), w
+    db.close()
+
+
+def test_status_malformed_last_checked_at_red():
+    """S6 §3: present but malformed last_checked_at -> explicit RED reason."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, attempt_count) "
+        "VALUES (?,?,?,?)",
+        ("st1", "not-a-timestamp", "ok", 1))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert any("malformed_timestamp" in r for r in w["red_reasons"]), w
+    db.close()
+
+
+def test_status_malformed_next_check_after_red():
+    """S6 §3: present but malformed next_check_after -> explicit RED reason."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                  "event": {"id": "e1", "slug": "us"}}, cond="st1")
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, next_check_after, "
+        "attempt_count) VALUES (?,?,?,?,?)",
+        ("st1", _recent_ts(0), "ok", "malformed", 1))
+    db.conn.commit()
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    w = out["wallets"][0]
+    assert any("malformed_timestamp" in r for r in w["red_reasons"]), w
+    db.close()
+
+
+def test_status_current_failed_error_conflict_red():
+    """S6 §3: current failed/error/conflict status -> RED (no last_error needed)."""
+    for status in ("failed", "error", "conflict"):
+        db, _ = _open()
+        _seed_wallet(db, WID, ADDR)
+        _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+        _seed_trade(db, "st1", meta={"taxonomy": {"raw_category": "Politics"},
+                                      "event": {"id": "e1", "slug": "us"}}, cond="st1")
+        db.conn.execute(
+            "INSERT INTO specialist_market_refresh_state("
+            "market_source_id, last_checked_at, last_status, attempt_count) "
+            "VALUES (?,?,?,?)",
+            ("st1", _recent_ts(0), status, 5))
+        db.conn.commit()
+        st = _load("specialist_evidence_status.py")
+        out = _status_json(st, db)
+        w = out["wallets"][0]
+        assert any("refresh_current_failed" in r for r in w["red_reasons"]), (status, w)
+        db.close()
+
+
+def test_status_explicit_sample_selector_exits_2():
+    """S6 §4: explicit --wallet-id on a SAMPLE wallet -> exit 2."""
+    db, _ = _open()
+    _seed_wallet(db, "uuid-sample", "0x" + "s" * 40, is_sample=1)
+    _seed_watch(db, "wl-s", "uuid-sample")
+    st = _load("specialist_evidence_status.py")
+    rc = st.main(["--db-path", str(db.db_path), "--wallet-id", "uuid-sample"])
+    assert rc == 2, rc
+    db.close()
+
+
+def test_status_duplicate_active_watch_dedup_lowest_id():
+    """S6 §4: cohort is deterministic and evaluates each wallet once, choosing
+    the lowest/stable watch id. (The DB enforces one ACTIVE watch per wallet
+    via a partial unique index, so the CLI's dedup is defensive; we assert the
+    cohort ordering is stable by wallet_id then watch id.)"""
+    db, _ = _open()
+    # Two distinct watched wallets, both active.
+    _seed_wallet(db, "uuid-a", "0x" + "a" * 40)
+    _seed_watch(db, "wl-zzz", "uuid-a")  # higher id, should sort after
+    _seed_wallet(db, "uuid-b", "0x" + "b" * 40)
+    _seed_watch(db, "wl-aaa", "uuid-b")  # lower id
+    _seed_trade(db, "polymarket:st1")
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    # Exactly two wallet records, evaluated once each, ordered by wallet id.
+    assert len(out["wallets"]) == 2, out
+    ids = [w["wallet_id"] for w in out["wallets"]]
+    assert ids == ["uuid-a", "uuid-b"], ids
+    assert out["wallets"][0]["watch_id"] == "wl-zzz", out
+    db.close()
+
+
+def test_status_missing_wallet_record_red():
+    """S6 §4: FK disabled seed with an orphan active watch -> missing_wallet_record RED."""
+    db, _ = _open()
+    # Disable FK so we can insert an orphan watch (no wallets row).
+    db.conn.execute("PRAGMA foreign_keys = OFF")
+    db.conn.execute(
+        "INSERT INTO specialist_evidence_watchlist(wallet_id, status, source, "
+        "reason, created_by, created_at, last_collection_at) "
+        "VALUES (?, 'active', 'manual', 'seed', 't', '2026-01-01T00:00:00Z', ?)",
+        ("uuid-ghost", _recent_ts(0)))
+    db.conn.commit()
+    db.conn.execute("PRAGMA foreign_keys = ON")
+    st = _load("specialist_evidence_status.py")
+    rc = st.main(["--db-path", str(db.db_path)])
+    assert rc == 0, rc
+    out = _status_json(st, db)
+    # The monitor must still report the damaged row honestly as RED.
+    assert any("missing_wallet_record" in w["red_reasons"] for w in out["wallets"]), out
+    db.close()
+
+
+def test_evidence_db_absent_optional_table_returns_zero():
+    """S6 §5: a genuinely absent optional table returns 0 via count_table_optional."""
+    db, _ = _open()
+    conn = DbConn(db.conn)
+    # 'nonexistent_table' is not in sqlite_master -> 0.
+    assert conn.count_table_optional("nonexistent_table") == 0
+    db.close()
+
+
+def test_evidence_db_present_bogus_name_propagates():
+    """S6 §5: a present table whose COUNT raises the DB's internal
+    'no such table: ...' propagates rather than returning zero.
+
+    We create a REAL view (so it appears in sqlite_master) that references a
+    non-existent base table; SELECT COUNT(*) over it raises an OperationalError
+    containing 'no such table'. count_table (strict) must propagate it.
+    """
+    db, _ = _open()
+    conn = DbConn(db.conn)
+    conn.conn.execute(
+        "CREATE VIEW bogus_internal_name AS SELECT 1 AS x FROM nonexistent_base"
+    )
+    conn.conn.commit()
+    with pytest.raises(sqlite3.OperationalError) as exc:
+        conn.count_table("bogus_internal_name")
+    assert "no such table" in str(exc.value).lower(), exc.value
+    db.close()
+
+
+def test_status_schema_version_reported():
+    """S6 §6: top-level schema_version populated from the _meta row (==21)."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    st = _load("specialist_evidence_status.py")
+    out = _status_json(st, db)
+    assert out["schema_version"] == 21, out
+    db.close()
+
+
+def test_status_nonpositive_stale_hours_exits_2():
+    """S6 §6: non-positive stale-hour arguments -> exit 2."""
+    db, _ = _open()
+    _seed_wallet(db, WID, ADDR)
+    _seed_watch(db, "wl-e", WID, last_collection_at=_recent_ts(0))
+    st = _load("specialist_evidence_status.py")
+    rc = st.main(["--db-path", str(db.db_path),
+                  "--collector-stale-after-hours", "0"])
+    assert rc == 2, rc
+    rc = st.main(["--db-path", str(db.db_path),
+                  "--refresh-stale-after-hours", "-1"])
+    assert rc == 2, rc
+    db.close()
+
+
+def _instrumented_readonly(db_path):
+    """S6 §7: return an instrumented DbConn whose execute records writes.
+    The most recent spy is stashed in `_LAST_SPY` for assertions."""
+    class _WriteSpyDbConn(DbConn):
+        _writes = []
+
+        def execute(self, sql, params=None):
+            s = str(sql).strip().upper()
+            if s.startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")):
+                self._writes.append(sql)
+            return super().execute(sql, params)
+    real = open_readonly(db_path)
+    spy = _WriteSpyDbConn(real.conn)
+    global _LAST_SPY
+    _LAST_SPY = spy
+    return spy
+
+
+def test_status_zero_write_proof_all_states():
+    """S6 §7: a complete GREEN, YELLOW, and RED report executes ZERO writes on
+    the connection actually used by the status code."""
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
+    # GREEN wallet.
+    dbg, _ = _open()
+    _seed_wallet(dbg, "uuid-g", "0x" + "g" * 40)
+    _seed_watch(dbg, "wl-g", "uuid-g", last_collection_at=_recent_ts(0))
+    _seed_green_evidence(dbg, "uuid-g", "0x" + "g" * 40)
+    # YELLOW wallet (never collected).
+    _seed_wallet(dbg, "uuid-y", "0x" + "y" * 40)
+    _seed_watch(dbg, "wl-y", "uuid-y", last_collection_at=None)
+    # RED wallet (current failed refresh).
+    _seed_wallet(dbg, "uuid-r", "0x" + "r" * 40)
+    _seed_watch(dbg, "wl-r", "uuid-r", last_collection_at=_recent_ts(0))
+    _seed_trade(dbg, "str", meta={"taxonomy": {"raw_category": "Politics"},
+                                   "event": {"id": "e1", "slug": "us"}}, cond="str")
+    dbg.conn.execute(
+        "INSERT INTO specialist_market_refresh_state("
+        "market_source_id, last_checked_at, last_status, attempt_count) "
+        "VALUES (?,?,?,?)",
+        ("str", _recent_ts(0), "failed", 5))
+    dbg.conn.commit()
+    # Patch the CLI's open_readonly to return our instrumented connection.
+    orig = st.open_readonly
+    st.open_readonly = _instrumented_readonly
+    try:
+        rc = st.main(["--db-path", str(dbg.db_path)])
+    finally:
+        st.open_readonly = orig
+    assert rc == 0, rc
+    assert _LAST_SPY._writes == [], _LAST_SPY._writes
+    dbg.close()
+
+
+def test_status_uses_readonly_open():
+    """S6 §7: the monitor opens read-only (mode=ro) for the report."""
+    import importlib
+    st = importlib.import_module("specialist_evidence_status")
+    dbg, _ = _open()
+    _seed_wallet(dbg, WID, ADDR)
+    _seed_watch(dbg, "wl-e", WID, last_collection_at=_recent_ts(0))
+    seen = {}
+    orig = st.open_readonly
+    def _spy(p):
+        conn = orig(p)
+        seen["called"] = True
+        # Prove the underlying connection is read-only: an attempt to modify the
+        # DB through this connection must be rejected.
+        try:
+            conn.conn.execute("CREATE TABLE _ro_probe(x INTEGER)")
+            seen["readonly"] = False
+        except sqlite3.OperationalError:
+            seen["readonly"] = True
+        return conn
+    st.open_readonly = _spy
+    try:
+        st.main(["--db-path", str(dbg.db_path)])
+    finally:
+        st.open_readonly = orig
+    assert seen.get("called") is True, seen
+    assert seen.get("readonly") is True, seen
+    dbg.close()

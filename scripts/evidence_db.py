@@ -106,12 +106,44 @@ class DbConn:
     def count_table(self, table: str) -> int:
         """COUNT(*) a table, PROPAGATING any SQL/schema/connection error.
 
-        A genuinely absent (optional) table raises ``sqlite3.OperationalError``
-        rather than returning 0 — callers that tolerate a missing optional
-        table must catch that themselves. This is the fail-closed count
-        contract used by the research-evidence CLIs: a missing table is never
-        silently reported as zero.
+        Table presence is decided ONLY via ``sqlite_master`` (never inferred
+        from exception text). A genuinely absent table raises
+        ``sqlite3.OperationalError`` ("no such table: <name>") rather than
+        returning 0 — callers that tolerate a missing optional table must catch
+        that themselves. This is the fail-closed count contract used by the
+        research-evidence CLIs: a missing table is never silently reported as
+        zero.
         """
+        # Exact table-existence check via sqlite_master (no exception-text
+        # heuristic). The table identifier comes only from the caller's fixed
+        # tuple; we still quote it for safety but never decide absence from an
+        # error message.
+        cur = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        exists = cur.fetchone() is not None
+        if not exists:
+            # Use the DB's own dialect: SELECT COUNT(*) FROM a missing table
+            # raises sqlite3.OperationalError with the internal table name.
+            self._conn.execute(f"SELECT COUNT(*) FROM {table}")
+        cur = self._conn.execute(f"SELECT COUNT(*) FROM {table}")
+        return int(cur.fetchone()[0])
+
+    def count_table_optional(self, table: str) -> int:
+        """COUNT(*) a table that MAY legitimately not exist yet.
+
+        Uses ``sqlite_master`` to decide presence. Returns 0 when the table is
+        genuinely absent; raises on any other SQL/schema/connection error so
+        failures still propagate (fail-closed). ``table`` must come from the
+        fixed internal tuple, never from user input.
+        """
+        cur = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+        if cur.fetchone() is None:
+            return 0
         cur = self._conn.execute(f"SELECT COUNT(*) FROM {table}")
         return int(cur.fetchone()[0])
 

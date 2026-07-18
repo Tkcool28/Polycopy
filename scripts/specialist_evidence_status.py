@@ -42,7 +42,11 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from evidence_db import DbConn, FORBIDDEN_EXECUTION_TABLES, open_readonly  # noqa: E402
+from evidence_db import (  # noqa: E402
+    DbConn,
+    FORBIDDEN_EXECUTION_TABLES,
+    open_readonly,
+)
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
@@ -115,16 +119,11 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
 def _count_forbidden(db: DbConn, table: str) -> int:
     """COUNT(*) a forbidden table, PROPAGATING real errors (fail-closed).
 
-    A genuinely absent optional table is reported as 0 (the research plane may
-    not have created every execution table yet). Any other SQL/schema/connection
-    error propagates unchanged.
+    Presence is decided via ``sqlite_master`` (see ``DbConn.count_table_optional``
+    in evidence_db.py) — never from exception text. A genuinely absent optional
+    table is reported as 0; any other SQL/schema/connection error propagates.
     """
-    try:
-        return db.count_table(table)
-    except Exception as exc:  # pragma: no cover - defensive
-        if "no such table" in str(exc).lower():
-            return 0
-        raise
+    return db.count_table_optional(table)
 
 
 def _distance_to_gates(evidence: Any, gates: dict[str, int]) -> dict[str, Any]:
@@ -167,7 +166,15 @@ def _taxonomy_completeness(db: DbConn, wallet_id: str) -> dict[str, Any]:
         "SELECT address, canonical_address FROM wallets WHERE id=?", (wallet_id,)
     )
     if wallet is None:
-        return {"buy_count": 0, "complete_count": 0, "pct": 0.0}
+        # Orphan watch (no wallets row) — report empty completeness without
+        # crashing; build_wallet_status flags missing_wallet_record separately.
+        return {
+            "buy_count": 0,
+            "usable_count": 0,
+            "partial_count": 0,
+            "unavailable_count": 0,
+            "pct": 0.0,
+        }
     address = str(wallet["canonical_address"] or wallet["address"] or "").lower()
     rows = db.fetchall(
         "SELECT side, resolution_status, metadata_json FROM source_trades "
@@ -194,6 +201,20 @@ def _taxonomy_completeness(db: DbConn, wallet_id: str) -> dict[str, Any]:
         "unavailable_count": unavailable,
         "pct": round(pct, 2),
     }
+
+
+def _read_meta_schema_version(db: DbConn) -> Optional[int]:
+    """Read schema_version from the validated _meta row (None if absent)."""
+    try:
+        row = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
+    except Exception:
+        return None
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
 
 
 def _integrity_ok(db: DbConn) -> tuple[bool, list[str]]:
@@ -284,7 +305,10 @@ def _wallet_resolution_conflict(db: DbConn, wallet_id: str) -> Optional[str]:
         if msid not in wallet_markets:
             continue  # another wallet's market failure must not RED this wallet
         status = row["last_status"]
-        if status in ("conflict", "failed", "error") or row["last_error"]:
+        # Current-state authority: only an explicit failed/error/conflict
+        # status REDs. A non-null last_error ALONE (e.g. on a recovered row)
+        # must NOT reintroduce RED.
+        if status in ("conflict", "failed", "error"):
             return f"resolution_conflict:market={msid}:status={status}"
     return None
 
@@ -359,8 +383,20 @@ def _refresh_freshness(
         status = row["last_status"]
         last_checked = _parse_ts(row["last_checked_at"])
         next_after = _parse_ts(row["next_check_after"])
-        # Current failed/error/conflict status -> RED.
-        if status in ("conflict", "failed", "error") or row["last_error"]:
+        # Malformed timestamp -> explicit RED reason (distinct from missing).
+        if row["last_checked_at"] and last_checked is None:
+            reasons.append(f"refresh_malformed_timestamp:market={msid}:field=last_checked_at")
+            detail["current_failed"] += 1
+            detail["conflict_market_ids"].append(msid)
+            continue
+        if row["next_check_after"] and next_after is None:
+            reasons.append(f"refresh_malformed_timestamp:market={msid}:field=next_check_after")
+            detail["current_failed"] += 1
+            detail["conflict_market_ids"].append(msid)
+            continue
+        # Current-state authority: an explicit failed/error/conflict status REDs.
+        # A lingering last_error on a recovered row does NOT reintroduce RED.
+        if status in ("conflict", "failed", "error"):
             reasons.append(f"refresh_current_failed:market={msid}")
             detail["current_failed"] += 1
             detail["conflict_market_ids"].append(msid)
@@ -372,14 +408,18 @@ def _refresh_freshness(
         if next_after is not None and now > next_after + timedelta(hours=stale_after_hours):
             overdue = True
         if status in ("unresolved", "stale") or overdue:
-            if status == "unresolved":
-                # Unresolved market is not an error on its own.
+            if status == "unresolved" and not overdue:
+                # Recent unresolved is healthy/informational (not an error).
+                detail["unresolved_ok"] += 1
+                continue
+            if status == "stale" and not overdue:
+                # Recent stale is informational too.
                 detail["unresolved_ok"] += 1
                 continue
             reasons.append(f"refresh_overdue:market={msid}")
             detail["current_overdue"] += 1
             continue
-        # Otherwise (resolved / recent success) -> recovered / healthy.
+        # Otherwise (resolved / ok / success / complete) -> recovered / healthy.
         if status in ("resolved", "ok", "success", "complete"):
             detail["recovered"] += 1
     return reasons, detail
@@ -540,19 +580,24 @@ def build_wallet_status(
         and best_category is not None
         and best_category["verdict"] == WalletVerdict.COPY_CANDIDATE.value
     )
+    score_pair_candidate = is_green
     if reasons:
         state = "RED"
-    elif is_green:
+    elif score_pair_candidate:
         state = "GREEN"
     else:
         state = "YELLOW"
+
+    # ready_for_human_review is derived from the FINAL state, never directly
+    # from score_pair_candidate (S6 §2).
+    ready_for_human_review = (state == "GREEN")
 
     return {
         "wallet_id": wallet_id,
         "watch_id": watch.get("id"),
         "watch_status": watch.get("status"),
         "state": state,
-        "ready_for_human_review": is_green,
+        "ready_for_human_review": ready_for_human_review,
         "red_reasons": reasons,
         "yellow_reasons": yellow_reasons,
         "is_sample": bool(watch.get("is_sample")),
@@ -601,11 +646,13 @@ def build_status(
     # One-shot global health (S6 §12) — run each expensive check ONCE.
     ok, integrity_reasons = _integrity_ok(db)
     exec_counts, exec_errors = _global_execution_counts(db)
+    schema_version = _read_meta_schema_version(db)
     global_health = {
         "integrity_ok": ok,
         "integrity_reasons": integrity_reasons,
         "execution_artifact_counts": exec_counts,
         "execution_artifact_errors": exec_errors,
+        "schema_version": schema_version,
     }
     if exec_errors:
         # Fail closed: cannot produce a trustworthy report.
@@ -627,16 +674,65 @@ def build_status(
 
     # Cohort: active / paused / retired watches. Paused/retired are
     # informational only; they never drive GREEN/YELLOW/RED.
+    # Explicit column selection (S6 §4): wallet_row_id + is_sample come from the
+    # wallets join, never a COALESCE-as-existence signal.
     raw = db.fetchall(
         "SELECT w.id, w.wallet_id, w.status, w.last_collection_at, "
-        "COALESCE(wl.is_sample, 0) AS is_sample "
+        "wl.id AS wallet_row_id, wl.is_sample AS is_sample "
         "FROM specialist_evidence_watchlist w "
         "LEFT JOIN wallets wl ON wl.id = w.wallet_id "
         "ORDER BY w.wallet_id, w.id"
     )
 
-    # When --wallet-id is given, filter the cohort read-only BEFORE evaluating
-    # and recompute all counts (never retain the unfiltered overall state).
+    # Explicit --wallet-id validation BEFORE evaluating (S6 §4):
+    #   unknown wallet / no active watch / sample wallet -> exit 2.
+    if wallet_id is not None:
+        matched = [r for r in raw if str(r["wallet_id"]) == wallet_id]
+        if not matched:
+            return {
+                "generated_at": _utcnow().isoformat(),
+                "overall_state": "RED",
+                "schema_version": schema_version,
+                "watched_count": 0,
+                "ready_for_human_review_count": 0,
+                "active_watch_count": 0,
+                "paused_watch_count": 0,
+                "retired_watch_count": 0,
+                "global_integrity": {"ok": ok, "reasons": integrity_reasons},
+                "execution_artifact_counts": exec_counts,
+                "execution_artifact_errors": exec_errors,
+                "wallets": [],
+                "selector_error": "unknown_or_unwatched_wallet",
+            }
+        # Determine existence + sample status from explicit columns.
+        row0 = matched[0]
+        if row0["wallet_row_id"] is None:
+            sel_err = "missing_wallet_record"
+        elif bool(row0["is_sample"]):
+            sel_err = "sample_wallet"
+        elif row0["status"] != "active":
+            sel_err = "not_watched"
+        else:
+            sel_err = None
+        if sel_err is not None:
+            return {
+                "generated_at": _utcnow().isoformat(),
+                "overall_state": "RED",
+                "schema_version": schema_version,
+                "watched_count": 0,
+                "ready_for_human_review_count": 0,
+                "active_watch_count": 0,
+                "paused_watch_count": 0,
+                "retired_watch_count": 0,
+                "global_integrity": {"ok": ok, "reasons": integrity_reasons},
+                "execution_artifact_counts": exec_counts,
+                "execution_artifact_errors": exec_errors,
+                "wallets": [],
+                "selector_error": sel_err,
+            }
+
+    # When --wallet-id is given and valid, filter the cohort read-only BEFORE
+    # evaluating and recompute all counts.
     if wallet_id is not None:
         raw = [r for r in raw if str(r["wallet_id"]) == wallet_id]
 
@@ -647,10 +743,8 @@ def build_status(
     per_wallet: list[dict[str, Any]] = []
     for row in active_rows:
         watch: dict[str, Any] = dict(row)
-        # Missing wallet record behind an active watch -> RED.
-        if row["is_sample"] is None and db.fetchone(
-            "SELECT 1 FROM wallets WHERE id=?", (str(row["wallet_id"]),)
-        ) is None:
+        # Explicit missing-wallet detection (S6 §4): wallet_row_id IS NULL.
+        if row["wallet_row_id"] is None:
             watch["missing_wallet_record"] = True
         rec = build_wallet_status(
             db, str(row["wallet_id"]), watch,
@@ -701,29 +795,41 @@ def main(argv: list[str] | None = None) -> int:
                    type=int, default=DEFAULT_REFRESH_STALE_AFTER_HOURS)
     args = p.parse_args(argv)
 
-    db = open_readonly(args.db_path)
+    # Positive stale-hour arguments; non-positive -> exit 2 (S6 §6).
+    if args.collector_stale_after_hours <= 0 or args.refresh_stale_after_hours <= 0:
+        print("error: stale-after-hours must be a positive integer", file=sys.stderr)
+        return 2
+
+    # Open read-only; catch open/schema failures -> controlled exit 1.
     try:
-        report = build_status(
-            db,
-            wallet_id=getattr(args, "wallet_id", None),
-            collector_stale_after_hours=args.collector_stale_after_hours,
-            refresh_stale_after_hours=args.refresh_stale_after_hours,
-        )
-        # Invalid selector: an explicit --wallet-id that matches no watched
-        # wallet (or a wallet with no active watch) cannot produce a report.
-        if getattr(args, "wallet_id", None) is not None:
-            matched = [
-                w for w in report.get("wallets", [])
-                if w.get("wallet_id") == args.wallet_id
-            ]
-            if not matched:
-                print(f"error: selector: no active watch for wallet "
-                      f"{args.wallet_id}", file=sys.stderr)
-                return 2
-        # Count/exec error -> report is untrustworthy -> exit 1.
+        db = open_readonly(args.db_path)
+    except Exception as exc:
+        print(f"error: cannot open database read-only: {exc!r}", file=sys.stderr)
+        return 1
+
+    try:
+        try:
+            report = build_status(
+                db,
+                wallet_id=getattr(args, "wallet_id", None),
+                collector_stale_after_hours=args.collector_stale_after_hours,
+                refresh_stale_after_hours=args.refresh_stale_after_hours,
+            )
+        except Exception as exc:  # build/schema failure -> controlled exit 1
+            print(f"error: failed to build status report: {exc!r}", file=sys.stderr)
+            return 1
+
+        # Invalid selector (unknown / no active watch / sample) -> exit 2.
+        # Validation happens BEFORE the full report is built (see build_status).
+        if report.get("selector_error") is not None:
+            print(f"error: selector: {report['selector_error']}", file=sys.stderr)
+            return 2
+
+        # Count/exec error -> report is untrustworthy -> exit 1 (NOT exit 2).
         if report.get("fail_closed") is not None:
             print(f"error: {report['fail_closed']}", file=sys.stderr)
             return 1
+
         if args.json:
             print(json.dumps(report, indent=1, default=str))
         else:

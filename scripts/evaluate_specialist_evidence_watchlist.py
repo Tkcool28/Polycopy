@@ -142,17 +142,11 @@ def _count_forbidden(db: DbConn, table: str, *, allow_missing: bool = True) -> i
     """COUNT(*) a forbidden table, PROPAGATING real errors.
 
     * Present table -> real COUNT(*).
-    * Genuinely absent optional table -> ``sqlite3.OperationalError`` is
-      converted to ``0`` ONLY when ``allow_missing`` is True (a table the
-      research plane may legitimately not have created yet).
+    * Genuinely absent optional table -> 0 (via sqlite_master; never inferred
+      from exception text).
     * Any other SQL/schema/connection error propagates unchanged (fail-closed).
     """
-    try:
-        return db.count_table(table)
-    except Exception as exc:  # pragma: no cover - defensive
-        if allow_missing and "no such table" in str(exc).lower():
-            return 0
-        raise
+    return db.count_table_optional(table)
 
 
 # ── Score one wallet (stages writes; does NOT commit) ────────────────────────
@@ -329,9 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     # Default (no flag) remains dry-run.
     persist = bool(getattr(args, "write", False))
 
-    # Production write missing any required gate exits 2 BEFORE every DB symbol.
-    # require_write_gates() returns False for a normal dry-run (no --write),
-    # which is CORRECT and must NOT be treated as a refusal.
+    # Production write gate check must happen BEFORE every DB symbol.
     if persist and not require_write_gates(args, db_path=args.db_path):
         if is_production_db(args.db_path):
             msg = (
@@ -343,16 +335,37 @@ def main(argv: list[str] | None = None) -> int:
         print(msg, file=sys.stderr)
         return 2
 
-    # ── Open the connection (read-only default, writable only if persisting) ──
-    db = open_writable(args.db_path, args) if persist else open_readonly(args.db_path)
+    # ── Open a READ-ONLY connection FIRST (S6 §1: preflight selector) ──────
+    # The selector/cohort is resolved and validated on the read-only
+    # connection. open_writable is NEVER called for an invalid selector.
+    try:
+        db = open_readonly(args.db_path)
+    except Exception as exc:  # DB open / schema failure -> controlled exit 1
+        print(f"error: cannot open database read-only: {exc!r}", file=sys.stderr)
+        return 1
+
     try:
         now = datetime.now(timezone.utc)
 
-        # ── Resolve selector READ-ONLY first (S6 §1) ───────────────────────
+        # ── Resolve selector READ-ONLY (invalid -> close ro, exit 2) ───────
         cohort, selector_code = _resolve_selector(db, getattr(args, "wallet_id", None))
         if selector_code is not None:
             print(f"error: selector={selector_code}", file=sys.stderr)
+            db.close()
             return 2
+
+        # ── For a valid WRITE, swap to a writable connection, carrying the
+        #     immutable validated wallet/watch IDs (do NOT re-query on writable
+        #     to avoid TOCTOU / selector drift). ──────────────────────────────
+        if persist:
+            validated = list(cohort)  # immutable copy of (wallet_id, watch_id, is_sample)
+            db.close()
+            try:
+                db = open_writable(args.db_path, args)
+            except Exception as exc:  # controlled exit 1 on open failure
+                print(f"error: cannot open database writable: {exc!r}", file=sys.stderr)
+                return 1
+            cohort = validated
 
         # ── Forbidden-artifact baseline (before) ───────────────────────────
         try:
