@@ -85,22 +85,25 @@ def main(argv: list[str] | None = None) -> int:
 
     is_prod = is_production_db(args.db_path)
 
-    # Production write refusal ordering: refuse BEFORE any open / schema read /
-    # lookup / adapter / network. A recognized production path requires all
-    # three gates; non-production paths require at least --write.
-    if args.write and is_prod:
-        if not require_write_gates(args, db_path=args.db_path):
+    # ── Write-gate refusal (BEFORE any DB open / schema read / lookup / ──
+    # adapter / network). Every write — production OR non-production — requires
+    # --write AND --allow-live. A recognized production write additionally
+    # requires --confirm-production-db. Refuse with exit 2 before touching
+    # open_readonly / open_writable / the resolver / the DB at all.
+    if args.write:
+        missing = []
+        if not args.allow_live:
+            missing.append("--allow-live")
+        if is_prod and not args.confirm_production_db:
+            missing.append("--confirm-production-db")
+        if missing:
+            parts = " ".join(missing)
+            scope = "production" if is_prod else "non-production"
             print(
-                "error: production enrichment write requires: "
-                "--write --allow-live --confirm-production-db",
+                f"error: {scope} enrichment write requires: --write {parts}",
                 file=sys.stderr,
             )
             return 2
-    elif args.write and not is_prod:
-        # Non-production write still requires --write (and we open writable
-        # only after the gate). No --allow-live check here for the open, but a
-        # canonical repair still requires --allow-live to actually resolve Gamma.
-        pass
 
     # Open read-only first (fail-closed: schema must already be exactly v21,
     # no creation, no migration). The shared helper refuses a missing file.
@@ -113,12 +116,12 @@ def main(argv: list[str] | None = None) -> int:
 
     do_write = require_write_gates(args, db_path=args.db_path)
     if args.write and not do_write:
-        # Gates not satisfied for this target (e.g. non-prod missing --write
-        # semantics or production missing a gate). Refuse before any write.
+        # Gates not satisfied for this target (e.g. production missing a gate,
+        # caught above with exit 2; this is a defensive secondary refusal).
         db.close()
         print(
             "error: enrichment write refused — requires --write"
-            + (" --allow-live --confirm-production-db" if is_prod else ""),
+            + (" --allow-live --confirm-production-db" if is_prod else " --allow-live"),
             file=sys.stderr,
         )
         return 2
@@ -175,6 +178,23 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
+    # A persistence/operational failure (incl. a SAVEPOINT that rolled back)
+    # must NOT be committed. The object returned, but the atomic operation did
+    # not succeed, so we leave the transaction uncommitted and exit nonzero.
+    # A Gamma provider error is likewise a hard failure: the CLI exits nonzero
+    # even though an audit row may have been durably persisted.
+    if getattr(result, "operational_error", False) or getattr(result, "provider_error", False):
+        db.conn.rollback()
+        if adapter is not None:
+            try:
+                import asyncio
+                asyncio.run(adapter.aclose())
+            except Exception:
+                pass
+        db.close()
+        print(f"error: {result.error_message or result.status}", file=sys.stderr)
+        return 1
+
     # The canonical repair commits only after the atomic metadata+provenance
     # SAVEPOINT succeeded inside enrich_source_trade. For a real write we
     # explicitly commit the outer transaction here.
@@ -217,9 +237,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"reason_codes={out['reason_codes']}")
         if out["error_message"]:
             print(f"error={out['error_message']}")
-    # A completed honest outcome (complete/incomplete/unavailable/conflict/
-    # error) exits 0; only invalid selection / safety refusal exit 2, and
-    # hard failures exit nonzero above.
+    # An honest completed outcome (complete/incomplete/unavailable/conflict)
+    # exits 0. provider_error / operational_error exit nonzero (handled above).
     return 0
 
 

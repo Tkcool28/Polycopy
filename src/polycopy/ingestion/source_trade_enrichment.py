@@ -198,6 +198,8 @@ class EnrichmentResult:
     reason_codes: list[str] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
     metadata_changed: bool = False
+    operational_error: bool = False
+    provider_error: bool = False
     error_message: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -208,10 +210,28 @@ class EnrichmentResult:
             "created": self.created,
             "updated": self.updated,
             "metadata_changed": self.metadata_changed,
+            "operational_error": self.operational_error,
+            "provider_error": self.provider_error,
             "reason_codes": self.reason_codes,
             "evidence": self.evidence,
             "error_message": self.error_message,
         }
+
+    def with_provider_error(self) -> "EnrichmentResult":
+        """Return a copy flagged as a Gamma provider (hard) failure."""
+        return EnrichmentResult(
+            source_trade_internal_id=self.source_trade_internal_id,
+            enrichment_id=self.enrichment_id,
+            status=self.status,
+            created=self.created,
+            updated=self.updated,
+            reason_codes=list(self.reason_codes),
+            evidence=self.evidence,
+            metadata_changed=self.metadata_changed,
+            operational_error=self.operational_error,
+            provider_error=True,
+            error_message=self.error_message,
+        )
 
     def allows_dispatch(self) -> bool:
         """Convenience seam: mirror the dispatcher gate without invoking it."""
@@ -269,7 +289,25 @@ def enrich_source_trade(
             gamma_resolver, condition_id
         )
 
-    merge_status: str
+    # A Gamma provider error is an operational (hard) failure: it remains
+    # distinguishable from ordinary not-found, persists an audit row (so it is
+    # transactionally durable), but the CLI must return nonzero because the
+    # evidence could not be resolved. status stays "error" for
+    # dispatcher-blocking/audit semantics; provider_error flags the hard case.
+    if gamma_state == GAMMA_PROVIDER_ERROR:
+        payload = build_provenance_payload(
+            source_trade=row,
+            canonical_meta=row.get("metadata_json"),
+            gamma_market=None,
+            merge_status=MERGE_UNAVAILABLE,
+            gamma_state=gamma_state,
+            gamma_reason=gamma_reason,
+            merge_reasons=[],
+        )
+        return _persist(
+            db, source_trade_internal_id, payload, dry_run=dry_run,
+            metadata_json=None,
+        ).with_provider_error()
     merge_reasons: list[str]
     canonical_meta: Any
     if gamma_market is not None:
@@ -356,6 +394,16 @@ def _persist(
     ``metadata_json`` is None when the merge forbids a metadata write
     (CONFLICT / UNAVAILABLE). On any failure we ROLLBACK TO SAVEPOINT and
     RELEASE it so metadata_json and the enrichment row are left unchanged.
+
+    Replay contract (zero-write when nothing changed)
+    -------------------------------------------------
+    * When ``metadata_json`` is provided, compare its exact bytes against the
+      currently stored ``source_trades.metadata_json``. Pass a metadata UPDATE
+      to the SAVEPOINT only when the bytes DIFFER. An identical-byte metadata
+      value (e.g. an already-canonical serialization) produces NO UPDATE.
+    * The provenance layer independently no-ops when the evidence hash is
+      unchanged. So an equivalent replay executes zero SQL against either
+      table and preserves every field exactly.
     """
     ev_hash = evidence_hash(payload)
 
@@ -371,10 +419,22 @@ def _persist(
             evidence=payload,
         )
 
+    # Determine whether the metadata write is actually required. Comparing the
+    # exact stored bytes (not just the parsed object) is what makes an
+    # already-canonical value a true zero-write on replay.
+    metadata_write_required = False
+    if metadata_json is not None:
+        row = db.fetchone(
+            "SELECT metadata_json FROM source_trades WHERE id=?",
+            (source_trade_internal_id,),
+        )
+        current_meta = row["metadata_json"] if row is not None else None
+        metadata_write_required = (current_meta != metadata_json)
+
     db.conn.execute("SAVEPOINT s5_enrich")
     try:
         metadata_changed = False
-        if metadata_json is not None:
+        if metadata_write_required:
             db.conn.execute(
                 "UPDATE source_trades SET metadata_json = ? WHERE id = ?",
                 (metadata_json, source_trade_internal_id),
@@ -390,6 +450,10 @@ def _persist(
     except Exception as exc:
         db.conn.execute("ROLLBACK TO SAVEPOINT s5_enrich")
         db.conn.execute("RELEASE SAVEPOINT s5_enrich")
+        # Operational (persistence) failure: no partial write survives, and the
+        # caller/CLI returns controlled nonzero. status stays error for audit/
+        # dispatcher-blocking semantics, but operational_error flags the hard
+        # failure so commit is never attempted.
         return EnrichmentResult(
             source_trade_internal_id=source_trade_internal_id,
             enrichment_id=None,
@@ -398,6 +462,7 @@ def _persist(
             updated=False,
             reason_codes=["persist_failed"],
             evidence=payload,
+            operational_error=True,
             error_message=f"{type(exc).__name__}: {exc}",
         )
 

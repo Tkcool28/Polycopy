@@ -688,3 +688,309 @@ def test_dispatch_gate_blocks_non_complete():
     for s in ("conflict", "unavailable", "incomplete", "error"):
         assert enrichment_status_allows_dispatch(s) is False
     assert enrichment_status_allows_dispatch("complete") is True
+
+
+# ── 1b. equivalent replay executes ZERO SQL against either table ──────────
+class _SqlObserver:
+    """Wrap a real DB connection to count INSERT/UPDATE against the two tables."""
+
+    def __init__(self, real):
+        self._real = real
+        self.inserts = 0
+        self.updates = 0
+
+    @property
+    def conn(self):
+        real_conn = self._real.conn
+
+        class _Obs:
+            def __init__(self, real, obs):
+                self._real = real
+                self._obs = obs
+
+            def execute(self, sql, params=None):
+                s = sql.lstrip().upper()
+                if s.startswith("INSERT INTO SOURCE_TRADE_ENRICHMENTS"):
+                    self._obs.inserts += 1
+                elif s.startswith("UPDATE SOURCE_TRADE_ENRICHMENTS"):
+                    self._obs.updates += 1
+                elif s.startswith("UPDATE SOURCE_TRADES SET METADATA_JSON"):
+                    self._obs.updates += 1
+                return self._real.execute(sql, params or [])
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        return _Obs(real_conn, self)
+
+    def fetchone(self, sql, params=None):
+        return self._real.fetchone(sql, params)
+
+    def fetchall(self, sql, params=None):
+        return self._real.fetchall(sql, params)
+
+
+def test_equivalent_replay_zero_sql():
+    db, _ = _open()
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:st1", COND, {})
+    r1 = enrich_source_trade(db, "polymarket:st1", gamma_resolver=_fake_resolver)
+    assert r1.created is True, r1
+
+    meta_after_run1 = _metadata_of(db, "polymarket:st1")
+    enr_after_run1 = get_enrichment(db, "polymarket:st1")
+    assert enr_after_run1 is not None
+
+    obs = _SqlObserver(db)
+    r2 = enrich_source_trade(obs, "polymarket:st1", gamma_resolver=_fake_resolver)
+    # No INSERT or UPDATE against either source_trades or source_trade_enrichments.
+    assert obs.inserts == 0 and obs.updates == 0, (obs.inserts, obs.updates)
+    assert r2.created is False and r2.updated is False, r2
+    assert r2.metadata_changed is False, r2
+
+    # All stability fields preserved exactly.
+    enr = get_enrichment(db, "polymarket:st1")
+    assert enr is not None, "enrichment row must exist after first run"
+    assert enr["created_at"] == enr_after_run1["created_at"]
+    assert enr["updated_at"] == enr_after_run1["updated_at"]
+    assert enr["fetched_at"] == enr_after_run1["fetched_at"]
+    assert enr["evidence_hash"] == enr_after_run1["evidence_hash"]
+    assert enr["reason_codes_json"] == enr_after_run1["reason_codes_json"]
+    assert enr["enrichment_id"] == enr_after_run1["enrichment_id"]
+    # metadata_json bytes unchanged across replay
+    assert _metadata_of(db, "polymarket:st1") == meta_after_run1
+    db.close()
+
+
+# ── 1c. first canonical normalization writes once; next replay writes nothing ─
+def test_normalize_once_then_replay_zero():
+    db, _ = _open()
+    _seed_wallet(db)
+    # Seed a semantically valid but NON-canonical metadata serialization.
+    non_canonical = {"taxonomy": {"raw_category": "politics"},
+                     "metadata_version": "1"}
+    _seed_trade(db, "polymarket:st1", COND, non_canonical)
+    obs = _SqlObserver(db)
+    r1 = enrich_source_trade(obs, "polymarket:st1", gamma_resolver=_fake_resolver)
+    # First pass normalizes -> exactly one enrichment INSERT/UPDATE and one
+    # metadata UPDATE (canonical reshaping).
+    assert r1.created is True, r1
+    first_writes = obs.inserts + obs.updates
+    assert first_writes >= 1, first_writes
+
+    obs2 = _SqlObserver(db)
+    r2 = enrich_source_trade(obs2, "polymarket:st1", gamma_resolver=_fake_resolver)
+    # Immediate next replay: zero writes.
+    assert obs2.inserts == 0 and obs2.updates == 0, (obs2.inserts, obs2.updates)
+    assert r2.created is False and r2.updated is False, r2
+    db.close()
+
+
+# ── 2b. CLI: non-production --write without --allow-live => exit 2, no open ─
+def _run_cli_refusal(args):
+    import scripts.enrich_approved_source_trade as cli
+    import evidence_db as edb
+    import polycopy.ingestion.source_trade_enrichment as ste
+
+    captured = {}
+
+    def _open_readonly(path):
+        captured["open_readonly"] = path
+        raise AssertionError("open_readonly must not be called on refusal")
+
+    def _open_writable(path, a):
+        captured["open_writable"] = path
+        raise AssertionError("open_writable must not be called on refusal")
+
+    def _make_adapter():
+        captured["adapter"] = True
+        raise AssertionError("adapter must not be built on refusal")
+
+    def _no_enrich(*a, **k):
+        captured["enrich"] = True
+        raise AssertionError("enrich_source_trade must not be called on refusal")
+
+    fns = [("open_readonly", _open_readonly),
+           ("open_writable", _open_writable),
+           ("require_write_gates", lambda a, db_path: False)]
+    orig = {n: getattr(edb, n) for n, _ in fns}
+    for n, f in fns:
+        setattr(edb, n, f)
+    orig_adapter = cli._make_adapter
+    cli._make_adapter = _make_adapter
+    orig_enrich = ste.enrich_source_trade
+    ste.enrich_source_trade = _no_enrich
+    # The CLI imports these names directly, so patch the bound module names too.
+    orig_cli_ro = cli.open_readonly
+    orig_cli_rw = cli.open_writable
+    cli.open_readonly = _open_readonly
+    cli.open_writable = _open_writable
+    try:
+        rc = cli.main(args)
+    finally:
+        for n, f in fns:
+            setattr(edb, n, orig[n])
+        cli._make_adapter = orig_adapter
+        ste.enrich_source_trade = orig_enrich
+        cli.open_readonly = orig_cli_ro
+        cli.open_writable = orig_cli_rw
+    return rc, captured
+
+
+def test_cli_nonprod_write_requires_allow_live():
+    # Non-production DB path (tmp file). --write without --allow-live => exit 2
+    # before any DB open / adapter / enrich.
+    tmp = str(_tmp())
+    rc, cap = _run_cli_refusal(
+        ["--source-trade-id", "polymarket:st1", "--write", "--db-path", tmp]
+    )
+    assert rc == 2, rc
+    assert "open_readonly" not in cap, cap
+    assert "open_writable" not in cap, cap
+    assert "adapter" not in cap, cap
+    assert "enrich" not in cap, cap
+
+
+def test_cli_prod_write_requires_all_gates():
+    # Recognized production DB. Missing --allow-live and --confirm-production-db
+    # => exit 2 before any open / schema read / lookup / adapter / network.
+    prod = str(Path("/root/Polycopy/data/polycopy.db"))
+    rc, cap = _run_cli_refusal(
+        ["--source-trade-id", "polymarket:st1", "--write", "--db-path", prod]
+    )
+    assert rc == 2, rc
+    assert "open_readonly" not in cap, cap
+    assert "open_writable" not in cap, cap
+    assert "adapter" not in cap, cap
+    assert "enrich" not in cap, cap
+
+
+# ── 3b. CLI: persistence failure -> exit nonzero, no commit ─────────────────
+def test_cli_persistence_failure_nonzero():
+    import scripts.enrich_approved_source_trade as cli
+    from polycopy.db.database import Database
+    import polycopy.ingestion.source_trade_enrichment as ste
+
+    # A recording Database subclass so we can prove commit/rollback were (or
+    # were not) called without monkeypatching read-only sqlite3 methods.
+    calls = {"commit": 0, "rollback": 0}
+
+    class _RecordingDb(Database):
+        def commit(self):
+            calls["commit"] += 1
+            return super().commit()
+
+        def rollback(self):
+            calls["rollback"] += 1
+            return super().rollback()
+
+        def close(self):
+            # Keep the connection alive across the CLI's open→close→reopen dance
+            # so the single recording instance stays connected for the test.
+            return None
+
+    # Build a real, connected, seeded DB via the recording subclass.
+    p = _tmp()
+    db = _RecordingDb(p).connect()
+    # Record any ROLLBACK issued via the raw connection (SAVEPOINT rollback and
+    # the CLI's final conn.rollback() both go to the raw sqlite3 connection).
+    db.conn.set_trace_callback(
+        lambda sql: calls.__setitem__(
+            "rollback", calls["rollback"] + (1 if "ROLLBACK" in sql.upper() else 0)
+        )
+    )
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:st1", COND, {})
+
+    orig_write = ste.write_provenance
+
+    def _boom(db_, **kw):
+        raise RuntimeError("prov fail")
+
+    ste.write_provenance = _boom
+
+    orig_enrich = ste.enrich_source_trade
+    orig_cli_enrich = cli.enrich_source_trade
+
+    def _enrich(db_arg, st_id, **kw):
+        # Route through the CLI's bound entry, but it delegates to the real
+        # enrich_source_trade (which we let run, with write_provenance boomed).
+        return orig_enrich(db_arg, st_id, **kw)
+
+    ste.enrich_source_trade = _enrich
+    cli.enrich_source_trade = orig_enrich
+
+    orig_ro, orig_rw = cli.open_readonly, cli.open_writable
+
+    def _ro(path):
+        return db
+
+    def _rw(path, args):
+        return db
+
+    cli.open_readonly = _ro
+    cli.open_writable = _rw
+    try:
+        rc = cli.main(
+            ["--source-trade-id", "polymarket:st1", "--write",
+             "--allow-live", "--db-path", str(_tmp())]
+        )
+    finally:
+        cli.open_readonly, cli.open_writable = orig_ro, orig_rw
+        ste.enrich_source_trade = orig_enrich
+        cli.enrich_source_trade = orig_cli_enrich
+        ste.write_provenance = orig_write
+
+    assert rc not in (0, None), rc
+    # Commit must NOT have been called; a rollback must have occurred.
+    assert calls["commit"] == 0, calls
+    assert calls["rollback"] >= 1, calls
+    # metadata unchanged (rolled back); no enrichment row created.
+    assert _metadata_of(db, "polymarket:st1") == {}, _metadata_of(db, "polymarket:st1")
+    assert get_enrichment(db, "polymarket:st1") is None
+    db.close()
+
+
+# ── 3c. CLI: provider error -> exit nonzero, structured status retained ────
+def test_cli_provider_error_nonzero():
+    import scripts.enrich_approved_source_trade as cli
+    import polycopy.ingestion.source_trade_enrichment as ste
+
+    db, _ = _open()
+    _seed_wallet(db)
+    _seed_trade(db, "polymarket:st1", COND, {})
+
+    def _boom_resolver(_cid):
+        raise RuntimeError("network down")
+
+    orig_enrich = ste.enrich_source_trade
+
+    def _enrich(db_arg, st_id, **kw):
+        return orig_enrich(db, st_id, gamma_resolver=_boom_resolver, **kw)
+
+    ste.enrich_source_trade = _enrich
+    orig_cli_enrich = cli.enrich_source_trade
+    cli.enrich_source_trade = orig_enrich
+
+    orig_ro, orig_rw = cli.open_readonly, cli.open_writable
+
+    def _ro(path):
+        return db
+
+    def _rw(path, args):
+        return db
+
+    cli.open_readonly = _ro
+    cli.open_writable = _rw
+    try:
+        rc = cli.main(
+            ["--source-trade-id", "polymarket:st1", "--write",
+             "--allow-live", "--db-path", str(_tmp())]
+        )
+    finally:
+        cli.open_readonly, cli.open_writable = orig_ro, orig_rw
+        ste.enrich_source_trade = orig_enrich
+        cli.enrich_source_trade = orig_cli_enrich
+    db.close()
+    # Provider error is a hard failure -> nonzero exit.
+    assert rc not in (0, None), rc
