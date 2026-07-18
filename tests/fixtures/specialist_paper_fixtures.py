@@ -91,11 +91,22 @@ class _FakeMarket(collections.abc.Mapping):
         self.series = [{"id": "srfake", "slug": "series-fake", "title": "Fake Series"}]
         # Mapping protocol so build_metadata_from_gamma_market can read it
         # (production passes a Pydantic Market, which is Mapping-compatible).
+        # S5/S3 realism: a real Gamma market carries a conditionId and a
+        # clobTokenIds list string. merge_canonical_metadata verifies the
+        # conditionId against the source trade's market_source_id and the
+        # trade's token_id against clobTokenIds, so the stub MUST expose them
+        # (otherwise enrichment honestly fails the merge as unavailable).
         self._mapping = {
+            "conditionId": condition_id,
+            # Real binary Polymarket market exposes both outcome tokens: the
+            # "Yes" token is the condition id and the "No" token is BUY_NO_TOKEN.
+            "clobTokenIds": json.dumps([condition_id, BUY_NO_TOKEN]),
             "category": self.category,
             "tags": self.tags,
             "events": self.events,
             "series": self.series,
+            "question": self.question,
+            "slug": "fake-market",
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -107,6 +118,11 @@ class _FakeMarket(collections.abc.Mapping):
             return self.events
         if key == "series":
             return self.series
+        # Fall back to the mapping dict so any S5/S3-realistic key added there
+        # (conditionId, clobTokenIds, question, slug, ...) is readable by
+        # subscripting callers (normalize_source_trade, merge_canonical_metadata).
+        if key in self._mapping:
+            return self._mapping[key]
         raise KeyError(key)
 
     def get(self, key: str, default: Any = None) -> Any:

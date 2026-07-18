@@ -32,8 +32,10 @@ from polycopy.execution.specialist_approval import (
     get_approval,
 )
 from polycopy.ingestion.source_trade_enrichment import (
-    STATUS_COMPLETE,
     enrich_source_trade,
+)
+from polycopy.ingestion.source_trade_provenance import (
+    enrichment_status_allows_dispatch,
 )
 from polycopy.engine.approved_wallet_trade_bridge import (
     BridgeDependencies,
@@ -307,7 +309,10 @@ def dispatch_one(
     # ── Enrich BEFORE bridge ──
     enrichment = enrich_source_trade(db, st_id, gamma_resolver=gamma_resolver,
                                      dry_run=False)
-    if enrichment.status != STATUS_COMPLETE:
+    if not enrichment_status_allows_dispatch(enrichment.status):
+        # Bridge is blocked for any non-complete enrichment status
+        # (conflict / unavailable / incomplete / error). Uses the same pure
+        # gate S5 proves in its regression tests, so the contract cannot drift.
         _set_dispatch(
             db, dispatch_id, status=DISPATCH_ENRICHMENT_INCOMPLETE,
             enrichment_id=enrichment.enrichment_id,

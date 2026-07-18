@@ -60,7 +60,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -77,15 +76,14 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MERGE_CONFLICT,
     MERGE_FILLED,
     MERGE_UNCHANGED,
-    MERGE_UNAVAILABLE,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
-from polycopy.scoring.wallet_evidence import (  # noqa: E402
-    CATEGORY_TAXONOMY_PARTIAL,
-    CATEGORY_TAXONOMY_USABLE,
-    classify_category_taxonomy,
+from polycopy.ingestion.source_trade_provenance import (  # noqa: E402
+    build_provenance_payload,
+    evidence_hash,
+    write_provenance,
 )
+from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
 from evidence_db import (  # noqa: E402
     DbConn,
     is_production_db,
@@ -283,115 +281,35 @@ async def _resolve_gamma_batch(
     return out
 
 
-# ── Provenance (one current row per trade; honest; audit-only) ───────────────
-
-
-def _taxonomy_status(canonical_meta: dict[str, Any], merge_status: str) -> str:
-    """Map to the enrichment table's taxonomy_status vocabulary.
-
-    usable / partial / unavailable — derived from the canonical nested metadata
-    classification, never claimed unless safe. For conflicts/unavailable we do
-    not assert a usable label.
-    """
-    if merge_status in (MERGE_CONFLICT, MERGE_UNAVAILABLE):
-        return "unavailable"
-    try:
-        cls = classify_category_taxonomy(canonical_meta)
-    except Exception:
-        return "unavailable"
-    status = str(cls.status)
-    if status == CATEGORY_TAXONOMY_USABLE and cls.category_label:
-        return "usable"
-    if status == CATEGORY_TAXONOMY_PARTIAL:
-        return "partial"
-    return "unavailable"
+# ── Provenance (delegates to the shared one-current-row implementation) ──────
 
 
 def _build_evidence(
     trade: dict[str, Any],
-    canonical_meta: dict[str, Any],
+    canonical_meta: Any,
     gamma: Optional[dict[str, Any]],
     merge_status: str,
     gamma_result: GammaResult,
     merge_reasons: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Build the honest current provenance payload (no scoring authority)."""
-    # canonical_meta may be the raw preserved value (a malformed string) on
-    # unavailable/conflict; only classify a real dict.
-    safe_meta = canonical_meta if isinstance(canonical_meta, dict) else {}
-    try:
-        classification = classify_category_taxonomy(safe_meta)
-    except Exception:
-        classification = None
-    # normalized_category may be populated ONLY when the merge is filled/unchanged
-    # AND the canonical taxonomy classification is usable. On conflict/unavailable
-    # it MUST remain NULL (we never claim a usable normalized taxonomy).
-    usable = (
-        classification is not None
-        and str(classification.status) == CATEGORY_TAXONOMY_USABLE
-        and classification.category_label
+    """Build the honest current provenance payload via the shared module.
+
+    S5: the real provenance contract lives in
+    :mod:`polycopy.ingestion.source_trade_provenance` so backfill and the
+    per-trade enrichment cannot diverge. This wrapper only supplies the
+    backfill-specific ``evidence_source`` tag; all behavior is owned by the
+    shared implementation.
+    """
+    return build_provenance_payload(
+        source_trade=trade,
+        canonical_meta=canonical_meta,
+        gamma_market=gamma,
+        merge_status=merge_status,
+        gamma_state=gamma_result.state,
+        gamma_reason=gamma_result.reason,
+        merge_reasons=merge_reasons,
+        evidence_source="backfill",
     )
-    if merge_status in (MERGE_FILLED, MERGE_UNCHANGED) and usable:
-        normalized_category = classification.category_label
-    else:
-        normalized_category = None
-
-    # High-level status vocabulary for source_trade_enrichments.status.
-    # A provider/network error takes precedence over an (unavailable) merge
-    # result so it is never conflated with an ordinary gamma_missing.
-    if gamma_result.state == "provider_error":
-        status = "error"
-    elif merge_status == MERGE_CONFLICT:
-        status = "conflict"
-    elif merge_status == MERGE_UNAVAILABLE:
-        status = "unavailable"
-    elif normalized_category:
-        status = "complete"
-    else:
-        status = "incomplete"
-
-    # market_slug only from a non-empty authoritative Gamma "slug" field.
-    # Never fall back to question/title text.
-    slug = None
-    if gamma is not None:
-        raw_slug = gamma.get("slug")
-        if isinstance(raw_slug, str) and raw_slug.strip():
-            slug = raw_slug
-
-    # token_id from the SOURCE TRADE, never from Gamma's clobTokenIds.
-    token_id = trade.get("token_id")
-    condition_id = trade.get("market_source_id") or ""
-
-    # Persist the EXACT merge reason codes (do not discard them), alongside the
-    # merge status, gamma state, and any provider-specific reason.
-    reason_codes: list[str] = []
-    for r in (merge_reasons or []):
-        if r and r not in reason_codes:
-            reason_codes.append(r)
-    reason_codes.append(f"merge:{merge_status}")
-    reason_codes.append(f"gamma:{gamma_result.state}")
-    if gamma_result.state == "provider_error":
-        reason_codes.append("provider_error")
-    if gamma_result.reason:
-        reason_codes.append(gamma_result.reason)
-
-    return {
-        "status": status,
-        "token_id": token_id,
-        "condition_id": condition_id,
-        "market_id": condition_id,
-        "market_slug": slug,
-        "normalized_category": normalized_category,
-        "taxonomy_status": _taxonomy_status(safe_meta, merge_status),
-        "gamma_source": "gamma_market_raw" if gamma is not None else None,
-        "evidence_source": "backfill",
-        "reason_codes": reason_codes,
-    }
-
-
-def _evidence_hash(ev: dict[str, Any]) -> str:
-    canonical = json.dumps(ev, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _write_provenance(
@@ -400,62 +318,22 @@ def _write_provenance(
     ev: dict[str, Any],
     merge_status: str,
 ) -> tuple[bool, bool]:
-    """Upsert the single CURRENT provenance row keyed by source_trade_internal_id.
+    """Upsert the single CURRENT provenance row via the shared module.
 
-    Returns ``(changed, is_new)``:
-      * insert when absent (created_at = now)
-      * update current provenance when evidence materially changes
-        (evidence_hash differs) — preserves created_at, updates updated_at
-      * equivalent replay performs no write (changed = False)
-      * never creates a duplicate row (UNIQUE(source_trade_internal_id))
-      * never silently ignores newer conflict/unavailable evidence
-    Does NOT mutate enrichment_id to bypass uniqueness.
+    Returns ``(changed, is_new)``. Delegates to
+    :func:`source_trade_provenance.write_provenance` so the one-current-row
+    contract (no duplicate rows, stable enrichment_id, in-place update) is
+    identical to the per-trade enrichment path.
     """
-    internal_id = trade["id"]
-    now = _now()
-    ev_hash = _evidence_hash(ev)
-    existing = db.fetchone(
-        "SELECT enrichment_id, evidence_hash, created_at FROM "
-        "source_trade_enrichments WHERE source_trade_internal_id=?",
-        (internal_id,),
+    ev_hash = evidence_hash(ev)
+    changed, is_new, _eid = write_provenance(
+        db,
+        source_trade_internal_id=trade["id"],
+        payload=ev,
+        evidence_hash_value=ev_hash,
+        enrichment_id_prefix="bk",
     )
-    if existing is None:
-        enrichment_id = f"bk:{internal_id}"
-        db.conn.execute(
-            "INSERT INTO source_trade_enrichments ("
-            "enrichment_id, source_trade_internal_id, status, token_id, "
-            "condition_id, market_id, market_slug, normalized_category, "
-            "taxonomy_status, evidence_source, gamma_source, evidence_hash, "
-            "reason_codes_json, fetched_at, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                enrichment_id, internal_id, ev["status"], ev["token_id"],
-                ev["condition_id"], ev["market_id"], ev["market_slug"],
-                ev["normalized_category"], ev["taxonomy_status"],
-                ev["evidence_source"], ev["gamma_source"], ev_hash,
-                json.dumps(ev["reason_codes"], sort_keys=True), now, now, now,
-            ),
-        )
-        return True, True
-
-    # Existing current row: only update when evidence materially changed.
-    if existing["evidence_hash"] == ev_hash:
-        return False, False
-    db.conn.execute(
-        "UPDATE source_trade_enrichments SET "
-        "status=?, token_id=?, condition_id=?, market_id=?, market_slug=?, "
-        "normalized_category=?, taxonomy_status=?, evidence_source=?, "
-        "gamma_source=?, evidence_hash=?, reason_codes_json=?, "
-        "fetched_at=?, updated_at=? WHERE source_trade_internal_id=?",
-        (
-            ev["status"], ev["token_id"], ev["condition_id"], ev["market_id"],
-            ev["market_slug"], ev["normalized_category"], ev["taxonomy_status"],
-            ev["evidence_source"], ev["gamma_source"], ev_hash,
-            json.dumps(ev["reason_codes"], sort_keys=True), now, now,
-            internal_id,
-        ),
-    )
-    return True, False
+    return changed, is_new
 
 
 # ── Run ──────────────────────────────────────────────────────────────────────

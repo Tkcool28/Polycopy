@@ -1,28 +1,41 @@
 """Authoritative, durable enrichment for one exact approved source trade.
 
-This module resolves and persists the normalized evidence required to prove a
-source trade is a safe, traceable copy-candidate input. It operates on ONE
-exact ``source_trades.id`` (never an arbitrary wallet history fetch) and writes
-ONLY the ``source_trade_enrichments`` durable state row. Canonical
-``source_trades`` columns (token_id, condition_id, market_source_id, outcome,
-timestamp) remain the system of record; this table records the resolved
-normalized evidence + completion status + provenance, not a copy of those
-columns.
+This module resolves and persists the canonical, scorer-visible evidence
+required to prove a source trade is a safe, traceable copy-candidate input. It
+operates on ONE exact ``source_trades.id`` (never an arbitrary wallet-history
+fetch) and performs TWO atomic writes inside one SAVEPOINT:
 
-Design rules (per Pass 2 spec):
-  * Use existing adapters and PR66 taxonomy logic. Do NOT invent category.
-  * Do NOT infer a category from wallet behavior when market taxonomy is
-    unavailable. When taxonomy is missing/partial, status becomes
-    ``incomplete`` / ``unavailable`` and the bridge is never invoked by the
-    dispatcher.
-  * Do NOT overwrite conflicting evidence silently; a material change in
-    evidence hash creates a new enrichment record version (versioned by
-    ``created_at``) rather than clobbering the prior proof.
-  * Replay with identical evidence must not create a duplicate operational
-    state: the table has UNIQUE(source_trade_internal_id); a second call with
-    the same resolved evidence hash returns the existing current record.
-  * Every network operation is bounded. The optional ``gamma_resolver`` is
-    called at most once, behind the caller's own timeout.
+  1. ``source_trades.metadata_json`` — the SCORER-VISIBLE canonical nested
+     contract (``taxonomy.raw_category``), written ONLY when the merge status
+     permits (FILLED / UNCHANGED).
+  2. ``source_trade_enrichments`` — one CURRENT audit/provenance row, owned by
+     :mod:`polycopy.ingestion.source_trade_provenance`.
+
+The scoring authority is, and remains,
+``source_trades.metadata_json['taxonomy']['raw_category']``.
+``source_trade_enrichments`` is audit/provenance state only and is never a
+scoring authority.
+
+S5 repair scope
+---------------
+* The broken enrichment-versioning contract (which mutated ``enrichment_id`` to
+  ``archived:<id>`` and inserted a second row to dodge
+  ``UNIQUE(source_trade_internal_id)``) is REMOVED. There is exactly one
+  current audit row per source trade. See
+  :func:`source_trade_provenance.write_provenance` for the contract.
+* Honest merge-status / reason handling (FILLED / UNCHANGED / CONFLICT /
+  UNAVAILABLE) — conflict and unavailable preserve ``metadata_json``
+  byte-for-byte and never report complete.
+* Exact source-trade eligibility (Polymarket BUY, non-sample, non-empty
+  market_source_id) with explicit refusal reason codes and zero provider calls
+  or DB writes after a refusal.
+* The real Gamma route: ``PolymarketPublicAdapter.get_market_raw(condition_id)``,
+  at most once per trade, with provider-error distinct from not-found and a
+  fail-closed ``aclose()`` in a finally block.
+* Exact source-trade identity: ``token_id`` from ``source_trades.token_id``,
+  ``condition_id``/``market_id`` from ``market_source_id``,
+  ``outcome_identity`` from ``outcome``. A missing token stays missing and
+  fails closed through the canonical token-membership contract.
 """
 
 from __future__ import annotations
@@ -34,69 +47,92 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from polycopy.ingestion.canonical_metadata import (
+    MERGE_CONFLICT,
+    MERGE_UNAVAILABLE,
     merge_canonical_metadata,
 )
-from polycopy.scoring.wallet_evidence import (
-    CATEGORY_TAXONOMY_PARTIAL,
-    CATEGORY_TAXONOMY_USABLE,
-    classify_category_taxonomy,
+from polycopy.ingestion.source_trade_provenance import (
+    STATUS_ERROR,
+    build_provenance_payload,
+    enrichment_status_allows_dispatch,
+    evidence_hash,
+    get_current_enrichment,
+    write_provenance,
 )
+from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
 
-# Status vocabulary for source_trade_enrichments.status.
-STATUS_PENDING = "pending"
-STATUS_COMPLETE = "complete"
-STATUS_INCOMPLETE = "incomplete"
-STATUS_UNAVAILABLE = "unavailable"
-STATUS_CONFLICT = "conflict"
-STATUS_ERROR = "error"
-
-_VALID_STATUSES = frozenset({
-    STATUS_PENDING, STATUS_COMPLETE, STATUS_INCOMPLETE,
-    STATUS_UNAVAILABLE, STATUS_CONFLICT, STATUS_ERROR,
-})
+# Exact, repository-proven Polymarket source_trades writer values (no fuzzy
+# matching, no id prefixes). A bare "polymarket" literal is NOT a proven
+# source_trades writer value here (it is used for the markets/raw_snapshots
+# tables), so it is intentionally excluded.
+POLYMARKET_SOURCES = frozenset({SOURCE_NAME, "polymarket_clob"})
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _uuid() -> str:
-    from uuid import uuid4
-
-    return str(uuid4())
+# Refusal reason codes (explicit; zero provider calls / DB writes after these).
+SOURCE_TRADE_NOT_FOUND = "source_trade_not_found"
+SOURCE_NOT_SUPPORTED = "source_not_supported"
+SELL_NOT_SUPPORTED = "sell_not_supported"
+SAMPLE_TRADE_REFUSED = "sample_trade_refused"
+MISSING_MARKET_IDENTITY = "missing_market_identity"
 
 
 def _read_source_trade(db: Any, source_trade_internal_id: str) -> Optional[dict[str, Any]]:
     row = db.fetchone(
         "SELECT id, source, source_trade_id, market_source_id, token_id, "
-        "outcome, timestamp, metadata_json, is_sample FROM source_trades "
+        "side, outcome, timestamp, metadata_json, is_sample FROM source_trades "
         "WHERE id=?",
         (source_trade_internal_id,),
     )
     return dict(row) if row is not None else None
 
 
-def _coerce_metadata_json(raw: Any) -> dict[str, Any]:
-    if not raw:
-        return {}
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except (json.JSONDecodeError, ValueError):
-            return {}
-    return {}
+def get_enrichment(db: Any, source_trade_internal_id: str) -> Optional[dict[str, Any]]:
+    """Return the single current enrichment row for a source trade (or None).
 
-
-def _call_gamma_resolver(gamma_resolver: Callable[[str], Any], condition_id: str) -> Any:
-    """Invoke a sync OR async gamma resolver, bounded to one call.
-
-    The dispatcher passes a synchronous ``gamma.get_market``; the research
-    collector passes an ``async`` resolver. Support both without leaking a
-    coroutine into the canonical builder.
+    Delegates to the shared one-current-row provenance module. Kept as a stable
+    public alias so existing callers/tests keep working.
     """
+    return get_current_enrichment(db, source_trade_internal_id)
+
+
+@dataclass
+class _Eligibility:
+    ok: bool
+    reason: Optional[str] = None
+
+
+def _check_eligibility(row: dict[str, Any]) -> _Eligibility:
+    """Exact source-trade eligibility (no prefix/fuzzy matching).
+
+    Accepts only:
+      * source in {polymarket_data_api_trades_user, polymarket_clob}
+      * side == BUY
+      * is_sample == 0
+      * non-empty market_source_id
+    """
+    if not row.get("id"):
+        return _Eligibility(ok=False, reason=SOURCE_TRADE_NOT_FOUND)
+    side = str(row.get("side") or "").upper()
+    if side != "BUY":
+        return _Eligibility(ok=False, reason=SELL_NOT_SUPPORTED)
+    if bool(row.get("is_sample")):
+        return _Eligibility(ok=False, reason=SAMPLE_TRADE_REFUSED)
+    source = row.get("source")
+    if source not in POLYMARKET_SOURCES:
+        return _Eligibility(ok=False, reason=SOURCE_NOT_SUPPORTED)
+    if not (row.get("market_source_id") or "").strip():
+        return _Eligibility(ok=False, reason=MISSING_MARKET_IDENTITY)
+    return _Eligibility(ok=True)
+
+
+def _call_gamma_resolver(
+    gamma_resolver: Callable[[str], Any], condition_id: str
+) -> Any:
+    """Invoke a sync OR async gamma resolver, bounded to one call."""
     market = gamma_resolver(condition_id)
     if inspect.isawaitable(market):
         import asyncio
@@ -104,7 +140,6 @@ def _call_gamma_resolver(gamma_resolver: Callable[[str], Any], condition_id: str
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Rare: nested loop. Fall back to a fresh loop in a thread.
                 import concurrent.futures
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -115,96 +150,42 @@ def _call_gamma_resolver(gamma_resolver: Callable[[str], Any], condition_id: str
     return market
 
 
-def _gamma_slug(gamma_market: Any) -> Optional[str]:
-    if gamma_market is None:
-        return None
-    get = gamma_market.get if hasattr(gamma_market, "get") else (lambda k, d=None: d)
-    slug = get("slug")
-    if isinstance(slug, str) and slug.strip():
-        return slug.strip()
-    return None
+# Gamma resolution states (distinct from ordinary missing evidence).
+GAMMA_FOUND = "found"
+GAMMA_NOT_FOUND = "not_found"
+GAMMA_PROVIDER_ERROR = "provider_error"
+GAMMA_AMBIGUOUS = "ambiguous"
+GAMMA_MALFORMED = "malformed"
 
 
-def _build_evidence(
-    row: dict[str, Any],
-    canonical_metadata: dict[str, Any],
-    *,
-    gamma_market: Optional[Any] = None,
-) -> dict[str, Any]:
-    """Resolve normalized evidence from the CANONICAL nested metadata.
+def resolve_gamma_state(
+    gamma_resolver: Callable[[str], Any], condition_id: str
+) -> tuple[Optional[dict[str, Any]], str, Optional[str]]:
+    """Resolve one condition id through the real Gamma route, distinguishing:
 
-    ``canonical_metadata`` is the shared nested shape produced by
-    ``merge_canonical_metadata`` (``taxonomy``/``event``/``series``). The
-    scorer-facing taxonomy lives ONLY in
-    ``canonical_metadata["taxonomy"]["raw_category"]``; this provenance row is
-    audit-only. Category is taken from taxonomy classification only, and is
-    NEVER inferred from wallet behavior or market title.
+      * found            -> authoritative Gamma dict returned
+      * not_found        -> resolver returned None (no exact match)
+      * provider_error    -> exception raised (NEVER conflated with not_found)
+      * ambiguous        -> resolver signalled an ambiguous selection
+      * malformed        -> resolver signalled an unexpected payload shape
+
+    The resolver must be a thin wrapper around
+    ``PolymarketPublicAdapter.get_market_raw`` (NOT a catch-everything wrapper
+    that swallows provider exceptions into None — that would convert provider
+    failure into ordinary missing evidence). Returns ``(market, state, reason)``.
     """
-    ev: dict[str, Any] = {}
-
-    # Token / condition / market identity (system of record precedence).
-    if row.get("token_id"):
-        ev["token_id"] = row["token_id"]
-    else:
-        cond = row.get("market_source_id")
-        if cond:
-            ev["token_id"] = cond
-    if row.get("market_source_id"):
-        ev["condition_id"] = row["market_source_id"]
-    ev["market_id"] = row.get("market_source_id")
-    if row.get("outcome"):
-        ev["outcome_identity"] = row["outcome"]
-
-    # Classify taxonomy from the CANONICAL nested metadata (the fix: the scorer
-    # reads this exact shape, so enrichment must classify the identical shape).
-    classification = classify_category_taxonomy(canonical_metadata)
-    status = str(classification.status)
-    if status == CATEGORY_TAXONOMY_USABLE and classification.category_label:
-        ev["normalized_category"] = classification.category_label
-        ev["taxonomy_status"] = "usable"
-    elif status == CATEGORY_TAXONOMY_PARTIAL:
-        ev["taxonomy_status"] = "partial"
-    else:
-        ev["taxonomy_status"] = "unavailable"
-
-    event = canonical_metadata.get("event")
-    if isinstance(event, dict):
-        ev["event_identity"] = event.get("id") or event.get("slug")
-
-    slug = _gamma_slug(gamma_market)
-    if slug:
-        ev["market_slug"] = slug
-
-    if row.get("timestamp"):
-        ev["market_start_at"] = str(row["timestamp"])
-
-    ev["evidence_source"] = "canonical_metadata"
-    if gamma_market is not None:
-        ev["gamma_source"] = "gamma_market_resolver"
-    return ev
-
-
-def _evidence_hash(ev: dict[str, Any]) -> str:
-    import hashlib
-
-    canonical = json.dumps(ev, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _classify_status(ev: dict[str, Any], reason_codes: list[str]) -> str:
-    """Map resolved evidence + reason codes to a durable enrichment status."""
-    if "taxonomy_unavailable" in reason_codes or ev.get("taxonomy_status") == "unavailable":
-        return STATUS_INCOMPLETE
-    if ev.get("taxonomy_status") == "partial":
-        # Partial taxonomy is a blocker for a durable copy decision; treat as
-        # incomplete (bridge not invoked by dispatcher).
-        return STATUS_INCOMPLETE
-    if "gamma_error" in reason_codes:
-        return STATUS_ERROR
-    if not ev.get("normalized_category"):
-        return STATUS_INCOMPLETE
-    # Usable taxonomy + category present => authoritative evidence complete.
-    return STATUS_COMPLETE
+    try:
+        market = _call_gamma_resolver(gamma_resolver, condition_id)
+    except ValueError as exc:
+        msg = str(exc)
+        if "ambiguous" in msg:
+            return None, GAMMA_AMBIGUOUS, msg
+        return None, GAMMA_MALFORMED, msg
+    except Exception as exc:  # HTTP / network / client failure
+        return None, GAMMA_PROVIDER_ERROR, f"{type(exc).__name__}: {exc}"
+    if market is None:
+        return None, GAMMA_NOT_FOUND, None
+    return market, GAMMA_FOUND, None
 
 
 @dataclass
@@ -216,6 +197,7 @@ class EnrichmentResult:
     updated: bool
     reason_codes: list[str] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
+    metadata_changed: bool = False
     error_message: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -225,18 +207,15 @@ class EnrichmentResult:
             "status": self.status,
             "created": self.created,
             "updated": self.updated,
+            "metadata_changed": self.metadata_changed,
             "reason_codes": self.reason_codes,
             "evidence": self.evidence,
             "error_message": self.error_message,
         }
 
-
-def get_enrichment(db: Any, source_trade_internal_id: str) -> Optional[dict[str, Any]]:
-    row = db.fetchone(
-        "SELECT * FROM source_trade_enrichments WHERE source_trade_internal_id=?",
-        (source_trade_internal_id,),
-    )
-    return dict(row) if row is not None else None
+    def allows_dispatch(self) -> bool:
+        """Convenience seam: mirror the dispatcher gate without invoking it."""
+        return enrichment_status_allows_dispatch(self.status)
 
 
 def enrich_source_trade(
@@ -249,8 +228,10 @@ def enrich_source_trade(
     """Resolve and persist (or link) authoritative enrichment for one trade.
 
     The ``gamma_resolver`` (optional) is ``Callable[[condition_id] -> market|None``
-    and is invoked at most once, bounded by the caller's own timeout. It is used
-    only to FILL missing provenance fields, never to overwrite existing ones.
+    and is invoked at most once, behind the caller's own timeout. It MUST be a
+    thin wrapper around ``PolymarketPublicAdapter.get_market_raw`` (see
+    :func:`resolve_gamma_state`) — NOT a catch-everything wrapper that returns
+    None on provider error.
     """
     row = _read_source_trade(db, source_trade_internal_id)
     if row is None:
@@ -260,158 +241,173 @@ def enrich_source_trade(
             status=STATUS_ERROR,
             created=False,
             updated=False,
-            reason_codes=["source_trade_not_found"],
+            reason_codes=[SOURCE_TRADE_NOT_FOUND],
             error_message="source_trade_internal_id not found",
         )
 
-    reason_codes: list[str] = []
-    gamma_market: Optional[Any] = None
-    if gamma_resolver is not None:
-        try:
-            condition_id = row.get("market_source_id")
-            if condition_id:
-                gamma_market = _call_gamma_resolver(gamma_resolver, condition_id)
-        except Exception:  # bounded; record and continue on metadata only
-            reason_codes.append("gamma_error")
-            gamma_market = None
-            # Do not fail enrichment on a network error; mark as durable error
-            # state but still persist the metadata-derived evidence.
-
-    # Build the CANONICAL nested metadata via the shared service. This reuses
-    # the exact shape the scorer reads (taxonomy.raw_category), merging the
-    # resolved Gamma market onto the stored source_trades.metadata_json
-    # (never overwriting existing trusted provenance). Fixes the prior defect
-    # where a flat Gamma dict was classified instead of the nested shape.
-    canonical_meta, _merge_status, _merge_reasons = merge_canonical_metadata(
-        row.get("metadata_json"),
-        gamma_market,
-        condition_id=row.get("market_source_id") or "",
-        token_id=row.get("token_id"),
-    )
-
-    ev = _build_evidence(row, canonical_meta, gamma_market=gamma_market)
-    if ev.get("taxonomy_status") == "unavailable":
-        reason_codes.append("taxonomy_unavailable")
-    elif ev.get("taxonomy_status") == "partial":
-        reason_codes.append("taxonomy_partial")
-
-    evidence_hash = _evidence_hash(ev)
-    status = _classify_status(ev, reason_codes)
-
-    existing = get_enrichment(db, source_trade_internal_id)
-    if existing is not None:
-        # Idempotent replay: identical evidence hash => no change.
-        if existing.get("evidence_hash") == evidence_hash:
-            return EnrichmentResult(
-                source_trade_internal_id=source_trade_internal_id,
-                enrichment_id=existing["enrichment_id"],
-                status=existing["status"],
-                created=False,
-                updated=False,
-                reason_codes=reason_codes,
-                evidence=ev,
-            )
-        # Material change: version the evidence by creating a NEW current
-        # record. The prior record is preserved (we do not DELETE it); the
-        # UNIQUE(source_trade_internal_id) constraint means we must first
-        # detach the old id from the unique slot to keep provenance history.
-        if dry_run:
-            return EnrichmentResult(
-                source_trade_internal_id=source_trade_internal_id,
-                enrichment_id=existing["enrichment_id"],
-                status=STATUS_CONFLICT,
-                created=False,
-                updated=False,
-                reason_codes=["evidence_changed"] + reason_codes,
-                evidence=ev,
-                error_message="evidence hash changed; dry-run refuses write",
-            )
-        _new_id = _uuid()
-        db.conn.execute(
-            "UPDATE source_trade_enrichments SET enrichment_id=? "
-            "WHERE enrichment_id=?",
-            (f"archived:{existing['enrichment_id']}", existing["enrichment_id"]),
-        )
-        _persist_new(db, _new_id, source_trade_internal_id, ev, evidence_hash,
-                     status, reason_codes, gamma_market is not None)
-        return EnrichmentResult(
-            source_trade_internal_id=source_trade_internal_id,
-            enrichment_id=_new_id,
-            status=status,
-            created=True,
-            updated=False,
-            reason_codes=["evidence_changed"] + reason_codes,
-            evidence=ev,
-        )
-
-    if dry_run:
+    eligibility = _check_eligibility(row)
+    if not eligibility.ok:
+        # Explicit refusal. No provider call, no DB write.
         return EnrichmentResult(
             source_trade_internal_id=source_trade_internal_id,
             enrichment_id=None,
-            status=status,
+            status=STATUS_ERROR,
             created=False,
             updated=False,
-            reason_codes=reason_codes,
-            evidence=ev,
+            reason_codes=[eligibility.reason or SOURCE_NOT_SUPPORTED],
+            error_message=f"eligibility refused: {eligibility.reason}",
         )
 
-    _new_id = _uuid()
-    _persist_new(db, _new_id, source_trade_internal_id, ev, evidence_hash,
-                 status, reason_codes, gamma_market is not None)
+    condition_id = row.get("market_source_id") or ""
+
+    # One bounded Gamma request, if authorized.
+    gamma_market: Optional[Any] = None
+    gamma_state = GAMMA_NOT_FOUND
+    gamma_reason: Optional[str] = None
+    if gamma_resolver is not None:
+        gamma_market, gamma_state, gamma_reason = resolve_gamma_state(
+            gamma_resolver, condition_id
+        )
+
+    merge_status: str
+    merge_reasons: list[str]
+    canonical_meta: Any
+    if gamma_market is not None:
+        canonical_meta, merge_status, merge_reasons = merge_canonical_metadata(
+            row.get("metadata_json"),
+            gamma_market,
+            condition_id=condition_id,
+            token_id=row.get("token_id"),
+        )
+    else:
+        # No Gamma evidence: merge against an empty market. This preserves
+        # existing metadata (merge status unchanged/unavailable) without a
+        # network call.
+        canonical_meta, merge_status, merge_reasons = merge_canonical_metadata(
+            row.get("metadata_json"),
+            None,
+            condition_id=condition_id,
+            token_id=row.get("token_id"),
+        )
+
+    # Honest merge-status handling.
+    if merge_status == MERGE_CONFLICT:
+        # Preserve source_trades.metadata_json byte-for-byte; no metadata write.
+        payload = build_provenance_payload(
+            source_trade=row,
+            canonical_meta=canonical_meta,
+            gamma_market=gamma_market,
+            merge_status=merge_status,
+            gamma_state=gamma_state,
+            gamma_reason=gamma_reason,
+            merge_reasons=merge_reasons,
+        )
+        return _persist(
+            db, source_trade_internal_id, payload, dry_run=dry_run,
+            metadata_json=None,
+        )
+
+    if merge_status == MERGE_UNAVAILABLE:
+        # Preserve source_trades.metadata_json byte-for-byte; no metadata write.
+        # status stays unavailable (unless a provider error escalates to error).
+        payload = build_provenance_payload(
+            source_trade=row,
+            canonical_meta=canonical_meta,
+            gamma_market=gamma_market,
+            merge_status=merge_status,
+            gamma_state=gamma_state,
+            gamma_reason=gamma_reason,
+            merge_reasons=merge_reasons,
+        )
+        return _persist(
+            db, source_trade_internal_id, payload, dry_run=dry_run,
+            metadata_json=None,
+        )
+
+    # MERGE_FILLED / MERGE_UNCHANGED: canonical metadata may be persisted and
+    # classified. Write the deterministic canonical metadata to source_trades.
+    # On CONFLICT/UNAVAILABLE we passed metadata_json=None to skip the write.
+    new_metadata_json = json.dumps(canonical_meta, sort_keys=True, separators=(",", ":"))
+    payload = build_provenance_payload(
+        source_trade=row,
+        canonical_meta=canonical_meta,
+        gamma_market=gamma_market,
+        merge_status=merge_status,
+        gamma_state=gamma_state,
+        gamma_reason=gamma_reason,
+        merge_reasons=merge_reasons,
+    )
+    return _persist(
+        db, source_trade_internal_id, payload, dry_run=dry_run,
+        metadata_json=new_metadata_json,
+    )
+
+
+def _persist(
+    db: Any,
+    source_trade_internal_id: str,
+    payload: dict[str, Any],
+    *,
+    dry_run: bool,
+    metadata_json: Optional[str],
+) -> EnrichmentResult:
+    """Atomic metadata + provenance write inside one SAVEPOINT.
+
+    ``metadata_json`` is None when the merge forbids a metadata write
+    (CONFLICT / UNAVAILABLE). On any failure we ROLLBACK TO SAVEPOINT and
+    RELEASE it so metadata_json and the enrichment row are left unchanged.
+    """
+    ev_hash = evidence_hash(payload)
+
+    if dry_run:
+        # Compute/report only; zero metadata and provenance writes.
+        return EnrichmentResult(
+            source_trade_internal_id=source_trade_internal_id,
+            enrichment_id=None,
+            status=payload["status"],
+            created=False,
+            updated=False,
+            reason_codes=list(payload["reason_codes"]),
+            evidence=payload,
+        )
+
+    db.conn.execute("SAVEPOINT s5_enrich")
+    try:
+        metadata_changed = False
+        if metadata_json is not None:
+            db.conn.execute(
+                "UPDATE source_trades SET metadata_json = ? WHERE id = ?",
+                (metadata_json, source_trade_internal_id),
+            )
+            metadata_changed = True
+        changed, is_new, enrichment_id = write_provenance(
+            db,
+            source_trade_internal_id=source_trade_internal_id,
+            payload=payload,
+            evidence_hash_value=ev_hash,
+        )
+        db.conn.execute("RELEASE SAVEPOINT s5_enrich")
+    except Exception as exc:
+        db.conn.execute("ROLLBACK TO SAVEPOINT s5_enrich")
+        db.conn.execute("RELEASE SAVEPOINT s5_enrich")
+        return EnrichmentResult(
+            source_trade_internal_id=source_trade_internal_id,
+            enrichment_id=None,
+            status=STATUS_ERROR,
+            created=False,
+            updated=False,
+            reason_codes=["persist_failed"],
+            evidence=payload,
+            error_message=f"{type(exc).__name__}: {exc}",
+        )
+
     return EnrichmentResult(
         source_trade_internal_id=source_trade_internal_id,
-        enrichment_id=_new_id,
-        status=status,
-        created=True,
-        updated=False,
-        reason_codes=reason_codes,
-        evidence=ev,
+        enrichment_id=enrichment_id,
+        status=payload["status"],
+        created=is_new,
+        updated=(changed and not is_new),
+        metadata_changed=metadata_changed,
+        reason_codes=list(payload["reason_codes"]),
+        evidence=payload,
     )
-
-
-def _persist_new(
-    db: Any,
-    enrichment_id: str,
-    source_trade_internal_id: str,
-    ev: dict[str, Any],
-    evidence_hash: str,
-    status: str,
-    reason_codes: list[str],
-    used_gamma: bool,
-) -> None:
-    now = _now_iso()
-    db.conn.execute(
-        """INSERT INTO source_trade_enrichments (
-               enrichment_id, source_trade_internal_id, status,
-               token_id, condition_id, market_id, market_slug, market_title,
-               outcome_identity, event_identity, normalized_category,
-               taxonomy_status, market_start_at, market_end_at, market_state,
-               evidence_source, gamma_source, evidence_hash, reason_codes_json,
-               fetched_at, created_at, updated_at
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            enrichment_id,
-            source_trade_internal_id,
-            status,
-            ev.get("token_id"),
-            ev.get("condition_id"),
-            ev.get("market_id"),
-            ev.get("market_slug"),
-            ev.get("market_title"),
-            ev.get("outcome_identity"),
-            ev.get("event_identity"),
-            ev.get("normalized_category"),
-            ev.get("taxonomy_status"),
-            ev.get("market_start_at"),
-            ev.get("market_end_at"),
-            ev.get("market_state"),
-            ev.get("evidence_source"),
-            ev.get("gamma_source") if used_gamma else None,
-            evidence_hash,
-            json.dumps(reason_codes, sort_keys=True),
-            now,
-            now,
-            now,
-        ),
-    )
-    db.conn.commit()
