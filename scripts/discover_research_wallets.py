@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
 
     except LockError:
         # Lock contention - return nonzero, no provider/DB constructed
-        print(json.dumps({"error": "lock_unavailable", "run_id": ""}))
+        print(json.dumps({"error": "lock_unavailable", "run_id": "", "status": "failed"}))
         return 4
 
     except Exception as e:  # noqa: BLE001

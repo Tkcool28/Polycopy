@@ -1489,7 +1489,7 @@ def test_main_failure_emits_structured_failed_json(capsys):
 
 
 # ── §10: lock contention -> rc 4, zero side effects ───────────────────────────────
-def test_main_lock_contention_zero_side_effects():
+def test_main_lock_contention_zero_side_effects(capsys):
     p = _fresh_v21_db()
     from polycopy.runtime.locks import LockError
     provider_calls = []
@@ -1546,8 +1546,10 @@ def test_main_lock_contention_zero_side_effects():
     assert ro_opens == []
     assert rw_opens == []
     assert persist_calls == []
-    # structured output includes status=failed / error=lock_unavailable
-    # (captured via stdout; main prints JSON to stdout on lock path)
+    # Exact structured failure JSON on the lock-contention path
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload == {"error": "lock_unavailable", "run_id": "", "status": "failed"}, payload
     p.unlink()
 
 
