@@ -76,3 +76,6 @@ frontend/coverage/
 # Local execution scratchpads — never committed. Use `docs/` for
 # durable design notes / ADRs that belong on the branch instead.
 docs/plans/
+.tmp/
+.pytest-tmp/
+.cache/
