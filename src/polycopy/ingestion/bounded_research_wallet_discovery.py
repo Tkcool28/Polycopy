@@ -399,11 +399,13 @@ def persist_candidates(
                         db, wid, "discovery", "bounded research-wallet discovery (PR72)", perform_writes=True)
                     if w_created:
                         result.watches_created += 1
+                        watch_id_to_set = w_id
                     else:
                         result.watches_existing += 1
             else:
                 result.existing_wallets += 1
                 wid = str(existing[0])
+                watch_id_to_set = None
                 if add_to_watchlist:
                     watch = db.fetchone(
                         """SELECT id FROM specialist_evidence_watchlist
@@ -412,7 +414,7 @@ def persist_candidates(
                     if watch:
                         result.watches_existing += 1
                     else:
-                        w_id, w_created = _add_watch_idempotent(
+                        watch_id_to_set, w_created = _add_watch_idempotent(
                             db, wid, "discovery", "bounded research-wallet discovery (PR72)", perform_writes=True)
                         result.watches_created += 1
 
@@ -439,6 +441,8 @@ def persist_candidates(
                     (wid,))
                 if watch:
                     candidate["existing_watch_id"] = str(watch[0])
+                if watch_id_to_set:
+                    candidate["created_watch_id"] = str(watch_id_to_set)
         else:
             # Dry-run: check existing state for reporting
             if existing:

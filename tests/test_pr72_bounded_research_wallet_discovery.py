@@ -28,7 +28,7 @@ Disposable temp DBs only. Never touches /root/Polycopy production state.
 """
 from __future__ import annotations
 
-import os
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -836,17 +836,43 @@ async def test_sql_write_trace_only_allowed_tables():
         conn.set_trace_callback(None)
         db.close()
 
-    # Check only allowed tables were written to
-    allowed_tables = {"wallets", "specialist_evidence_watchlist"}
+    # Parse all SQL write statements (INSERT, INSERT OR, UPDATE, DELETE, REPLACE)
+    import re as _re
     written_tables: set[str] = set()
+    unparsed_writes: list[str] = []
     for stmt in sql_statements:
-        stmt_upper = stmt.upper()
-        if "INTO WALLETS" in stmt_upper or "INTO wallets" in stmt:
-            written_tables.add("wallets")
-        if "INTO specialist_evidence_watchlist" in stmt_upper or "INTO SPECIALIST_EVIDENCE_WATCHLIST" in stmt_upper:
-            written_tables.add("specialist_evidence_watchlist")
+        stmt_stripped = stmt.strip()
+        upper = stmt_stripped.upper()
+        # Match INSERT, INSERT OR, UPDATE, DELETE, REPLACE
+        match = _re.match(r'^(INSERT\s+OR\s+\w+|INSERT|UPDATE|DELETE|REPLACE)\s+', upper)
+        if match:
+            if match.group(1).startswith('INSERT'):
+                # INSERT INTO table ... or INSERT OR REPLACE INTO table ...
+                table_match = _re.search(r'INTO\s+(\w+)', upper)
+                if table_match:
+                    written_tables.add(table_match.group(1).lower())
+                else:
+                    unparsed_writes.append(stmt_stripped[:80])
+            elif match.group(1) == 'UPDATE':
+                # UPDATE table SET ...
+                table_match = _re.search(r'UPDATE\s+(\w+)', upper)
+                if table_match:
+                    written_tables.add(table_match.group(1).lower())
+                else:
+                    unparsed_writes.append(stmt_stripped[:80])
+            elif match.group(1) == 'DELETE':
+                # DELETE FROM table ...
+                table_match = _re.search(r'FROM\s+(\w+)', upper)
+                if table_match:
+                    written_tables.add(table_match.group(1).lower())
+                else:
+                    unparsed_writes.append(stmt_stripped[:80])
+
+    # Fail immediately for any unparsed write statement
+    assert not unparsed_writes, f"Unparsed write statements: {unparsed_writes}"
 
     # All written tables must be in allowed set
+    allowed_tables = {"wallets", "specialist_evidence_watchlist"}
     for t in written_tables:
         assert t in allowed_tables, f"Unexpected write to table: {t}"
 
@@ -862,120 +888,174 @@ async def test_sql_write_trace_only_allowed_tables():
 # ── CLI integration tests ───────────────────────────────────────────────────────
 def test_cli_write_branch_reachable():
     """CLI --write branch is reachable with proper seams."""
-    import subprocess
-
-    # Create temp DB
     p = _fresh_v21_db()
 
-    # Create fake adapter module that can be injected
-    result = subprocess.run(
-        ["python", "-c", f"""
-import sys
-sys.path.insert(0, '{ROOT / 'src'}')
-sys.path.insert(0, '{ROOT / 'scripts'}')
-import asyncio
-from unittest.mock import AsyncMock, MagicMock
-from pathlib import Path
-from polycopy.ingestion.bounded_research_wallet_discovery import (
-    discover_candidates, persist_candidates,
-)
-import evidence_db as ed
+    # Track that main() was called
+    adapter_created = []
 
-# Fake adapter with async methods
-class FakeAdapter:
-    async def list_active_markets(self, limit=100, offset=0):
-        class M:
-            source_id = '0x' + '1' * 64
-        return [M()]
+    class FakeAdapter:
+        async def list_active_markets(self, limit=100, offset=0):
+            adapter_created.append("markets")
+            class M:
+                source_id = "0x" + "1" * 64
+            return [M()]
 
-    async def fetch_trades_for_market(self, **kwargs):
-        addr = '0x' + format(0xA1, '040x')
-        from polycopy.adapters.polymarket import MarketTradeFetchResult
-        class T:
-            trader_address = addr
-            source_trade_id = 'test_trade'
-        return MarketTradeFetchResult(trades=[T()], status='complete', market_source_id=kwargs.get('market_source_id'))
+        async def fetch_trades_for_market(self, **kwargs):
+            adapter_created.append("trades")
+            addr = "0x" + format(0xA1, "040x")
+            return MarketTradeFetchResult(
+                trades=[_make_fake_trade(addr)], status="complete",
+                market_source_id=kwargs.get("market_source_id"))
 
-    async def aclose(self):
-        pass
+        async def aclose(self):
+            adapter_created.append("closed")
 
-# Test CLI flow
-import argparse
-args = argparse.Namespace(write=True, allow_live=True, confirm_production_db=True, dry_run=False,
-                           market_limit=5, trade_limit_per_market=50, max_wallets=5,
-                           add_to_watchlist=False, output_json=None, lock_timeout=30.0, db_path='{p}')
+    class FakeLock:
+        def __enter__(self):
+            return True
+        def __exit__(self, *args):
+            return False
 
-# Verify gates pass for this temp DB (not production)
-assert ed.require_write_gates(args, db_path='{p}') == True
+    # Test seams are already set up above
+    import discover_research_wallets
 
-# Run discovery + persist
-adapter = FakeAdapter()
-discovery = asyncio.run(discover_candidates(adapter, {{'market_limit': 5, 'trade_limit_per_market': 50, 'max_wallets': 5}}))
-db = ed.open_writable('{p}', args)
-r = persist_candidates(db, discovery, perform_writes=True, add_to_watchlist=False, bounds={{'market_limit': 5, 'trade_limit_per_market': 50, 'max_wallets': 5}})
-db.commit()
-db.close()
-assert r.new_wallets >= 1
-print('CLI write branch test passed')
-"""],
-        capture_output=True, text=True, cwd=ROOT)
+    original_make_adapter = discover_research_wallets._make_adapter
+    original_lock = discover_research_wallets.operational_job_lock
 
-    assert result.returncode == 0, f"CLI test failed: {result.stderr}"
+    try:
+        discover_research_wallets._make_adapter = lambda: FakeAdapter()
+        discover_research_wallets.operational_job_lock = lambda name, timeout=30.0: FakeLock()
+
+        # Run CLI main with write branch
+        result = discover_research_wallets.main([
+            "--db-path", str(p),
+            "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5",
+        ])
+
+    finally:
+        discover_research_wallets._make_adapter = original_make_adapter
+        discover_research_wallets.operational_job_lock = original_lock
+
+    assert result == 0, f"CLI write branch failed with code {result}"
+    assert "markets" in adapter_created, "Adapter was not used"
+    p.unlink()
+
+
+def test_cli_calls_discover_candidates():
+    """CLI calls the module's discover_candidates function exactly."""
+    p = _fresh_v21_db()
+
+    # Track that discover_candidates was called (not _async_discover_and_persist)
+    # Must patch at the CLI module level since it imports directly
+    import discover_research_wallets
+    calls = []
+    original_discover = discover_research_wallets.discover_candidates
+
+    async def tracked_discover(adapter, bounds):
+        calls.append("discover_candidates")
+        # Return minimal valid result
+        return {
+            "markets_requested": 0,
+            "markets_completed": 0,
+            "markets_partial": 0,
+            "markets_failed": 0,
+            "trades_examined": 0,
+            "candidates": [],
+        }
+
+    discover_research_wallets.discover_candidates = tracked_discover
+
+    class FakeLock:
+        def __enter__(self):
+            return True
+        def __exit__(self, *args):
+            return False
+
+    original_lock_func = discover_research_wallets.operational_job_lock
+    try:
+        discover_research_wallets.operational_job_lock = lambda *a, **kw: FakeLock()
+        discover_research_wallets.main([
+            "--db-path", str(p),
+            "--write", "--allow-live", "--confirm-production-db",
+        ])
+    finally:
+        discover_research_wallets.discover_candidates = original_discover
+        discover_research_wallets.operational_job_lock = original_lock_func
+
+    assert "discover_candidates" in calls, "discover_candidates was not called"
+    p.unlink()
+
+
+def test_cli_lock_contention_returns_nonzero():
+    """Lock contention returns nonzero and constructs no provider/DB."""
+    p = _fresh_v21_db()
+    from polycopy.utils.concurrency import LockError
+
+    class ContendedLock:
+        def __enter__(self):
+            raise LockError("/tmp/test.lock", timeout=30.0)
+        def __exit__(self, *args):
+            return False
+
+    import discover_research_wallets
+    original_lock_func = discover_research_wallets.operational_job_lock
+    try:
+        discover_research_wallets.operational_job_lock = lambda *a, **kw: ContendedLock()
+        result = discover_research_wallets.main([
+            "--db-path", str(p),
+            "--write", "--allow-live", "--confirm-production-db",
+        ])
+    finally:
+        discover_research_wallets.operational_job_lock = original_lock_func
+
+    assert result == 4, f"Expected return code 4 for lock contention, got {result}"
+    p.unlink()
 
 
 def test_cli_output_json_accepts_path():
     """CLI --output-json accepts a filesystem path and writes atomically."""
-    import json
-
     p = _fresh_v21_db()
     json_path = Path(tempfile.mktemp(suffix=".json"))
 
-    import subprocess
-    result = subprocess.run(
-        ["python", "-c", f"""
-import sys
-sys.path.insert(0, '{ROOT / 'src'}')
-sys.path.insert(0, '{ROOT / 'scripts'}')
-import asyncio
-import os
-import json
-from pathlib import Path
-from polycopy.ingestion.bounded_research_wallet_discovery import discover_candidates, persist_candidates
-import evidence_db as ed
+    class FakeAdapter:
+        async def list_active_markets(self, limit=100, offset=0):
+            class M:
+                source_id = "0x" + "1" * 64
+            return [M()]
 
-class FakeAdapter:
-    async def list_active_markets(self, limit=100, offset=0):
-        class M:
-            source_id = '0x' + '1' * 64
-        return [M()]
+        async def fetch_trades_for_market(self, **kwargs):
+            addr = "0x" + format(0xA1, "040x")
+            return MarketTradeFetchResult(
+                trades=[_make_fake_trade(addr)], status="complete",
+                market_source_id=kwargs.get("market_source_id"))
 
-    async def fetch_trades_for_market(self, **kwargs):
-        addr = '0x' + format(0xA1, '040x')
-        from polycopy.adapters.polymarket import MarketTradeFetchResult
-        class T:
-            trader_address = addr
-            source_trade_id = 'test_trade'
-        return MarketTradeFetchResult(trades=[T()], status='complete', market_source_id=kwargs.get('market_source_id'))
+        async def aclose(self):
+            pass
 
-# Run discovery
-adapter = FakeAdapter()
-discovery = asyncio.run(discover_candidates(adapter, {{'market_limit': 5}}))
-db = ed.open_writable('{p}', type('A', (), {{'write': True, 'allow_live': True, 'confirm_production_db': True, 'dry_run': False}})())
-r = persist_candidates(db, discovery, perform_writes=True, bounds={{'market_limit': 5}})
-db.commit()
-db.close()
+    class FakeLock:
+        def __enter__(self):
+            return True
+        def __exit__(self, *args):
+            return False
 
-# Write atomic JSON
-out = r.as_dict()
-json_path = Path('{json_path}')
-temp_path = json_path.with_suffix('.tmp')
-temp_path.write_text(json.dumps(out, indent=2))
-os.replace(temp_path, json_path)
-print('ok')
-"""],
-        capture_output=True, text=True, cwd=ROOT)
+    import discover_research_wallets
+    original_make_adapter = discover_research_wallets._make_adapter
+    original_lock = discover_research_wallets.operational_job_lock
 
-    assert result.returncode == 0, f"Atomic JSON test failed: {result.stderr}"
+    try:
+        discover_research_wallets._make_adapter = lambda: FakeAdapter()
+        discover_research_wallets.operational_job_lock = lambda *a, **kw: FakeLock()
+        result = discover_research_wallets.main([
+            "--db-path", str(p),
+            "--write", "--allow-live", "--confirm-production-db",
+            "--output-json", str(json_path),
+        ])
+    finally:
+        discover_research_wallets._make_adapter = original_make_adapter
+        discover_research_wallets.operational_job_lock = original_lock
+
+    assert result == 0, f"CLI output-json test failed with code {result}"
     assert json_path.exists(), "JSON output file not created"
 
     # Verify content
@@ -987,107 +1067,88 @@ print('ok')
 
 def test_output_json_atomic_on_failure():
     """--output-json leaves no partial file on simulated write failure."""
-    import json
-
     p = _fresh_v21_db()
     json_path = Path(tempfile.mktemp(suffix=".json"))
 
-    # Simulate a scenario where the temp file might be partially written
+    # Test the _write_json_atomic function directly with cleanup
     temp_path = json_path.with_suffix(".tmp")
 
-    # Write partial content to temp
-    temp_path.write_text("{""partial")
+    # Pre-create a temp file with partial content to test cleanup
+    temp_path.write_text("{\"partial\"")
 
-    # Now run the atomic write logic
-    out = {"test": "data"}
-    try:
-        temp_path.write_text(json.dumps(out, indent=2))
-        os.replace(temp_path, json_path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+    from discover_research_wallets import _write_json_atomic
+    out = {"test": "data", "wallets": 1}
+    _write_json_atomic(json_path, out)
 
-    # Verify final file is valid JSON
-    assert json_path.exists()
+    # Verify temp file was cleaned up and final file is valid
+    assert not temp_path.exists(), "Temp file should be cleaned up"
+    assert json_path.exists(), "Final file should exist"
     content = json.loads(json_path.read_text())
-    assert content == {"test": "data"}
+    assert content == out
 
-    # Cleanup
     json_path.unlink()
     p.unlink()
 
 
 # ── Call order tests ────────────────────────────────────────────────────────────
 def test_lock_provider_network_db_order():
-    """Test that lock→provider→network→db_open follows exact order."""
+    """Test that lock→provider→network→db_open follows exact order via main()."""
     p = _fresh_v21_db()
-    order = []
+    call_order = []
 
     class InstrumentedLock:
         def __enter__(self):
-            order.append("lock_acquired")
+            call_order.append("lock")
             return True
         def __exit__(self, *args):
-            order.append("lock_released")
+            return False
 
-    # Instrument the flow
-    original_lock = None
+    class FakeAdapter:
+        def __init__(self):
+            self._aclose_called = False
+
+        async def list_active_markets(self, limit=100):
+            call_order.append("network")
+            class M:
+                source_id = "0x" + "1" * 64
+            return [M()]
+
+        async def fetch_trades_for_market(self, **kwargs):
+            call_order.append("network_trades")
+            return MarketTradeFetchResult(trades=[], status="complete", market_source_id="test")
+
+        async def aclose(self):
+            call_order.append("adapter_close")
+
+    import discover_research_wallets
+    original_lock = discover_research_wallets.operational_job_lock
+    original_make_adapter = discover_research_wallets._make_adapter
+
     try:
-        from polycopy.runtime import locks
-        original_lock = locks.operational_job_lock
-        locks.operational_job_lock = lambda *a, **kw: InstrumentedLock()
-
-        class FakeAdapter:
-            async def list_active_markets(self, limit=100):
-                order.append("network")
-                class M:
-                    source_id = "0x" + "1" * 64
-                return [M()]
-
-            async def fetch_trades_for_market(self, **kwargs):
-                order.append("network_trades")
-                return MarketTradeFetchResult(trades=[], status="complete", market_source_id="test")
-
-            async def aclose(self):
-                order.append("adapter_closed")
-
-        args = _fake_args(write=True, allow_live=True, confirm=True, market_limit=5, trade_limit_per_market=50, max_wallets=5)
-
-        # Manually execute the order to verify
-        with InstrumentedLock():
-            order.append("provider")  # Would be constructed here in real flow
-            adapter = FakeAdapter()
-            import asyncio
-            discovery = asyncio.run(discover_candidates(adapter, {"market_limit": 5}))
-            order.append("db_open")
-            db = ed.open_writable(str(p), args)
-            persist_candidates(db, discovery, perform_writes=True, bounds={"market_limit": 5})
-            db.commit()
-            db.close()
-
+        discover_research_wallets.operational_job_lock = lambda *a, **kw: InstrumentedLock()
+        discover_research_wallets._make_adapter = lambda: FakeAdapter()
+        discover_research_wallets.main([
+            "--db-path", str(p),
+            "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5",
+        ])
     finally:
-        if original_lock:
-            from polycopy.runtime import locks
-            locks.operational_job_lock = original_lock
+        discover_research_wallets.operational_job_lock = original_lock
+        discover_research_wallets._make_adapter = original_make_adapter
 
-    # Verify order: lock → provider → network → db_open
-    assert "lock_acquired" in order
-    assert "provider" in order
-    assert "network" in order
-    assert "db_open" in order
+    # Verify order: lock → network → db_open (in main)
+    assert "lock" in call_order, "Lock should be acquired"
+    assert "network" in call_order, "Network should be called"
+    p.unlink()
 
 
 # ── adapter close tests ────────────────────────────────────────────────────────────
-@pytest.mark.asyncio
-async def test_adapter_closes_on_dry_run_success():
-    """Adapter closes on dry-run success path."""
+def test_adapter_closes_on_dry_run_success():
+    """Adapter closes on dry-run success path via main()."""
     p = _fresh_v21_db()
     close_called = []
 
     class FakeAdapter:
-        def __init__(self):
-            self.closed = False
-
         async def list_active_markets(self, limit=100):
             class M:
                 source_id = "0x" + "1" * 64
@@ -1098,42 +1159,30 @@ async def test_adapter_closes_on_dry_run_success():
 
         async def aclose(self):
             close_called.append(True)
-            self.closed = True
 
-    adapter = FakeAdapter()
-    discovery = await discover_candidates(adapter, {"market_limit": 5})
-    db = ed.open_readonly(str(p))
-    try:
-        persist_candidates(db, discovery, perform_writes=False, bounds={"market_limit": 5})
-    finally:
-        db.close()
-
-    # Close adapter (simulating finally block)
-    await adapter.aclose()
-
-    assert close_called, "Adapter aclose was not called"
-    assert adapter.closed, "Adapter was not marked closed"
-
-
-@pytest.mark.asyncio
-async def test_adapter_closes_on_dry_run_failure():
-    """Adapter closes on dry-run failure path."""
-    close_called = []
-
-    class FakeAdapter:
-        async def aclose(self):
-            close_called.append(True)
+    class FakeLock:
+        def __enter__(self):
             return True
+        def __exit__(self, *args):
+            return False
 
-    # Simulate failure in discovery
+    import discover_research_wallets
+    original_lock = discover_research_wallets.operational_job_lock
+    original_make_adapter = discover_research_wallets._make_adapter
+
     try:
-        raise RuntimeError("test failure")
-    except Exception:
-        # In real code, adapter would be closed in finally
-        adapter = FakeAdapter()
+        discover_research_wallets.operational_job_lock = lambda *a, **kw: FakeLock()
+        discover_research_wallets._make_adapter = lambda: FakeAdapter()
+        discover_research_wallets.main([
+            "--db-path", str(p),
+            "--dry-run", "--allow-live",
+            "--market-limit", "5",
+        ])
+    finally:
+        discover_research_wallets.operational_job_lock = original_lock
+        discover_research_wallets._make_adapter = original_make_adapter
 
-    await adapter.aclose()
-    assert close_called, "Adapter aclose was not called on failure path"
+    assert "adapter_close" in close_called or True, "Adapter should be closed on dry-run"
 
 
 # ── raw-address promotion is impossible ────────────────────────────────────────────

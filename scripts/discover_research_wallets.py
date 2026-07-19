@@ -31,9 +31,10 @@ for _cand in (_REPOSITORY_ROOT / "src", _REPOSITORY_ROOT / "scripts", _REPOSITOR
 
 from polycopy.ingestion.bounded_research_wallet_discovery import (  # noqa: E402
     _default_bounds,
+    discover_candidates,
     persist_candidates,
 )
-from polycopy.runtime.locks import operational_job_lock  # noqa: E402
+from polycopy.runtime.locks import LockError, operational_job_lock  # noqa: E402
 import evidence_db as ed  # noqa: E402
 
 PRODUCTION_DB_PATH = (_REPOSITORY_ROOT / "data" / "polycopy.db").resolve()
@@ -105,65 +106,25 @@ def _apply_bounds(bounds: dict, args: argparse.Namespace) -> dict:
     return bounds
 
 
-async def _async_discover_and_persist(
-    adapter,
-    bounds: dict,
-) -> dict:
-    """Async discovery returning in-memory candidates with provenance."""
-    markets = await adapter.list_active_markets(limit=bounds["market_limit"])
+def _make_adapter() -> Any:  # noqa: F821
+    """Construct and return a PolymarketPublicAdapter. Overrideable for testing."""
+    from polycopy.adapters.polymarket import PolymarketPublicAdapter
+    return PolymarketPublicAdapter(
+        gamma_base_url="https://gamma-api.polymarket.com",
+        clob_base_url="https://clob.polymarket.com",
+    )
 
-    discovery_result = {
-        "markets_requested": 0,
-        "markets_completed": 0,
-        "markets_partial": 0,
-        "markets_failed": 0,
-        "trades_examined": 0,
-        "candidates": [],  # Each: {canonical_address, source_market_id, source_trade_id_or_hash}
-    }
 
-    market_limit = bounds["market_limit"]
-    trade_limit = bounds["trade_limit_per_market"]
-    markets_fetched = 0
-
-    for market in markets:
-        market_id = getattr(market, "source_id", None) or getattr(market, "condition_id", None)
-        if market_id is None:
-            continue
-
-        discovery_result["markets_requested"] += 1
-
-        fetch_result = await adapter.fetch_trades_for_market(
-            market_source_id=str(market_id),
-            limit=trade_limit,
-            max_pages=1,
-            max_rows=trade_limit,
-        )
-
-        if fetch_result.status == "complete":
-            discovery_result["markets_completed"] += 1
-            trades = list(fetch_result)
-            discovery_result["trades_examined"] += len(trades)
-            for trade in trades:
-                addr = getattr(trade, "trader_address", None)
-                if addr is not None and str(addr).strip():
-                    trade_id = getattr(trade, "source_trade_id", None)
-                    if not trade_id:
-                        trade_id = getattr(trade, "transaction_hash", None)
-                    discovery_result["candidates"].append({
-                        "canonical_address": str(addr).lower().strip(),
-                        "source_market_id": str(market_id),
-                        "source_trade_id_or_hash": trade_id,
-                    })
-        elif fetch_result.status == "partial":
-            discovery_result["markets_partial"] += 1
-        else:
-            discovery_result["markets_failed"] += 1
-
-        markets_fetched += 1
-        if markets_fetched >= market_limit:
-            break
-
-    return discovery_result
+def _write_json_atomic(output_path: Path, data: dict) -> None:
+    """Write JSON atomically using temp file + os.replace()."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_suffix(".tmp")
+    try:
+        temp_path.write_text(json.dumps(data, indent=2))
+        os.replace(temp_path, output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -186,71 +147,66 @@ def main(argv: list[str] | None = None) -> int:
               "--confirm-production-db", file=sys.stderr)
         return 2
 
-    # Acquire lock BEFORE adapter construction or network discovery
-    lock = operational_job_lock("discovery", timeout=args.lock_timeout)
-    locked = lock.__enter__()
-    if not locked:
-        print("error: could not acquire operational lock", file=sys.stderr)
-        return 3
-
+    # Initialize variables for exception/finally handling
     adapter = None
     db = None
+    result = None
 
+    # Acquire lock BEFORE adapter construction or network discovery
     try:
-        # Construct adapter INSIDE lock
-        if args.allow_live:
-            from polycopy.adapters.polymarket import PolymarketPublicAdapter
-            adapter = PolymarketPublicAdapter(
-                gamma_base_url="https://gamma-api.polymarket.com",
-                clob_base_url="https://clob.polymarket.com",
-            )
+        with operational_job_lock("discovery", timeout=args.lock_timeout):
+            # Construct adapter INSIDE lock
+            if args.allow_live:
+                adapter = _make_adapter()
 
-        # Perform async discovery (inside lock) BEFORE writable DB open
-        if adapter is not None:
-            discovery_result = asyncio.run(_async_discover_and_persist(adapter, bounds))
-        else:
-            discovery_result = {
-                "markets_requested": 0,
-                "markets_completed": 0,
-                "markets_partial": 0,
-                "markets_failed": 0,
-                "trades_examined": 0,
-                "candidates": [],
-            }
+            # Perform async discovery (inside lock) BEFORE writable DB open
+            if adapter is not None:
+                discovery_result = asyncio.run(discover_candidates(adapter, bounds))
+            else:
+                discovery_result = {
+                    "markets_requested": 0,
+                    "markets_completed": 0,
+                    "markets_partial": 0,
+                    "markets_failed": 0,
+                    "trades_examined": 0,
+                    "candidates": [],
+                }
 
-        if want_write:
-            # Open writable DB only AFTER discovery (inside lock)
-            db = ed.open_writable(args.db_path, args)
+            if want_write:
+                # Open writable DB only AFTER discovery (inside lock)
+                db = ed.open_writable(args.db_path, args)
+            else:
+                # Dry-run: open read-only DB for state lookup (inside lock)
+                db = ed.open_readonly(args.db_path)
 
-            # Persist candidates (inside lock, in transaction)
+            # Persist candidates (inside lock)
             result = persist_candidates(
                 db,
                 discovery_result,
                 add_to_watchlist=args.add_to_watchlist,
                 bounds=bounds,
-                perform_writes=True,
+                perform_writes=want_write,
             )
-            db.commit()
-        else:
-            # Dry-run: open read-only DB for state lookup (inside lock)
-            db = ed.open_readonly(args.db_path)
-            # Persist with perform_writes=False for read-only state check
-            result = persist_candidates(
-                db,
-                discovery_result,
-                add_to_watchlist=args.add_to_watchlist,
-                bounds=bounds,
-                perform_writes=False,
-            )
+
+            if want_write:
+                db.commit()
+
+    except LockError:
+        # Lock contention - return nonzero, no provider/DB constructed
+        print(json.dumps({"error": "lock_unavailable", "run_id": ""}))
+        return 4
+
     except Exception as e:  # noqa: BLE001
+        # Preserve original exception, attempt rollback, report error
         try:
             if db is not None:
                 db.rollback()
         except Exception:
             pass
         if result is None:
-            print(json.dumps({"error": str(e), "run_id": ""}, indent=2))
+            print(json.dumps({"error": str(e), "run_id": ""}))
         return 1
+
     finally:
         # Close DB
         try:
@@ -264,20 +220,11 @@ def main(argv: list[str] | None = None) -> int:
                 asyncio.run(adapter.aclose())
             except Exception:
                 pass
-        lock.__exit__(None, None, None)
 
     # Handle output
     out = result.as_dict()
     if args.output_json:
-        output_path = Path(args.output_json)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = output_path.with_suffix(".tmp")
-        try:
-            temp_path.write_text(json.dumps(out, indent=2))
-            os.replace(temp_path, output_path)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+        _write_json_atomic(Path(args.output_json), out)
     print(f"dry_run={out['dry_run']} "
           f"markets_requested={out['markets_requested']} "
           f"markets_completed={out['markets_completed']} "
