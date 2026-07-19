@@ -392,6 +392,7 @@ def persist_candidates(
         if perform_writes:
             wid, created = _upsert_wallet(db, canonical, perform_writes=True)
 
+            watch_id_to_set = None
             if created:
                 result.new_wallets += 1
                 if add_to_watchlist:
@@ -402,21 +403,31 @@ def persist_candidates(
                         watch_id_to_set = w_id
                     else:
                         result.watches_existing += 1
+                candidate_action = (
+                    "created_wallet_and_watch" if (created and add_to_watchlist)
+                    else "created_wallet"
+                )
+                candidate_reason = "created"
             else:
                 result.existing_wallets += 1
                 wid = str(existing[0])
-                watch_id_to_set = None
+                candidate_action = "existing_wallet"
+                candidate_reason = "wallet_already_exists"
                 if add_to_watchlist:
-                    watch = db.fetchone(
+                    existing_watch = db.fetchone(
                         """SELECT id FROM specialist_evidence_watchlist
                            WHERE wallet_id = ? AND status = 'active'""",
                         (wid,))
-                    if watch:
+                    if existing_watch is not None:
                         result.watches_existing += 1
+                        candidate_action = "existing_wallet_and_watch"
+                        candidate_reason = "active_watch_already_exists"
                     else:
                         watch_id_to_set, w_created = _add_watch_idempotent(
                             db, wid, "discovery", "bounded research-wallet discovery (PR72)", perform_writes=True)
                         result.watches_created += 1
+                        candidate_action = "created_watch_for_existing_wallet"
+                        candidate_reason = "active_watch_missing"
 
             # Record candidate with proper provenance
             candidate = {
@@ -429,8 +440,8 @@ def persist_candidates(
                 "existing_wallet_id": wid if not created else None,
                 "existing_watch_id": None,
                 "created_watch_id": None,
-                "action": "created_wallet_and_watch" if created and add_to_watchlist else ("created_wallet" if created else "existing_wallet"),
-                "reason": "created" if created else "wallet_already_exists",
+                "action": candidate_action,
+                "reason": candidate_reason,
             }
 
             # Add watch IDs if applicable
@@ -439,9 +450,11 @@ def persist_candidates(
                     """SELECT id FROM specialist_evidence_watchlist
                        WHERE wallet_id = ? AND status = 'active'""",
                     (wid,))
-                if watch:
+                # If we just CREATED the active watch this run, report it as
+                # created_watch_id only (never double-tag as existing_watch_id).
+                if watch is not None and watch_id_to_set is None:
                     candidate["existing_watch_id"] = str(watch[0])
-                if watch_id_to_set:
+                if watch_id_to_set is not None:
                     candidate["created_watch_id"] = str(watch_id_to_set)
         else:
             # Dry-run: check existing state for reporting
@@ -467,9 +480,15 @@ def persist_candidates(
                     """SELECT id FROM specialist_evidence_watchlist
                        WHERE wallet_id = ? AND status = 'active'""",
                     (wid,))
-                if watch:
+                if watch is not None:
                     candidate["existing_watch_id"] = str(watch[0])
+                    candidate["action"] = "existing_wallet_and_watch"
+                    candidate["reason"] = "active_watch_already_exists"
                     result.watches_existing += 1
+                elif add_to_watchlist:
+                    candidate["action"] = "would_create_watch_for_existing_wallet"
+                    candidate["reason"] = "active_watch_missing"
+                    result.would_create_watches += 1
             else:
                 candidate = {
                     "address": _redact(canonical),

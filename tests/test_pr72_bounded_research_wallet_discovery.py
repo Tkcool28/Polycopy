@@ -50,6 +50,7 @@ from polycopy.ingestion.bounded_research_wallet_discovery import (  # noqa: E402
     persist_candidates,
 )
 import evidence_db as ed  # noqa: E402
+import discover_research_wallets  # noqa: E402  (real CLI under test)
 
 # All tables that must remain unchanged (forbidden writes)
 FORBIDDEN_TABLES = [
@@ -1182,7 +1183,7 @@ def test_adapter_closes_on_dry_run_success():
         discover_research_wallets.operational_job_lock = original_lock
         discover_research_wallets._make_adapter = original_make_adapter
 
-    assert "adapter_close" in close_called or True, "Adapter should be closed on dry-run"
+    assert close_called == [True], "Adapter aclose must be called exactly once on dry-run success"
 
 
 # ── raw-address promotion is impossible ────────────────────────────────────────────
@@ -1311,6 +1312,711 @@ async def test_duplicate_rejected_reports_real_duplicates():
         db.close()
 
     assert result.duplicate_rejected == 1, f"Expected 1 duplicate rejected, got {result.duplicate_rejected}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════════
+# PR #72 final repair proof suite (real main() integration)
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def _patch_main_seams(make_adapter=None, op_lock=None):
+    """Patch discover_research_wallets main() seams; returns originals dict."""
+    import discover_research_wallets as cli
+    orig = {
+        "_make_adapter": cli._make_adapter,
+        "operational_job_lock": cli.operational_job_lock,
+        "discover_candidates": cli.discover_candidates,
+        "persist_candidates": cli.persist_candidates,
+        "ed_open_readonly": ed.open_readonly,
+        "ed_open_writable": ed.open_writable,
+    }
+    if make_adapter is not None:
+        cli._make_adapter = make_adapter
+    if op_lock is not None:
+        cli.operational_job_lock = op_lock
+    return orig
+
+
+def _restore_main_seams(orig):
+    import discover_research_wallets as cli
+    cli._make_adapter = orig["_make_adapter"]
+    cli.operational_job_lock = orig["operational_job_lock"]
+    cli.discover_candidates = orig["discover_candidates"]
+    cli.persist_candidates = orig["persist_candidates"]
+    ed.open_readonly = orig["ed_open_readonly"]
+    ed.open_writable = orig["ed_open_writable"]
+
+
+class _CloseCountingAdapter:
+    """Async adapter that records aclose() calls exactly once-observable."""
+    def __init__(self, trades=None, fail_at=None):
+        self.trades = trades or []
+        self.fail_at = fail_at  # "list", "fetch", "persist", "commit"
+        self.close_calls = 0
+
+    async def list_active_markets(self, limit=100, offset=0):
+        if self.fail_at == "list":
+            raise RuntimeError("simulated provider construction/network failure")
+        class M:
+            source_id = "0x" + "1" * 64
+        return [M()]
+
+    async def fetch_trades_for_market(self, **kwargs):
+        if self.fail_at == "fetch":
+            raise RuntimeError("simulated network failure during fetch")
+        return MarketTradeFetchResult(
+            trades=[_make_fake_trade(a) for a in self.trades],
+            status="complete", market_source_id=kwargs.get("market_source_id"))
+
+    async def aclose(self):
+        self.close_calls += 1
+
+
+class _NoOpLock:
+    def __enter__(self):
+        return True
+    def __exit__(self, *args):
+        return False
+
+
+# ── §9: real main() failure/close tests (exactly-once aclose) ─────────────────────
+def test_main_dry_run_success_closes_adapter_once():
+    p = _fresh_v21_db()
+    adapter = _CloseCountingAdapter(trades=[_valid_address(0xA1)])
+    orig = _patch_main_seams(make_adapter=lambda: adapter, op_lock=lambda *a, **kw: _NoOpLock())
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--dry-run", "--allow-live", "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+    assert rc == 0
+    assert adapter.close_calls == 1
+    p.unlink()
+
+
+def test_main_dry_run_network_failure_closes_adapter_once_and_fails():
+    p = _fresh_v21_db()
+    adapter = _CloseCountingAdapter(trades=[_valid_address(0xA1)], fail_at="fetch")
+    orig = _patch_main_seams(make_adapter=lambda: adapter, op_lock=lambda *a, **kw: _NoOpLock())
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--dry-run", "--allow-live", "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+    assert rc != 0
+    assert adapter.close_calls == 1
+    p.unlink()
+
+
+def test_main_write_success_closes_adapter_once():
+    p = _fresh_v21_db()
+    adapter = _CloseCountingAdapter(trades=[_valid_address(0xA1)])
+    orig = _patch_main_seams(make_adapter=lambda: adapter, op_lock=lambda *a, **kw: _NoOpLock())
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+    assert rc == 0
+    assert adapter.close_calls == 1
+    p.unlink()
+
+
+def test_main_write_persistence_failure_closes_adapter_once_and_fails():
+    p = _fresh_v21_db()
+    adapter = _CloseCountingAdapter(trades=[_valid_address(0xA1)])
+    orig = _patch_main_seams(make_adapter=lambda: adapter, op_lock=lambda *a, **kw: _NoOpLock())
+    # Force persist_candidates to raise
+    def _boom(db, discovery_result, **kwargs):
+        raise RuntimeError("simulated persistence failure")
+    discover_research_wallets.persist_candidates = _boom
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+    assert rc != 0
+    assert adapter.close_calls == 1
+    p.unlink()
+
+
+def test_main_write_commit_failure_closes_adapter_once_and_fails():
+    p = _fresh_v21_db()
+    adapter = _CloseCountingAdapter(trades=[_valid_address(0xA1)])
+    # Make writable open install a commit-time failure hook
+    orig_open = ed.open_writable
+    def _open_failing(path, args):
+        db = orig_open(str(path), args)
+        db._COMMIT_FAIL_HOOK = RuntimeError("simulated commit failure")
+        return db
+    ed.open_writable = _open_failing
+    orig = _patch_main_seams(make_adapter=lambda: adapter, op_lock=lambda *a, **kw: _NoOpLock())
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+        ed.open_writable = orig_open
+    assert rc != 0
+    assert adapter.close_calls == 1
+    p.unlink()
+
+
+# ── §7: structured failure JSON carries status=failed + original text ───────────────
+def test_main_failure_emits_structured_failed_json(capsys):
+    p = _fresh_v21_db()
+    adapter = _CloseCountingAdapter(trades=[_valid_address(0xA1)])
+    orig = _patch_main_seams(make_adapter=lambda: adapter, op_lock=lambda *a, **kw: _NoOpLock())
+    def _boom(db, discovery_result, **kwargs):
+        raise ValueError("boom-original-text")
+    discover_research_wallets.persist_candidates = _boom
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+    assert rc != 0
+    # main() prints structured failure JSON to stdout on the exception path
+    out = capsys.readouterr().out
+    assert "status" in out and "failed" in out, f"failure JSON missing: {out!r}"
+    payload = json.loads(out)
+    assert payload["status"] == "failed"
+    assert "boom-original-text" in payload["error"]
+    p.unlink()
+
+
+# ── §10: lock contention -> rc 4, zero side effects ───────────────────────────────
+def test_main_lock_contention_zero_side_effects():
+    p = _fresh_v21_db()
+    from polycopy.runtime.locks import LockError
+    provider_calls = []
+    network_calls = []
+    ro_opens = []
+    rw_opens = []
+    persist_calls = []
+
+    class _ContendedLock:
+        def __enter__(self):
+            raise LockError("/tmp/test.lock", timeout=30.0)
+        def __exit__(self, *args):
+            return False
+
+    class _SpyAdapter:
+        async def list_active_markets(self, limit=100, offset=0):
+            provider_calls.append("provider")
+            return []
+        async def fetch_trades_for_market(self, **kwargs):
+            network_calls.append("network")
+            return MarketTradeFetchResult(trades=[], status="complete")
+        async def aclose(self):
+            pass
+
+    orig = _patch_main_seams(
+        make_adapter=lambda: _SpyAdapter(),
+        op_lock=lambda *a, **kw: _ContendedLock())
+    real_open_ro = ed.open_readonly
+    real_open_rw = ed.open_writable
+    real_persist = discover_research_wallets.persist_candidates
+    def _ro(path, args):
+        ro_opens.append("ro")
+        return real_open_ro(str(path), args)
+    def _rw(path, args):
+        rw_opens.append("rw")
+        return real_open_rw(str(path), args)
+    def _persist(db, dr, **kw):
+        persist_calls.append("persist")
+        return real_persist(db, dr, **kw)
+    ed.open_readonly = _ro
+    ed.open_writable = _rw
+    discover_research_wallets.persist_candidates = _persist
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+        ed.open_readonly = real_open_ro
+        ed.open_writable = real_open_rw
+    assert rc == 4
+    assert provider_calls == []
+    assert network_calls == []
+    assert ro_opens == []
+    assert rw_opens == []
+    assert persist_calls == []
+    # structured output includes status=failed / error=lock_unavailable
+    # (captured via stdout; main prints JSON to stdout on lock path)
+    p.unlink()
+
+
+# ── §11: exact call-order proofs (write + dry-run) ────────────────────────────────
+def test_main_write_call_order_exact():
+    p = _fresh_v21_db()
+    order = []
+
+    class _OrderAdapter:
+        async def list_active_markets(self, limit=100):
+            order.append("network")
+            class M:
+                source_id = "0x" + "1" * 64
+            return [M()]
+        async def fetch_trades_for_market(self, **kwargs):
+            order.append("network")
+            return MarketTradeFetchResult(trades=[_make_fake_trade(_valid_address(0xA1))],
+                                          status="complete", market_source_id="m")
+        async def aclose(self):
+            order.append("adapter_close")
+
+    class _OrderLock:
+        def __enter__(self):
+            order.append("lock")
+            return True
+        def __exit__(self, *args):
+            return False
+
+    orig = _patch_main_seams(
+        make_adapter=lambda: _OrderAdapter(),
+        op_lock=lambda *a, **kw: _OrderLock())
+    real_open_rw = ed.open_writable
+    real_persist = discover_research_wallets.persist_candidates
+    def _rw(path, args):
+        db = real_open_rw(str(path), args)
+        real_close = db.close
+        def _close():
+            order.append("db_close")
+            real_close()
+        db.close = _close
+        order.append("writable_db_open")
+        return db
+    def _persist(db, dr, **kw):
+        order.append("persist")
+        return real_persist(db, dr, **kw)
+    ed.open_writable = _rw
+    discover_research_wallets.persist_candidates = _persist
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--write", "--allow-live", "--confirm-production-db",
+            "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+        ed.open_writable = real_open_rw
+    assert rc == 0
+    # Exact sequence: lock -> network -> network -> writable_db_open -> persist -> db_close -> adapter_close
+    tail = order[order.index("lock"):]
+    assert tail == ["lock", "network", "network", "writable_db_open", "persist",
+                    "db_close", "adapter_close"], tail
+    p.unlink()
+
+
+def test_main_dry_run_call_order_exact():
+    p = _fresh_v21_db()
+    order = []
+
+    class _OrderAdapter:
+        async def list_active_markets(self, limit=100):
+            order.append("network")
+            class M:
+                source_id = "0x" + "1" * 64
+            return [M()]
+        async def fetch_trades_for_market(self, **kwargs):
+            order.append("network")
+            return MarketTradeFetchResult(trades=[_make_fake_trade(_valid_address(0xA1))],
+                                          status="complete", market_source_id="m")
+        async def aclose(self):
+            order.append("adapter_close")
+
+    class _OrderLock:
+        def __enter__(self):
+            order.append("lock")
+            return True
+        def __exit__(self, *args):
+            return False
+
+    orig = _patch_main_seams(
+        make_adapter=lambda: _OrderAdapter(),
+        op_lock=lambda *a, **kw: _OrderLock())
+    real_open_ro = ed.open_readonly
+    real_persist = discover_research_wallets.persist_candidates
+    def _ro(db_path, args=None):
+        db = real_open_ro(str(db_path))
+        real_close = db.close
+        def _close():
+            order.append("db_close")
+            real_close()
+        db.close = _close
+        order.append("readonly_db_open")
+        return db
+    def _persist(db, dr, **kw):
+        order.append("persist")
+        return real_persist(db, dr, **kw)
+    ed.open_readonly = _ro
+    discover_research_wallets.persist_candidates = _persist
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p), "--dry-run", "--allow-live", "--market-limit", "5"])
+    finally:
+        _restore_main_seams(orig)
+        ed.open_readonly = real_open_ro
+    assert rc == 0
+    tail = order[order.index("lock"):]
+    assert tail == ["lock", "network", "network", "readonly_db_open", "persist",
+                    "db_close", "adapter_close"], tail
+    p.unlink()
+
+
+# ── §12: real PR #72 -> PR #71 build_status handoff via main() ───────────────────
+def _load_status_module():
+    import importlib.util
+    s = importlib.util.spec_from_file_location(
+        "specialist_evidence_status_pr72", ROOT / "scripts" / "specialist_evidence_status.py")
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    return m
+
+
+EXEC_DELTA_TABLES = [
+    "specialist_approvals",
+    "approved_specialist_trade_dispatches",
+    "copy_candidates",
+    "candidate_price_snapshots",
+    "paper_signal_decisions",
+    "paper_signal_execution_authorizations",
+    "execution_risk_decisions",
+    "paper_orders",
+    "paper_fills",
+    "paper_positions",
+    "paper_position_lots",
+    "paper_position_marks",
+    "paper_position_settlements",
+]
+
+
+def test_pr72_cli_creates_watches_visible_to_pr71_build_status():
+    """PR #72 CLI main() creates 5 wallets + 5 watches; PR #71 build_status sees them."""
+    p = _fresh_v21_db()
+    fakes = [_valid_address(i) for i in range(0xA1, 0xA6)]  # 5 addresses
+
+    class _FakeAdapter:
+        async def list_active_markets(self, limit=100, offset=0):
+            class M:
+                source_id = "0x" + "1" * 64
+            return [M()]
+        async def fetch_trades_for_market(self, **kwargs):
+            return MarketTradeFetchResult(
+                trades=[_make_fake_trade(a) for a in fakes],
+                status="complete", market_source_id="0x" + "1" * 64)
+        async def aclose(self):
+            pass
+
+    orig = _patch_main_seams(
+        make_adapter=lambda: _FakeAdapter(),
+        op_lock=lambda *a, **kw: _NoOpLock())
+    try:
+        rc = discover_research_wallets.main([
+            "--db-path", str(p),
+            "--write", "--allow-live", "--confirm-production-db",
+            "--add-to-watchlist",
+            "--market-limit", "5", "--trade-limit-per-market", "100", "--max-wallets", "5"])
+    finally:
+        _restore_main_seams(orig)
+    assert rc == 0
+
+    # Exactly five non-sample wallet rows
+    conn = Database(p).connect()
+    wallet_rows = conn.execute(
+        "SELECT COUNT(*) FROM wallets WHERE is_sample = 0").fetchone()[0]
+    assert wallet_rows == 5, f"expected 5 non-sample wallets, got {wallet_rows}"
+    watch_rows = conn.execute(
+        "SELECT COUNT(*) FROM specialist_evidence_watchlist WHERE status = 'active'").fetchone()[0]
+    assert watch_rows == 5, f"expected 5 active watches, got {watch_rows}"
+
+    # Invoke the ACCEPTED PR #71 build_status against the CLI-created DB
+    status_mod = _load_status_module()
+    sdb = ed.open_readonly(str(p))
+    try:
+        out = status_mod.build_status(sdb)
+    finally:
+        sdb.close()
+
+    # All five CLI-created watches must be visible through build_status
+    assert out["active_watch_count"] == 5, \
+        f"PR #71 build_status should see 5 active watches, saw {out.get('active_watch_count')}"
+
+    # Zero deltas in the execution-plane tables
+    for t in EXEC_DELTA_TABLES:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
+        if exists is not None:
+            cnt = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            assert cnt == 0, f"execution-plane table {t} had {cnt} rows after CLI run"
+    conn.close()
+    p.unlink()
+
+
+# ── §13: complete SQL write-trace parsing (exact allowed-set) ─────────────────────
+@pytest.mark.asyncio
+async def test_sql_write_trace_exact_allowed_set():
+    """set_trace_callback captures every write; only wallets + watchlist are written."""
+    p = _fresh_v21_db()
+    fakes = [_valid_address(i) for i in range(0xA1, 0xA4)]
+    sql_statements = []
+
+    async def mock_list(limit=100, offset=0):
+        class M:
+            source_id = "0x" + "1" * 64
+        return [M()]
+    async def mock_fetch(**kwargs):
+        return MarketTradeFetchResult(
+            trades=[_make_fake_trade(a) for a in fakes],
+            status="complete", market_source_id="0x" + "1" * 64)
+
+    adapter = MagicMock()
+    adapter.list_active_markets = AsyncMock(side_effect=mock_list)
+    adapter.fetch_trades_for_market = AsyncMock(side_effect=mock_fetch)
+
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    conn = db.conn
+    conn.set_trace_callback(lambda s: sql_statements.append(s))
+    import re as _re
+    written_tables = set()
+    unparsed = []
+    try:
+        dr = await discover_candidates(adapter, {"market_limit": 5, "trade_limit_per_market": 50, "max_wallets": 5})
+        persist_candidates(db, dr, add_to_watchlist=True,
+                                     bounds={"market_limit": 5, "trade_limit_per_market": 50, "max_wallets": 5},
+                                     perform_writes=True)
+        db.commit()
+    finally:
+        conn.set_trace_callback(None)
+        db.close()
+
+    for stmt in sql_statements:
+        s = stmt.strip()
+        u = s.upper()
+        m = _re.match(r'^(INSERT\s+OR\s+\w+|INSERT|UPDATE|DELETE|REPLACE)\s+', u)
+        if not m:
+            continue
+        kw = m.group(1)
+        if kw.startswith("INSERT"):
+            tm = _re.search(r'INTO\s+(\w+)', u)
+        elif kw == "UPDATE":
+            tm = _re.search(r'UPDATE\s+(\w+)', u)
+        elif kw == "DELETE":
+            tm = _re.search(r'FROM\s+(\w+)', u)
+        else:
+            tm = None
+        if tm is None:
+            unparsed.append(s[:80])
+            continue
+        written_tables.add(tm.group(1).lower())
+
+    assert not unparsed, f"unparsed write statements: {unparsed}"
+    assert written_tables == {"wallets", "specialist_evidence_watchlist"}, written_tables
+
+    # separately: forbidden-table counts unchanged
+    conn = Database(p).connect()
+    for t in FORBIDDEN_TABLES:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone():
+            cnt = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            assert cnt == 0, f"forbidden table {t} has {cnt} rows"
+    conn.close()
+
+
+# ── §14: six exact watch-output cases ─────────────────────────────────────────────
+@pytest.mark.asyncio
+async def _make_one_candidate(db, addr, add_to_watchlist, perform_writes):
+    class _A:
+        async def list_active_markets(self, limit=100):
+            class M:
+                source_id = "0x" + "1" * 64
+            return [M()]
+        async def fetch_trades_for_market(self, **kwargs):
+            return MarketTradeFetchResult(
+                trades=[_make_fake_trade(addr)], status="complete",
+                market_source_id="0x" + "1" * 64)
+    adapter = _A()
+    dr = await discover_candidates(adapter, {"market_limit": 5, "max_wallets": 5})
+    return persist_candidates(db, dr, add_to_watchlist=add_to_watchlist,
+                              bounds={"market_limit": 5, "max_wallets": 5},
+                              perform_writes=perform_writes)
+
+
+def _assert_case(c, expected):
+    for k, v in expected.items():
+        assert c.get(k) == v, f"field {k}: expected {v!r}, got {c.get(k)!r}"
+
+
+@pytest.mark.asyncio
+async def test_case_new_wallet_no_watch():
+    p = _fresh_v21_db()
+    addr = _valid_address(0xA1)
+    db = ed.open_writable(str(p), _fake_args(write=True))
+    try:
+        result = await _make_one_candidate(db, addr, add_to_watchlist=False, perform_writes=True)
+        db.commit()
+    finally:
+        db.close()
+    c = result.candidates[0]
+    _assert_case(c, {
+        "action": "created_wallet", "reason": "created",
+        "existing_wallet_id": None, "created_wallet_id": c["created_wallet_id"],
+        "existing_watch_id": None, "created_watch_id": None,
+    })
+    assert result.existing_wallets == 0 and result.would_create_wallets == 0
+    assert result.new_wallets == 1 and result.watches_existing == 0
+    assert result.would_create_watches == 0 and result.watches_created == 0
+    assert c["created_wallet_id"] is not None
+    p.unlink()
+
+
+@pytest.mark.asyncio
+async def test_case_new_wallet_new_watch():
+    p = _fresh_v21_db()
+    addr = _valid_address(0xA2)
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    try:
+        result = await _make_one_candidate(db, addr, add_to_watchlist=True, perform_writes=True)
+        db.commit()
+    finally:
+        db.close()
+    c = result.candidates[0]
+    _assert_case(c, {
+        "action": "created_wallet_and_watch", "reason": "created",
+        "existing_wallet_id": None, "created_wallet_id": c["created_wallet_id"],
+        "existing_watch_id": None, "created_watch_id": c["created_watch_id"],
+    })
+    assert result.new_wallets == 1 and result.watches_created == 1
+    assert c["created_wallet_id"] is not None and c["created_watch_id"] is not None
+    p.unlink()
+
+
+@pytest.mark.asyncio
+async def test_case_existing_wallet_existing_watch():
+    p = _fresh_v21_db()
+    addr = _valid_address(0xA3)
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    try:
+        db.conn.execute(
+            "INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("wa_e", addr, addr, "e", 0, "2024-01-01T00:00:00Z"))
+        db.conn.execute(
+            "INSERT INTO specialist_evidence_watchlist (id, wallet_id, status, source, reason, created_by, created_at, max_new_trades_per_run) "
+            "VALUES (?, ?, 'active', 'discovery', 'prior', 'discovery', '2024-01-01T00:00:00Z', 25)",
+            ("sew_e", "wa_e"))
+        db.commit()
+    finally:
+        db.close()
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    try:
+        result = await _make_one_candidate(db, addr, add_to_watchlist=True, perform_writes=True)
+        db.commit()
+    finally:
+        db.close()
+    c = result.candidates[0]
+    _assert_case(c, {
+        "action": "existing_wallet_and_watch", "reason": "active_watch_already_exists",
+        "existing_wallet_id": "wa_e", "created_wallet_id": None,
+        "existing_watch_id": "sew_e", "created_watch_id": None,
+    })
+    assert result.existing_wallets == 1 and result.watches_existing == 1
+    assert result.new_wallets == 0 and result.watches_created == 0
+    p.unlink()
+
+
+@pytest.mark.asyncio
+async def test_case_existing_wallet_newly_created_watch():
+    p = _fresh_v21_db()
+    addr = _valid_address(0xA4)
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    try:
+        db.conn.execute(
+            "INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("wa_x", addr, addr, "x", 0, "2024-01-01T00:00:00Z"))
+        db.commit()
+    finally:
+        db.close()
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    try:
+        result = await _make_one_candidate(db, addr, add_to_watchlist=True, perform_writes=True)
+        db.commit()
+    finally:
+        db.close()
+    c = result.candidates[0]
+    _assert_case(c, {
+        "action": "created_watch_for_existing_wallet", "reason": "active_watch_missing",
+        "existing_wallet_id": "wa_x", "created_wallet_id": None,
+        "existing_watch_id": None, "created_watch_id": c["created_watch_id"],
+    })
+    assert result.existing_wallets == 1 and result.watches_created == 1
+    assert result.watches_existing == 0 and result.new_wallets == 0
+    assert c["created_watch_id"] is not None
+    p.unlink()
+
+
+@pytest.mark.asyncio
+async def test_case_dry_run_existing_wallet_existing_watch():
+    p = _fresh_v21_db()
+    addr = _valid_address(0xA5)
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    try:
+        db.conn.execute(
+            "INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("wa_d", addr, addr, "d", 0, "2024-01-01T00:00:00Z"))
+        db.conn.execute(
+            "INSERT INTO specialist_evidence_watchlist (id, wallet_id, status, source, reason, created_by, created_at, max_new_trades_per_run) "
+            "VALUES (?, ?, 'active', 'discovery', 'prior', 'discovery', '2024-01-01T00:00:00Z', 25)",
+            ("sew_d", "wa_d"))
+        db.commit()
+    finally:
+        db.close()
+    db = ed.open_readonly(str(p))
+    try:
+        result = await _make_one_candidate(db, addr, add_to_watchlist=True, perform_writes=False)
+    finally:
+        db.close()
+    c = result.candidates[0]
+    _assert_case(c, {
+        "action": "existing_wallet_and_watch", "reason": "active_watch_already_exists",
+        "existing_wallet_id": "wa_d", "created_wallet_id": None,
+        "existing_watch_id": "sew_d", "created_watch_id": None,
+    })
+    assert result.existing_wallets == 1 and result.watches_existing == 1
+    assert result.would_create_watches == 0
+    p.unlink()
+
+
+@pytest.mark.asyncio
+async def test_case_dry_run_existing_wallet_would_create_watch():
+    p = _fresh_v21_db()
+    addr = _valid_address(0xA6)
+    db = ed.open_writable(str(p), _fake_args(write=True, add_to_watchlist=True))
+    try:
+        db.conn.execute(
+            "INSERT INTO wallets (id, address, canonical_address, label, is_sample, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("wa_w", addr, addr, "w", 0, "2024-01-01T00:00:00Z"))
+        db.commit()
+    finally:
+        db.close()
+    db = ed.open_readonly(str(p))
+    try:
+        result = await _make_one_candidate(db, addr, add_to_watchlist=True, perform_writes=False)
+    finally:
+        db.close()
+    c = result.candidates[0]
+    _assert_case(c, {
+        "action": "would_create_watch_for_existing_wallet", "reason": "active_watch_missing",
+        "existing_wallet_id": "wa_w", "created_wallet_id": None,
+        "existing_watch_id": None, "created_watch_id": None,
+    })
+    assert result.existing_wallets == 1
+    assert result.would_create_watches == 1 and result.watches_existing == 0
+    p.unlink()
 
 
 # ── Helper: valid address generation ───────────────────────────────────────────────

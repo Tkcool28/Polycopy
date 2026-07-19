@@ -198,13 +198,13 @@ def main(argv: list[str] | None = None) -> int:
 
     except Exception as e:  # noqa: BLE001
         # Preserve original exception, attempt rollback, report error
+        run_id = result.run_id if result is not None else ""
         try:
             if db is not None:
                 db.rollback()
         except Exception:
             pass
-        if result is None:
-            print(json.dumps({"error": str(e), "run_id": ""}))
+        print(json.dumps({"error": str(e), "run_id": run_id, "status": "failed"}))
         return 1
 
     finally:
