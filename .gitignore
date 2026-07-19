@@ -59,6 +59,8 @@ observations/24h_*
 observations/post-pr22-24h/
 reports/pr24z_backup_*
 reports/pr24z_deletion_*
+.env
+.mypy_cache/
 node_modules/
 frontend/node_modules/
 dist/
