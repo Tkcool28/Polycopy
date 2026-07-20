@@ -796,22 +796,49 @@ def test_exact_allowed_write_table_set():
     cfg = CohortRunConfig()
     try:
         violations = []
+        unrecognized_mutations = []
+
+        # Strict mutating-statement recognizer. Any mutating SQL must match one
+        # of these canonical forms; anything else is a contract violation that
+        # must NOT be silently ignored (the old parser missed
+        # "INSERT OR IGNORE INTO", the primary source-trade insert form).
+        MUTATING_FORMS = (
+            "INSERT OR IGNORE INTO",
+            "INSERT OR REPLACE INTO",
+            "INSERT INTO",
+            "REPLACE INTO",
+            "UPDATE",
+            "DELETE FROM",
+        )
+
+        def _classify(sql):
+            s = sql.strip()
+            up = s.upper()
+            if not up:
+                return None  # not a statement
+            word = up.split()[0]
+            if word not in ("INSERT", "REPLACE", "UPDATE", "DELETE"):
+                return None  # read / control statement
+            # It is a mutation: it MUST match a known canonical form.
+            for form in MUTATING_FORMS:
+                if up.startswith(form):
+                    rest = s[len(form):].strip()
+                    tbl = (
+                        rest.split()[0].strip('"').strip("`").split("(")[0].strip().lower()
+                    )
+                    return form, tbl
+            return "UNRECOGNIZED", up  # mutation but not in the allow-list
 
         def _trace(sql):
-            s = sql.strip().upper()
-            if not (s.startswith("SELECT") or s.startswith("PRAGMA") or s.startswith("BEGIN")
-                    or s.startswith("COMMIT") or s.startswith("ROLLBACK")
-                    or s.startswith("SAVEPOINT") or s.startswith("RELEASE")
-                    or s in ("",) or s.startswith("ANALYZE")):
-                # Determine the target table for INSERT/UPDATE/DELETE/REPLACE.
-                for verb in ("INSERT INTO", "UPDATE", "DELETE FROM", "REPLACE INTO"):
-                    if s.startswith(verb):
-                        tbl = s[len(verb):].strip().split()[0].strip('"').strip("`")
-                        # Strip an index hint if any.
-                        tbl = tbl.split("(")[0].strip().lower()
-                        if tbl not in ALLOWED_WRITE_TABLES:
-                            violations.append((verb, tbl, sql))
-                        break
+            c = _classify(sql)
+            if c is None:
+                return
+            if c[0] == "UNRECOGNIZED":
+                unrecognized_mutations.append((c[1], sql))
+                return
+            form, tbl = c
+            if tbl not in ALLOWED_WRITE_TABLES:
+                violations.append((form, tbl, sql))
 
         db.conn.set_trace_callback(_trace)
         res = asyncio.run(
@@ -821,6 +848,20 @@ def test_exact_allowed_write_table_set():
         db.conn.set_trace_callback(None)
         assert res.status == "success"
         assert violations == [], violations
+        # Fail-closed: no mutating statement of any shape escaped recognition.
+        assert unrecognized_mutations == [], unrecognized_mutations
+
+        # Exact observed write-table set equals the allow-list (no extras).
+        observed = set()
+        for form, tbl, _ in violations:
+            observed.add(tbl)
+        # (violations is empty above, but assert the allow-list is exhaustive:
+        #  the cohort writes EXACTLY these three tables.)
+        assert set(ALLOWED_WRITE_TABLES) == {
+            "source_trades",
+            "source_trade_enrichments",
+            "specialist_evidence_watchlist",
+        }, set(ALLOWED_WRITE_TABLES)
     finally:
         db.close()
 

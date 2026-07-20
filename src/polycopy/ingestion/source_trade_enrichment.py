@@ -46,6 +46,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+# Local import (no cycle): gamma_budget imports only stdlib/typing.
+from polycopy.ingestion.gamma_budget import GammaBudgetExhausted
+
 from polycopy.ingestion.canonical_metadata import (
     MERGE_CONFLICT,
     MERGE_UNAVAILABLE,
@@ -162,8 +165,6 @@ def resolve_gamma_state(
     gamma_resolver: Callable[[str], Any], condition_id: str
 ) -> tuple[Optional[dict[str, Any]], str, Optional[str]]:
     """Resolve one condition id through the real Gamma route, distinguishing:
-
-      * found            -> authoritative Gamma dict returned
       * not_found        -> resolver returned None (no exact match)
       * provider_error    -> exception raised (NEVER conflated with not_found)
       * ambiguous        -> resolver signalled an ambiguous selection
@@ -176,6 +177,10 @@ def resolve_gamma_state(
     """
     try:
         market = _call_gamma_resolver(gamma_resolver, condition_id)
+    except GammaBudgetExhausted:
+        # A cohort-wide Gamma budget exhaustion is a hard, structured stop
+        # signal — never downgrade it to provider_error/not-found.
+        raise
     except ValueError as exc:
         msg = str(exc)
         if "ambiguous" in msg:

@@ -11,7 +11,9 @@ Bounds (fail-closed):
   * NO wallet-address selector, NO discovery, NO implicit "all active" expansion.
 
 Execution model:
-  * validate all watch ids BEFORE any network/provider/DB-mutating activity;
+  * validate watch COUNT / FORMAT / DUPLICATES WITHOUT opening a database;
+  * validate active / missing / sample semantics through READ-ONLY access;
+  * apply the production write gates;
   * acquire the GLOBAL operational lock ONCE for the whole cohort;
   * construct the provider only AFTER the lock is held;
   * call the accepted underlying collector once per watch, deterministically,
@@ -19,12 +21,15 @@ Execution model:
   * commit the ENTIRE cohort as one transaction, or roll the whole cohort
     back on the first unhandled watch failure.
 
-Write gates (PR68 pattern, shared with the single-watch CLI):
-  * --dry-run (default): open read-only, ZERO writes, full reporting.
-  * production write requires: --write --allow-live --confirm-production-db
-    (mutually exclusive with --dry-run).
-  * gate validation runs BEFORE provider construction / network / DB-open /
-    persistence; the global lock is held before any provider/network activity.
+PR #73 correction 6 — invalid watch sets are rejected BEFORE any writable
+database open. The CLI opens the writable connection ONLY after:
+  (1) count/format/duplicate validation (no DB);
+  (2) read-only semantic validation (active/missing/sample);
+  (3) the production write gates;
+  (4) the operational lock is held.
+Provider construction and network work happen only behind the lock. A zero /
+six / malformed / duplicate watch-id set exits with code 2 and NEVER opens the
+writable database, never constructs the adapter, and never makes a network call.
 
 No approval / dispatch / candidate / paper-signal / execution write is ever
 performed. Todd must separately authorize any production run.
@@ -48,8 +53,10 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
 from polycopy.ingestion import specialist_evidence_cohort as cohort  # noqa: E402
 from polycopy.ingestion.specialist_evidence_cohort import (  # noqa: E402
     CohortRunConfig,
+    CohortValidationError,
     build_run_config,
     run_cohort,
+    validate_watch_ids,
 )
 from evidence_db import (  # noqa: E402
     open_readonly,
@@ -94,10 +101,43 @@ def _atomic_write_json(path: str, payload: dict) -> None:
         raise
 
 
+# ── Pre-DB validation of the explicit watch set (fail-closed, exit 2) ───────
+_WATCH_ID_RE = cohort._WATCH_ID_RE
+MIN_WATCH_IDS = cohort.MIN_WATCH_IDS
+MAX_WATCH_IDS = cohort.MAX_WATCH_IDS
+
+
+def _validate_watch_set_shape(watch_ids: list[str]) -> None:
+    """Validate count / format / duplicates WITHOUT any database access.
+
+    Raises ``CohortValidationError`` (caught by main -> exit 2) on any failure.
+    """
+    if not (MIN_WATCH_IDS <= len(watch_ids) <= MAX_WATCH_IDS):
+        raise CohortValidationError(
+            f"watch id count must be between {MIN_WATCH_IDS} and "
+            f"{MAX_WATCH_IDS}, got {len(watch_ids)}",
+            rejected_watch_ids=list(watch_ids),
+        )
+    malformed = [i for i in watch_ids if not _WATCH_ID_RE.match(i or "")]
+    if malformed:
+        raise CohortValidationError(
+            f"malformed watch id(s): {malformed}", rejected_watch_ids=malformed
+        )
+    seen: dict[str, int] = {}
+    for i in watch_ids:
+        seen[i] = seen.get(i, 0) + 1
+    duplicates = [i for i, c in seen.items() if c > 1]
+    if duplicates:
+        raise CohortValidationError(
+            f"duplicate watch id(s) supplied: {duplicates}",
+            rejected_watch_ids=duplicates,
+        )
+
+
 async def _async_run(db, args, adapter) -> cohort.CohortResult:
     cfg: CohortRunConfig = build_run_config(args)
-    # No gamma resolver injected here; the cohort layer builds a real resolver
-    # only when --resolve-gamma is set (network). Tests pass a fake adapter.
+    # The cohort layer builds the real Gamma resolver only when resolve_gamma
+    # is set; in tests a fake gamma resolver is injected via the adapter spec.
     return await run_cohort(
         db,
         watch_ids=args.watch_ids,
@@ -119,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--watch-ids-file", default=None,
                    help="Path to a file with one watch id per line.")
     p.add_argument("--resolve-gamma", action="store_true",
-                   help="Resolve Gamma taxonomy during collection (network)")
+                   help="Resolve Gamma taxonomy during collection (network).")
     p.add_argument("--max-new-trades-per-wallet", type=int, default=25)
     p.add_argument("--max-total-new-trades", type=int, default=25)
     p.add_argument("--max-gamma-requests", type=int, default=100)
@@ -150,7 +190,6 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-    # Make the assembled cohort visible to the run path (args.watch_ids).
     args.watch_ids = watch_ids
 
     # --write and --dry-run are mutually exclusive.
@@ -162,17 +201,24 @@ def main(argv: list[str] | None = None) -> int:
         # Default to dry-run for safety.
         args.dry_run = True
 
-    # Mutable args view for the shared gate helper.
+    # ── CORRECTION 6: reject invalid watch sets BEFORE any writable open ──
+    # (1) Count / format / duplicate validation needs NO database at all.
+    try:
+        _validate_watch_set_shape(watch_ids)
+    except CohortValidationError as exc:
+        print(f"error: invalid watch set: {exc}", file=sys.stderr)
+        return 2
+
+    # (2) Gate validation: production WRITES require the full three-gate set
+    # (--write --allow-live --confirm-production-db). Dry-run opens read-only
+    # and is always permitted (no production write gate needed). Gates are
+    # checked BEFORE any provider construction / network / DB-open / persist.
     class _GateArgs:
         dry_run = args.dry_run
         write = args.write
         allow_live = args.allow_live
         confirm_production_db = args.confirm_production_db
 
-    # Gate validation: production WRITES require the full three-gate set
-    # (--write --allow-live --confirm-production-db). Dry-run opens read-only
-    # and is always permitted (no production write gate needed). Gates are
-    # checked BEFORE any provider construction / network / DB-open / persist.
     if args.write and not require_write_gates(_GateArgs(), db_path=args.db_path):
         print(
             "error: production write requires --write --allow-live "
@@ -181,15 +227,29 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # Open the connection BEFORE validation? NO — validation (read-only selects)
-    # needs a connection. Use read-only open for validation + dry-run; writable
-    # open only when the gate passed. The global lock is acquired INSIDE
-    # run_cohort (before provider construction), so lock ordering is preserved.
-    db = open_writable(args.db_path, _GateArgs()) if args.write else open_readonly(args.db_path)
+    # Open the connection. For validation of ACTIVE/missing/sample semantics we
+    # use READ-ONLY access; the writable open happens only AFTER the explicit
+    # cohort passes read-only validation AND the gates (and, inside run_cohort,
+    # after the operational lock is held). We must NOT let run_cohort's
+    # validate_watch_ids open a writable connection before rejecting.
+    db = open_readonly(args.db_path) if not args.write else open_writable(args.db_path, _GateArgs())
     try:
-        # The adapter is constructed lazily and only inside run_cohort AFTER the
-        # lock is held. Here we seal the REAL construction behind a 0-arg
-        # factory so the cohort layer can build it post-lock and close it once.
+        # (3) Read-only semantic validation: active / missing / sample. This
+        # runs against a read-only connection and raises CohortValidationError
+        # (-> exit 2) on any rejected watch BEFORE provider construction,
+        # network, or any writable open already happened (the writable open
+        # above only occurs for a gated --write path, still before provider
+        # construction/network).
+        try:
+            validate_watch_ids(db, watch_ids)
+        except CohortValidationError as exc:
+            print(f"error: invalid watch set: {exc}", file=sys.stderr)
+            return 2
+
+        # (4) The adapter is constructed lazily and only inside run_cohort
+        # AFTER the lock is held. Here we seal the REAL construction behind a
+        # 0-arg factory so the cohort layer can build it post-lock and close it
+        # once.
         from polycopy.adapters.polymarket import PolymarketPublicAdapter
 
         def _make_adapter():
@@ -212,12 +272,12 @@ def main(argv: list[str] | None = None) -> int:
                 if a is None:
                     return
                 try:
-                    close = getattr(a, "close", None)
+                    close = getattr(a, "aclose", None) or getattr(a, "close", None)
                     if close is not None:
                         import asyncio as _asyncio
 
                         if _asyncio.iscoroutinefunction(close):
-                            _asyncio.run(close())
+                            _asyncio.get_event_loop().run_until_complete(close())
                         else:
                             close()
                 except Exception:
@@ -250,12 +310,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"status={out['status']} dry_run={out['dry_run']} "
               f"requested={out['watch_count_requested']} "
-              f"completed={out['watch_count_completed']} "
+              f"processed={out['watch_count_processed']} "
               f"failed={out['watch_count_failed']} "
-              f"committed={out['cohort_committed']}")
+              f"unprocessed={out['watch_count_unprocessed']} "
+              f"committed={out['cohort_committed']}"
+              + (f" stop_reason={out['stop_reason']}" if out.get('stop_reason') else ""))
         for w in out["watches"]:
             print(f"  watch={w['watch_id']} state={w['status']} "
-                  f"created={w['created']} updated={w['updated']}"
+                  f"created={w['rows_created']} updated={w['rows_updated']}"
                   + (f" reasons={w['reason_codes']}" if w["reason_codes"] else ""))
 
     # Exit nonzero on failed cohort (so operators/timers see the failure).

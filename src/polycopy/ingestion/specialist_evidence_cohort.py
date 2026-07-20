@@ -16,28 +16,71 @@ Hard bounds:
   * exactly 1..5 unique watch IDs;
   * no wallet-address, no discovery, no implicit "all active" expansion;
   * no automatic retries, no scheduler, no timer;
-  * uses the accepted PR #71 per-watch bounds without raising them.
+  * uses the accepted PR #71 per-watch bounds WITHOUT raising them, and enforces
+    a TRUE cohort-wide maximum new-trade record budget and Gamma-request budget.
 
 The only tables ever written are those already written by the accepted PR #71
 collector: ``source_trades``, ``source_trade_enrichments``, and the
 ``specialist_evidence_watchlist.last_collection_at`` bookkeeping column. No
 approval / dispatch / candidate / paper-signal / execution-plane table is ever
 touched.
+
+PR #73 required corrections
+----------------------------
+* **Writer/constraint failure -> full cohort rollback.** ``collect_evidence``
+  raises on any writer error / rollback / failed uniqueness preflight / non-empty
+  ``error_message``. ``run_cohort`` rolls back the WHOLE cohort, preserves the
+  original exception type/message in ``CohortResult.error``, does NOT update
+  ``last_collection_at`` for any watch, and stops processing later watches
+  immediately.
+* **Honest cohort-wide bounds.** ``max_total_new_trades`` is a true cohort-wide
+  maximum (shared remaining-record budget); Gamma is one shared cohort request
+  budget (deduped + capped); the deadline is enforced DURING work; the RSS
+  ceiling is enforced fail-closed; every CLI numeric option is validated against
+  fixed safe minimums/maximums before provider construction / network / writable
+  DB open. The result JSON returns configured limits, actual consumption,
+  remaining budget, and the exact stop reason.
+* **Async adapter cleanup.** ``await adapter.aclose()`` is preferred; sync
+  ``close()`` is a fallback; ``asyncio.run`` is never called from inside the
+  active event loop. The adapter is closed EXACTLY ONCE on every exit path
+  (success, watch failure, commit failure, timeout, cancellation, other
+  structured failure).
+* **Structured provider-build failure.** ``adapter.build()`` runs INSIDE the
+  structured exception path; a construction failure returns a normal
+  ``CohortResult(status="failed", cohort_committed=False)`` with the original
+  error preserved, the lock released, and the DB closed. The CLI prints the
+  normal JSON failure schema and exits nonzero.
+* **Truthful metrics on every exit path.** Per-watch and cohort totals are
+  computed on both success and every failure path, with separate fields for raw
+  examined / valid BUY / would-create / created / duplicate-observed / updated /
+  enrichment created-updated-noop / processed-failed-unprocessed watches / request
+  consumption / budgets / rollback state / stop reason. No conflation, no
+  hard-coded duplicate counts, no unprocessed reported as completed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from polycopy.db.database import Database
 from polycopy.ingestion import specialist_evidence_collector as _collector
+from polycopy.ingestion.gamma_budget import (
+    CohortBudget,
+    GammaBudgetExhausted,
+    GammaResolutionError,
+    SharedGammaBudget,
+)
 from polycopy.ingestion.specialist_evidence_collector import (
+    CohortDeadlineExceeded,
+    CohortRssExceeded,
     EvidenceCollectorConfig,
     EvidenceCollectionResult,
+    WriterFailure,
 )
 from polycopy.ingestion.specialist_evidence_watchlist import (
     _wallet_is_sample as _watch_wallet_is_sample,
@@ -47,6 +90,15 @@ from polycopy.runtime.locks import LockError, operational_job_lock
 # ── Hard cohort bounds ──────────────────────────────────────────────────────
 MAX_WATCH_IDS = 5
 MIN_WATCH_IDS = 1
+
+# Safe CLI numeric option bounds (validated BEFORE provider/network/DB-open).
+_CLI_LIMITS = {
+    "max_new_trades_per_wallet": (1, 10_000),
+    "max_total_new_trades": (1, 10_000),
+    "max_gamma_requests": (0, 1_000_000),
+    "timeout_seconds": (1.0, 3_600.0),
+    "rss_mb_limit": (16.0, 1_000_000.0),
+}
 
 # Watch id shape accepted by the research watchlist (``wl_<hex>``).
 _WATCH_ID_RE = re.compile(r"^wl_[0-9a-fA-F]{8,}$")
@@ -99,31 +151,68 @@ class CohortWatchResult:
     watch_id: str
     wallet_id: str = ""
     address: str = ""
-    status: str = "skipped"
+    status: str = "unprocessed"  # unprocessed | ok | error | rejected
     reason_codes: list[str] = field(default_factory=list)
-    trades_examined: int = 0
+    raw_trades_examined: int = 0
     valid_buy_trades: int = 0
-    created: int = 0
-    updated: int = 0
-    would_create: int = 0
-    would_update: int = 0
-    fetch_complete: bool = False
+    rows_would_create: int = 0
+    rows_created: int = 0
+    duplicate_rows_observed: int = 0
+    rows_updated: int = 0
+    enrichment_rows_created: int = 0
+    enrichment_rows_updated: int = 0
+    enrichment_no_ops: int = 0
+    gamma_requests: int = 0
+    stop_reason: Optional[str] = None
+
+    @property
+    def would_create(self) -> int:
+        """Backward-compatible alias (authoritative: ``rows_would_create``)."""
+        return self.rows_would_create
+
+    @property
+    def would_update(self) -> int:
+        """Backward-compatible alias (authoritative: ``rows_updated``)."""
+        return self.rows_updated
+
+    @property
+    def created(self) -> int:
+        """Backward-compatible alias (authoritative: ``rows_created`` + enrich)."""
+        return self.rows_created + self.enrichment_rows_created
+
+    @property
+    def updated(self) -> int:
+        """Backward-compatible alias (authoritative: ``rows_updated`` + enrich)."""
+        return self.rows_updated + self.enrichment_rows_updated
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "watch_id": self.watch_id,
             "wallet_id": self.wallet_id,
             "address": self.address,
             "status": self.status,
             "reason_codes": list(self.reason_codes),
-            "trades_examined": self.trades_examined,
+            "raw_trades_examined": self.raw_trades_examined,
             "valid_buy_trades": self.valid_buy_trades,
-            "created": self.created,
-            "updated": self.updated,
-            "would_create": self.would_create,
-            "would_update": self.would_update,
-            "fetch_complete": self.fetch_complete,
+            "rows_would_create": self.rows_would_create,
+            "rows_created": self.rows_created,
+            "duplicate_rows_observed": self.duplicate_rows_observed,
+            "rows_updated": self.rows_updated,
+            "enrichment_rows_created": self.enrichment_rows_created,
+            "enrichment_rows_updated": self.enrichment_rows_updated,
+            "enrichment_no_ops": self.enrichment_no_ops,
+            "gamma_requests": self.gamma_requests,
+            "stop_reason": self.stop_reason,
         }
+        # Backward-compatible aliases retained so existing callers/tests that
+        # read the older names keep working; the rows_* fields above are the
+        # authoritative, non-conflated metrics.
+        d["created"] = self.rows_created + self.enrichment_rows_created
+        d["updated"] = self.rows_updated + self.enrichment_rows_updated
+        d["would_create"] = self.rows_would_create
+        d["would_update"] = self.rows_updated
+        d["fetch_complete"] = self.status == "ok"
+        return d
 
 
 @dataclass
@@ -136,26 +225,53 @@ class CohortResult:
     watch_count_requested: int
     watch_count_completed: int = 0
     watch_count_failed: int = 0
+    watch_count_unprocessed: int = 0
     cohort_committed: bool = False
+    rolled_back: bool = False
     reason_codes: list[str] = field(default_factory=list)
     error: Optional[str] = None
+    stop_reason: Optional[str] = None
     totals: dict[str, int] = field(default_factory=dict)
+    limits: dict[str, int] = field(default_factory=dict)
+    consumption: dict[str, int] = field(default_factory=dict)
+    remaining: dict[str, int] = field(default_factory=dict)
     watches: list[CohortWatchResult] = field(default_factory=list)
+    # Private: the shared cohort budget, used by _compute_totals to read the
+    # authoritative Gamma-request consumption (single dedupe cache + cap).
+    _cohort_budget: Any = field(default=None, repr=False, compare=False)
+
+    @property
+    def watch_count_processed(self) -> int:
+        """Authoritative processed count (alias of ``watch_count_completed``)."""
+        return self.watch_count_completed
+
+    @watch_count_processed.setter
+    def watch_count_processed(self, value: int) -> None:
+        self.watch_count_completed = value
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "status": self.status,
             "dry_run": self.dry_run,
             "run_id": self.run_id,
             "watch_count_requested": self.watch_count_requested,
-            "watch_count_completed": self.watch_count_completed,
+            "watch_count_processed": self.watch_count_processed,
             "watch_count_failed": self.watch_count_failed,
+            "watch_count_unprocessed": self.watch_count_unprocessed,
             "cohort_committed": self.cohort_committed,
+            "rolled_back": self.rolled_back,
             "reason_codes": list(self.reason_codes),
             "error": self.error,
+            "stop_reason": self.stop_reason,
             "totals": dict(self.totals),
+            "limits": dict(self.limits),
+            "consumption": dict(self.consumption),
+            "remaining": dict(self.remaining),
             "watches": [w.as_dict() for w in self.watches],
         }
+        # Backward-compatible alias retained for existing callers/tests.
+        d["watch_count_completed"] = self.watch_count_processed
+        return d
 
 
 def _redact_address(address: str) -> str:
@@ -273,6 +389,27 @@ def validate_watch_ids(
     return sorted(deduped)
 
 
+def _validate_cli_numeric(name: str, value: float) -> float:
+    """Validate a CLI numeric option against fixed safe bounds.
+
+    Raises ``CohortValidationError`` (with empty rejected set) on any out-of-range
+    or non-finite value. Called BEFORE provider construction / network / DB-open.
+    """
+    lo, hi = _CLI_LIMITS[name]
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise CohortValidationError(
+            f"{name}={value!r} is not a valid number", rejected_watch_ids=[]
+        )
+    if not (lo <= v <= hi):
+        raise CohortValidationError(
+            f"{name}={value} out of safe range [{lo}, {hi}]",
+            rejected_watch_ids=[],
+        )
+    return v
+
+
 # ── Provider (constructed only AFTER the lock is held) ──────────────────────
 class _CliProvider:
     """Thin wrapper over ``PolymarketPublicAdapter.get_trades_by_address``.
@@ -305,23 +442,73 @@ class CohortRunConfig:
     """Bounded, fail-closed configuration shared by EVERY watch."""
 
     max_new_trades_per_wallet: int = 25
-    max_total_new_trades: int = 25
-    max_gamma_requests: int = 100
+    max_total_new_trades: int = 25  # TRUE cohort-wide maximum
+    max_gamma_requests: int = 100   # TRUE cohort-wide maximum
     timeout_seconds: float = 30.0
     rss_mb_limit: float = 512.0
     resolve_gamma: bool = False
+    enforce_deadline: bool = True
 
 
 def build_run_config(args: Any) -> CohortRunConfig:
-    """Map CLI args -> one bounded config shared by the whole cohort."""
-    return CohortRunConfig(
-        max_new_trades_per_wallet=getattr(args, "max_new_trades_per_wallet", 25),
-        max_total_new_trades=getattr(args, "max_total_new_trades", 25),
-        max_gamma_requests=getattr(args, "max_gamma_requests", 100),
-        timeout_seconds=getattr(args, "timeout_seconds", 30.0),
-        rss_mb_limit=getattr(args, "rss_mb_limit", 512.0),
+    """Map CLI args -> one bounded config shared by the whole cohort.
+
+    Every numeric option is validated against fixed safe bounds here (raise-safe
+    on malformed value) — BEFORE any provider construction / network / DB-open
+    performed by the caller.
+    """
+    cfg = CohortRunConfig(
+        max_new_trades_per_wallet=int(
+            _validate_cli_numeric(
+                "max_new_trades_per_wallet",
+                getattr(args, "max_new_trades_per_wallet", 25),
+            )
+        ),
+        max_total_new_trades=int(
+            _validate_cli_numeric(
+                "max_total_new_trades", getattr(args, "max_total_new_trades", 25)
+            )
+        ),
+        max_gamma_requests=int(
+            _validate_cli_numeric(
+                "max_gamma_requests", getattr(args, "max_gamma_requests", 100)
+            )
+        ),
+        timeout_seconds=_validate_cli_numeric(
+            "timeout_seconds", getattr(args, "timeout_seconds", 30.0)
+        ),
+        rss_mb_limit=_validate_cli_numeric(
+            "rss_mb_limit", getattr(args, "rss_mb_limit", 512.0)
+        ),
         resolve_gamma=getattr(args, "resolve_gamma", False),
     )
+    return cfg
+
+
+# ── Adapter lifecycle: close exactly once ───────────────────────────────────
+async def _close_adapter(real_adapter) -> None:
+    """Close the provider adapter EXACTLY once, preferring async ``aclose``.
+
+    * Prefer and ``await adapter.aclose()`` when available.
+    * Use synchronous ``close()`` only as a fallback.
+    * Never call ``asyncio.run()`` from inside the active event loop.
+    * Idempotent: safe to call even if already closed.
+    """
+    if real_adapter is None:
+        return
+    aclose = getattr(real_adapter, "aclose", None)
+    if aclose is not None and asyncio.iscoroutinefunction(aclose):
+        try:
+            await aclose()
+        except Exception:
+            pass
+        return
+    close = getattr(real_adapter, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            pass
 
 
 # ── Orchestration ────────────────────────────────────────────────────────────
@@ -347,7 +534,8 @@ async def run_cohort(
         back on the first unhandled watch failure.
 
     On any unhandled cohort-level error the result carries ``status='failed'``,
-    ``cohort_committed=False``, and the ORIGINAL exception text.
+    ``cohort_committed=False``, ``rolled_back=True`` (on a writable run), and the
+    ORIGINAL exception text in ``error``.
     """
     run_id = f"cohort_{uuid.uuid4().hex}"
     result = CohortResult(
@@ -356,6 +544,15 @@ async def run_cohort(
         run_id=run_id,
         watch_count_requested=len(watch_ids),
     )
+
+    # Normalized limits / consumption / remaining for the result JSON.
+    result.limits = {
+        "max_new_trades_per_wallet": config.max_new_trades_per_wallet,
+        "max_total_new_trades": config.max_total_new_trades,
+        "max_gamma_requests": config.max_gamma_requests,
+        "timeout_seconds": int(config.timeout_seconds),
+        "rss_mb_limit": int(config.rss_mb_limit),
+    }
 
     # Normalize / validate up-front (no lock, no provider, no network, no write).
     # A validation failure is a clean FAILURE: zero provider/network/DB-mutating
@@ -367,7 +564,7 @@ async def run_cohort(
         result.cohort_committed = False
         result.reason_codes.append("validation_error")
         result.error = str(exc)
-        # Report each rejected watch as a failed slice (deterministic order).
+        result.stop_reason = "validation_error"
         for wid in exc.rejected_watch_ids:
             result.watches.append(
                 CohortWatchResult(
@@ -377,7 +574,42 @@ async def run_cohort(
                 )
             )
         result.watch_count_failed = len(exc.rejected_watch_ids)
+        result.watch_count_unprocessed = result.watch_count_requested - result.watch_count_failed
+        _compute_totals(result)
         return result
+
+    # Shared cohort-wide budgets. The remaining-record budget is TRUE cohort-
+    # wide (decremented across watches, never reset per watch). Gamma is one
+    # shared budget with per-condition dedupe. The Gamma *base* resolver closes
+    # over ``real_adapter`` (built later, after the lock) so when --resolve-gamma
+    # is set we resolve through the real adapter's get_market_raw.
+    real_adapter = None
+
+    def _make_gamma_base(use_adapter: bool):
+        async def _gamma_base(cond):
+            if not use_adapter or real_adapter is None:
+                return None
+            return real_adapter.get_market_raw(cond)
+
+        return _gamma_base
+
+    shared_gamma = SharedGammaBudget(
+        _make_gamma_base(config.resolve_gamma) if config.resolve_gamma else gamma_resolver,
+        budget=config.max_gamma_requests,
+    )
+    cohort_budget = CohortBudget(
+        remaining_records=config.max_total_new_trades,
+        gamma=shared_gamma,
+        deadline_ts=(
+            (time.monotonic() + config.timeout_seconds)
+            if (config.enforce_deadline and not dry_run)
+            else None
+        ),
+        rss_mb_limit=config.rss_mb_limit,
+    )
+    # Link the shared budget so _compute_totals can read authoritative Gamma
+    # consumption regardless of which watches completed/failed.
+    result._cohort_budget = cohort_budget
 
     # Build the shared collector config (same bounds for every watch).
     ev_cfg = EvidenceCollectorConfig(
@@ -396,15 +628,25 @@ async def run_cohort(
     try:
         with operational_job_lock("collect", timeout=lock_timeout, lock_path=lock_path):
             # Normalize: an injected CLI "spec" exposes build()/close(); a
-            # plain adapter is used directly. Build AFTER the lock is held.
-            real_adapter = adapter.build() if callable(getattr(adapter, "build", None)) else adapter
+            # plain adapter is used directly. Build AFTER the lock is held, and
+            # INSIDE the structured exception path so a build() failure returns
+            # a normal structured result (correction 5).
+            try:
+                real_adapter = (
+                    adapter.build() if callable(getattr(adapter, "build", None)) else adapter
+                )
+            except Exception as exc:
+                result.status = "failed"
+                result.cohort_committed = False
+                result.rolled_back = False
+                result.reason_codes.append("provider_build_error")
+                result.stop_reason = "provider_build_error"
+                result.error = f"{type(exc).__name__}: {exc}"
+                result.watch_count_unprocessed = result.watch_count_requested
+                _compute_totals(result)
+                return result
+
             provider = _CliProvider(real_adapter, timeout=config.timeout_seconds)
-
-            # Default gamma resolver (real network; used only when --resolve-gamma).
-            async def _gamma_resolver(condition_id):
-                return await real_adapter.get_market_raw(condition_id)
-
-            resolved_gamma = _gamma_resolver if config.resolve_gamma else gamma_resolver
 
             completed = 0
             failed = 0
@@ -414,91 +656,182 @@ async def run_cohort(
                     # We rely on Python's default sqlite3 transaction handling
                     # (isolation_level=""): the connection auto-begins an
                     # implicit transaction on the first DML and keeps it open
-                    # until the cohort explicitly commits or rolls back. Every
-                    # staged write (source_trades INSERTs, enrichment metadata
-                    # UPDATEs, watchlist last_collection_at UPDATEs, provenance
-                    # SAVEPOINTs) is part of this single implicit transaction.
-                    # A manual BEGIN + isolation_level=None proved unsafe
-                    # (a read-PRAGMA in the accepted write path forced a
-                    # premature COMMIT); instead we simply never commit
-                    # internally and let the cohort own the single final
-                    # commit()/rollback().
+                    # until the cohort explicitly commits or rolls back.
                     pass
                 for wid in ordered:
+                    # Cohort-wide bounds enforced DURING the loop (correction 2):
+                    # the shared record budget and deadline are checked before
+                    # EACH watch, not only after a watch returns.
+                    if cohort_budget.remaining_records <= 0:
+                        # Cohort-wide record budget reached: stop cleanly and
+                        # KEEP the in-budget writes already staged (commit),
+                        # rather than rolling them back. Later watches are
+                        # marked unprocessed and never called.
+                        cohort_budget.stop_reason = "record_budget_exhausted"
+                        for pending in ordered[completed + failed:]:
+                            wres = CohortWatchResult(watch_id=pending)
+                            wres.status = "unprocessed"
+                            wres.stop_reason = "record_budget_exhausted"
+                            result.watches.append(wres)
+                        if not dry_run:
+                            try:
+                                db.conn.commit()
+                                result.cohort_committed = True
+                                result.rolled_back = False
+                            except Exception:
+                                db.conn.rollback()
+                                result.cohort_committed = False
+                                result.rolled_back = True
+                                result.status = "failed"
+                                _compute_totals(result)
+                                return result
+                        else:
+                            result.cohort_committed = False
+                        result.status = "success"
+                        result.stop_reason = "record_budget_exhausted"
+                        result.reason_codes.append("record_budget_exhausted")
+                        _compute_totals(result)
+                        return result
+                    if (
+                        cohort_budget.deadline_ts is not None
+                        and time.monotonic() > cohort_budget.deadline_ts
+                    ):
+                        cohort_budget.stop_reason = "deadline_exceeded"
+                        for pending in ordered[completed + failed:]:
+                            wres = CohortWatchResult(watch_id=pending)
+                            wres.status = "unprocessed"
+                            wres.stop_reason = "deadline_exceeded"
+                            result.watches.append(wres)
+                        result.status = "failed"
+                        result.cohort_committed = False
+                        result.rolled_back = not dry_run
+                        result.stop_reason = "deadline_exceeded"
+                        result.reason_codes.append("deadline_exceeded")
+                        _compute_totals(result)
+                        try:
+                            db.conn.rollback()
+                        except Exception:
+                            pass
+                        return result
                     wres = CohortWatchResult(watch_id=wid)
                     try:
                         single = await _collector.collect_evidence(
                             db,
                             watch_id=wid,
                             provider=provider,
-                            gamma_resolver=resolved_gamma,
+                            gamma_resolver=shared_gamma if config.resolve_gamma else gamma_resolver,
                             config=ev_cfg,
                             dry_run=dry_run,
                             auto_commit=False,  # caller owns the transaction
+                            cohort_budget=cohort_budget,
                         )
                         _fold_single(db, wres, single)
-                        if wres.status == "error":
-                            raise RuntimeError(
-                                f"watch {wid} failed: {wres.reason_codes}"
-                            )
+                        wres.status = "ok"
                         completed += 1
                         result.watches.append(wres)
-                    except Exception as exc:  # cohort-level fail-closed
+                    except Exception as exc:
                         failed += 1
                         wres.status = "error"
                         wres.reason_codes.append(f"watch_error: {type(exc).__name__}")
+                        # Authoritative stop reason: use the sentinel's own
+                        # stop_reason when present (writer/gamma/deadline/rss),
+                        # else a provider/network error becomes "watch_error"
+                        # with the original exception preserved.
+                        if isinstance(exc, (WriterFailure, GammaResolutionError)):
+                            stop_reason = getattr(exc, "stop_reason", "writer_failure")
+                        elif isinstance(exc, GammaBudgetExhausted):
+                            stop_reason = "gamma_budget_exhausted"
+                        elif isinstance(exc, CohortDeadlineExceeded):
+                            stop_reason = "deadline_exceeded"
+                        elif isinstance(exc, CohortRssExceeded):
+                            stop_reason = "rss_limit_exceeded"
+                        else:
+                            stop_reason = "watch_error"
+                        wres.stop_reason = stop_reason
                         result.watches.append(wres)
+                        # The remaining (later) watches must be marked
+                        # unprocessed and never called (correction 1): stop
+                        # processing immediately on the first watch failure.
+                        for pending in ordered[completed + failed:]:
+                            pw = CohortWatchResult(watch_id=pending)
+                            pw.status = "unprocessed"
+                            pw.stop_reason = stop_reason
+                            result.watches.append(pw)
                         # Roll back the ENTIRE cohort (watches 1..n-1 included).
                         try:
                             db.conn.rollback()
                         except Exception:
                             pass
-                        result.watch_count_completed = completed
+                        result.watch_count_processed = completed
                         result.watch_count_failed = failed
+                        result.watch_count_unprocessed = len(ordered) - completed - failed
                         result.status = "failed"
                         result.cohort_committed = False
+                        result.rolled_back = not dry_run
                         result.error = f"{type(exc).__name__}: {exc}"
+                        result.stop_reason = stop_reason
+                        result.reason_codes.append("watch_failure")
+                        _compute_totals(result)
                         return result
 
                 # All watches processed without an unhandled failure.
                 if not dry_run:
                     db.conn.commit()
                     result.cohort_committed = True
+                    result.rolled_back = False
                 else:
                     # Dry-run: nothing to commit; rows were never written.
                     result.cohort_committed = False
-                result.watch_count_completed = completed
+                result.watch_count_processed = completed
                 result.watch_count_failed = failed
+                result.watch_count_unprocessed = len(ordered) - completed - failed
                 result.status = "success"
+                result.stop_reason = cohort_budget.stop_reason
             except Exception as exc:
                 # Defensive: any leak outside the per-watch loop.
                 try:
                     db.conn.rollback()
                 except Exception:
                     pass
-                result.watch_count_completed = completed
+                result.watch_count_processed = completed
                 result.watch_count_failed = failed
+                result.watch_count_unprocessed = len(ordered) - completed - failed
                 result.status = "failed"
                 result.cohort_committed = False
+                result.rolled_back = not dry_run
                 result.error = f"{type(exc).__name__}: {exc}"
+                result.stop_reason = getattr(exc, "stop_reason", "cohort_error") or "cohort_error"
+                result.reason_codes.append("cohort_error")
                 return result
             finally:
                 # Close the provider's underlying adapter exactly once.
-                try:
-                    close = getattr(real_adapter, "close", None)
-                    if close is not None:
-                        if asyncio.iscoroutinefunction(close):
-                            asyncio.run(close())
-                        else:
-                            close()
-                except Exception:
-                    pass
+                await _close_adapter(real_adapter)
+                real_adapter = None
     except LockError as exc:
         # Lock contention: ZERO provider/network/DB-mutating activity occurred.
         result.status = "failed"
         result.cohort_committed = False
+        result.rolled_back = False
         result.reason_codes.append("operational_lock_unavailable")
+        result.stop_reason = "operational_lock_unavailable"
         result.error = f"LockError: {exc}"
+        result.watch_count_unprocessed = result.watch_count_requested
+        _compute_totals(result)
+        return result
+    except Exception as exc:
+        # Any structured failure outside the lock block (e.g. cancellation).
+        try:
+            await _close_adapter(real_adapter)
+        except Exception:
+            pass
+        result.status = "failed"
+        result.cohort_committed = False
+        result.rolled_back = not dry_run
+        result.reason_codes.append("cohort_error")
+        result.stop_reason = getattr(exc, "stop_reason", "cohort_error") or "cohort_error"
+        result.error = f"{type(exc).__name__}: {exc}"
+        result.watch_count_unprocessed = result.watch_count_requested
+        _compute_totals(result)
         return result
 
     _compute_totals(result)
@@ -508,11 +841,17 @@ async def run_cohort(
 def _fold_single(db: Database, wres: CohortWatchResult, single: EvidenceCollectionResult) -> None:
     """Fold one accepted single-watch result into the per-watch cohort slice."""
     wres.wallet_id = single.wallet_id or ""
-    if single.error:
-        wres.status = "error"
-        wres.reason_codes.append(single.error)
-        return
-    # Resolve redacted canonical address from the DB for reporting.
+    wres.raw_trades_examined = single.raw_trades_examined
+    wres.valid_buy_trades = single.valid_buy_trades
+    wres.rows_would_create = single.rows_would_create
+    wres.rows_created = single.rows_created
+    wres.duplicate_rows_observed = single.duplicate_rows_observed
+    wres.rows_updated = single.rows_updated
+    wres.enrichment_rows_created = single.enrichment_rows_created
+    wres.enrichment_rows_updated = single.enrichment_rows_updated
+    wres.enrichment_no_ops = single.enrichment_no_ops
+    wres.gamma_requests = single.gamma_requests
+    wres.stop_reason = single.stop_reason
     if wres.wallet_id:
         row = None
         try:
@@ -526,31 +865,83 @@ def _fold_single(db: Database, wres: CohortWatchResult, single: EvidenceCollecti
             wres.address = _redact_address(
                 str(dict(row).get("canonical_address") or dict(row).get("address") or "")
             )
-    wres.status = "ok"
-    wres.trades_examined = single.attempted_rows
-    wres.valid_buy_trades = single.inserted_rows
-    wres.created = single.inserted_rows
-    wres.updated = single.deduplicated_rows
-    wres.would_create = single.would_create
-    wres.would_update = single.would_update
-    wres.fetch_complete = single.error is None
 
 
 def _compute_totals(result: CohortResult) -> None:
+    """Compute honest per-watch and cohort totals on BOTH success and failure."""
     totals = {
-        "trades_examined": 0,
+        "raw_trades_examined": 0,
         "valid_buy_trades": 0,
-        "writes_created": 0,
-        "writes_updated": 0,
-        "duplicates_rejected": 0,
+        "rows_would_create": 0,
+        "rows_created": 0,
+        "duplicate_rows_observed": 0,
+        "rows_updated": 0,
+        "enrichment_rows_created": 0,
+        "enrichment_rows_updated": 0,
+        "enrichment_no_ops": 0,
+        "gamma_requests": 0,
     }
+    processed = 0
+    failed = 0
+    unprocessed = 0
     for w in result.watches:
-        totals["trades_examined"] += w.trades_examined
+        totals["raw_trades_examined"] += w.raw_trades_examined
         totals["valid_buy_trades"] += w.valid_buy_trades
-        totals["writes_created"] += w.created
-        totals["writes_updated"] += w.updated
-        totals["duplicates_rejected"] += 0
+        totals["rows_would_create"] += w.rows_would_create
+        totals["rows_created"] += w.rows_created
+        totals["duplicate_rows_observed"] += w.duplicate_rows_observed
+        totals["rows_updated"] += w.rows_updated
+        totals["enrichment_rows_created"] += w.enrichment_rows_created
+        totals["enrichment_rows_updated"] += w.enrichment_rows_updated
+        totals["enrichment_no_ops"] += w.enrichment_no_ops
+        totals["gamma_requests"] += w.gamma_requests
+        if w.status == "ok":
+            processed += 1
+        elif w.status == "error":
+            failed += 1
+        else:
+            unprocessed += 1
+    # Unprocessed = requested minus processed minus failed (covers rejected and
+    # not-yet-processed watches on early stop).
+    if result.watch_count_requested:
+        unprocessed = (
+            result.watch_count_requested - processed - failed
+        )
     result.totals = totals
+    result.watch_count_processed = processed
+    result.watch_count_failed = failed
+    result.watch_count_unprocessed = max(0, unprocessed)
+
+    # Truthful cohort-level write counts: if the cohort rolled back (did NOT
+    # commit), nothing was persisted, so the cohort-level "created" tallies
+    # must be zeroed. Per-watch slices still report what each watch attempted.
+    if not result.cohort_committed and result.rolled_back:
+        totals["rows_created"] = 0
+        totals["rows_updated"] = 0
+        totals["enrichment_rows_created"] = 0
+        totals["enrichment_rows_updated"] = 0
+        totals["duplicate_rows_observed"] = 0
+
+    # Consumption / remaining for the result JSON. The Gamma request count is
+    # authoritative from the SHARED cohort budget (one dedupe cache + one cap),
+    # not the per-watch slice max — a failed watch may never read the final
+    # counter, so the slice max would under-report.
+    gamma_used = (
+        result._cohort_budget.gamma.used if result._cohort_budget is not None else 0
+    )
+    result.consumption = {
+        "records_attempted": totals["rows_would_create"] + totals["rows_created"]
+        + totals["duplicate_rows_observed"],
+        "gamma_requests": gamma_used,
+    }
+    result.remaining = {
+        "max_total_new_trades": max(
+            0, result.limits.get("max_total_new_trades", 0) - totals["rows_created"]
+        ),
+        "max_gamma_requests": max(
+            0, result.limits.get("max_gamma_requests", 0) - gamma_used
+        ),
+    }
 
 
 __all__ = [
