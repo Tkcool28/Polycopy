@@ -330,6 +330,10 @@ def write_valid_rows(
     *,
     dry_run: bool = True,
     pre_existing_ids: Optional[set[str]] = None,
+    # PR #73 seam: when False the writer performs NO commit; the caller (the
+    # bounded multi-watch cohort CLI) owns the transaction so the whole cohort
+    # commits or rolls back together. Defaults to True (unchanged behavior).
+    auto_commit: bool = True,
 ) -> WriteResult:
     """Insert validated normalized rows into source_trades.
 
@@ -404,16 +408,25 @@ def write_valid_rows(
             # INSERT OR IGNORE: rowcount == 1 fresh, 0 duplicate (UNIQUE hit).
             if getattr(cur, "rowcount", 0) == 1:
                 inserted += 1
-        conn.commit()
+        if auto_commit:
+            # Standalone single-watch path: commit immediately as before.
+            conn.commit()
+            result.committed = True
+        # auto_commit=False: caller (cohort) owns the transaction; do NOT
+        # commit here. result.committed stays False.
         result.inserted = inserted
         result.deduplicated = result.attempted - inserted
-        result.committed = True
     except sqlite3.Error as exc:
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
+        if auto_commit:
+            # Standalone path: roll back the local transaction.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        # auto_commit=False: propagate the exception so the cohort owner
+        # performs the one outer rollback. Do NOT roll back here.
         result.rolled_back = True
         result.errors += 1
         result.error_message = f"{type(exc).__name__}: {exc}"[:300]
+        return result
     return result

@@ -79,6 +79,10 @@ class EvidenceCollectionResult:
     enrichment_conflicts: int = 0
     enriched: int = 0
     committed: bool = False
+    # PR #73 dry-run reporting: when no write occurs, what WOULD the
+    # collector have done? Filled in only for dry-run reporting.
+    would_create: int = 0
+    would_update: int = 0
     error: Optional[str] = None
     # Zero-execution guarantees (asserted by integration tests).
     specialist_approvals_created: int = 0
@@ -102,6 +106,8 @@ class EvidenceCollectionResult:
             "enrichment_conflicts": self.enrichment_conflicts,
             "enriched": self.enriched,
             "committed": self.committed,
+            "would_create": self.would_create,
+            "would_update": self.would_update,
             "error": self.error,
         }
 
@@ -136,6 +142,12 @@ async def collect_evidence(
     gamma_resolver: Optional[GammaResolver] = None,
     config: Optional[EvidenceCollectorConfig] = None,
     dry_run: bool = True,
+    # PR #73 seam: when ``auto_commit`` is False the single-watch collector
+    # performs NO commit of its own. The caller owns the transaction (used by
+    # the bounded multi-watch cohort CLI to commit the entire cohort as one unit
+    # or roll the whole cohort back). Defaults to True to preserve the
+    # pre-existing single-watch commit behavior unchanged.
+    auto_commit: bool = True,
 ) -> EvidenceCollectionResult:
     """Collect BUY trades for one active watchlist entry, idempotently.
 
@@ -211,10 +223,32 @@ async def collect_evidence(
     result.attempted_rows = len(accepted)
 
     # Persist BUY source trades idempotently (INSERT OR IGNORE by UNIQUE).
-    write_res = write_valid_rows(db, accepted, dry_run=dry_run)
+    write_res = write_valid_rows(db, accepted, dry_run=dry_run, auto_commit=auto_commit)
     result.inserted_rows = write_res.inserted or 0
     result.deduplicated_rows = write_res.deduplicated or 0
     result.rejected_rows += (write_res.rejected or 0)
+
+    # Dry-run reporting (PR #73): what WOULD a writable run do for this watch?
+    # would_create = accepted BUY rows not yet present in source_trades;
+    # would_update = accepted BUY rows already present (they would be
+    # re-enriched / metadata-merged on a real run). Computed read-only.
+    if dry_run and accepted:
+        pre = {
+            r[0]
+            for r in db.conn.execute(
+                "SELECT source_trade_id FROM source_trades "
+                "WHERE lower(trader_address)=? AND source_trade_id IN ({})".format(
+                    ",".join("?" for _ in accepted)
+                ),
+                [requested_address.lower(), *[c.source_trade_id for c in accepted]],
+            ).fetchall()
+        }
+        result.would_create = sum(
+            1 for c in accepted if c.source_trade_id not in pre
+        )
+        result.would_update = sum(
+            1 for c in accepted if c.source_trade_id in pre
+        )
 
     # Enrichment provenance for the freshly-inserted rows (and existing ones,
     # idempotent). We call the shared enrichment writer with a gamma_resolver
@@ -283,9 +317,12 @@ async def collect_evidence(
             "WHERE id=?",
             (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), watch_id),
         )
-        db.conn.commit()
-        result.committed = True
-
+        if auto_commit:
+            # Standalone single-watch path: commit immediately as before.
+            db.conn.commit()
+            result.committed = True
+        # auto_commit=False: caller (cohort) owns the transaction; do NOT
+        # commit here. result.committed stays False.
     # Timeout guard (informational; pipeline is synchronous here).
     if time.monotonic() - started > config.timeout_seconds:
         result.error = result.error or "timeout_exceeded"
