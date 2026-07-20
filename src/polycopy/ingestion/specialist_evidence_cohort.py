@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
@@ -43,7 +42,7 @@ from polycopy.ingestion.specialist_evidence_collector import (
 from polycopy.ingestion.specialist_evidence_watchlist import (
     _wallet_is_sample as _watch_wallet_is_sample,
 )
-from polycopy.runtime.locks import FileLock, LockError, operational_job_lock
+from polycopy.runtime.locks import LockError, operational_job_lock
 
 # ── Hard cohort bounds ──────────────────────────────────────────────────────
 MAX_WATCH_IDS = 5
@@ -403,8 +402,6 @@ async def run_cohort(
 
             # Default gamma resolver (real network; used only when --resolve-gamma).
             async def _gamma_resolver(condition_id):
-                from polycopy.adapters.polymarket import PolymarketPublicAdapter
-
                 return await real_adapter.get_market_raw(condition_id)
 
             resolved_gamma = _gamma_resolver if config.resolve_gamma else gamma_resolver
