@@ -638,8 +638,8 @@ def test_s7_disposable_e2e_full_lifecycle():
     resolver = _EnrichResolver(by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B})
     enr_before2 = db.conn.execute(
         "SELECT COUNT(*) FROM source_trade_enrichments").fetchone()[0]
-    result = enrich.enrich_source_trade(
-        db, CT1, gamma_resolver=resolver, dry_run=False)
+    result = asyncio.run(enrich.enrich_source_trade_async(
+        db, CT1, gamma_resolver=resolver, dry_run=False))
     assert result is not None
     assert resolver.calls == 1, resolver.calls  # exactly one Gamma resolve
     # Enrichment UPSERTs the single current provenance row for CT1 (stable id);
@@ -654,7 +654,8 @@ def test_s7_disposable_e2e_full_lifecycle():
     assert row["taxonomy_status"] == "usable", row
     # Enrichment replay: same single request, ZERO new provenance rows.
     calls_before = resolver.calls
-    enrich.enrich_source_trade(db, CT1, gamma_resolver=resolver, dry_run=False)
+    asyncio.run(enrich.enrich_source_trade_async(
+        db, CT1, gamma_resolver=resolver, dry_run=False))
     assert resolver.calls - calls_before == 1, resolver.calls
     enr_after_replay = db.conn.execute(
         "SELECT COUNT(*) FROM source_trade_enrichments").fetchone()[0]

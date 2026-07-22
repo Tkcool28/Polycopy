@@ -329,7 +329,11 @@ def write_valid_rows(
     rows: list[NormalizedSourceTrade],
     *,
     dry_run: bool = True,
-    pre_existing_ids: Optional[set[str]] = None,
+    pre_existing_ids: Optional[set[str] | set[tuple[str, str]]] = None,
+    # PR #73 seam: when False the writer performs NO commit; the caller (the
+    # bounded multi-watch cohort CLI) owns the transaction so the whole cohort
+    # commits or rolls back together. Defaults to True (unchanged behavior).
+    auto_commit: bool = True,
 ) -> WriteResult:
     """Insert validated normalized rows into source_trades.
 
@@ -339,9 +343,11 @@ def write_valid_rows(
         dry_run: when True, perform NO writes and return a result with
             ``attempted`` set but ``committed=False``. The CLI passes
             ``dry_run=True`` for every non-production path.
-        pre_existing_ids: set of canonical source_trade_ids already present in
-            the DB for this source (used to count existing-duplicate
-            recognition; does NOT change INSERT OR IGNORE behavior).
+        pre_existing_ids: canonical identities already present in the DB, used
+            only for existing-duplicate recognition (does NOT change INSERT OR
+            IGNORE behavior).  Legacy callers may pass source-trade-id strings;
+            multi-source callers should pass ``(source, source_trade_id)``
+            pairs so same-ID rows from another source are never mislabeled.
 
     Returns:
         A :class:`WriteResult`. On a production write, exactly one transaction
@@ -369,7 +375,7 @@ def write_valid_rows(
     pre = pre_existing_ids or set()
     for c in eligible:
         sid = c.source_trade_id
-        if sid is not None and sid in pre:
+        if sid is not None and ((c.source, sid) in pre or sid in pre):
             result.existing_duplicates_recognized += 1
 
     if dry_run:
@@ -404,16 +410,25 @@ def write_valid_rows(
             # INSERT OR IGNORE: rowcount == 1 fresh, 0 duplicate (UNIQUE hit).
             if getattr(cur, "rowcount", 0) == 1:
                 inserted += 1
-        conn.commit()
+        if auto_commit:
+            # Standalone single-watch path: commit immediately as before.
+            conn.commit()
+            result.committed = True
+        # auto_commit=False: caller (cohort) owns the transaction; do NOT
+        # commit here. result.committed stays False.
         result.inserted = inserted
         result.deduplicated = result.attempted - inserted
-        result.committed = True
     except sqlite3.Error as exc:
-        try:
-            conn.rollback()
-        except sqlite3.Error:
-            pass
+        if auto_commit:
+            # Standalone path: roll back the local transaction.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        # auto_commit=False: propagate the exception so the cohort owner
+        # performs the one outer rollback. Do NOT roll back here.
         result.rolled_back = True
         result.errors += 1
         result.error_message = f"{type(exc).__name__}: {exc}"[:300]
+        return result
     return result

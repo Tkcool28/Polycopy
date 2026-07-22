@@ -920,16 +920,15 @@ def test_cli_persistence_failure_nonzero():
 
     ste.write_provenance = _boom
 
-    orig_enrich = ste.enrich_source_trade
-    orig_cli_enrich = cli.enrich_source_trade
+    orig_enrich = ste.enrich_source_trade_async
+    orig_cli_enrich = cli.enrichment_async_fn
 
-    def _enrich(db_arg, st_id, **kw):
-        # Route through the CLI's bound entry, but it delegates to the real
-        # enrich_source_trade (which we let run, with write_provenance boomed).
-        return orig_enrich(db_arg, st_id, **kw)
+    async def _enrich(db_arg, st_id, **kw):
+        # Exercise the real native async enrichment with write_provenance boomed.
+        return await orig_enrich(db_arg, st_id, **kw)
 
-    ste.enrich_source_trade = _enrich
-    cli.enrich_source_trade = orig_enrich
+    ste.enrich_source_trade_async = _enrich
+    cli.enrichment_async_fn = orig_enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -948,8 +947,8 @@ def test_cli_persistence_failure_nonzero():
         )
     finally:
         cli.open_readonly, cli.open_writable = orig_ro, orig_rw
-        ste.enrich_source_trade = orig_enrich
-        cli.enrich_source_trade = orig_cli_enrich
+        ste.enrich_source_trade_async = orig_enrich
+        cli.enrichment_async_fn = orig_cli_enrich
         ste.write_provenance = orig_write
 
     assert rc not in (0, None), rc
@@ -983,7 +982,7 @@ def test_cli_provider_error_nonzero():
 
     orig_adapter = cli._make_adapter
     cli._make_adapter = _make_boom_adapter
-    orig_cli_enrich = cli.enrich_source_trade
+    orig_cli_enrich = cli.enrichment_async_fn
     # CLI uses its own bound enrich_source_trade; leave it as the real one.
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -1003,7 +1002,7 @@ def test_cli_provider_error_nonzero():
     finally:
         cli._make_adapter = orig_adapter
         cli.open_readonly, cli.open_writable = orig_ro, orig_rw
-        cli.enrich_source_trade = orig_cli_enrich
+        cli.enrichment_async_fn = orig_cli_enrich
     db.close()
     # Provider error is a hard failure -> nonzero exit (1).
     assert rc not in (0, None), rc
@@ -1117,8 +1116,6 @@ def _run_cli_invalid(reason_code, *, side="BUY", source=CANON_SOURCE,
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
     cli.open_readonly = lambda path: db
     cli.open_writable = lambda path, a: db
-    orig_enrich = cli.enrich_source_trade
-    cli.enrich_source_trade = enrich_source_trade
     try:
         rc = cli.main(
             ["--source-trade-id", trade_id, "--write",
@@ -1127,7 +1124,6 @@ def _run_cli_invalid(reason_code, *, side="BUY", source=CANON_SOURCE,
     finally:
         cli._make_adapter = orig_adapter
         cli.open_readonly, cli.open_writable = orig_ro, orig_rw
-        cli.enrich_source_trade = orig_enrich
     db.close()
     return rc, calls, provider_calls, db
 
@@ -1203,8 +1199,6 @@ def test_cli_unknown_id_exit2_zero_write():
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
     cli.open_readonly = lambda path: db
     cli.open_writable = lambda path, a: db
-    orig_enrich = cli.enrich_source_trade
-    cli.enrich_source_trade = enrich_source_trade
     try:
         rc = cli.main(
             ["--source-trade-id", "polymarket:absent_id", "--write",
@@ -1213,7 +1207,6 @@ def test_cli_unknown_id_exit2_zero_write():
     finally:
         cli._make_adapter = orig_adapter
         cli.open_readonly, cli.open_writable = orig_ro, orig_rw
-        cli.enrich_source_trade = orig_enrich
     db.close()
     assert rc == 2, rc
     assert provider_calls["n"] == 0, provider_calls
@@ -1231,9 +1224,9 @@ def test_cli_honest_outcomes_exit0():
     _seed_wallet(db)
     _seed_trade(db, "polymarket:st1", COND, {})
 
-    orig_enrich = ste.enrich_source_trade
-    orig_cli_enrich = cli.enrich_source_trade
-    cli.enrich_source_trade = orig_enrich
+    orig_enrich = ste.enrich_source_trade_async
+    orig_cli_enrich = cli.enrichment_async_fn
+    cli.enrichment_async_fn = orig_enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -1252,8 +1245,8 @@ def test_cli_honest_outcomes_exit0():
         )
     finally:
         cli.open_readonly, cli.open_writable = orig_ro, orig_rw
-        ste.enrich_source_trade = orig_enrich
-        cli.enrich_source_trade = orig_cli_enrich
+        ste.enrich_source_trade_async = orig_enrich
+        cli.enrichment_async_fn = orig_cli_enrich
     db.close()
     # Honest complete enrichment -> exit 0.
     assert rc == 0, rc
@@ -1266,9 +1259,9 @@ def test_cli_equivalent_replay_still_zero_write_exit0():
     db = _NoCloseDb(_tmp()).connect()
     _seed_wallet(db)
     _seed_trade(db, "polymarket:st1", COND, {})
-    orig_enrich = ste.enrich_source_trade
-    orig_cli_enrich = cli.enrich_source_trade
-    cli.enrich_source_trade = orig_enrich
+    orig_enrich = ste.enrich_source_trade_async
+    orig_cli_enrich = cli.enrichment_async_fn
+    cli.enrichment_async_fn = orig_enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -1291,8 +1284,8 @@ def test_cli_equivalent_replay_still_zero_write_exit0():
         )
     finally:
         cli.open_readonly, cli.open_writable = orig_ro, orig_rw
-        ste.enrich_source_trade = orig_enrich
-        cli.enrich_source_trade = orig_cli_enrich
+        ste.enrich_source_trade_async = orig_enrich
+        cli.enrichment_async_fn = orig_cli_enrich
     db.close()
     assert rc1 == 0 and rc2 == 0, (rc1, rc2)
     # Two passes; the second replay must have produced zero enrichment INSERT.

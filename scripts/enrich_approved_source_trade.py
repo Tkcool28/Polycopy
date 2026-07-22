@@ -31,6 +31,7 @@ Safety envelope (S5 repair)
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -47,11 +48,34 @@ from evidence_db import (  # noqa: E402
     open_writable,
     require_write_gates,
 )
-from polycopy.ingestion.source_trade_enrichment import enrich_source_trade  # noqa: E402
+from polycopy.ingestion.source_trade_enrichment import enrich_source_trade_async  # noqa: E402
+
+# Explicit module-bound injection seam for tests. The CLI invokes this async
+# callable only via its single asyncio.Runner boundary.
+enrichment_async_fn = enrich_source_trade_async
 from polycopy.adapters.polymarket import PolymarketPublicAdapter  # noqa: E402
 from polycopy.config.settings import Settings  # noqa: E402
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
+
+
+def _close_adapter(runner: asyncio.Runner, adapter) -> None:
+    """Close an async adapter on this CLI's single primary event loop."""
+    if adapter is None:
+        return
+    aclose = getattr(adapter, "aclose", None)
+    if callable(aclose):
+        try:
+            runner.run(aclose())
+        except Exception:
+            pass
+        return
+    close = getattr(adapter, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 def _make_adapter():
@@ -139,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     # Build the bounded Gamma resolver (only when live resolution authorized).
     gamma_resolver = None
     adapter = None
+    runner = asyncio.Runner()
     if args.allow_live:
         try:
             adapter = _make_adapter()
@@ -149,30 +174,24 @@ def main(argv: list[str] | None = None) -> int:
                 return await adapter.get_market_raw(condition_id)
             gamma_resolver = _resolver
         except Exception as exc:
-            if adapter is not None:
-                try:
-                    import asyncio
-                    asyncio.run(adapter.aclose())
-                except Exception:
-                    pass
+            _close_adapter(runner, adapter)
+            runner.close()
             db.close()
             print(f"error: adapter init failed: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
             return 1
 
     try:
-        result = enrich_source_trade(
-            db, args.source_trade_id,
-            gamma_resolver=gamma_resolver,
-            dry_run=not do_write,
+        result = runner.run(
+            enrichment_async_fn(
+                db, args.source_trade_id,
+                gamma_resolver=gamma_resolver,
+                dry_run=not do_write,
+            )
         )
     except Exception as exc:
-        if adapter is not None:
-            try:
-                import asyncio
-                asyncio.run(adapter.aclose())
-            except Exception:
-                pass
+        _close_adapter(runner, adapter)
+        runner.close()
         db.close()
         print(f"error: enrichment failed: {type(exc).__name__}: {exc}",
               file=sys.stderr)
@@ -186,12 +205,8 @@ def main(argv: list[str] | None = None) -> int:
     # caller-owned transaction is NOT durably persisted by this CLI.
     if getattr(result, "operational_error", False) or getattr(result, "provider_error", False):
         db.conn.rollback()
-        if adapter is not None:
-            try:
-                import asyncio
-                asyncio.run(adapter.aclose())
-            except Exception:
-                pass
+        _close_adapter(runner, adapter)
+        runner.close()
         db.close()
         print(f"error: {result.error_message or result.status}", file=sys.stderr)
         return 1
@@ -207,12 +222,8 @@ def main(argv: list[str] | None = None) -> int:
             db.conn.rollback()
         except Exception:
             pass
-        if adapter is not None:
-            try:
-                import asyncio
-                asyncio.run(adapter.aclose())
-            except Exception:
-                pass
+        _close_adapter(runner, adapter)
+        runner.close()
         db.close()
         print(
             f"error: invalid selection: {result.error_message or result.reason_codes}",
@@ -228,24 +239,16 @@ def main(argv: list[str] | None = None) -> int:
             db.conn.commit()
         except Exception as exc:
             db.conn.rollback()
-            if adapter is not None:
-                try:
-                    import asyncio
-                    asyncio.run(adapter.aclose())
-                except Exception:
-                    pass
+            _close_adapter(runner, adapter)
+            runner.close()
             db.close()
             print(f"error: commit failed: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
             return 1
 
-    # Close the adapter on success and failure (finally-equivalent).
-    if adapter is not None:
-        try:
-            import asyncio
-            asyncio.run(adapter.aclose())
-        except Exception:
-            pass
+    # Close the adapter on success through the same primary CLI event loop.
+    _close_adapter(runner, adapter)
+    runner.close()
     db.close()
 
     out = result.as_dict()

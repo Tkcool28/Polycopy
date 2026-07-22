@@ -14,7 +14,7 @@ production DB). They use the same fixtures as the PR25A bridge test file.
 # ruff: noqa: E402, E701, E702
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -48,7 +48,7 @@ class _Gamma:
         return Market(
             source_id="condition-1", source="polymarket", question="Q",
             outcomes=[MarketOutcome(label="Yes", price=.5, clob_token_id="tok1")],
-            end_date=datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc),
+            end_date=datetime.now(timezone.utc) + timedelta(hours=12),
             fetched_at=datetime.now(timezone.utc),
         )
 

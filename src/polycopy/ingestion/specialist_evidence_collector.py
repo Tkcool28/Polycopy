@@ -9,30 +9,106 @@ ACTIVE watchlist entry (``--watch-id``), never for a ``specialist_approval``.
 Hard limits (all enforced):
   * max_wallets_per_run
   * max_new_trades_per_wallet
-  * max_total_new_trades
-  * max_gamma_requests
+  * max_total_new_trades (shared cohort-wide budget when called by the cohort)
+  * max_gamma_requests (shared cohort-wide budget when called by the cohort)
   * processing timeout
-  * RSS guard
+  * RSS guard (fail-closed)
   * deterministic (sorted) processing order
+
+PR #73 corrections
+-------------------
+* A writer failure, rolled-back write, failed uniqueness preflight, or
+  non-empty ``error_message`` is treated as a collection failure:
+  ``collect_evidence`` raises (preserving the original exception type/message)
+  so the caller (single-watch CLI OR the bounded cohort) can propagate it as a
+  structured failure. It never reports a failed watch as ``ok``.
+* Gamma is resolved exactly once per unique condition against a SHARED cohort
+  budget (dedupe cache + hard cap). The collector no longer performs a redundant
+  second metadata merge/update; ``enrich_source_trade`` is the single
+  authoritative owner of canonical metadata persistence, and it uses the same
+  deterministic serializer as the writer.
+* Honest per-watch metrics: raw examined, valid BUY, would-create, created,
+  duplicate-observed, updated, enrichment created/updated/no-op, gamma requests,
+  and an exact stop reason — never conflating inserted with valid-BUY, nor
+  duplicates with updates.
 """
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from polycopy.db.database import Database
 from polycopy.ingestion import ingest_pipeline
-from polycopy.ingestion.canonical_metadata import (
-    MERGE_FILLED,
-    MERGE_UNCHANGED,
-    merge_canonical_metadata,
+from polycopy.ingestion.gamma_budget import (
+    CohortBudget,
+    GammaBudgetExhausted,
+    GammaResolutionError,
 )
 from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
-from polycopy.ingestion.source_trade_enrichment import enrich_source_trade
+from polycopy.ingestion.source_trade_enrichment import enrich_source_trade_async
 from polycopy.ingestion.source_trade_writer import write_valid_rows
+
+
+# ── Cohort-stopping sentinels raised by collect_evidence ─────────────────────
+class CohortResourceStop(Exception):
+    """Base class for a cohort-bounded stop (deadline / RSS / record budget).
+
+    Carries the authoritative ``stop_reason`` so the orchestrator can report it
+    verbatim in the result JSON without guessing.
+    """
+
+    stop_reason: str = "resource_stop"
+
+    def __init__(self, message: str, *, stop_reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        if stop_reason is not None:
+            self.stop_reason = stop_reason
+
+
+class CohortDeadlineExceeded(CohortResourceStop):
+    stop_reason = "deadline_exceeded"
+
+
+class CohortRssExceeded(CohortResourceStop):
+    stop_reason = "rss_limit_exceeded"
+
+
+class WriterFailure(Exception):
+    """A source-trade writer failure surfaced as a collection failure.
+
+    Preserves the original writer error message so the cohort result carries the
+    authoritative failure text.
+    """
+
+    def __init__(self, message: str, *, stop_reason: str = "writer_failure") -> None:
+        super().__init__(message)
+        self.stop_reason = stop_reason
+
+
+def _total_duplicate_observations(*, pipeline: int, preflight: int, writer: int) -> int:
+    """Authoritative, non-overlapping duplicate observation composition."""
+    return pipeline + preflight + writer
+
+
+def _rss_mb() -> float:
+    """Resident-set size in MiB, fail-closed (unknown => +inf).
+
+    A production-shaped process always has an rusage reading; if we cannot
+    measure it we MUST treat the limit as exceeded rather than silently pass.
+    """
+    try:
+        import resource
+
+        # ru_maxrss is in KiB on Linux, Bytes on macOS — normalize to MiB.
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if rss > 10**9:  # looks like bytes (macOS)
+            return rss / (1024.0 * 1024.0)
+        return rss / 1024.0
+    except Exception:
+        return float("inf")
+
 
 GammaResolver = Callable[[str], Awaitable[Optional[Mapping[str, Any]]]]
 
@@ -60,7 +136,7 @@ class EvidenceCollectorConfig:
         self.max_total_new_trades = max(1, int(max_total_new_trades))
         self.max_gamma_requests = max(1, int(max_gamma_requests))
         self.timeout_seconds = max(1.0, float(timeout_seconds))
-        self.rss_mb_limit = max(16.0, float(rss_mb_limit))
+        self.rss_mb_limit = max(0.0, float(rss_mb_limit))
 
 
 @dataclass
@@ -68,17 +144,33 @@ class EvidenceCollectionResult:
     watch_id: str
     wallet_id: str
     dry_run: bool
+    # ── Honest, non-conflated metrics (PR #73 correction 8) ──
+    raw_trades_examined: int = 0
+    valid_buy_trades: int = 0
+    rows_would_create: int = 0
+    rows_would_update: int = 0
+    rows_created: int = 0
+    duplicate_rows_observed: int = 0
+    rows_updated: int = 0
+    enrichment_rows_created: int = 0
+    enrichment_rows_updated: int = 0
+    enrichment_no_ops: int = 0
+    gamma_requests: int = 0
+    # Actual per-watch fresh-row ceiling after watchlist, invocation, and shared
+    # cohort constraints have all been applied.
+    effective_new_trade_limit: int = 0
+    stop_reason: Optional[str] = None
+    processed: bool = False
+    # ── Backward-compatible aliases used by other tests/CLIs ──
     attempted_rows: int = 0
     inserted_rows: int = 0
     deduplicated_rows: int = 0
     rejected_rows: int = 0
     sell_excluded: int = 0
     sample_excluded: int = 0
-    gamma_requests: int = 0
-    gamma_failures: int = 0
-    enrichment_conflicts: int = 0
-    enriched: int = 0
     committed: bool = False
+    would_create: int = 0
+    would_update: int = 0
     error: Optional[str] = None
     # Zero-execution guarantees (asserted by integration tests).
     specialist_approvals_created: int = 0
@@ -86,22 +178,44 @@ class EvidenceCollectionResult:
     candidates_created: int = 0
     paper_signals_created: int = 0
 
+    @property
+    def enriched(self) -> int:
+        """Backward-compatible alias for total enrichment activity."""
+        return (
+            self.enrichment_rows_created
+            + self.enrichment_rows_updated
+            + self.enrichment_no_ops
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "watch_id": self.watch_id,
             "wallet_id": self.wallet_id,
             "dry_run": self.dry_run,
+            "raw_trades_examined": self.raw_trades_examined,
+            "valid_buy_trades": self.valid_buy_trades,
+            "rows_would_create": self.rows_would_create,
+            "rows_would_update": self.rows_would_update,
+            "rows_created": self.rows_created,
+            "duplicate_rows_observed": self.duplicate_rows_observed,
+            "rows_updated": self.rows_updated,
+            "enrichment_rows_created": self.enrichment_rows_created,
+            "enrichment_rows_updated": self.enrichment_rows_updated,
+            "enrichment_no_ops": self.enrichment_no_ops,
+            "gamma_requests": self.gamma_requests,
+            "effective_new_trade_limit": self.effective_new_trade_limit,
+            "stop_reason": self.stop_reason,
+            "processed": self.processed,
+            "enriched": self.enriched,
             "attempted_rows": self.attempted_rows,
             "inserted_rows": self.inserted_rows,
             "deduplicated_rows": self.deduplicated_rows,
             "rejected_rows": self.rejected_rows,
             "sell_excluded": self.sell_excluded,
             "sample_excluded": self.sample_excluded,
-            "gamma_requests": self.gamma_requests,
-            "gamma_failures": self.gamma_failures,
-            "enrichment_conflicts": self.enrichment_conflicts,
-            "enriched": self.enriched,
             "committed": self.committed,
+            "would_create": self.would_create,
+            "would_update": self.would_update,
             "error": self.error,
         }
 
@@ -136,16 +250,36 @@ async def collect_evidence(
     gamma_resolver: Optional[GammaResolver] = None,
     config: Optional[EvidenceCollectorConfig] = None,
     dry_run: bool = True,
+    # PR #73 seam: when ``auto_commit`` is False the single-watch collector
+    # performs NO commit of its own. The caller owns the transaction (used by
+    # the bounded multi-watch cohort CLI to commit the entire cohort as one unit
+    # or roll the whole cohort back). Defaults to True to preserve the
+    # pre-existing single-watch commit behavior unchanged.
+    auto_commit: bool = True,
+    # PR #73 correction 2/3: when the cohort passes a shared budget, the
+    # per-watch record cap is drawn from the cohort-wide remaining budget, and
+    # Gamma is resolved exactly once per unique condition against the shared
+    # cohort Gamma budget. When None, the single-watch CLI behaves as before.
+    cohort_budget: Optional[CohortBudget] = None,
 ) -> EvidenceCollectionResult:
     """Collect BUY trades for one active watchlist entry, idempotently.
 
     Never invokes approval, dispatch, candidate, paper-signal, or execution
     writes. SELL and sample trades are excluded. Replayed runs add 0 rows.
+
+    Failure contract (PR #73 correction 1/3): any writer error, rolled-back
+    write, failed uniqueness preflight, or non-empty ``error_message`` is
+    surfaced as a raised exception (preserving the original type/message), so
+    the caller — single-watch CLI or bounded cohort — can propagate it as a
+    structured failure and roll back. A failed watch is NEVER reported ``ok``.
     """
     config = config or EvidenceCollectorConfig()
-    started = time.monotonic()
     watch = _fetch_active_watch(db, watch_id)
     if watch is None:
+        # Precondition (input validation), not a mid-collection failure: return
+        # a result with ``error`` set so standalone callers/the single-watch
+        # CLI can report it. The cohort path already rejects this via
+        # ``validate_watch_ids`` before calling ``collect_evidence``.
         return EvidenceCollectionResult(
             watch_id=watch_id, wallet_id="", dry_run=dry_run,
             error="watch_not_active_or_missing",
@@ -170,21 +304,38 @@ async def collect_evidence(
     )
 
     # Determine the per-wallet bound: the smaller of the watch entry's own
-    # max_new_trades_per_run and the run config (fail-closed, lower wins).
+    # max_new_trades_per_run, the run config, and — when a cohort budget is
+    # supplied — the SHARED cohort-wide remaining record budget (never resets
+    # per watch).
     watch_bound = int(watch.get("max_new_trades_per_run") or config.max_new_trades_per_wallet)
     per_wallet_bound = min(watch_bound, config.max_new_trades_per_wallet,
-                           config.max_total_new_trades)
+                            config.max_total_new_trades)
+    if cohort_budget is not None:
+        per_wallet_bound = min(per_wallet_bound, cohort_budget.remaining_records)
+    result.effective_new_trade_limit = per_wallet_bound
+
+    # The authoritative Gamma resolver: the shared cohort budget (dedupe + cap)
+    # when supplied, otherwise the caller's resolver directly.
+    effective_gamma: Optional[GammaResolver] = None
+    if gamma_resolver is not None:
+        effective_gamma = (
+            cohort_budget.gamma if cohort_budget is not None else gamma_resolver
+        )
+
+    if cohort_budget is not None:
+        # Fail closed before any provider work (including dry-run), then let the
+        # provider wrapper enforce the remaining deadline with wait_for.
+        _checkpoint(cohort_budget)
 
     pipe = await ingest_pipeline.run_ingestion(
         provider, requested_address,
         record_limit=per_wallet_bound,
         max_pages=1,
         requested_wallet=requested_address,
-        gamma_resolver=gamma_resolver,
+        gamma_resolver=effective_gamma,
     )
     if pipe.error:
-        result.error = pipe.error
-        return result
+        raise RuntimeError(pipe.error)
 
     # Count SELL rows that were rejected by the BUY-only gate (evidence that
     # the collector correctly excluded non-BUY activity). These never reach
@@ -205,89 +356,237 @@ async def collect_evidence(
             result.rejected_rows += 1
             continue
         accepted.append(c)
+        result.valid_buy_trades += 1
         if len(accepted) >= per_wallet_bound:
             break
 
+    result.raw_trades_examined = len(pipe.candidates)
     result.attempted_rows = len(accepted)
 
-    # Persist BUY source trades idempotently (INSERT OR IGNORE by UNIQUE).
-    write_res = write_valid_rows(db, accepted, dry_run=dry_run)
+    # Cohort-wide record budget clamp (correction 2): accepted rows may never
+    # exceed the SHARED remaining-record budget. Trim here so the writer cannot
+    # over-consume across watches.
+    if cohort_budget is not None and not dry_run and cohort_budget.remaining_records >= 0:
+        if len(accepted) > cohort_budget.remaining_records:
+            accepted = accepted[: cohort_budget.remaining_records]
+
+    # Bounded canonical preflight for (source, source_trade_id).  This prevents
+    # duplicate-only replays from issuing INSERT OR IGNORE, but the writer still
+    # validates the UNIQUE constraint and remains race-safe for fresh rows.
+    existing_keys: set[tuple[str, str]] = set()
+    if accepted:
+        clauses = " OR ".join("(source=? AND source_trade_id=?)" for _ in accepted)
+        params = [item for c in accepted for item in (c.source, c.source_trade_id)]
+        existing_keys = {
+            (str(row[0]), str(row[1]))
+            for row in db.conn.execute(
+                f"SELECT source, source_trade_id FROM source_trades WHERE {clauses}", params
+            ).fetchall()
+        }
+    # Preserve the exact source-scoped preflight snapshot as writer telemetry.
+    # Only ``fresh`` rows are sent to the writer below, so these pairs can never
+    # cause a fresh row to be reported as pre-existing (including same-ID rows
+    # from a different source).
+    pre_existing_ids = existing_keys
+    fresh: list[NormalizedSourceTrade] = []
+    seen_keys: set[tuple[str, str]] = set()
+    batch_duplicates = 0
+    for candidate in accepted:
+        key = (candidate.source, str(candidate.source_trade_id))
+        if key in existing_keys or key in seen_keys:
+            batch_duplicates += 1
+            continue
+        seen_keys.add(key)
+        fresh.append(candidate)
+
+    # Preserve the real writer (and its uniqueness preflight) for fresh rows.
+    # A concurrent insert after this read remains safe: INSERT OR IGNORE reports
+    # it as a writer-side duplicate rather than creating a correctness gap.
+    write_res = write_valid_rows(
+        db,
+        fresh,
+        dry_run=dry_run,
+        pre_existing_ids=pre_existing_ids,
+        auto_commit=auto_commit,
+    )
+    # PR #73 correction 1: a writer error / rollback / failed preflight /
+    # non-empty error_message is a collection failure — raise it so the caller
+    # rolls the cohort back. We never report a failed write as success.
+    if not dry_run and (
+        write_res.errors
+        or write_res.rolled_back
+        or write_res.error_message
+        or not write_res.unique_constraint_present
+    ):
+        raise WriterFailure(
+            write_res.error_message
+            or f"writer failure: errors={write_res.errors}, "
+               f"rolled_back={write_res.rolled_back}, "
+               f"unique_constraint_present={write_res.unique_constraint_present}",
+            stop_reason="writer_failure",
+        )
+
     result.inserted_rows = write_res.inserted or 0
-    result.deduplicated_rows = write_res.deduplicated or 0
+    result.rows_created = write_res.inserted or 0
+    # Distinct duplicate layers are additive: ingestion marks stable-ID repeats
+    # rejected before accepted; the collector observes persisted/batch keys;
+    # the writer adds only a concurrent race duplicate.
+    result.deduplicated_rows = _total_duplicate_observations(
+        pipeline=pipe.duplicate_rows_observed,
+        preflight=batch_duplicates,
+        writer=write_res.deduplicated or 0,
+    )
+    result.duplicate_rows_observed = result.deduplicated_rows
     result.rejected_rows += (write_res.rejected or 0)
 
-    # Enrichment provenance for the freshly-inserted rows (and existing ones,
-    # idempotent). We call the shared enrichment writer with a gamma_resolver
-    # (condition_id -> market) so it builds the canonical nested metadata via
-    # the shared producer. No scoring, no dispatch.
+    # Consume only fresh source-trade rows. Replayed duplicates are observations,
+    # never fresh-row budget usage.
+    if cohort_budget is not None and not dry_run:
+        cohort_budget.remaining_records = max(
+            0, cohort_budget.remaining_records - (write_res.inserted or 0)
+        )
+
+    # Dry-run reporting (PR #73): what WOULD a writable run do for this watch?
+    # would_create = accepted BUY rows not yet present in source_trades;
+    # would_update = accepted BUY rows already present (they would be
+    # re-enriched / metadata-merged on a real run). Computed read-only.
+    if dry_run and accepted:
+        pre = {
+            (str(r[0]), str(r[1]))
+            for r in db.conn.execute(
+                "SELECT source, source_trade_id FROM source_trades "
+                "WHERE lower(trader_address)=? AND (" +
+                " OR ".join("(source=? AND source_trade_id=?)" for _ in accepted) + ")",
+                [
+                    requested_address.lower(),
+                    *[item for c in accepted for item in (c.source, c.source_trade_id)],
+                ],
+            ).fetchall()
+        }
+        result.rows_would_create = sum(
+            1 for c in accepted if (c.source, str(c.source_trade_id)) not in pre
+        )
+        result.rows_would_update = sum(
+            1 for c in accepted if (c.source, str(c.source_trade_id)) in pre
+        )
+        result.would_create = result.rows_would_create
+        result.would_update = result.rows_would_update
+        if cohort_budget is not None:
+            cohort_budget.remaining_records = max(
+                0, cohort_budget.remaining_records - result.rows_would_create
+            )
+
+    # Enrichment provenance for the accepted rows (idempotent). The shared
+    # enrichment writer is the SINGLE authoritative owner of canonical metadata
+    # persistence and uses the same deterministic serializer as the writer, so
+    # the collector performs NO second/redundant metadata merge/update.
     if not dry_run and accepted:
         # Read back internal ids for the inserted source trades (deterministic
-        # order by canonical source_trade_id).
+        # order by canonical source_trade_id). On replay the INSERT OR IGNORE
+        # has already happened; we re-select the same rows to re-run the
+        # idempotent enrichment (which becomes no-ops when evidence is
+        # unchanged).
         inserted_rows = db.conn.execute(
             "SELECT id, source_trade_id FROM source_trades "
-            "WHERE lower(trader_address)=? AND source_trade_id IN ({})".format(
-                ",".join("?" for _ in accepted)
-            ),
-            [requested_address.lower(), *[c.source_trade_id for c in accepted]],
+            "WHERE lower(trader_address)=? AND (" +
+            " OR ".join("(source=? AND source_trade_id=?)" for _ in accepted) + ")",
+            [
+                requested_address.lower(),
+                *[item for c in accepted for item in (c.source, c.source_trade_id)],
+            ],
         ).fetchall()
         internal_ids = [dict(r)["id"] for r in inserted_rows]
         for rid in internal_ids:
-            if config.max_gamma_requests and result.gamma_requests >= config.max_gamma_requests:
-                break
-            result.gamma_requests += 1
+            # Cohort resource bounds (deadline / RSS) enforced DURING the loop.
+            if cohort_budget is not None:
+                _checkpoint(cohort_budget)
+            # SharedGammaBudget itself checks the cap only for a cache miss;
+            # a cache hit for this condition is free and must remain allowed.
             try:
-                er = enrich_source_trade(
-                    db, rid, gamma_resolver=gamma_resolver, dry_run=False,
+                er = await enrich_source_trade_async(
+                    db, rid, gamma_resolver=effective_gamma, dry_run=False,
                 )
-            except Exception as exc:  # conflict / transient
-                result.error = f"enrich_error: {exc}"[:300]
-                continue
+            except GammaBudgetExhausted:
+                if cohort_budget is not None:
+                    cohort_budget.stop_reason = "gamma_budget_exhausted"
+                raise
+            except GammaResolutionError as exc:
+                # Hard Gamma provider failure: propagate as cohort failure.
+                if cohort_budget is not None:
+                    cohort_budget.stop_reason = "gamma_resolution_error"
+                raise WriterFailure(
+                    f"gamma resolution error: {exc}",
+                    stop_reason="gamma_resolution_error",
+                )
+            except Exception as exc:  # conflict / transient -> fail closed
+                if cohort_budget is not None:
+                    cohort_budget.stop_reason = "enrich_error"
+                raise WriterFailure(
+                    f"enrich_error: {exc}", stop_reason="enrich_error"
+                )
             if er.status == "conflict":
-                result.enrichment_conflicts += 1
-            elif er.status != "error":
-                result.enriched += 1
-                # Write the canonical nested taxonomy back onto
-                # source_trades.metadata_json. The frozen scorer reads
-                # metadata["taxonomy"]["raw_category"] from here, so the
-                # collected evidence must carry the canonical shape (not just
-                # the separate source_trade_enrichments row). Reuses the shared
-                # merge_canonical_metadata service -> byte-equivalent to
-                # backfill and collection.
-                row = db.fetchone(
-                    "SELECT metadata_json, market_source_id, token_id "
-                    "FROM source_trades WHERE id=?", (rid,))
-                if row is not None:
-                    rdict = dict(row)
-                    gamma = None
-                    if gamma_resolver is not None:
-                        try:
-                            gamma = await _await_gamma(
-                                gamma_resolver, rdict["market_source_id"])
-                        except Exception:
-                            gamma = None
-                    new_meta, _st, _rc = merge_canonical_metadata(
-                        rdict["metadata_json"],
-                        gamma,
-                        condition_id=rdict["market_source_id"] or "",
-                        token_id=rdict.get("token_id"),
-                    )
-                    if _st in (MERGE_FILLED, MERGE_UNCHANGED):
-                        db.conn.execute(
-                            "UPDATE source_trades SET metadata_json=? WHERE id=?",
-                            (json.dumps(new_meta, sort_keys=True), rid),
-                        )
+                result.enrichment_no_ops += 1
+            elif er.status == "error" or er.operational_error or er.provider_error:
+                # The enrichment reported a hard failure (provider/operational).
+                if cohort_budget is not None:
+                    cohort_budget.stop_reason = "enrich_error"
+                raise WriterFailure(
+                    f"enrichment failed for {rid}: {er.error_message}",
+                    stop_reason="enrich_error",
+                )
+            elif er.created:
+                result.enrichment_rows_created += 1
+            elif er.updated:
+                result.enrichment_rows_updated += 1
+            else:
+                result.enrichment_no_ops += 1
 
-        # Update watchlist last_collection_at.
-        db.conn.execute(
-            "UPDATE specialist_evidence_watchlist SET last_collection_at=? "
-            "WHERE id=?",
-            (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), watch_id),
-        )
-        db.conn.commit()
-        result.committed = True
+        # True no-op replay: do not mutate collection bookkeeping when neither
+        # source rows nor enrichment evidence changed.
+        if (
+            result.rows_created
+            or result.enrichment_rows_created
+            or result.enrichment_rows_updated
+        ):
+            db.conn.execute(
+                "UPDATE specialist_evidence_watchlist SET last_collection_at=? "
+                "WHERE id=?",
+                (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), watch_id),
+            )
+        if auto_commit:
+            # Standalone single-watch path: commit immediately as before.
+            db.conn.commit()
+            result.committed = True
+        # auto_commit=False: caller (cohort) owns the transaction; do NOT
+        # commit here. result.committed stays False.
 
-    # Timeout guard (informational; pipeline is synchronous here).
-    if time.monotonic() - started > config.timeout_seconds:
-        result.error = result.error or "timeout_exceeded"
+    # Honest gamma request count from the shared budget (single source of truth
+    # for Gamma counting under the cohort).
+    if cohort_budget is not None:
+        result.gamma_requests = cohort_budget.gamma.used
 
+    # Cohort resource bounds checked DURING work (correction 2): deadline and
+    # RSS are enforced before a watch is allowed to proceed AND inside the
+    # per-row enrichment loop, not only after a watch returns.
+    if cohort_budget is not None:
+        _checkpoint(cohort_budget)
+
+    result.processed = True
     return result
+
+
+def _checkpoint(cohort_budget: Any) -> None:
+    """Fail-closed cohort resource bound enforcement (deadline + RSS).
+
+    Called at the top of ``collect_evidence`` and inside the per-row
+    enrichment loop so a long-running watch stops mid-flight rather than after
+    completing all of its (potentially many) rows.
+    """
+    if cohort_budget.deadline_ts is not None and time.monotonic() > cohort_budget.deadline_ts:
+        cohort_budget.stop_reason = "deadline_exceeded"
+        raise CohortDeadlineExceeded("cohort deadline exceeded")
+    if _rss_mb() > cohort_budget.rss_mb_limit:
+        cohort_budget.stop_reason = "rss_limit_exceeded"
+        raise CohortRssExceeded(
+            f"RSS {_rss_mb():.1f} MiB exceeded limit {cohort_budget.rss_mb_limit:.1f} MiB"
+        )

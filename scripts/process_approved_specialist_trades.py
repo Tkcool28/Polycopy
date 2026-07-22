@@ -22,6 +22,7 @@ Safety envelope (carried from PR68 + Pass 2):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -35,12 +36,9 @@ from polycopy.db.database import Database  # noqa: E402
 from polycopy.execution.specialist_approval import (  # noqa: E402
     get_approval,
 )
-from polycopy.ingestion.approved_wallet_collector import (  # noqa: E402
-    collect,
-    _raw_gamma_resolver_adapter,
-)
+from polycopy.ingestion.approved_wallet_collector import collect  # noqa: E402
 from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
-from polycopy.ingestion.source_trade_enrichment import enrich_source_trade  # noqa: E402
+from polycopy.ingestion.source_trade_enrichment import enrich_source_trade_async  # noqa: E402
 from polycopy.engine.approved_specialist_dispatcher import dispatch_one  # noqa: E402
 from polycopy.config.settings import Settings  # noqa: E402
 from polycopy.adapters.polymarket import PolymarketPublicAdapter  # noqa: E402
@@ -88,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
             return 2
 
+    adapter = None
+    runner = None
     db = Database(Path(args.db_path)).connect()
     try:
         # Resolve approval (reject unknown/disabled/revoked via active check).
@@ -113,28 +113,59 @@ def main(argv: list[str] | None = None) -> int:
             data_api_base_url=settings.data_api_base_url,
             timeout=10.0,
         )
-        gamma_resolver = _raw_gamma_resolver_adapter(adapter)
+        runner = asyncio.Runner()
+        gamma_cache: dict[str, object] = {}
+
+        async def gamma_async(condition_id: str):
+            if condition_id not in gamma_cache:
+                gamma_cache[condition_id] = await adapter.get_market_raw(condition_id)
+            return gamma_cache[condition_id]
+
+        def gamma_sync(condition_id: str):
+            # Dispatcher/scoring stays synchronous and must never invoke the
+            # async adapter. Collection/enrichment pre-resolve the exact trade.
+            if condition_id not in gamma_cache:
+                raise RuntimeError(
+                    "synchronous dispatch requested uncached Gamma market "
+                    f"{condition_id!r}; pre-resolve it before dispatch"
+                )
+            return gamma_cache[condition_id]
 
         # ── Stage 1: collect at most one new trade (approval-driven) ──
-        result = collect(adapter, wallet, gamma_resolver=gamma_resolver)
+        result = runner.run(collect(adapter, wallet, gamma_resolver=gamma_async))
         accepted = result.accepted_rows[:args.max_new_trades]
         source_trade_internal_id = None
         inserted_trades = 0
         if args.write and accepted:
             from polycopy.ingestion.normalized_source_trade import normalize_source_trade  # noqa
-            pre = {r[0] for r in db.conn.execute(
-                "SELECT source_trade_id FROM source_trades WHERE source=?",
-                ("polymarket_data_api_trades_user",))}
+            pre = {
+                (str(r[0]), str(r[1]))
+                for r in db.conn.execute(
+                    "SELECT source, source_trade_id FROM source_trades WHERE source=?",
+                    ("polymarket_data_api_trades_user",),
+                )
+            }
             norms = [normalize_source_trade(t, requested_wallet=wallet, allow_sell=False,
-                                            gamma_market=gamma_resolver(t.market_source_id))
+                                            gamma_market=gamma_sync(t.market_source_id))
                      for t in accepted]
-            out = write_valid_rows(db, norms, dry_run=False, pre_existing_ids=pre)
+            # Replay-safe script boundary uses the exact canonical writer key:
+            # (source, source_trade_id), never an ID-only approximation.
+            fresh_norms = [
+                n for n in norms if (str(n.source), str(n.source_trade_id)) not in pre
+            ]
+            out = write_valid_rows(
+                db, fresh_norms, dry_run=False,
+                pre_existing_ids={
+                    n.source_trade_id for n in fresh_norms if n.source_trade_id is not None
+                },
+            )
             inserted_trades = out.inserted
             # Resolve the persisted internal id of the first accepted trade.
             first = norms[0]
             row = db.fetchone(
-                "SELECT id FROM source_trades WHERE source_trade_id=?",
-                (first.source_trade_id,))
+                "SELECT id FROM source_trades WHERE source=? AND source_trade_id=?",
+                (first.source, first.source_trade_id),
+            )
             if row:
                 source_trade_internal_id = row["id"]
         elif accepted:
@@ -159,13 +190,13 @@ def main(argv: list[str] | None = None) -> int:
 
         # ── Stage 2 + 3: enrich + dispatch the exact source trade ──
         if source_trade_internal_id is not None:
-            enrichment = enrich_source_trade(
+            enrichment = runner.run(enrich_source_trade_async(
                 db, source_trade_internal_id,
-                gamma_resolver=gamma_resolver, dry_run=not args.write)
+                gamma_resolver=gamma_async, dry_run=not args.write))
             disp = dispatch_one(
                 db, approval_id=args.approval_id,
                 source_trade_internal_id=source_trade_internal_id,
-                gamma_resolver=gamma_resolver, clob_provider=adapter,
+                gamma_resolver=gamma_sync, clob_provider=adapter,
                 dry_run=not args.write)
         else:
             enrichment = None
@@ -185,6 +216,20 @@ def main(argv: list[str] | None = None) -> int:
             "mode": "write" if args.write else "dry-run",
         }
     finally:
+        if adapter is not None:
+            aclose = getattr(adapter, "aclose", None)
+            if callable(aclose) and runner is not None:
+                try:
+                    runner.run(aclose())
+                except Exception:
+                    pass
+            elif callable(getattr(adapter, "close", None)):
+                try:
+                    adapter.close()
+                except Exception:
+                    pass
+        if runner is not None:
+            runner.close()
         db.close()
 
     if args.json:
