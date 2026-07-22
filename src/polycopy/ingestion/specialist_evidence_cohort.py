@@ -463,7 +463,7 @@ class _CliProvider:
         self._deadline_ts = deadline_ts
 
     async def fetch_trades(self, wallet: str, *, limit: int, page: int):
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         remaining = self._timeout
         if self._deadline_ts is not None:
@@ -474,7 +474,12 @@ class _CliProvider:
             return await asyncio.wait_for(
                 self._adapter.get_trades_by_address(
                     wallet,
-                    since=datetime.min,
+                    # ``datetime.min`` is a naive year-1 value whose
+                    # ``timestamp()`` conversion underflows on this platform
+                    # before the public request can be made. Polymarket-era
+                    # Unix-second trade data is post-epoch, so UTC epoch keeps
+                    # the intended no-meaningful-lower-bound semantics safely.
+                    since=datetime.fromtimestamp(0, tz=timezone.utc),
                     limit=limit,
                     offset=page * limit,
                     return_raw=True,
