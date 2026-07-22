@@ -243,6 +243,30 @@ def test_gamma_budget_exhaustion_is_cohort_wide():
     db.close()
 
 
+def test_advertised_limits_match_effective_cohort_and_watch_caps():
+    db = _open()
+    wids = _seed(db, [0])
+    db.conn.execute(
+        "UPDATE specialist_evidence_watchlist SET max_new_trades_per_run=3 WHERE id=?",
+        (wids[0],),
+    )
+    db.conn.commit()
+    try:
+        result = asyncio.run(run_cohort(
+            db,
+            watch_ids=wids,
+            adapter=FakeAdapter(_targets([0], rows_per=10)),
+            dry_run=False,
+            config=CohortRunConfig(max_new_trades_per_wallet=9, max_total_new_trades=5),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert result.limits["max_new_trades_per_wallet"] == 5
+        assert result.watches[0].effective_new_trade_limit == 3
+        assert result.totals["rows_created"] == 3
+    finally:
+        db.close()
+
+
 def test_deadline_expiry_rolls_back():
     db = _open()
     wids = _seed(db, [0, 1, 2])
@@ -1002,6 +1026,51 @@ def test_canonical_prefilter_keeps_fresh_writer_existing_duplicate_metric_zero()
         ))
         assert result.status == "success", result.as_dict()
         assert observed == [(1, 0, 0)]
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()
+
+
+def test_canonical_prefilter_passes_only_actual_pre_existing_ids_as_telemetry():
+    """Preflight IDs are observable without contaminating fresh writer metrics."""
+    import polycopy.ingestion.specialist_evidence_collector as collector
+
+    db = _open()
+    wids = _seed(db, [0])
+    existing = _buy("already-there", COND[0], TOK[0], ADDR[0])
+    fresh = _buy("still-fresh", COND[0], TOK[0], ADDR[0])
+    cfg = CohortRunConfig(max_new_trades_per_wallet=2, max_total_new_trades=2)
+    original_writer = collector.write_valid_rows
+    observed = []
+    try:
+        seeded = asyncio.run(run_cohort(
+            db,
+            watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [existing]}),
+            dry_run=False,
+            config=cfg,
+        ))
+        assert seeded.status == "success", seeded.as_dict()
+
+        def writer_spy(db_arg, rows, **kwargs):
+            observed.append((
+                [row.source_trade_id for row in rows], kwargs.get("pre_existing_ids")
+            ))
+            return original_writer(db_arg, rows, **kwargs)
+
+        collector.write_valid_rows = writer_spy
+        result = asyncio.run(run_cohort(
+            db,
+            watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [existing, fresh]}),
+            dry_run=False,
+            config=cfg,
+        ))
+        assert result.status == "success", result.as_dict()
+        assert observed == [(
+            ["polymarket:still-fresh"],
+            {("polymarket_data_api_trades_user", "polymarket:already-there")},
+        )]
     finally:
         collector.write_valid_rows = original_writer
         db.close()

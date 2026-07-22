@@ -156,6 +156,9 @@ class EvidenceCollectionResult:
     enrichment_rows_updated: int = 0
     enrichment_no_ops: int = 0
     gamma_requests: int = 0
+    # Actual per-watch fresh-row ceiling after watchlist, invocation, and shared
+    # cohort constraints have all been applied.
+    effective_new_trade_limit: int = 0
     stop_reason: Optional[str] = None
     processed: bool = False
     # ── Backward-compatible aliases used by other tests/CLIs ──
@@ -200,6 +203,7 @@ class EvidenceCollectionResult:
             "enrichment_rows_updated": self.enrichment_rows_updated,
             "enrichment_no_ops": self.enrichment_no_ops,
             "gamma_requests": self.gamma_requests,
+            "effective_new_trade_limit": self.effective_new_trade_limit,
             "stop_reason": self.stop_reason,
             "processed": self.processed,
             "enriched": self.enriched,
@@ -308,6 +312,7 @@ async def collect_evidence(
                             config.max_total_new_trades)
     if cohort_budget is not None:
         per_wallet_bound = min(per_wallet_bound, cohort_budget.remaining_records)
+    result.effective_new_trade_limit = per_wallet_bound
 
     # The authoritative Gamma resolver: the shared cohort budget (dedupe + cap)
     # when supplied, otherwise the caller's resolver directly.
@@ -378,6 +383,11 @@ async def collect_evidence(
                 f"SELECT source, source_trade_id FROM source_trades WHERE {clauses}", params
             ).fetchall()
         }
+    # Preserve the exact source-scoped preflight snapshot as writer telemetry.
+    # Only ``fresh`` rows are sent to the writer below, so these pairs can never
+    # cause a fresh row to be reported as pre-existing (including same-ID rows
+    # from a different source).
+    pre_existing_ids = existing_keys
     fresh: list[NormalizedSourceTrade] = []
     seen_keys: set[tuple[str, str]] = set()
     batch_duplicates = 0
@@ -393,7 +403,11 @@ async def collect_evidence(
     # A concurrent insert after this read remains safe: INSERT OR IGNORE reports
     # it as a writer-side duplicate rather than creating a correctness gap.
     write_res = write_valid_rows(
-        db, fresh, dry_run=dry_run, auto_commit=auto_commit,
+        db,
+        fresh,
+        dry_run=dry_run,
+        pre_existing_ids=pre_existing_ids,
+        auto_commit=auto_commit,
     )
     # PR #73 correction 1: a writer error / rollback / failed preflight /
     # non-empty error_message is a collection failure — raise it so the caller

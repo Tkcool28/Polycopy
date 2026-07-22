@@ -329,7 +329,7 @@ def write_valid_rows(
     rows: list[NormalizedSourceTrade],
     *,
     dry_run: bool = True,
-    pre_existing_ids: Optional[set[str]] = None,
+    pre_existing_ids: Optional[set[str] | set[tuple[str, str]]] = None,
     # PR #73 seam: when False the writer performs NO commit; the caller (the
     # bounded multi-watch cohort CLI) owns the transaction so the whole cohort
     # commits or rolls back together. Defaults to True (unchanged behavior).
@@ -343,9 +343,11 @@ def write_valid_rows(
         dry_run: when True, perform NO writes and return a result with
             ``attempted`` set but ``committed=False``. The CLI passes
             ``dry_run=True`` for every non-production path.
-        pre_existing_ids: set of canonical source_trade_ids already present in
-            the DB for this source (used to count existing-duplicate
-            recognition; does NOT change INSERT OR IGNORE behavior).
+        pre_existing_ids: canonical identities already present in the DB, used
+            only for existing-duplicate recognition (does NOT change INSERT OR
+            IGNORE behavior).  Legacy callers may pass source-trade-id strings;
+            multi-source callers should pass ``(source, source_trade_id)``
+            pairs so same-ID rows from another source are never mislabeled.
 
     Returns:
         A :class:`WriteResult`. On a production write, exactly one transaction
@@ -373,7 +375,7 @@ def write_valid_rows(
     pre = pre_existing_ids or set()
     for c in eligible:
         sid = c.source_trade_id
-        if sid is not None and sid in pre:
+        if sid is not None and ((c.source, sid) in pre or sid in pre):
             result.existing_duplicates_recognized += 1
 
     if dry_run:

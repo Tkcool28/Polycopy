@@ -165,6 +165,7 @@ class CohortWatchResult:
     enrichment_rows_updated: int = 0
     enrichment_no_ops: int = 0
     gamma_requests: int = 0
+    effective_new_trade_limit: int = 0
     stop_reason: Optional[str] = None
 
     @property
@@ -205,6 +206,7 @@ class CohortWatchResult:
             "enrichment_rows_updated": self.enrichment_rows_updated,
             "enrichment_no_ops": self.enrichment_no_ops,
             "gamma_requests": self.gamma_requests,
+            "effective_new_trade_limit": self.effective_new_trade_limit,
             "stop_reason": self.stop_reason,
         }
         # Backward-compatible aliases retained so existing callers/tests that
@@ -228,6 +230,7 @@ class CohortResult:
     watch_count_requested: int
     watch_count_completed: int = 0
     watch_count_failed: int = 0
+    watch_count_rejected: int = 0
     watch_count_unprocessed: int = 0
     cohort_committed: bool = False
     rolled_back: bool = False
@@ -260,6 +263,7 @@ class CohortResult:
             "watch_count_requested": self.watch_count_requested,
             "watch_count_processed": self.watch_count_processed,
             "watch_count_failed": self.watch_count_failed,
+            "watch_count_rejected": self.watch_count_rejected,
             "watch_count_unprocessed": self.watch_count_unprocessed,
             "cohort_committed": self.cohort_committed,
             "rolled_back": self.rolled_back,
@@ -283,6 +287,29 @@ def _redact_address(address: str) -> str:
     if len(a) >= 12:
         return f"{a[:6]}…{a[-4:]}"
     return a or "—"
+
+
+def _rollback_cohort(db: Database, result: CohortResult) -> bool:
+    """Attempt rollback without ever claiming it succeeded when it did not.
+
+    All writable failure paths use this helper.  It keeps an already-recorded
+    primary failure (notably a failed commit) intact and appends any secondary
+    rollback failure as diagnostic context rather than replacing that cause.
+    """
+    try:
+        db.conn.rollback()
+    except Exception as exc:
+        result.rolled_back = False
+        if "rollback_failure" not in result.reason_codes:
+            result.reason_codes.append("rollback_failure")
+        detail = f"{type(exc).__name__}: {exc}"
+        if result.error:
+            result.error = f"{result.error}; rollback_failure: {detail}"
+        else:
+            result.error = f"rollback_failure: {detail}"
+        return False
+    result.rolled_back = True
+    return True
 
 
 # ── Validation (no network, no provider, no DB write) ──────────────────────
@@ -549,9 +576,10 @@ async def run_cohort(
       * commit the ENTIRE cohort as one transaction, or roll the whole cohort
         back on the first unhandled watch failure.
 
-    On any unhandled cohort-level error the result carries ``status='failed'``,
-    ``cohort_committed=False``, ``rolled_back=True`` (on a writable run), and the
-    ORIGINAL exception text in ``error``.
+    On any unhandled cohort-level error the result carries ``status='failed'``
+    and ``cohort_committed=False``. ``rolled_back`` is true only when the
+    attempted rollback actually succeeded; ``error`` preserves the original
+    exception text.
     """
     run_id = f"cohort_{uuid.uuid4().hex}"
     result = CohortResult(
@@ -561,9 +589,13 @@ async def run_cohort(
         watch_count_requested=len(watch_ids),
     )
 
-    # Normalized limits / consumption / remaining for the result JSON.
+    # Normalized limits / consumption / remaining for the result JSON. A watch
+    # cannot use more than the shared cohort budget, so do not advertise an
+    # unreachable configured per-wallet cap as the effective bound.
     result.limits = {
-        "max_new_trades_per_wallet": config.max_new_trades_per_wallet,
+        "max_new_trades_per_wallet": min(
+            config.max_new_trades_per_wallet, config.max_total_new_trades
+        ),
         "max_total_new_trades": config.max_total_new_trades,
         "max_gamma_requests": config.max_gamma_requests,
         "timeout_seconds": int(config.timeout_seconds),
@@ -670,7 +702,9 @@ async def run_cohort(
                 await _close_adapter(real_adapter if real_adapter is not None else adapter)
                 result.status = "failed"
                 result.cohort_committed = False
-                result.rolled_back = not dry_run
+                # The resource gate runs before any writable work, so no
+                # rollback was attempted and reporting one would be untrue.
+                result.rolled_back = False
                 result.reason_codes.append(exc.stop_reason)
                 result.stop_reason = exc.stop_reason
                 result.error = f"{type(exc).__name__}: {exc}"
@@ -726,11 +760,13 @@ async def run_cohort(
                                 db.conn.commit()
                                 result.cohort_committed = True
                                 result.rolled_back = False
-                            except Exception:
-                                db.conn.rollback()
+                            except Exception as exc:
                                 result.cohort_committed = False
-                                result.rolled_back = True
                                 result.status = "failed"
+                                result.stop_reason = "commit_failure"
+                                result.reason_codes.append("commit_failure")
+                                result.error = f"{type(exc).__name__}: {exc}"
+                                _rollback_cohort(db, result)
                                 _compute_totals(result)
                                 return result
                         else:
@@ -752,14 +788,12 @@ async def run_cohort(
                             result.watches.append(wres)
                         result.status = "failed"
                         result.cohort_committed = False
-                        result.rolled_back = not dry_run
                         result.stop_reason = "deadline_exceeded"
                         result.reason_codes.append("deadline_exceeded")
+                        result.error = f"CohortDeadlineExceeded: {result.stop_reason}"
+                        if not dry_run:
+                            _rollback_cohort(db, result)
                         _compute_totals(result)
-                        try:
-                            db.conn.rollback()
-                        except Exception:
-                            pass
                         return result
                     wres = CohortWatchResult(watch_id=wid)
                     try:
@@ -807,20 +841,17 @@ async def run_cohort(
                             pw.status = "unprocessed"
                             pw.stop_reason = stop_reason
                             result.watches.append(pw)
-                        # Roll back the ENTIRE cohort (watches 1..n-1 included).
-                        try:
-                            db.conn.rollback()
-                        except Exception:
-                            pass
                         result.watch_count_processed = completed
                         result.watch_count_failed = failed
                         result.watch_count_unprocessed = len(ordered) - completed - failed
                         result.status = "failed"
                         result.cohort_committed = False
-                        result.rolled_back = not dry_run
                         result.error = f"{type(exc).__name__}: {exc}"
                         result.stop_reason = stop_reason
                         result.reason_codes.append("watch_failure")
+                        # Roll back the ENTIRE cohort (watches 1..n-1 included).
+                        if not dry_run:
+                            _rollback_cohort(db, result)
                         _compute_totals(result)
                         return result
 
@@ -843,23 +874,15 @@ async def run_cohort(
                 # staged rows must never survive it. Preserve cancellation for
                 # the caller after rollback; the inner finally closes adapter.
                 if not dry_run:
-                    try:
-                        db.conn.rollback()
-                    except Exception:
-                        pass
+                    _rollback_cohort(db, result)
                 raise
             except Exception as exc:
                 # Defensive: any leak outside the per-watch loop.
-                try:
-                    db.conn.rollback()
-                except Exception:
-                    pass
                 result.watch_count_processed = completed
                 result.watch_count_failed = failed
                 result.watch_count_unprocessed = len(ordered) - completed - failed
                 result.status = "failed"
                 result.cohort_committed = False
-                result.rolled_back = not dry_run
                 result.error = f"{type(exc).__name__}: {exc}"
                 result.stop_reason = (
                     "commit_failure"
@@ -867,6 +890,8 @@ async def run_cohort(
                     else (getattr(exc, "stop_reason", "cohort_error") or "cohort_error")
                 )
                 result.reason_codes.append(result.stop_reason)
+                if not dry_run:
+                    _rollback_cohort(db, result)
                 _compute_totals(result)
                 return result
             finally:
@@ -892,7 +917,9 @@ async def run_cohort(
             pass
         result.status = "failed"
         result.cohort_committed = False
-        result.rolled_back = not dry_run
+        # This outer boundary has no established transaction ownership; do not
+        # claim a rollback that was never attempted.
+        result.rolled_back = False
         result.reason_codes.append("cohort_error")
         result.stop_reason = getattr(exc, "stop_reason", "cohort_error") or "cohort_error"
         result.error = f"{type(exc).__name__}: {exc}"
@@ -918,6 +945,7 @@ def _fold_single(db: Database, wres: CohortWatchResult, single: EvidenceCollecti
     wres.enrichment_rows_updated = single.enrichment_rows_updated
     wres.enrichment_no_ops = single.enrichment_no_ops
     wres.gamma_requests = single.gamma_requests
+    wres.effective_new_trade_limit = single.effective_new_trade_limit
     wres.stop_reason = single.stop_reason
     if wres.wallet_id:
         row = None
@@ -951,6 +979,7 @@ def _compute_totals(result: CohortResult) -> None:
     }
     processed = 0
     failed = 0
+    rejected = 0
     unprocessed = 0
     for w in result.watches:
         totals["raw_trades_examined"] += w.raw_trades_examined
@@ -968,6 +997,12 @@ def _compute_totals(result: CohortResult) -> None:
             processed += 1
         elif w.status == "error":
             failed += 1
+        elif w.status == "rejected":
+            # Rejection is a completed validation failure, not a watch left
+            # unprocessed.  Count it in both the broad failed metric and its
+            # explicit rejected slice so clients can report either truthfully.
+            failed += 1
+            rejected += 1
         else:
             unprocessed += 1
     # Unprocessed = requested minus processed minus failed (covers rejected and
@@ -979,6 +1014,7 @@ def _compute_totals(result: CohortResult) -> None:
     result.totals = totals
     result.watch_count_processed = processed
     result.watch_count_failed = failed
+    result.watch_count_rejected = rejected
     result.watch_count_unprocessed = max(0, unprocessed)
 
     # Truthful cohort-level write counts: if the cohort rolled back (did NOT

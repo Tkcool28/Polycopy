@@ -122,6 +122,13 @@ async def run_ingestion(
         try:
             rows = await provider.fetch_trades(wallet, limit=record_limit, page=page)
         except Exception as exc:  # never crash on one bad page
+            # Cohort resource sentinels originate at the async provider boundary
+            # and must retain their structured stop reason.  Collapsing them to
+            # a string here makes a real timed-out provider look like an
+            # ordinary watch error, so the orchestrator cannot report deadline
+            # or RSS enforcement truthfully.
+            if getattr(exc, "stop_reason", None) is not None:
+                raise
             result.error = f"provider error on page {page}: {type(exc).__name__}: {exc}"[:300]
             break
         if made_call:
