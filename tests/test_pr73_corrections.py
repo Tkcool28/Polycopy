@@ -15,6 +15,7 @@ import contextlib
 from dataclasses import replace
 import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 from pathlib import Path
@@ -27,6 +28,10 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.specialist_evidence_cohort import (  # noqa: E402
     CohortRunConfig,
+    CohortValidationError,
+    HARD_MAX_RECORD_LIMIT,
+    HARD_MAX_TOTAL_NEW_TRADES,
+    build_run_config,
     run_cohort,
     ALLOWED_WRITE_TABLES,
     FORBIDDEN_WRITE_TABLES,
@@ -90,9 +95,11 @@ class FakeAdapter:
         self._gmr = get_market_raw or (lambda c: {"conditionId": c, "category": "Politics"})
         self.aclose_calls = 0
         self.get_trades_calls = 0
+        self.requested_limits = []
 
     async def get_trades_by_address(self, wallet, *, since, limit, offset, return_raw):
         self.get_trades_calls += 1
+        self.requested_limits.append(limit)
         return list(self._targets.get(wallet.lower(), []))[:limit]
 
     async def get_market_raw(self, condition_id):
@@ -263,6 +270,112 @@ def test_advertised_limits_match_effective_cohort_and_watch_caps():
         assert result.limits["max_new_trades_per_wallet"] == 5
         assert result.watches[0].effective_new_trade_limit == 3
         assert result.totals["rows_created"] == 3
+    finally:
+        db.close()
+
+
+def test_cli_record_limit_boundaries_are_100_per_watch_and_500_per_cohort():
+    """The CLI config path rejects values above the authoritative envelope."""
+    args = SimpleNamespace(
+        max_new_trades_per_wallet=HARD_MAX_RECORD_LIMIT,
+        max_total_new_trades=HARD_MAX_TOTAL_NEW_TRADES,
+        max_gamma_requests=0,
+        timeout_seconds=30.0,
+        rss_mb_limit=512.0,
+        resolve_gamma=False,
+    )
+    cfg = build_run_config(args)
+    assert cfg.max_new_trades_per_wallet == 100
+    assert cfg.max_total_new_trades == 500
+
+    for name, value, expected in (
+        ("max_new_trades_per_wallet", 101, r"safe range \[1, 100\]"),
+        ("max_total_new_trades", 501, r"safe range \[1, 500\]"),
+    ):
+        rejected = SimpleNamespace(**vars(args))
+        setattr(rejected, name, value)
+        with pytest.raises(CohortValidationError, match=expected):
+            build_run_config(rejected)
+
+
+def test_run_cohort_uses_truthful_provider_caps_for_100_101_500_and_501():
+    """Direct callers cannot make the provider exceed the CLI-safe envelope."""
+    for requested_per_watch, requested_total in ((100, 500), (101, 501)):
+        db = _open()
+        wids = _seed(db, [0, 1, 2, 3, 4])
+        db.conn.execute(
+            "UPDATE specialist_evidence_watchlist SET max_new_trades_per_run=100 "
+            "WHERE id IN ({})".format(",".join("?" for _ in wids)),
+            wids,
+        )
+        db.conn.commit()
+        adapter = FakeAdapter(_targets([0, 1, 2, 3, 4], rows_per=100))
+        try:
+            result = asyncio.run(run_cohort(
+                db,
+                watch_ids=wids,
+                adapter=adapter,
+                dry_run=True,
+                config=CohortRunConfig(
+                    max_new_trades_per_wallet=requested_per_watch,
+                    max_total_new_trades=requested_total,
+                ),
+            ))
+            assert result.status == "success", result.as_dict()
+            assert result.limits["max_new_trades_per_wallet"] == 100
+            assert result.limits["max_total_new_trades"] == 500
+            assert adapter.requested_limits == [100] * 5
+            assert [w.effective_new_trade_limit for w in result.watches] == [100] * 5
+        finally:
+            db.close()
+
+
+def test_per_watch_effective_limit_tracks_remaining_cohort_capacity():
+    db = _open()
+    wids = _seed(db, [0, 1])
+    db.conn.execute(
+        "UPDATE specialist_evidence_watchlist SET max_new_trades_per_run=100 "
+        "WHERE id IN ({})".format(",".join("?" for _ in wids)),
+        wids,
+    )
+    db.conn.commit()
+    adapter = FakeAdapter(_targets([0, 1], rows_per=100))
+    try:
+        result = asyncio.run(run_cohort(
+            db,
+            watch_ids=wids,
+            adapter=adapter,
+            dry_run=True,
+            config=CohortRunConfig(max_new_trades_per_wallet=100, max_total_new_trades=101),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert adapter.requested_limits == [100, 1]
+        assert [w.effective_new_trade_limit for w in result.watches] == [100, 1]
+        assert result.remaining["max_total_new_trades"] == 0
+    finally:
+        db.close()
+
+
+def test_watchlist_limit_is_clamped_to_authoritative_provider_maximum():
+    db = _open()
+    (wid,) = _seed(db, [0])
+    db.conn.execute(
+        "UPDATE specialist_evidence_watchlist SET max_new_trades_per_run=101 WHERE id=?",
+        (wid,),
+    )
+    db.conn.commit()
+    adapter = FakeAdapter(_targets([0], rows_per=100))
+    try:
+        result = asyncio.run(run_cohort(
+            db,
+            watch_ids=[wid],
+            adapter=adapter,
+            dry_run=True,
+            config=CohortRunConfig(max_new_trades_per_wallet=100, max_total_new_trades=500),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert adapter.requested_limits == [100]
+        assert result.watches[0].effective_new_trade_limit == 100
     finally:
         db.close()
 
@@ -568,6 +681,12 @@ def test_cli_rejection_matrix_never_opens_writable_or_builds_adapter(tmp_path, m
         "malformed": ["--watch-id", "not a watch id"],
         "duplicate": ["--watch-id", valid_watch, "--watch-id", valid_watch],
         "numeric_out_of_range": ["--watch-id", valid_watch, "--max-total-new-trades", "0"],
+        "per_watch_over_provider_max": [
+            "--watch-id", valid_watch, "--max-new-trades-per-wallet", "101"
+        ],
+        "cohort_over_five_watch_max": [
+            "--watch-id", valid_watch, "--max-total-new-trades", "501"
+        ],
         "missing": ["--watch-id", "wl_deadbeef"],
         "inactive": ["--watch-id", inactive_watch],
         "sample_wallet": ["--watch-id", sample_watch],

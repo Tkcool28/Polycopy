@@ -83,6 +83,7 @@ from polycopy.ingestion.specialist_evidence_collector import (
     EvidenceCollectionResult,
     WriterFailure,
 )
+from polycopy.ingestion.normalized_source_trade import HARD_MAX_RECORD_LIMIT
 from polycopy.ingestion.specialist_evidence_watchlist import (
     _wallet_is_sample as _watch_wallet_is_sample,
 )
@@ -91,11 +92,12 @@ from polycopy.runtime.locks import LockError, operational_job_lock
 # ── Hard cohort bounds ──────────────────────────────────────────────────────
 MAX_WATCH_IDS = 5
 MIN_WATCH_IDS = 1
+HARD_MAX_TOTAL_NEW_TRADES = HARD_MAX_RECORD_LIMIT * MAX_WATCH_IDS
 
 # Safe CLI numeric option bounds (validated BEFORE provider/network/DB-open).
 _CLI_LIMITS = {
-    "max_new_trades_per_wallet": (1, 10_000),
-    "max_total_new_trades": (1, 10_000),
+    "max_new_trades_per_wallet": (1, HARD_MAX_RECORD_LIMIT),
+    "max_total_new_trades": (1, HARD_MAX_TOTAL_NEW_TRADES),
     "max_gamma_requests": (0, 1_000_000),
     "timeout_seconds": (1.0, 3_600.0),
     "rss_mb_limit": (16.0, 1_000_000.0),
@@ -527,6 +529,21 @@ def build_run_config(args: Any) -> CohortRunConfig:
     return cfg
 
 
+def _effective_record_limits(config: CohortRunConfig) -> tuple[int, int]:
+    """Return actual per-watch and cohort record caps for this invocation.
+
+    CLI callers are rejected before this point when they exceed the public
+    bounds.  Programmatic callers can still construct ``CohortRunConfig``
+    directly, so cap those values here as well: the provider must never be
+    asked for more than its authoritative per-request limit, and a five-watch
+    cohort cannot claim more than five such requests.  The returned per-watch
+    value also accounts for a smaller total budget.
+    """
+    per_wallet = max(1, min(int(config.max_new_trades_per_wallet), HARD_MAX_RECORD_LIMIT))
+    total = max(1, min(int(config.max_total_new_trades), HARD_MAX_TOTAL_NEW_TRADES))
+    return min(per_wallet, total), total
+
+
 # ── Adapter lifecycle: close exactly once ───────────────────────────────────
 async def _close_adapter(real_adapter) -> None:
     """Close the provider adapter EXACTLY once, preferring async ``aclose``.
@@ -589,14 +606,13 @@ async def run_cohort(
         watch_count_requested=len(watch_ids),
     )
 
-    # Normalized limits / consumption / remaining for the result JSON. A watch
-    # cannot use more than the shared cohort budget, so do not advertise an
-    # unreachable configured per-wallet cap as the effective bound.
+    # Normalize direct programmatic configs too.  A watch cannot use more than
+    # the shared cohort budget, so do not advertise an unreachable configured
+    # per-wallet cap as its effective bound.
+    effective_per_wallet_limit, effective_total_limit = _effective_record_limits(config)
     result.limits = {
-        "max_new_trades_per_wallet": min(
-            config.max_new_trades_per_wallet, config.max_total_new_trades
-        ),
-        "max_total_new_trades": config.max_total_new_trades,
+        "max_new_trades_per_wallet": effective_per_wallet_limit,
+        "max_total_new_trades": effective_total_limit,
         "max_gamma_requests": config.max_gamma_requests,
         "timeout_seconds": int(config.timeout_seconds),
         "rss_mb_limit": int(config.rss_mb_limit),
@@ -652,7 +668,7 @@ async def run_cohort(
         budget=config.max_gamma_requests,
     )
     cohort_budget = CohortBudget(
-        remaining_records=config.max_total_new_trades,
+        remaining_records=effective_total_limit,
         gamma=shared_gamma,
         deadline_ts=(
             time.monotonic() + config.timeout_seconds
@@ -668,8 +684,8 @@ async def run_cohort(
     # Build the shared collector config (same bounds for every watch).
     ev_cfg = EvidenceCollectorConfig(
         max_wallets_per_run=1,
-        max_new_trades_per_wallet=config.max_new_trades_per_wallet,
-        max_total_new_trades=config.max_total_new_trades,
+        max_new_trades_per_wallet=effective_per_wallet_limit,
+        max_total_new_trades=effective_total_limit,
         max_gamma_requests=config.max_gamma_requests,
         timeout_seconds=config.timeout_seconds,
         rss_mb_limit=config.rss_mb_limit,
@@ -1056,6 +1072,8 @@ def _compute_totals(result: CohortResult) -> None:
 
 
 __all__ = [
+    "HARD_MAX_RECORD_LIMIT",
+    "HARD_MAX_TOTAL_NEW_TRADES",
     "MAX_WATCH_IDS",
     "MIN_WATCH_IDS",
     "ALLOWED_WRITE_TABLES",

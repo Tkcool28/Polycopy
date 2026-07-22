@@ -106,6 +106,8 @@ def _atomic_write_json(path: str, payload: dict) -> None:
 _WATCH_ID_RE = cohort._WATCH_ID_RE
 MIN_WATCH_IDS = cohort.MIN_WATCH_IDS
 MAX_WATCH_IDS = cohort.MAX_WATCH_IDS
+HARD_MAX_RECORD_LIMIT = cohort.HARD_MAX_RECORD_LIMIT
+HARD_MAX_TOTAL_NEW_TRADES = HARD_MAX_RECORD_LIMIT * MAX_WATCH_IDS
 
 
 def _validate_watch_set_shape(watch_ids: list[str]) -> None:
@@ -161,8 +163,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="Path to a file with one watch id per line.")
     p.add_argument("--resolve-gamma", action="store_true",
                    help="Resolve Gamma taxonomy during collection (network).")
-    p.add_argument("--max-new-trades-per-wallet", type=int, default=25)
-    p.add_argument("--max-total-new-trades", type=int, default=25)
+    p.add_argument(
+        "--max-new-trades-per-wallet", type=int, default=25,
+        help=f"New source trades per watch (1..{HARD_MAX_RECORD_LIMIT}).",
+    )
+    p.add_argument(
+        "--max-total-new-trades", type=int, default=25,
+        help=f"New source trades for the whole cohort (1..{HARD_MAX_TOTAL_NEW_TRADES}).",
+    )
     p.add_argument("--max-gamma-requests", type=int, default=100)
     p.add_argument("--timeout-seconds", type=float, default=30.0)
     p.add_argument("--rss-mb-limit", type=float, default=512.0)
