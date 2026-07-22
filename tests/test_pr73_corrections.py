@@ -11,8 +11,12 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from dataclasses import replace
 import sys
 import tempfile
+
+import pytest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -91,8 +95,11 @@ class FakeAdapter:
         self.get_trades_calls += 1
         return list(self._targets.get(wallet.lower(), []))[:limit]
 
-    def get_market_raw(self, condition_id):
-        return self._gmr(condition_id)
+    async def get_market_raw(self, condition_id):
+        value = self._gmr(condition_id)
+        if hasattr(value, "__await__"):
+            return await value
+        return value
 
     async def aclose(self):
         self.aclose_calls += 1
@@ -419,36 +426,132 @@ def test_provider_build_failure_structured():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CORRECTION 6 — invalid watch sets rejected before writable open (CLI)
+# CORRECTION 6 — actual CLI Phase B ordering and no-writable-open matrix
 # ═════════════════════════════════════════════════════════════════════════════
-def test_cli_invalid_watch_sets_before_writable_open():
+def test_cli_write_phase_b_orders_lock_writable_open_adapter_then_network(tmp_path, monkeypatch):
+    """Exercise ``main()`` against a disposable DB, not a fake CLI stage.
+
+    The write branch owns Phase B: after read-only validation it must acquire
+    the lock, then open writable SQLite, then construct the adapter, and only
+    then fetch.  Patch symbols in the *CLI module namespace* because those are
+    the bindings ``main()`` actually calls.
+    """
     import scripts.collect_specialist_evidence_cohort as cli
-    import evidence_db
+    import polycopy.adapters.polymarket as polymarket
 
-    calls = {"writable": 0}
-
-    def _open_writable_fail(*a, **k):
-        calls["writable"] += 1
-        raise AssertionError("open_writable must NOT be called for invalid input")
-
-    orig_open = evidence_db.open_writable
-    evidence_db.open_writable = _open_writable_fail
+    db_path = tmp_path / "phase-b-ordering.db"
+    seeded = Database(db_path).connect()
     try:
-        invalid = [
-            [],
-            [f"w{i}" for i in range(6)],
-            ["bad id with spaces"],
-            ["dup", "dup"],
-        ]
-        for ws in invalid:
-            argv = ["--db-path", ":memory:", "--dry-run"]
-            for w in ws:
-                argv += ["--watch-id", w]
-            rc = cli.main(argv)
-            assert rc == 2, (ws, rc)
-        assert calls["writable"] == 0, calls
+        watch_id = _seed(seeded, [0])[0]
     finally:
-        evidence_db.open_writable = orig_open
+        seeded.close()
+
+    events: list[str] = []
+    real_open_writable = cli.open_writable
+
+    @contextlib.contextmanager
+    def tracked_lock(*_args, **_kwargs):
+        events.append("lock_acquired")
+        try:
+            yield
+        finally:
+            events.append("lock_released")
+
+    def tracked_open_writable(*args, **kwargs):
+        events.append("writable_open")
+        db = real_open_writable(*args, **kwargs)
+        real_close = db.close
+
+        def tracked_close():
+            events.append("db_closed")
+            real_close()
+
+        db.close = tracked_close
+        return db
+
+    class Adapter:
+        def __init__(self, **_kwargs):
+            events.append("adapter_constructed")
+
+        async def get_trades_by_address(self, *_args, **_kwargs):
+            events.append("network_fetch")
+            return []
+
+        async def aclose(self):
+            events.append("adapter_closed")
+
+    monkeypatch.setattr(cli, "operational_job_lock", tracked_lock)
+    monkeypatch.setattr(cli, "open_writable", tracked_open_writable)
+    monkeypatch.setattr(polymarket, "PolymarketPublicAdapter", Adapter)
+
+    assert cli.main([
+        "--db-path", str(db_path),
+        "--watch-id", watch_id,
+        "--write",
+        "--lock-path", str(tmp_path / "phase-b-ordering.lock"),
+        "--json",
+    ]) == 0
+
+    assert events == [
+        "lock_acquired",
+        "writable_open",
+        "adapter_constructed",
+        "network_fetch",
+        "adapter_closed",
+        "db_closed",
+        "lock_released",
+    ], events
+
+
+def test_cli_rejection_matrix_never_opens_writable_or_builds_adapter(tmp_path, monkeypatch):
+    """Every pre-Phase-B rejection leaves the disposable DB unopened writable."""
+    import scripts.collect_specialist_evidence_cohort as cli
+    import polycopy.adapters.polymarket as polymarket
+
+    db_path = tmp_path / "no-writable-open-matrix.db"
+    seeded = Database(db_path).connect()
+    try:
+        valid_watch = _seed(seeded, [0])[0]
+        inactive_watch = _seed(seeded, [1])[0]
+        seeded.conn.execute(
+            "UPDATE specialist_evidence_watchlist SET status='paused' WHERE id=?",
+            (inactive_watch,),
+        )
+        _seed_wallet(seeded, WUUID[2], ADDR[2])
+        sample_watch = wl.add_watch(seeded, wallet_id=WUUID[2])
+        seeded.conn.execute("UPDATE wallets SET is_sample=1 WHERE id=?", (WUUID[2],))
+        seeded.conn.commit()
+    finally:
+        seeded.close()
+
+    calls = {"writable": 0, "adapter": 0}
+
+    def forbidden_writable(*_args, **_kwargs):
+        calls["writable"] += 1
+        raise AssertionError("rejected CLI input must not open writable SQLite")
+
+    class ForbiddenAdapter:
+        def __init__(self, **_kwargs):
+            calls["adapter"] += 1
+            raise AssertionError("rejected CLI input must not build an adapter")
+
+    monkeypatch.setattr(cli, "open_writable", forbidden_writable)
+    monkeypatch.setattr(polymarket, "PolymarketPublicAdapter", ForbiddenAdapter)
+
+    cases = {
+        "empty": [],
+        "too_many": sum((["--watch-id", f"wl_0000000{i}"] for i in range(1, 7)), []),
+        "malformed": ["--watch-id", "not a watch id"],
+        "duplicate": ["--watch-id", valid_watch, "--watch-id", valid_watch],
+        "numeric_out_of_range": ["--watch-id", valid_watch, "--max-total-new-trades", "0"],
+        "missing": ["--watch-id", "wl_deadbeef"],
+        "inactive": ["--watch-id", inactive_watch],
+        "sample_wallet": ["--watch-id", sample_watch],
+    }
+    for name, case_args in cases.items():
+        assert cli.main(["--db-path", str(db_path), "--write", *case_args]) == 2, name
+
+    assert calls == {"writable": 0, "adapter": 0}, calls
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -537,3 +640,655 @@ def test_truthful_metrics_writer_failure():
     assert res.watch_count_failed == 1
     assert res.totals["rows_created"] == 0
     db.close()
+
+
+# Production-shaped async Gamma regression: one actual adapter call for a
+# condition shared by multiple source trades; the completed mapping—not a
+# coroutine—is what reaches metadata/provenance.
+def test_async_gamma_one_call_per_unique_condition_and_no_coroutine_metadata():
+    db = _open()
+    wids = _seed(db, [0])
+    calls = []
+
+    async def get_market_raw(condition_id):
+        calls.append(condition_id)
+        await asyncio.sleep(0)
+        return {"conditionId": condition_id, "category": "Politics", "tokens": []}
+
+    adapter = FakeAdapter(_targets([0], rows_per=2), get_market_raw=get_market_raw)
+    try:
+        result = asyncio.run(
+            run_cohort(
+                db,
+                watch_ids=wids,
+                adapter=adapter,
+                dry_run=False,
+                config=CohortRunConfig(resolve_gamma=True, max_gamma_requests=1),
+            )
+        )
+        assert result.status == "success", result.as_dict()
+        assert calls == [COND[0]]
+        raw_metadata = db.conn.execute("SELECT metadata_json FROM source_trades").fetchall()
+        raw_provenance = db.conn.execute(
+            "SELECT evidence_hash, reason_codes_json FROM source_trade_enrichments"
+        ).fetchall()
+        assert all("coroutine" not in str(row[0]).lower() for row in raw_metadata + raw_provenance)
+        assert adapter.aclose_calls == 1
+    finally:
+        db.close()
+
+
+# Direct regression: the ingestion layer may not downgrade a structured Gamma
+# failure into unavailable metadata.
+def test_run_ingestion_propagates_structured_gamma_failure():
+    from polycopy.ingestion.gamma_budget import GammaBudgetExhausted
+    from polycopy.ingestion.ingest_pipeline import run_ingestion
+
+    class Provider:
+        made_network_call = False
+
+        async def fetch_trades(self, wallet, *, limit, page):
+            return [_buy("gamma-fail", COND[0], TOK[0], ADDR[0])] if page == 0 else []
+
+    async def exhausted(_condition_id):
+        raise GammaBudgetExhausted("test Gamma cap")
+
+    try:
+        asyncio.run(run_ingestion(Provider(), ADDR[0], gamma_resolver=exhausted))
+    except GammaBudgetExhausted as exc:
+        assert "test Gamma cap" in str(exc)
+    else:
+        raise AssertionError("GammaBudgetExhausted was silently downgraded")
+
+
+# The legacy sync entrypoint is explicitly sync-resolver-only: an awaitable
+# must fail deterministically and direct callers to the native async API.
+def test_sync_enrichment_rejects_async_resolver_with_migration_error():
+    from polycopy.ingestion.source_trade_enrichment import enrich_source_trade
+
+    db = _open()
+    try:
+        _seed_wallet(db, WUUID[0], ADDR[0])
+        from polycopy.ingestion.source_trade_writer import write_valid_rows
+        from polycopy.ingestion.normalized_source_trade import normalize_source_trade
+
+        row = normalize_source_trade(
+            _buy("sync-reject", COND[0], TOK[0], ADDR[0]),
+            requested_wallet=ADDR[0], record_index=0,
+        )
+        write_valid_rows(db, [row], dry_run=False)
+
+        async def resolver(_condition_id):
+            return {"conditionId": COND[0]}
+
+        internal_id = db.conn.execute(
+            "SELECT id FROM source_trades WHERE source_trade_id=?", (row.source_trade_id,)
+        ).fetchone()[0]
+        try:
+            enrich_source_trade(db, internal_id, gamma_resolver=resolver)
+        except TypeError as exc:
+            assert "enrich_source_trade_async" in str(exc)
+        else:
+            raise AssertionError("sync API accepted an async Gamma resolver")
+    finally:
+        db.close()
+
+
+# Strict actual-cohort replay proof: identical Gamma-enabled replay emits no DML
+# and preserves metadata/provenance bytes while observing duplicates truthfully.
+def test_identical_cohort_replay_is_zero_dml_and_preserves_evidence():
+    db = _open()
+    wids = _seed(db, [0])
+    calls = []
+
+    async def gamma(condition_id):
+        calls.append(condition_id)
+        return {"conditionId": condition_id, "category": "Politics"}
+
+    adapter = FakeAdapter(_targets([0], rows_per=2), get_market_raw=gamma)
+    cfg = CohortRunConfig(resolve_gamma=True, max_gamma_requests=1, max_total_new_trades=2)
+    try:
+        first = asyncio.run(run_cohort(db, watch_ids=wids, adapter=adapter, dry_run=False, config=cfg))
+        assert first.status == "success", first.as_dict()
+        before_meta = db.conn.execute("SELECT id, metadata_json FROM source_trades ORDER BY id").fetchall()
+        before_prov = db.conn.execute(
+            "SELECT source_trade_internal_id, evidence_hash, reason_codes_json FROM source_trade_enrichments "
+            "ORDER BY source_trade_internal_id"
+        ).fetchall()
+        before_watch = db.conn.execute(
+            "SELECT last_collection_at FROM specialist_evidence_watchlist WHERE id=?", (wids[0],)
+        ).fetchone()[0]
+        writes = []
+
+        def trace(sql):
+            statement = sql.lstrip().upper()
+            if statement.startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")):
+                writes.append(sql)
+
+        db.conn.set_trace_callback(trace)
+        replay = asyncio.run(run_cohort(db, watch_ids=wids, adapter=adapter, dry_run=False, config=cfg))
+        db.conn.set_trace_callback(None)
+        assert replay.status == "success", replay.as_dict()
+        assert writes == [], writes
+        assert replay.totals["duplicate_rows_observed"] == 2
+        assert replay.consumption["fresh_rows_created_or_projected"] == 0
+        assert replay.remaining["max_total_new_trades"] == 2
+        assert len(calls) == 2
+        assert db.conn.execute("SELECT id, metadata_json FROM source_trades ORDER BY id").fetchall() == before_meta
+        assert db.conn.execute(
+            "SELECT source_trade_internal_id, evidence_hash, reason_codes_json FROM source_trade_enrichments "
+            "ORDER BY source_trade_internal_id"
+        ).fetchall() == before_prov
+        assert db.conn.execute(
+            "SELECT last_collection_at FROM specialist_evidence_watchlist WHERE id=?", (wids[0],)
+        ).fetchone()[0] == before_watch
+    finally:
+        db.close()
+
+
+# Mixed replay: the duplicate avoids writer DML while one fresh candidate uses
+# the real writer, consumes exactly one capacity unit, and gets enrichment.
+def test_mixed_replay_writes_only_fresh_row_and_reports_duplicate():
+    db = _open()
+    wids = _seed(db, [0])
+    try:
+        first = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter(
+                _targets([0], rows_per=1),
+                get_market_raw=lambda c: {"conditionId": c, "category": "Politics"},
+            ),
+            dry_run=False, config=CohortRunConfig(resolve_gamma=True, max_gamma_requests=1, max_total_new_trades=2),
+        ))
+        assert first.status == "success", first.as_dict()
+        old = db.conn.execute(
+            "SELECT id, metadata_json FROM source_trades ORDER BY id LIMIT 1"
+        ).fetchone()
+        old_evidence = db.conn.execute(
+            "SELECT evidence_hash, reason_codes_json FROM source_trade_enrichments "
+            "WHERE source_trade_internal_id=?", (old[0],)
+        ).fetchone()
+        mixed = _targets([0], rows_per=1)[ADDR[0].lower()] + [
+            _buy("t0_fresh", COND[0], TOK[0], ADDR[0])
+        ]
+        calls = []
+
+        async def gamma(condition_id):
+            calls.append(condition_id)
+            return {"conditionId": condition_id, "category": "Politics"}
+
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): mixed}, get_market_raw=gamma),
+            dry_run=False,
+            config=CohortRunConfig(resolve_gamma=True, max_gamma_requests=1, max_total_new_trades=2),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert result.totals["rows_created"] == 1
+        assert result.totals["duplicate_rows_observed"] == 1
+        assert result.consumption["fresh_rows_created_or_projected"] == 1
+        assert result.remaining["max_total_new_trades"] == 1
+        assert _count(db, "source_trades") == 2
+        assert db.conn.execute(
+            "SELECT metadata_json FROM source_trades WHERE id=?", (old[0],)
+        ).fetchone()[0] == old[1]
+        assert db.conn.execute(
+            "SELECT evidence_hash, reason_codes_json FROM source_trade_enrichments "
+            "WHERE source_trade_internal_id=?", (old[0],)
+        ).fetchone() == old_evidence
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM source_trade_enrichments"
+        ).fetchone()[0] == 2
+        assert calls == [COND[0]]
+    finally:
+        db.close()
+
+
+# Real source-trade writer failure on watch 3 via SQLite's INSERT seam.
+def test_actual_writer_sqlite_execute_failure_on_watch_three_rolls_back():
+    db = _open()
+    wids = _seed(db, [0, 1, 2, 3, 4])
+    calls = {address.lower(): 0 for address in ADDR[:5]}
+
+    class Adapter(FakeAdapter):
+        async def get_trades_by_address(self, wallet, *, since, limit, offset, return_raw):
+            calls[wallet.lower()] += 1
+            return await super().get_trades_by_address(
+                wallet, since=since, limit=limit, offset=offset, return_raw=return_raw
+            )
+
+    ordered_indices = [wids.index(wid) for wid in sorted(wids)]
+    fail_index = ordered_indices[2]
+    later_indices = ordered_indices[3:]
+    db.conn.execute(
+        "CREATE TRIGGER fail_watch_three BEFORE INSERT ON source_trades "
+        "WHEN NEW.trader_address='" + ADDR[fail_index].lower() + "' "
+        "BEGIN SELECT RAISE(FAIL, 'writer sqlite failure watch 3'); END"
+    )
+    before = {table: _count(db, table) for table in ALLOWED_WRITE_TABLES + FORBIDDEN_WRITE_TABLES}
+    adapter = Adapter(_targets([0, 1, 2, 3, 4], rows_per=1))
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids, adapter=adapter, dry_run=False, config=CohortRunConfig(),
+        ))
+        after = {table: _count(db, table) for table in before}
+        assert result.status == "failed", result.as_dict()
+        assert "writer sqlite failure watch 3" in (result.error or "")
+        assert before == after
+        statuses = [watch.status for watch in result.watches]
+        assert statuses[:3] == ["ok", "ok", "error"], statuses
+        assert statuses[3:] == ["unprocessed", "unprocessed"], statuses
+        assert all(calls[ADDR[index].lower()] == 0 for index in later_indices), calls
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM specialist_evidence_watchlist WHERE last_collection_at IS NOT NULL"
+        ).fetchone()[0] == 0
+        assert adapter.aclose_calls == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "write_result", "expected"),
+    [
+        ("missing_constraint", {"unique_constraint_present": False, "errors": 1, "rolled_back": True, "error_message": "UNIQUE dedupe constraint missing"}, "UNIQUE dedupe constraint missing"),
+        ("writer_errors", {"unique_constraint_present": True, "errors": 2, "error_message": "writer reported errors=2"}, "writer reported errors=2"),
+        ("writer_rolled_back", {"unique_constraint_present": True, "rolled_back": True, "error_message": "writer rolled_back=True"}, "writer rolled_back=True"),
+        ("writer_message", {"unique_constraint_present": True, "error_message": "writer-specific returned message"}, "writer-specific returned message"),
+        ("unique_flag_false", {"unique_constraint_present": False}, "unique_constraint_present=False"),
+    ],
+)
+def test_actual_writer_result_failure_on_deterministic_watch_three_rolls_back(case, write_result, expected):
+    """Patch only the writer-result seam; collector/cohort remain real."""
+    from polycopy.ingestion.source_trade_writer import WriteResult
+    import polycopy.ingestion.specialist_evidence_collector as collector
+
+    db = _open()
+    wids = _seed(db, [0, 1, 2, 3, 4])
+    ordered_indices = [wids.index(wid) for wid in sorted(wids)]
+    fail_address = ADDR[ordered_indices[2]].lower()
+    later_indices = ordered_indices[3:]
+    calls = {address.lower(): 0 for address in ADDR[:5]}
+
+    class Adapter(FakeAdapter):
+        async def get_trades_by_address(self, wallet, *, since, limit, offset, return_raw):
+            calls[wallet.lower()] += 1
+            return await super().get_trades_by_address(
+                wallet, since=since, limit=limit, offset=offset, return_raw=return_raw
+            )
+
+    original_writer = collector.write_valid_rows
+
+    def writer_seam(db_arg, rows, **kwargs):
+        if rows and rows[0].trader_address == fail_address:
+            return WriteResult(**write_result)
+        return original_writer(db_arg, rows, **kwargs)
+
+    collector.write_valid_rows = writer_seam
+    before = {table: _count(db, table) for table in ALLOWED_WRITE_TABLES + FORBIDDEN_WRITE_TABLES}
+    adapter = Adapter(_targets([0, 1, 2, 3, 4], rows_per=1))
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids, adapter=adapter, dry_run=False, config=CohortRunConfig(),
+        ))
+        after = {table: _count(db, table) for table in before}
+        assert result.status == "failed", (case, result.as_dict())
+        assert expected in (result.error or ""), (case, result.error)
+        assert result.cohort_committed is False and result.rolled_back is True
+        assert before == after
+        statuses = [watch.status for watch in result.watches]
+        assert statuses[:3] == ["ok", "ok", "error"], (case, statuses)
+        assert statuses[3:] == ["unprocessed", "unprocessed"], (case, statuses)
+        assert all(calls[ADDR[index].lower()] == 0 for index in later_indices), (case, calls)
+        assert adapter.aclose_calls == 1
+        assert result.watch_count_processed + result.watch_count_failed + result.watch_count_unprocessed == 5
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()
+
+
+# Fresh rows must still pass through the writer's own uniqueness preflight.
+def test_fresh_candidate_uses_writer_uniqueness_preflight_after_duplicate_partition():
+    import polycopy.ingestion.specialist_evidence_collector as collector
+
+    db = _open()
+    wids = _seed(db, [0])
+    original_writer = collector.write_valid_rows
+    observed = []
+
+    def writer_spy(db_arg, rows, **kwargs):
+        result = original_writer(db_arg, rows, **kwargs)
+        observed.append((len(rows), result.unique_constraint_present, result.inserted))
+        return result
+
+    collector.write_valid_rows = writer_spy
+    adapter = FakeAdapter(_targets([0], rows_per=1))
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids, adapter=adapter, dry_run=False,
+            config=CohortRunConfig(max_total_new_trades=1),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert observed == [(1, True, 1)]
+        assert result.totals["rows_created"] == 1
+        assert result.consumption["fresh_rows_created_or_projected"] == 1
+        assert result.remaining["max_total_new_trades"] == 0
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()
+
+
+# The collector's canonical prefilter owns existing-duplicate observations.
+# Fresh rows must still reach the real writer's UNIQUE preflight, but must not
+# be mislabeled as writer-recognized existing duplicates merely because their
+# IDs were passed through an obsolete pre-existing-ID hint.
+def test_canonical_prefilter_keeps_fresh_writer_existing_duplicate_metric_zero():
+    import polycopy.ingestion.specialist_evidence_collector as collector
+
+    db = _open()
+    wids = _seed(db, [0])
+    original_writer = collector.write_valid_rows
+    observed = []
+
+    def writer_spy(db_arg, rows, **kwargs):
+        result = original_writer(db_arg, rows, **kwargs)
+        observed.append((result.inserted, result.deduplicated, result.existing_duplicates_recognized))
+        return result
+
+    collector.write_valid_rows = writer_spy
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids, adapter=FakeAdapter(_targets([0], rows_per=1)),
+            dry_run=False, config=CohortRunConfig(max_total_new_trades=1),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert observed == [(1, 0, 0)]
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()
+
+
+# Canonical duplicate identity is the pair (source, source_trade_id), not the
+# source_trade_id alone.  An identical ID owned by another source must remain
+# fresh for this collector and be inserted by the real writer.
+def test_canonical_prefilter_is_single_source_scoped():
+    from polycopy.ingestion.normalized_source_trade import normalize_source_trade
+    from polycopy.ingestion.source_trade_writer import write_valid_rows
+
+    db = _open()
+    wids = _seed(db, [0])
+    raw = _buy("shared-id", COND[0], TOK[0], ADDR[0])
+    other_source = replace(
+        normalize_source_trade(raw, requested_wallet=ADDR[0]), source="other_source"
+    )
+    try:
+        seeded = write_valid_rows(db, [other_source], dry_run=False)
+        assert (seeded.inserted, seeded.deduplicated) == (1, 0)
+
+        dry_result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [raw]}), dry_run=True,
+            config=CohortRunConfig(max_total_new_trades=1),
+        ))
+        assert dry_result.status == "success", dry_result.as_dict()
+        assert dry_result.totals["rows_would_create"] == 1
+        assert dry_result.totals["rows_would_update"] == 0
+
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [raw]}), dry_run=False,
+            config=CohortRunConfig(max_total_new_trades=1),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert result.totals["rows_created"] == 1
+        assert result.totals["duplicate_rows_observed"] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM source_trades WHERE source=? AND source_trade_id=?",
+            ("other_source", other_source.source_trade_id),
+        ).fetchone()[0] == 1
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM source_trades WHERE source=? AND source_trade_id=?",
+            ("polymarket_data_api_trades_user", other_source.source_trade_id),
+        ).fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+# Real writer race: the collector prefilter sees a fresh canonical key, a
+# separate writer wins before the collector's real writer executes, and the
+# collector must report exactly one writer-race duplicate without consuming a
+# fresh-row slot.  Both writes use the production writer implementation.
+def test_canonical_prefilter_real_writer_race_reports_writer_duplicate_once():
+    import polycopy.ingestion.specialist_evidence_collector as collector
+    from polycopy.ingestion.source_trade_writer import write_valid_rows as real_writer
+
+    db = _open()
+    wids = _seed(db, [0])
+    original_writer = collector.write_valid_rows
+    contender_results = []
+    collector_results = []
+
+    def race_writer(db_arg, rows, **kwargs):
+        contender_db = Database(db_arg.db_path).connect()
+        try:
+            contender = real_writer(contender_db, rows, dry_run=False)
+            contender_results.append((contender.inserted, contender.deduplicated))
+        finally:
+            contender_db.close()
+        result = original_writer(db_arg, rows, **kwargs)
+        collector_results.append((result.inserted, result.deduplicated))
+        return result
+
+    collector.write_valid_rows = race_writer
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [_buy("race-real", COND[0], TOK[0], ADDR[0])]}),
+            dry_run=False, config=CohortRunConfig(max_total_new_trades=1),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert contender_results == [(1, 0)]
+        assert collector_results == [(0, 1)]
+        assert result.totals["rows_created"] == 0
+        assert result.totals["duplicate_rows_observed"] == 1
+        assert result.consumption["fresh_rows_created_or_projected"] == 0
+        assert result.remaining["max_total_new_trades"] == 1
+        assert _count(db, "source_trades") == 1
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()
+
+
+# Two identical provider records are partitioned before the writer receives rows.
+def test_same_batch_duplicate_is_partitioned_before_writer():
+    import polycopy.ingestion.specialist_evidence_collector as collector
+
+    db = _open()
+    wids = _seed(db, [0])
+    original_writer = collector.write_valid_rows
+    seen_sizes = []
+
+    def writer_spy(db_arg, rows, **kwargs):
+        seen_sizes.append(len(rows))
+        return original_writer(db_arg, rows, **kwargs)
+
+    collector.write_valid_rows = writer_spy
+    duplicate = _buy("same-batch", COND[0], TOK[0], ADDR[0])
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [duplicate, dict(duplicate)]}),
+            dry_run=False, config=CohortRunConfig(max_total_new_trades=2),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert seen_sizes == [1]
+        assert result.totals["rows_created"] == 1
+        assert result.totals["duplicate_rows_observed"] == 1
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()
+
+
+# Ingestion counts every additional stable-ID duplicate, not just the first.
+def test_three_identical_provider_rows_report_two_duplicates():
+    db = _open()
+    wids = _seed(db, [0])
+    raw = _buy("triple", COND[0], TOK[0], ADDR[0])
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [raw, dict(raw), dict(raw)]}),
+            dry_run=False, config=CohortRunConfig(max_total_new_trades=3),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert result.totals["rows_created"] == 1
+        assert result.totals["duplicate_rows_observed"] == 2
+        assert result.consumption["fresh_rows_created_or_projected"] == 1
+        assert result.remaining["max_total_new_trades"] == 2
+    finally:
+        db.close()
+
+
+# One duplicate is collapsed in ingestion and the surviving canonical candidate
+# is an existing DB duplicate: two observations, no replay DML.
+def test_pipeline_duplicate_plus_existing_trade_reports_two_duplicates_zero_dml():
+    db = _open()
+    wids = _seed(db, [0])
+    raw = _buy("persisted-t", COND[0], TOK[0], ADDR[0])
+    cfg = CohortRunConfig(
+        resolve_gamma=True, max_gamma_requests=1,
+        max_new_trades_per_wallet=2, max_total_new_trades=2,
+    )
+    try:
+        first = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [raw]}, get_market_raw=lambda c: {"conditionId": c, "category": "Politics"}),
+            dry_run=False, config=cfg,
+        ))
+        assert first.status == "success"
+        before_rows = _count(db, "source_trades"), _count(db, "source_trade_enrichments")
+        before_meta = db.conn.execute("SELECT metadata_json FROM source_trades").fetchone()[0]
+        before_hash = db.conn.execute("SELECT evidence_hash FROM source_trade_enrichments").fetchone()[0]
+        before_watch = db.conn.execute(
+            "SELECT last_collection_at FROM specialist_evidence_watchlist WHERE id=?", (wids[0],)
+        ).fetchone()[0]
+        calls, writes = [], []
+
+        async def gamma(condition_id):
+            calls.append(condition_id)
+            return {"conditionId": condition_id, "category": "Politics"}
+
+        def trace(sql):
+            if sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")):
+                writes.append(sql)
+
+        db.conn.set_trace_callback(trace)
+        replay = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [raw, dict(raw)]}, get_market_raw=gamma),
+            dry_run=False, config=cfg,
+        ))
+        db.conn.set_trace_callback(None)
+        assert replay.status == "success", replay.as_dict()
+        assert replay.totals["duplicate_rows_observed"] == 2
+        assert replay.totals["rows_created"] == 0
+        assert replay.consumption["fresh_rows_created_or_projected"] == 0
+        assert replay.remaining["max_total_new_trades"] == 2
+        assert writes == [], writes
+        assert calls == [COND[0]]
+        assert (_count(db, "source_trades"), _count(db, "source_trade_enrichments")) == before_rows
+        assert db.conn.execute("SELECT metadata_json FROM source_trades").fetchone()[0] == before_meta
+        assert db.conn.execute("SELECT evidence_hash FROM source_trade_enrichments").fetchone()[0] == before_hash
+        assert db.conn.execute(
+            "SELECT last_collection_at FROM specialist_evidence_watchlist WHERE id=?", (wids[0],)
+        ).fetchone()[0] == before_watch
+    finally:
+        db.close()
+
+
+# The writer is the only seam patched: an otherwise-fresh candidate loses a
+# concurrent uniqueness race after preflight, while ingestion saw one duplicate.
+def test_pipeline_duplicate_plus_writer_race_reports_two_duplicates():
+    from polycopy.ingestion.source_trade_writer import WriteResult
+    import polycopy.ingestion.specialist_evidence_collector as collector
+
+    db = _open()
+    wids = _seed(db, [0])
+    raw = _buy("race-t", COND[0], TOK[0], ADDR[0])
+    original_writer = collector.write_valid_rows
+    seen = []
+
+    def race_writer(db_arg, rows, **kwargs):
+        seen.append(len(rows))
+        return WriteResult(attempted=len(rows), deduplicated=len(rows), unique_constraint_present=True)
+
+    collector.write_valid_rows = race_writer
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [raw, dict(raw)]}),
+            dry_run=False,
+            config=CohortRunConfig(max_new_trades_per_wallet=2, max_total_new_trades=2),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert seen == [1]
+        assert result.totals["rows_created"] == 0
+        assert result.totals["duplicate_rows_observed"] == 2
+        assert result.consumption["fresh_rows_created_or_projected"] == 0
+        assert result.remaining["max_total_new_trades"] == 2
+        assert _count(db, "source_trades") == 0
+        assert _count(db, "source_trade_enrichments") == 0
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "preflight", "writer", "expected"),
+    [(1, 1, 0, 2), (1, 0, 1, 2), (0, 1, 1, 2), (2, 3, 4, 9)],
+)
+def test_duplicate_observation_metric_composition(pipeline, preflight, writer, expected):
+    from polycopy.ingestion.specialist_evidence_collector import _total_duplicate_observations
+
+    assert _total_duplicate_observations(
+        pipeline=pipeline, preflight=preflight, writer=writer
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"not": "a production-shaped trade"},
+        _sell("rejected-sell", COND[0], TOK[0], ADDR[0]),
+        {**_buy("no-stable-id", COND[0], TOK[0], ADDR[0]), "sourceProvidedTradeId": None, "transactionHash": None, "timestamp": None},
+        {**_buy("bad-price", COND[0], TOK[0], ADDR[0]), "price": "not-a-number"},
+    ],
+)
+def test_non_duplicate_rejections_do_not_increment_duplicate_observations(raw):
+    import polycopy.ingestion.specialist_evidence_collector as collector
+
+    db = _open()
+    wids = _seed(db, [0])
+    original_writer = collector.write_valid_rows
+    calls = []
+
+    def writer_spy(db_arg, rows, **kwargs):
+        calls.append(rows)
+        return original_writer(db_arg, rows, **kwargs)
+
+    collector.write_valid_rows = writer_spy
+    try:
+        result = asyncio.run(run_cohort(
+            db, watch_ids=wids,
+            adapter=FakeAdapter({ADDR[0].lower(): [raw]}), dry_run=False,
+            config=CohortRunConfig(max_total_new_trades=1),
+        ))
+        assert result.status == "success", result.as_dict()
+        assert result.totals["duplicate_rows_observed"] == 0
+        assert result.totals["rows_created"] == 0
+        assert result.consumption["fresh_rows_created_or_projected"] == 0
+        assert calls == [[]]
+        assert _count(db, "source_trades") == 0
+        assert _count(db, "source_trade_enrichments") == 0
+    finally:
+        collector.write_valid_rows = original_writer
+        db.close()

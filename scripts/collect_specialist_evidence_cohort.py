@@ -58,6 +58,7 @@ from polycopy.ingestion.specialist_evidence_cohort import (  # noqa: E402
     run_cohort,
     validate_watch_ids,
 )
+from polycopy.runtime.locks import operational_job_lock  # noqa: E402
 from evidence_db import (  # noqa: E402
     open_readonly,
     open_writable,
@@ -134,18 +135,18 @@ def _validate_watch_set_shape(watch_ids: list[str]) -> None:
         )
 
 
-async def _async_run(db, args, adapter) -> cohort.CohortResult:
-    cfg: CohortRunConfig = build_run_config(args)
-    # The cohort layer builds the real Gamma resolver only when resolve_gamma
-    # is set; in tests a fake gamma resolver is injected via the adapter spec.
+async def _async_run(
+    db, args, adapter, *, config: CohortRunConfig, lock_already_held: bool = False
+) -> cohort.CohortResult:
     return await run_cohort(
         db,
         watch_ids=args.watch_ids,
         adapter=adapter,
         dry_run=args.dry_run,
-        config=cfg,
+        config=config,
         lock_timeout=getattr(args, "lock_timeout", 30.0),
         lock_path=getattr(args, "lock_path", None),
+        lock_already_held=lock_already_held,
     )
 
 
@@ -201,18 +202,15 @@ def main(argv: list[str] | None = None) -> int:
         # Default to dry-run for safety.
         args.dry_run = True
 
-    # ── CORRECTION 6: reject invalid watch sets BEFORE any writable open ──
-    # (1) Count / format / duplicate validation needs NO database at all.
+    # (1) Shape validation and (2) numeric validation occur with no database.
     try:
         _validate_watch_set_shape(watch_ids)
+        cfg = build_run_config(args)
     except CohortValidationError as exc:
-        print(f"error: invalid watch set: {exc}", file=sys.stderr)
+        print(f"error: invalid cohort input: {exc}", file=sys.stderr)
         return 2
 
-    # (2) Gate validation: production WRITES require the full three-gate set
-    # (--write --allow-live --confirm-production-db). Dry-run opens read-only
-    # and is always permitted (no production write gate needed). Gates are
-    # checked BEFORE any provider construction / network / DB-open / persist.
+    # (3) Production write gates are evaluated before any DB access.
     class _GateArgs:
         dry_run = args.dry_run
         write = args.write
@@ -227,72 +225,69 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    # Open the connection. For validation of ACTIVE/missing/sample semantics we
-    # use READ-ONLY access; the writable open happens only AFTER the explicit
-    # cohort passes read-only validation AND the gates (and, inside run_cohort,
-    # after the operational lock is held). We must NOT let run_cohort's
-    # validate_watch_ids open a writable connection before rejecting.
-    db = open_readonly(args.db_path) if not args.write else open_writable(args.db_path, _GateArgs())
+    # (4) Semantic validation is explicitly read-only. Close this connection
+    # before acquiring the operational lock/opening writable access.
     try:
-        # (3) Read-only semantic validation: active / missing / sample. This
-        # runs against a read-only connection and raises CohortValidationError
-        # (-> exit 2) on any rejected watch BEFORE provider construction,
-        # network, or any writable open already happened (the writable open
-        # above only occurs for a gated --write path, still before provider
-        # construction/network).
+        validation_db = open_readonly(args.db_path)
         try:
-            validate_watch_ids(db, watch_ids)
-        except CohortValidationError as exc:
-            print(f"error: invalid watch set: {exc}", file=sys.stderr)
-            return 2
+            validate_watch_ids(validation_db, watch_ids)
+        finally:
+            validation_db.close()
+    except (CohortValidationError, OSError, RuntimeError) as exc:
+        print(f"error: invalid watch set: {exc}", file=sys.stderr)
+        return 2
 
-        # (4) The adapter is constructed lazily and only inside run_cohort
-        # AFTER the lock is held. Here we seal the REAL construction behind a
-        # 0-arg factory so the cohort layer can build it post-lock and close it
-        # once.
-        from polycopy.adapters.polymarket import PolymarketPublicAdapter
+    # Adapter construction itself remains inside run_cohort, after the lock.
+    from polycopy.adapters.polymarket import PolymarketPublicAdapter
 
-        def _make_adapter():
-            return PolymarketPublicAdapter(
-                gamma_base_url="https://gamma-api.polymarket.com",
-                clob_base_url="https://clob.polymarket.com",
-                data_api_base_url="https://data-api.polymarket.com",
-                timeout=min(10.0, args.timeout_seconds),
-            )
+    def _make_adapter():
+        return PolymarketPublicAdapter(
+            gamma_base_url="https://gamma-api.polymarket.com",
+            clob_base_url="https://clob.polymarket.com",
+            data_api_base_url="https://data-api.polymarket.com",
+            timeout=min(10.0, args.timeout_seconds),
+        )
 
-        class _AdapterSpec:
-            built = None
+    class _AdapterSpec:
+        def build(self):
+            return _make_adapter()
 
-            def build(self):
-                self.built = _make_adapter()
-                return self.built
-
-            def close(self):
-                a = self.built
-                if a is None:
-                    return
+    spec: object = _AdapterSpec()
+    try:
+        if args.write:
+            # Required write ordering: lock -> writable open -> adapter/network.
+            with operational_job_lock(
+                "collect",
+                timeout=getattr(args, "lock_timeout", 30.0),
+                lock_path=getattr(args, "lock_path", None),
+            ):
+                db = open_writable(args.db_path, _GateArgs())
                 try:
-                    close = getattr(a, "aclose", None) or getattr(a, "close", None)
-                    if close is not None:
-                        import asyncio as _asyncio
-
-                        if _asyncio.iscoroutinefunction(close):
-                            _asyncio.get_event_loop().run_until_complete(close())
-                        else:
-                            close()
-                except Exception:
-                    pass
-
-        spec: object = _AdapterSpec()
-
-        result = asyncio.run(_async_run(db, args, spec))
-    finally:
-        try:
-            db.close()
-        except Exception:
-            pass
-        # The orchestrator owns adapter lifecycle (built + closed once inside
-        # run_cohort); do NOT close it again here.
+                    result = asyncio.run(
+                        _async_run(db, args, spec, config=cfg, lock_already_held=True)
+                    )
+                finally:
+                    db.close()
+        else:
+            # Dry-run keeps a read-only connection throughout execution and can
+            # never reach a writable database opener.
+            db = open_readonly(args.db_path)
+            try:
+                result = asyncio.run(_async_run(db, args, spec, config=cfg))
+            finally:
+                db.close()
+    except Exception as exc:
+        # Normal controlled failure envelope; no adapter/network work has been
+        # authorized for failures before run_cohort's adapter stage.
+        result = cohort.CohortResult(
+            status="failed",
+            dry_run=args.dry_run,
+            run_id="cohort_cli_failure",
+            watch_count_requested=len(watch_ids),
+            error=f"{type(exc).__name__}: {exc}",
+            stop_reason="cli_error",
+            reason_codes=["cli_error"],
+        )
 
     out = result.as_dict()
 

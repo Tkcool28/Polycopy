@@ -44,7 +44,7 @@ import inspect
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 # Local import (no cycle): gamma_budget imports only stdlib/typing.
 from polycopy.ingestion.gamma_budget import GammaBudgetExhausted
@@ -135,22 +135,45 @@ def _check_eligibility(row: dict[str, Any]) -> _Eligibility:
 def _call_gamma_resolver(
     gamma_resolver: Callable[[str], Any], condition_id: str
 ) -> Any:
-    """Invoke a sync OR async gamma resolver, bounded to one call."""
+    """Invoke only a synchronous legacy resolver.
+
+    The cohort path is natively async and uses ``enrich_source_trade_async``.
+    This compatibility helper deliberately refuses awaitables: it never creates
+    a secondary loop, helper thread, ``asyncio.run()``, or cached coroutine.
+    """
     market = gamma_resolver(condition_id)
     if inspect.isawaitable(market):
-        import asyncio
-
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    return ex.submit(asyncio.run, market).result()
-        except RuntimeError:
-            pass
-        return asyncio.run(market)
+        # Closing an un-awaited coroutine avoids a warning while preserving the
+        # hard boundary: callers must use the native async API instead.
+        close = getattr(market, "close", None)
+        if callable(close):
+            close()
+        raise TypeError("async Gamma resolver requires enrich_source_trade_async")
     return market
+
+
+async def resolve_gamma_state_async(
+    gamma_resolver: Callable[[str], Any], condition_id: str
+) -> tuple[Optional[dict[str, Any]], str, Optional[str]]:
+    """Native async Gamma resolution for cohort collection.
+
+    Provider, malformed, and ambiguity failures are deliberately raised as
+    structured errors for the cohort owner; only an explicit ``None`` is an
+    ordinary not-found result.
+    """
+    from polycopy.ingestion.gamma_budget import GammaResolutionError
+
+    try:
+        market = await gamma_resolver(condition_id)
+    except GammaBudgetExhausted:
+        raise
+    except Exception as exc:
+        raise GammaResolutionError(f"{type(exc).__name__}: {exc}") from exc
+    if market is None:
+        return None, GAMMA_NOT_FOUND, None
+    if not isinstance(market, Mapping):
+        raise GammaResolutionError(f"malformed Gamma response: {type(market).__name__}")
+    return dict(market), GAMMA_FOUND, None
 
 
 # Gamma resolution states (distinct from ordinary missing evidence).
@@ -181,6 +204,11 @@ def resolve_gamma_state(
         # A cohort-wide Gamma budget exhaustion is a hard, structured stop
         # signal — never downgrade it to provider_error/not-found.
         raise
+    except TypeError as exc:
+        if "enrich_source_trade_async" in str(exc):
+            # The synchronous public API is intentionally sync-resolver only.
+            raise
+        return None, GAMMA_PROVIDER_ERROR, f"TypeError: {exc}"
     except ValueError as exc:
         msg = str(exc)
         if "ambiguous" in msg:
@@ -389,6 +417,40 @@ def enrich_source_trade(
         db, source_trade_internal_id, payload, dry_run=dry_run,
         metadata_json=new_metadata_json,
     )
+
+
+async def enrich_source_trade_async(
+    db: Any,
+    source_trade_internal_id: str,
+    *,
+    gamma_resolver: Optional[Callable[[str], Any]] = None,
+    dry_run: bool = False,
+) -> EnrichmentResult:
+    """Native-async cohort enrichment without an async-to-sync bridge.
+
+    The only production-shaped Gamma call happens here, on the current cohort
+    event loop.  The legacy synchronous persistence implementation receives a
+    plain resolved mapping, never a coroutine; SharedGammaBudget owns dedupe and
+    charges the actual call exactly once per condition.
+    """
+    if gamma_resolver is None:
+        return enrich_source_trade(db, source_trade_internal_id, dry_run=dry_run)
+    row = _read_source_trade(db, source_trade_internal_id)
+    if row is None or not _check_eligibility(row).ok:
+        # Preserve the established refusal/not-found result without authorizing
+        # any Gamma work.
+        return enrich_source_trade(db, source_trade_internal_id, dry_run=dry_run)
+    condition_id = str(row["market_source_id"])
+    market, _state, _reason = await resolve_gamma_state_async(gamma_resolver, condition_id)
+    # The resolver below is synchronous and returns a completed value.  It is
+    # intentionally local so no coroutine can be cached in metadata/provenance.
+    return enrich_source_trade(
+        db,
+        source_trade_internal_id,
+        gamma_resolver=lambda _condition_id: market,
+        dry_run=dry_run,
+    )
+
 
 
 def _persist(

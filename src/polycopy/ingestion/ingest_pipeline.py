@@ -57,6 +57,8 @@ class IngestionResult:
     counters: IngestionCounters = field(default_factory=IngestionCounters)
     network_calls_attempted: int = 0
     network_calls_succeeded: int = 0
+    # Valid stable-identity duplicates collapsed by the ingestion layer.
+    duplicate_rows_observed: int = 0
     error: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -66,6 +68,7 @@ class IngestionResult:
             "counters": self.counters.as_dict(),
             "network_calls_attempted": self.network_calls_attempted,
             "network_calls_succeeded": self.network_calls_succeeded,
+            "duplicate_rows_observed": self.duplicate_rows_observed,
             "error": self.error,
         }
 
@@ -136,10 +139,10 @@ async def run_ingestion(
             if gamma_resolver is not None:
                 cond_id = raw.get("conditionId") or raw.get("market_source_id")
                 if isinstance(cond_id, str) and cond_id.strip():
-                    try:
-                        gamma_market = await gamma_resolver(cond_id.strip())
-                    except Exception:
-                        gamma_market = None
+                    # Gamma failures are structured cohort failures.  Do not
+                    # silently turn provider/network/budget failures into
+                    # ordinary unavailable metadata.
+                    gamma_market = await gamma_resolver(cond_id.strip())
             cand = normalize_source_trade(
                 raw,
                 requested_wallet=req,
@@ -184,6 +187,7 @@ async def run_ingestion(
                 bucket = seen_strong_ids if cand.identity_strong else seen_fallback_ids
                 if cand.source_trade_id in bucket:
                     counters.duplicate_records_in_fetch += 1
+                    result.duplicate_rows_observed += 1
                     # Still append so the reviewer sees it, but mark rejected.
                     cand.validation_status = "rejected"
                     if "duplicate_in_fetch" not in cand.validation_reasons:

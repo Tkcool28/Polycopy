@@ -101,7 +101,15 @@ class SharedGammaBudget:
             )
 
         self._used += 1
-        market = await self._base(condition_id)
+        try:
+            market = await self._base(condition_id)
+        except GammaBudgetExhausted:
+            raise
+        except GammaResolutionError:
+            raise
+        except Exception as exc:
+            # Never let a provider failure masquerade as unavailable metadata.
+            raise GammaResolutionError(f"{type(exc).__name__}: {exc}") from exc
         self._cache[condition_id] = market
         return market
 

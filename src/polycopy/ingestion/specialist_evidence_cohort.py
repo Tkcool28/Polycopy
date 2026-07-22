@@ -61,6 +61,7 @@ PR #73 required corrections
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import time
 import uuid
@@ -156,6 +157,7 @@ class CohortWatchResult:
     raw_trades_examined: int = 0
     valid_buy_trades: int = 0
     rows_would_create: int = 0
+    rows_would_update: int = 0
     rows_created: int = 0
     duplicate_rows_observed: int = 0
     rows_updated: int = 0
@@ -195,6 +197,7 @@ class CohortWatchResult:
             "raw_trades_examined": self.raw_trades_examined,
             "valid_buy_trades": self.valid_buy_trades,
             "rows_would_create": self.rows_would_create,
+            "rows_would_update": self.rows_would_update,
             "rows_created": self.rows_created,
             "duplicate_rows_observed": self.duplicate_rows_observed,
             "rows_updated": self.rows_updated,
@@ -210,7 +213,7 @@ class CohortWatchResult:
         d["created"] = self.rows_created + self.enrichment_rows_created
         d["updated"] = self.rows_updated + self.enrichment_rows_updated
         d["would_create"] = self.rows_would_create
-        d["would_update"] = self.rows_updated
+        d["would_update"] = self.rows_would_update
         d["fetch_complete"] = self.status == "ok"
         return d
 
@@ -421,20 +424,32 @@ class _CliProvider:
 
     made_network_call = True
 
-    def __init__(self, adapter, *, timeout: float) -> None:
+    def __init__(self, adapter, *, timeout: float, deadline_ts: Optional[float] = None) -> None:
         self._adapter = adapter
         self._timeout = timeout
+        self._deadline_ts = deadline_ts
 
     async def fetch_trades(self, wallet: str, *, limit: int, page: int):
         from datetime import datetime
 
-        return await self._adapter.get_trades_by_address(
-            wallet,
-            since=datetime.min,
-            limit=limit,
-            offset=page * limit,
-            return_raw=True,
-        )
+        remaining = self._timeout
+        if self._deadline_ts is not None:
+            remaining = min(remaining, self._deadline_ts - time.monotonic())
+        if remaining <= 0:
+            raise CohortDeadlineExceeded("cohort deadline exceeded before provider fetch")
+        try:
+            return await asyncio.wait_for(
+                self._adapter.get_trades_by_address(
+                    wallet,
+                    since=datetime.min,
+                    limit=limit,
+                    offset=page * limit,
+                    return_raw=True,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError as exc:
+            raise CohortDeadlineExceeded("provider fetch exceeded cohort deadline") from exc
 
 
 @dataclass
@@ -522,6 +537,7 @@ async def run_cohort(
     gamma_resolver: Optional[GammaResolver] = None,
     lock_timeout: float = 30.0,
     lock_path: Optional[Any] = None,
+    lock_already_held: bool = False,
 ) -> CohortResult:
     """Collect evidence for an explicit cohort as ONE bounded, atomic operator run.
 
@@ -589,7 +605,13 @@ async def run_cohort(
         async def _gamma_base(cond):
             if not use_adapter or real_adapter is None:
                 return None
-            return real_adapter.get_market_raw(cond)
+            # Native cohort flow: production's async adapter method is awaited
+            # on this active loop.  The non-awaitable branch is only a legacy
+            # fixture compatibility seam, never a coroutine bridge.
+            value = real_adapter.get_market_raw(cond)
+            if hasattr(value, "__await__"):
+                return await value
+            return value
 
         return _gamma_base
 
@@ -601,8 +623,8 @@ async def run_cohort(
         remaining_records=config.max_total_new_trades,
         gamma=shared_gamma,
         deadline_ts=(
-            (time.monotonic() + config.timeout_seconds)
-            if (config.enforce_deadline and not dry_run)
+            time.monotonic() + config.timeout_seconds
+            if config.enforce_deadline
             else None
         ),
         rss_mb_limit=config.rss_mb_limit,
@@ -626,15 +648,35 @@ async def run_cohort(
     # injected adapter factory). The orchestrator owns the adapter lifecycle
     # (built once, closed exactly once).
     try:
-        with operational_job_lock("collect", timeout=lock_timeout, lock_path=lock_path):
+        with (
+            contextlib.nullcontext()
+            if lock_already_held
+            else operational_job_lock("collect", timeout=lock_timeout, lock_path=lock_path)
+        ):
             # Normalize: an injected CLI "spec" exposes build()/close(); a
             # plain adapter is used directly. Build AFTER the lock is held, and
             # INSIDE the structured exception path so a build() failure returns
             # a normal structured result (correction 5).
             try:
+                # RSS/deadline must be checked before provider construction,
+                # including dry-runs; unknown RSS is fail-closed.
+                _collector._checkpoint(cohort_budget)
                 real_adapter = (
                     adapter.build() if callable(getattr(adapter, "build", None)) else adapter
                 )
+            except (CohortDeadlineExceeded, CohortRssExceeded) as exc:
+                # Directly supplied adapters are already constructed even
+                # though no provider work was authorized; close them once.
+                await _close_adapter(real_adapter if real_adapter is not None else adapter)
+                result.status = "failed"
+                result.cohort_committed = False
+                result.rolled_back = not dry_run
+                result.reason_codes.append(exc.stop_reason)
+                result.stop_reason = exc.stop_reason
+                result.error = f"{type(exc).__name__}: {exc}"
+                result.watch_count_unprocessed = result.watch_count_requested
+                _compute_totals(result)
+                return result
             except Exception as exc:
                 result.status = "failed"
                 result.cohort_committed = False
@@ -646,10 +688,15 @@ async def run_cohort(
                 _compute_totals(result)
                 return result
 
-            provider = _CliProvider(real_adapter, timeout=config.timeout_seconds)
+            provider = _CliProvider(
+                real_adapter,
+                timeout=config.timeout_seconds,
+                deadline_ts=cohort_budget.deadline_ts,
+            )
 
             completed = 0
             failed = 0
+            commit_attempted = False
             try:
                 if not dry_run:
                     # One bounded caller-owned transaction for the WHOLE cohort.
@@ -675,6 +722,7 @@ async def run_cohort(
                             result.watches.append(wres)
                         if not dry_run:
                             try:
+                                commit_attempted = True
                                 db.conn.commit()
                                 result.cohort_committed = True
                                 result.rolled_back = False
@@ -737,8 +785,10 @@ async def run_cohort(
                         # stop_reason when present (writer/gamma/deadline/rss),
                         # else a provider/network error becomes "watch_error"
                         # with the original exception preserved.
-                        if isinstance(exc, (WriterFailure, GammaResolutionError)):
+                        if isinstance(exc, WriterFailure):
                             stop_reason = getattr(exc, "stop_reason", "writer_failure")
+                        elif isinstance(exc, GammaResolutionError):
+                            stop_reason = "gamma_resolution_error"
                         elif isinstance(exc, GammaBudgetExhausted):
                             stop_reason = "gamma_budget_exhausted"
                         elif isinstance(exc, CohortDeadlineExceeded):
@@ -776,6 +826,7 @@ async def run_cohort(
 
                 # All watches processed without an unhandled failure.
                 if not dry_run:
+                    commit_attempted = True
                     db.conn.commit()
                     result.cohort_committed = True
                     result.rolled_back = False
@@ -787,6 +838,16 @@ async def run_cohort(
                 result.watch_count_unprocessed = len(ordered) - completed - failed
                 result.status = "success"
                 result.stop_reason = cohort_budget.stop_reason
+            except asyncio.CancelledError:
+                # Cancellation is not an ordinary provider failure, but writable
+                # staged rows must never survive it. Preserve cancellation for
+                # the caller after rollback; the inner finally closes adapter.
+                if not dry_run:
+                    try:
+                        db.conn.rollback()
+                    except Exception:
+                        pass
+                raise
             except Exception as exc:
                 # Defensive: any leak outside the per-watch loop.
                 try:
@@ -800,8 +861,13 @@ async def run_cohort(
                 result.cohort_committed = False
                 result.rolled_back = not dry_run
                 result.error = f"{type(exc).__name__}: {exc}"
-                result.stop_reason = getattr(exc, "stop_reason", "cohort_error") or "cohort_error"
-                result.reason_codes.append("cohort_error")
+                result.stop_reason = (
+                    "commit_failure"
+                    if commit_attempted
+                    else (getattr(exc, "stop_reason", "cohort_error") or "cohort_error")
+                )
+                result.reason_codes.append(result.stop_reason)
+                _compute_totals(result)
                 return result
             finally:
                 # Close the provider's underlying adapter exactly once.
@@ -844,6 +910,7 @@ def _fold_single(db: Database, wres: CohortWatchResult, single: EvidenceCollecti
     wres.raw_trades_examined = single.raw_trades_examined
     wres.valid_buy_trades = single.valid_buy_trades
     wres.rows_would_create = single.rows_would_create
+    wres.rows_would_update = single.rows_would_update
     wres.rows_created = single.rows_created
     wres.duplicate_rows_observed = single.duplicate_rows_observed
     wres.rows_updated = single.rows_updated
@@ -873,6 +940,7 @@ def _compute_totals(result: CohortResult) -> None:
         "raw_trades_examined": 0,
         "valid_buy_trades": 0,
         "rows_would_create": 0,
+        "rows_would_update": 0,
         "rows_created": 0,
         "duplicate_rows_observed": 0,
         "rows_updated": 0,
@@ -888,6 +956,7 @@ def _compute_totals(result: CohortResult) -> None:
         totals["raw_trades_examined"] += w.raw_trades_examined
         totals["valid_buy_trades"] += w.valid_buy_trades
         totals["rows_would_create"] += w.rows_would_create
+        totals["rows_would_update"] += w.rows_would_update
         totals["rows_created"] += w.rows_created
         totals["duplicate_rows_observed"] += w.duplicate_rows_observed
         totals["rows_updated"] += w.rows_updated
@@ -920,7 +989,6 @@ def _compute_totals(result: CohortResult) -> None:
         totals["rows_updated"] = 0
         totals["enrichment_rows_created"] = 0
         totals["enrichment_rows_updated"] = 0
-        totals["duplicate_rows_observed"] = 0
 
     # Consumption / remaining for the result JSON. The Gamma request count is
     # authoritative from the SHARED cohort budget (one dedupe cache + one cap),
@@ -929,14 +997,21 @@ def _compute_totals(result: CohortResult) -> None:
     gamma_used = (
         result._cohort_budget.gamma.used if result._cohort_budget is not None else 0
     )
+    records_used = (
+        result.limits.get("max_total_new_trades", 0) - result._cohort_budget.remaining_records
+        if result._cohort_budget is not None
+        else 0
+    )
     result.consumption = {
-        "records_attempted": totals["rows_would_create"] + totals["rows_created"]
-        + totals["duplicate_rows_observed"],
+        "fresh_rows_created_or_projected": max(0, records_used),
+        "duplicates_observed": totals["duplicate_rows_observed"],
         "gamma_requests": gamma_used,
     }
     result.remaining = {
-        "max_total_new_trades": max(
-            0, result.limits.get("max_total_new_trades", 0) - totals["rows_created"]
+        "max_total_new_trades": (
+            max(0, result._cohort_budget.remaining_records)
+            if result._cohort_budget is not None
+            else result.limits.get("max_total_new_trades", 0)
         ),
         "max_gamma_requests": max(
             0, result.limits.get("max_gamma_requests", 0) - gamma_used

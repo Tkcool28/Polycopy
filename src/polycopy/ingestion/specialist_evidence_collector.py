@@ -47,7 +47,7 @@ from polycopy.ingestion.gamma_budget import (
     GammaResolutionError,
 )
 from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
-from polycopy.ingestion.source_trade_enrichment import enrich_source_trade
+from polycopy.ingestion.source_trade_enrichment import enrich_source_trade_async
 from polycopy.ingestion.source_trade_writer import write_valid_rows
 
 
@@ -76,15 +76,20 @@ class CohortRssExceeded(CohortResourceStop):
 
 
 class WriterFailure(Exception):
-    """A source_trade writer failure surfaced as a collection failure.
+    """A source-trade writer failure surfaced as a collection failure.
 
-    Preserves the original writer error_message so the cohort result carries the
-    authoritative exception text.
+    Preserves the original writer error message so the cohort result carries the
+    authoritative failure text.
     """
 
     def __init__(self, message: str, *, stop_reason: str = "writer_failure") -> None:
         super().__init__(message)
         self.stop_reason = stop_reason
+
+
+def _total_duplicate_observations(*, pipeline: int, preflight: int, writer: int) -> int:
+    """Authoritative, non-overlapping duplicate observation composition."""
+    return pipeline + preflight + writer
 
 
 def _rss_mb() -> float:
@@ -143,6 +148,7 @@ class EvidenceCollectionResult:
     raw_trades_examined: int = 0
     valid_buy_trades: int = 0
     rows_would_create: int = 0
+    rows_would_update: int = 0
     rows_created: int = 0
     duplicate_rows_observed: int = 0
     rows_updated: int = 0
@@ -186,6 +192,7 @@ class EvidenceCollectionResult:
             "raw_trades_examined": self.raw_trades_examined,
             "valid_buy_trades": self.valid_buy_trades,
             "rows_would_create": self.rows_would_create,
+            "rows_would_update": self.rows_would_update,
             "rows_created": self.rows_created,
             "duplicate_rows_observed": self.duplicate_rows_observed,
             "rows_updated": self.rows_updated,
@@ -310,6 +317,11 @@ async def collect_evidence(
             cohort_budget.gamma if cohort_budget is not None else gamma_resolver
         )
 
+    if cohort_budget is not None:
+        # Fail closed before any provider work (including dry-run), then let the
+        # provider wrapper enforce the remaining deadline with wait_for.
+        _checkpoint(cohort_budget)
+
     pipe = await ingest_pipeline.run_ingestion(
         provider, requested_address,
         record_limit=per_wallet_bound,
@@ -353,8 +365,36 @@ async def collect_evidence(
         if len(accepted) > cohort_budget.remaining_records:
             accepted = accepted[: cohort_budget.remaining_records]
 
-    # Persist BUY source trades idempotently (INSERT OR IGNORE by UNIQUE).
-    write_res = write_valid_rows(db, accepted, dry_run=dry_run, auto_commit=auto_commit)
+    # Bounded canonical preflight for (source, source_trade_id).  This prevents
+    # duplicate-only replays from issuing INSERT OR IGNORE, but the writer still
+    # validates the UNIQUE constraint and remains race-safe for fresh rows.
+    existing_keys: set[tuple[str, str]] = set()
+    if accepted:
+        clauses = " OR ".join("(source=? AND source_trade_id=?)" for _ in accepted)
+        params = [item for c in accepted for item in (c.source, c.source_trade_id)]
+        existing_keys = {
+            (str(row[0]), str(row[1]))
+            for row in db.conn.execute(
+                f"SELECT source, source_trade_id FROM source_trades WHERE {clauses}", params
+            ).fetchall()
+        }
+    fresh: list[NormalizedSourceTrade] = []
+    seen_keys: set[tuple[str, str]] = set()
+    batch_duplicates = 0
+    for candidate in accepted:
+        key = (candidate.source, str(candidate.source_trade_id))
+        if key in existing_keys or key in seen_keys:
+            batch_duplicates += 1
+            continue
+        seen_keys.add(key)
+        fresh.append(candidate)
+
+    # Preserve the real writer (and its uniqueness preflight) for fresh rows.
+    # A concurrent insert after this read remains safe: INSERT OR IGNORE reports
+    # it as a writer-side duplicate rather than creating a correctness gap.
+    write_res = write_valid_rows(
+        db, fresh, dry_run=dry_run, auto_commit=auto_commit,
+    )
     # PR #73 correction 1: a writer error / rollback / failed preflight /
     # non-empty error_message is a collection failure — raise it so the caller
     # rolls the cohort back. We never report a failed write as success.
@@ -374,14 +414,22 @@ async def collect_evidence(
 
     result.inserted_rows = write_res.inserted or 0
     result.rows_created = write_res.inserted or 0
-    result.deduplicated_rows = write_res.deduplicated or 0
-    result.duplicate_rows_observed = write_res.deduplicated or 0
+    # Distinct duplicate layers are additive: ingestion marks stable-ID repeats
+    # rejected before accepted; the collector observes persisted/batch keys;
+    # the writer adds only a concurrent race duplicate.
+    result.deduplicated_rows = _total_duplicate_observations(
+        pipeline=pipe.duplicate_rows_observed,
+        preflight=batch_duplicates,
+        writer=write_res.deduplicated or 0,
+    )
+    result.duplicate_rows_observed = result.deduplicated_rows
     result.rejected_rows += (write_res.rejected or 0)
 
-    # Cohort record budget: consume what we attempted to write.
+    # Consume only fresh source-trade rows. Replayed duplicates are observations,
+    # never fresh-row budget usage.
     if cohort_budget is not None and not dry_run:
         cohort_budget.remaining_records = max(
-            0, cohort_budget.remaining_records - len(accepted)
+            0, cohort_budget.remaining_records - (write_res.inserted or 0)
         )
 
     # Dry-run reporting (PR #73): what WOULD a writable run do for this watch?
@@ -390,23 +438,29 @@ async def collect_evidence(
     # re-enriched / metadata-merged on a real run). Computed read-only.
     if dry_run and accepted:
         pre = {
-            r[0]
+            (str(r[0]), str(r[1]))
             for r in db.conn.execute(
-                "SELECT source_trade_id FROM source_trades "
-                "WHERE lower(trader_address)=? AND source_trade_id IN ({})".format(
-                    ",".join("?" for _ in accepted)
-                ),
-                [requested_address.lower(), *[c.source_trade_id for c in accepted]],
+                "SELECT source, source_trade_id FROM source_trades "
+                "WHERE lower(trader_address)=? AND (" +
+                " OR ".join("(source=? AND source_trade_id=?)" for _ in accepted) + ")",
+                [
+                    requested_address.lower(),
+                    *[item for c in accepted for item in (c.source, c.source_trade_id)],
+                ],
             ).fetchall()
         }
         result.rows_would_create = sum(
-            1 for c in accepted if c.source_trade_id not in pre
+            1 for c in accepted if (c.source, str(c.source_trade_id)) not in pre
         )
-        result.rows_updated = sum(
-            1 for c in accepted if c.source_trade_id in pre
+        result.rows_would_update = sum(
+            1 for c in accepted if (c.source, str(c.source_trade_id)) in pre
         )
         result.would_create = result.rows_would_create
-        result.would_update = result.rows_updated
+        result.would_update = result.rows_would_update
+        if cohort_budget is not None:
+            cohort_budget.remaining_records = max(
+                0, cohort_budget.remaining_records - result.rows_would_create
+            )
 
     # Enrichment provenance for the accepted rows (idempotent). The shared
     # enrichment writer is the SINGLE authoritative owner of canonical metadata
@@ -420,25 +474,22 @@ async def collect_evidence(
         # unchanged).
         inserted_rows = db.conn.execute(
             "SELECT id, source_trade_id FROM source_trades "
-            "WHERE lower(trader_address)=? AND source_trade_id IN ({})".format(
-                ",".join("?" for _ in accepted)
-            ),
-            [requested_address.lower(), *[c.source_trade_id for c in accepted]],
+            "WHERE lower(trader_address)=? AND (" +
+            " OR ".join("(source=? AND source_trade_id=?)" for _ in accepted) + ")",
+            [
+                requested_address.lower(),
+                *[item for c in accepted for item in (c.source, c.source_trade_id)],
+            ],
         ).fetchall()
         internal_ids = [dict(r)["id"] for r in inserted_rows]
         for rid in internal_ids:
             # Cohort resource bounds (deadline / RSS) enforced DURING the loop.
             if cohort_budget is not None:
                 _checkpoint(cohort_budget)
-            # Cohort-wide Gamma budget exhausted -> stop cleanly (raise).
-            if effective_gamma is not None and cohort_budget is not None:
-                if cohort_budget.gamma.used >= cohort_budget.gamma.budget:
-                    cohort_budget.stop_reason = "gamma_budget_exhausted"
-                    raise GammaBudgetExhausted(
-                        "cohort Gamma request budget exhausted during enrichment"
-                    )
+            # SharedGammaBudget itself checks the cap only for a cache miss;
+            # a cache hit for this condition is free and must remain allowed.
             try:
-                er = enrich_source_trade(
+                er = await enrich_source_trade_async(
                     db, rid, gamma_resolver=effective_gamma, dry_run=False,
                 )
             except GammaBudgetExhausted:
@@ -476,12 +527,18 @@ async def collect_evidence(
             else:
                 result.enrichment_no_ops += 1
 
-        # Update watchlist last_collection_at (allowed bookkeeping column).
-        db.conn.execute(
-            "UPDATE specialist_evidence_watchlist SET last_collection_at=? "
-            "WHERE id=?",
-            (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), watch_id),
-        )
+        # True no-op replay: do not mutate collection bookkeeping when neither
+        # source rows nor enrichment evidence changed.
+        if (
+            result.rows_created
+            or result.enrichment_rows_created
+            or result.enrichment_rows_updated
+        ):
+            db.conn.execute(
+                "UPDATE specialist_evidence_watchlist SET last_collection_at=? "
+                "WHERE id=?",
+                (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), watch_id),
+            )
         if auto_commit:
             # Standalone single-watch path: commit immediately as before.
             db.conn.commit()
