@@ -103,8 +103,11 @@ _CLI_LIMITS = {
     "rss_mb_limit": (16.0, 1_000_000.0),
 }
 
-# Watch id shape accepted by the research watchlist (``wl_<hex>``).
-_WATCH_ID_RE = re.compile(r"^wl_[0-9a-fA-F]{8,}$")
+# Persisted research-watch identities are intentionally compatible with both
+# established generators: legacy/manual ``wl_<hex>`` and PR #72 discovery
+# ``sew_<16 hex>``.  They remain opaque database identities after this narrow
+# syntax preflight.
+_WATCH_ID_RE = re.compile(r"^(?:wl_[0-9a-fA-F]{8,}|sew_[0-9a-fA-F]{16})$")
 
 # Tables legitimately written by the accepted PR #71 collector. Any SQL write
 # against a table outside this set is a contract violation (tests assert it).
@@ -325,7 +328,8 @@ def validate_watch_ids(
 
     Rules enforced (fail-closed):
       * count 1..5;
-      * each id well-formed (``wl_<hex>``);
+      * each id is a supported persisted identity (legacy/manual ``wl_<hex>``
+        or discovery ``sew_<16 hex>``);
       * no duplicates (deterministic dedupe, reported);
       * no two ids may map to the SAME wallet (duplicate wallet membership);
       * each watch must be ACTIVE (when ``reject_inactive``);

@@ -31,6 +31,13 @@ those planes are out of scope for this PR.
 
 ## 2. Research-plane flow
 
+### Persisted watch identities
+
+Watch IDs are opaque persisted identities, not user-selectable inputs. The
+currently supported generated forms are `wl_<hex>` for legacy/manual watch
+creation and `sew_<16 hex>` for bounded discovery-created watches. Operators
+must use the watch ID already persisted for the selected watch.
+
 ```
 manage_specialist_evidence_watchlist.py add --wallet-id <id>
         │  (creates an ACTIVE research watch; NO approval)
