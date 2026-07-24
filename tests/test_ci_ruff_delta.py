@@ -1,82 +1,95 @@
+"""Regression tests for the CI Ruff no-new-debt comparator."""
+
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
+from io import StringIO
 from pathlib import Path
 
+from scripts.ci.check_ruff_delta import compare_diagnostics, write_report
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_SCRIPT = _REPO_ROOT / "scripts" / "ci" / "check_ruff_delta.py"
+_SHIFTED_ROW = 40
 
 
-def _diagnostic(filename: str, code: str = "F401", message: str = "unused import") -> dict:
+def _diagnostic(
+    filename: str,
+    *,
+    code: str = "F401",
+    message: str = "unused import",
+    row: int = 1,
+) -> dict[str, object]:
     return {
         "filename": filename,
         "code": code,
         "message": message,
-        "location": {"row": 1, "column": 1},
-        "end_location": {"row": 1, "column": 2},
+        "location": {"row": row, "column": 1},
+        "end_location": {"row": row, "column": 2},
         "fix": None,
-        "noqa_row": 1,
+        "noqa_row": row,
         "url": "https://docs.astral.sh/ruff/rules/unused-import",
     }
 
 
-def _run(tmp_path: Path, base: list[dict], head: list[dict]) -> subprocess.CompletedProcess[str]:
-    base_path = tmp_path / "base.json"
-    head_path = tmp_path / "head.json"
-    base_path.write_text(json.dumps(base), encoding="utf-8")
-    head_path.write_text(json.dumps(head), encoding="utf-8")
-    return subprocess.run(
-        [
-            sys.executable,
-            str(_SCRIPT),
-            "--base",
-            str(base_path),
-            "--head",
-            str(head_path),
-            "--base-root",
-            str(tmp_path / "base-root"),
-            "--head-root",
-            str(tmp_path / "head-root"),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-
 def test_accepts_unchanged_diagnostics_with_shifted_locations(tmp_path: Path) -> None:
-    base = [_diagnostic("tests/example.py")]
-    head = [_diagnostic("tests/example.py")]
-    head[0]["location"]["row"] = 40
+    """Line-number movement must not create false new debt."""
+    base_root = tmp_path / "base"
+    head_root = tmp_path / "head"
+    base = [_diagnostic(str(base_root / "tests" / "example.py"))]
+    head = [
+        _diagnostic(
+            str(head_root / "tests" / "example.py"),
+            row=_SHIFTED_ROW,
+        )
+    ]
 
-    result = _run(tmp_path, base, head)
+    delta = compare_diagnostics(base, head, base_root=base_root, head_root=head_root)
 
-    assert result.returncode == 0
-    assert "New diagnostics: 0" in result.stdout
+    assert not delta.added
+    assert not delta.removed
 
 
 def test_rejects_a_new_diagnostic(tmp_path: Path) -> None:
-    result = _run(tmp_path, [], [_diagnostic("tests/new.py")])
+    """A fingerprint absent from the base must fail the gate."""
+    delta = compare_diagnostics(
+        [],
+        [_diagnostic("tests/new.py")],
+        base_root=tmp_path / "base",
+        head_root=tmp_path / "head",
+    )
+    output = StringIO()
 
-    assert result.returncode == 1
-    assert "New diagnostics: 1" in result.stdout
-    assert "tests/new.py: F401 unused import" in result.stdout
+    exit_code = write_report(delta, output)
+
+    assert exit_code == 1
+    assert "New diagnostics: 1" in output.getvalue()
+    assert "tests/new.py: F401 unused import" in output.getvalue()
 
 
 def test_accepts_and_reports_removed_debt(tmp_path: Path) -> None:
-    result = _run(tmp_path, [_diagnostic("tests/old.py")], [])
+    """Removing a base diagnostic must pass and appear in the report."""
+    delta = compare_diagnostics(
+        [_diagnostic("tests/old.py")],
+        [],
+        base_root=tmp_path / "base",
+        head_root=tmp_path / "head",
+    )
+    output = StringIO()
 
-    assert result.returncode == 0
-    assert "Removed diagnostics: 1" in result.stdout
-    assert "Ruff no-new-debt check passed" in result.stdout
+    exit_code = write_report(delta, output)
+
+    assert exit_code == 0
+    assert "Removed diagnostics: 1" in output.getvalue()
+    assert "Ruff no-new-debt check passed" in output.getvalue()
 
 
 def test_duplicate_diagnostics_are_compared_as_a_multiset(tmp_path: Path) -> None:
+    """An added duplicate occurrence must not be hidden by an existing one."""
     diagnostic = _diagnostic("tests/repeated.py")
-    result = _run(tmp_path, [diagnostic], [diagnostic, diagnostic])
 
-    assert result.returncode == 1
-    assert "New diagnostics: 1" in result.stdout
+    delta = compare_diagnostics(
+        [diagnostic],
+        [diagnostic, diagnostic],
+        base_root=tmp_path / "base",
+        head_root=tmp_path / "head",
+    )
+
+    assert delta.added.total() == 1
