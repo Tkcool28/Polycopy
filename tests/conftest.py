@@ -14,6 +14,8 @@ from collections.abc import Generator
 import pytest
 from tests.sqlite_test_utils import OwnedSQLitePaths
 
+pytest_plugins = ("pytester",)
+
 # Tests must explicitly use the safe test default rather than inheriting a
 # production `.env` kill switch. Individual risk-gate tests override this with
 # monkeypatch and restore their own required value.
