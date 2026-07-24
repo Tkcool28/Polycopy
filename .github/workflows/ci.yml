@@ -38,12 +38,15 @@ jobs:
           pip install "ruff==0.16.0"
 
       - name: Ruff no-new-debt check
+        id: ruff_delta
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           BASE_DIR: ${{ runner.temp }}/polycopy-ruff-base
           BASE_JSON: ${{ runner.temp }}/ruff-base.json
           HEAD_JSON: ${{ runner.temp }}/ruff-head.json
+          DELTA_REPORT: ${{ runner.temp }}/ruff-delta.txt
         run: |
           set -euo pipefail
           ruff check src tests scripts/ci/check_ruff_delta.py \
@@ -57,7 +60,20 @@ jobs:
             --base "$BASE_JSON" \
             --head "$HEAD_JSON" \
             --base-root "$BASE_DIR" \
-            --head-root "$GITHUB_WORKSPACE"
+            --head-root "$GITHUB_WORKSPACE" | tee "$DELTA_REPORT"
+
+      - name: Upload Ruff delta report
+        if: github.event_name == 'pull_request' && steps.ruff_delta.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruff-delta-python-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/ruff-delta.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce Ruff no-new-debt result
+        if: github.event_name == 'pull_request' && steps.ruff_delta.outcome == 'failure'
+        run: exit 1
 
       - name: Ruff inventory on main
         if: github.event_name == 'push'
