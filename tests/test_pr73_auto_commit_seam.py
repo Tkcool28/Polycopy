@@ -10,17 +10,26 @@ Run with:
   /root/Polycopy/.venv/bin/python -B -m pytest -q \
   tests/test_pr73_auto_commit_seam.py -vv
 """
-import tempfile
-from pathlib import Path
+
+import pytest
 
 
 def _make_db():
     """Create a temp-file DB with the full Polycopy schema (via migrations)."""
+    raise RuntimeError("_make_db is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
     from polycopy.db.database import Database
-    db_path = Path(tempfile.mktemp(suffix=".db"))
-    db = Database(db_path)
-    db.connect()
-    return db
+
+    def _make() -> Database:
+        db = Database(owned_sqlite.new_path())
+        db.connect()
+        return db
+
+    monkeypatch.setitem(globals(), "_make_db", _make)
 
 
 def _make_valid_row(source_trade_id="test:1"):
@@ -56,7 +65,6 @@ def test_write_valid_rows_auto_commit_true_commits():
     count = db.conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
     assert count == 1, f"count={count}"
     db.close()
-    db.db_path.unlink(missing_ok=True)
 
 
 def test_write_valid_rows_auto_commit_false_no_commit():
@@ -75,7 +83,6 @@ def test_write_valid_rows_auto_commit_false_no_commit():
     count_after = db.conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
     assert count_after == 0, f"count_after={count_after}"
     db.close()
-    db.db_path.unlink(missing_ok=True)
 
 
 def test_write_valid_rows_auto_commit_false_error_propagates():
@@ -93,7 +100,6 @@ def test_write_valid_rows_auto_commit_false_error_propagates():
     )
     assert result.committed is False
     db.close()
-    db.db_path.unlink(missing_ok=True)
 
 
 def test_write_valid_rows_dry_run_no_writes():
@@ -108,7 +114,6 @@ def test_write_valid_rows_dry_run_no_writes():
     count = db.conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
     assert count == 0
     db.close()
-    db.db_path.unlink(missing_ok=True)
 
 
 def test_collect_evidence_forwards_auto_commit_to_write_valid_rows():

@@ -24,7 +24,6 @@ import io
 import json
 import sqlite3
 import sys
-import tempfile
 import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,7 +52,13 @@ def _load(name):
 
 
 def _tmp():
-    return Path(tempfile.mktemp(suffix=".db"))
+    raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(globals(), "_tmp", owned_sqlite.new_path)
 
 
 def _open():

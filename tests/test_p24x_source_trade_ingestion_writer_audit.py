@@ -25,8 +25,9 @@ from __future__ import annotations
 import inspect
 import json
 import sqlite3
-import tempfile
 from pathlib import Path
+
+import pytest
 
 from polycopy.engine import source_trade_ingestion_writer_audit as mod
 from polycopy.engine.source_trade_ingestion_writer_audit import (
@@ -57,12 +58,24 @@ _GUARDED_TABLES = (
 )
 
 
+
+
+_OWNED_SQLITE = None
+
+
+@pytest.fixture(autouse=True)
+def _use_owned_sqlite(owned_sqlite):
+    """Route every file-backed test database through the exact-path fixture."""
+    global _OWNED_SQLITE
+    _OWNED_SQLITE = owned_sqlite
+    try:
+        yield
+    finally:
+        _OWNED_SQLITE = None
+
 def _make_db(rows, *, add_guarded_tables=False) -> str:
     """Build an isolated temp SQLite DB with a source_trades table + rows."""
-    import os as _os
-    fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24x_test_")
-    _os.close(fd)
-    Path(path).unlink()  # mkstemp creates the file; recreate clean.
+    path = _OWNED_SQLITE.new_path("pr24x")
     con = sqlite3.connect(path)
     con.execute(
         """

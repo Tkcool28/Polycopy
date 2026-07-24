@@ -20,8 +20,9 @@ import asyncio
 import importlib.util
 import json
 import sys
-import tempfile
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 for p in (str(ROOT / "src"), str(ROOT / "scripts")):
@@ -44,7 +45,13 @@ def _load(n):
 
 
 def _tmp():
-    return Path(tempfile.mktemp(suffix=".db"))
+    raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(globals(), "_tmp", owned_sqlite.new_path)
 
 
 COND_A = "0x" + "a" * 64

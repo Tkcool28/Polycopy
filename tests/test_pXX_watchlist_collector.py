@@ -6,13 +6,20 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
+
 
 def _tmp():
-    return Path(tempfile.mktemp(suffix=".db"))
+    raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(globals(), "_tmp", owned_sqlite.new_path)
 
 ROOT = Path(__file__).resolve().parent.parent
 for p in (str(ROOT / "src"), str(ROOT / "scripts")):
@@ -28,8 +35,6 @@ from polycopy.ingestion.specialist_evidence_collector import (  # noqa: E402
 
 
 def _open(path: Path) -> Database:
-    if path.exists():
-        path.unlink()
     return Database(path).connect()
 
 

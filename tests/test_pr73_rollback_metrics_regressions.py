@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-import tempfile
-from pathlib import Path
+
+import pytest
 
 from polycopy.db.database import Database
 from polycopy.ingestion import specialist_evidence_watchlist as watchlist
@@ -20,7 +20,15 @@ TOKEN = "0x" + "b" * 64
 
 
 def _open() -> Database:
-    return Database(Path(tempfile.mktemp(suffix=".db"))).connect()
+    raise RuntimeError("_open is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(
+        globals(), "_open", lambda: Database(owned_sqlite.new_path()).connect()
+    )
 
 
 def _seed(db: Database) -> list[str]:

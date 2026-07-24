@@ -16,8 +16,6 @@ in-memory stubs so the test never depends on a live history fetch.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -255,21 +253,16 @@ def make_target_trade(side: str = "BUY", *, with_taxonomy: bool = True,
     return row
 
 
-def build_target_db(*, tmp_path: Optional[Path] = None) -> tuple[Database, Path]:
+def build_target_db(*, tmp_path: Path) -> tuple[Database, Path]:
     """Create + migrate a fixed temp DB seeded with evidence + target trade.
 
-    Returns (db, path). Caller is responsible for cleanup (tests use tmp_path;
-    the proof script deletes the file on completion).
+    Returns (db, path). The caller must provide a pytest-owned directory or
+    another explicitly owned location for cleanup.
     """
-    if tmp_path is None:
-        fd, name = tempfile.mkstemp(suffix=".db", prefix="specialist_paper_")
-        os.close(fd)
-        tmp_path = Path(name)
-    else:
-        tmp_path = Path(tmp_path) / "specialist_paper_proof.db"
-    db = Database(tmp_path).connect()
+    db_path = Path(tmp_path) / "specialist_paper_proof.db"
+    db = Database(db_path).connect()
     seed_resolved_evidence(db)
-    return db, tmp_path
+    return db, db_path
 
 
 def ingest_target_trade(db: Any, *, trade: Optional[dict[str, Any]] = None) -> dict[str, Any]:

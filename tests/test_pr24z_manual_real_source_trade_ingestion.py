@@ -30,8 +30,9 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+import pytest
 
 from polycopy.ingestion import source_trade_writer as writer_mod
 from polycopy.ingestion.normalized_source_trade import (
@@ -45,6 +46,20 @@ from polycopy.ingestion.normalized_source_trade import (
 from polycopy.ingestion.source_trade_writer import write_valid_rows
 from polycopy.db.database import Database
 
+
+
+_OWNED_SQLITE = None
+
+
+@pytest.fixture(autouse=True)
+def _use_owned_sqlite(owned_sqlite):
+    """Keep every file artifact under pytest's fixture-owned directory."""
+    global _OWNED_SQLITE
+    _OWNED_SQLITE = owned_sqlite
+    try:
+        yield
+    finally:
+        _OWNED_SQLITE = None
 
 def _tx(i: str) -> str:
     return "0x" + i * 64
@@ -308,10 +323,7 @@ def test_writer_has_no_network_imports():
 def test_writer_accepts_validated_rows_only():
     # A row without validation_status==valid is rejected by the writer.
     c = normalize_source_trade(_build_raw(side="SELL"))
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    os.remove(tmp)
+    tmp = str(_OWNED_SQLITE.new_path("pr24z-ingestion"))
     db = Database(Path(tmp))
     db.connect()
     try:
@@ -320,19 +332,11 @@ def test_writer_accepts_validated_rows_only():
         assert res.inserted == 0
     finally:
         db.close()
-        for suf in ("", "-wal", "-shm"):
-            try:
-                os.remove(tmp + suf)
-            except OSError:
-                pass
 
 
 def test_temp_db_insert_succeeds():
     c = normalize_source_trade(_build_raw())
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    os.remove(tmp)
+    tmp = str(_OWNED_SQLITE.new_path("pr24z-ingestion"))
     db = Database(Path(tmp))
     db.connect()
     try:
@@ -344,19 +348,11 @@ def test_temp_db_insert_succeeds():
         assert n == 1
     finally:
         db.close()
-        for suf in ("", "-wal", "-shm"):
-            try:
-                os.remove(tmp + suf)
-            except OSError:
-                pass
 
 
 def test_second_identical_insert_deduplicates():
     c = normalize_source_trade(_build_raw())
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    os.remove(tmp)
+    tmp = str(_OWNED_SQLITE.new_path("pr24z-ingestion"))
     db = Database(Path(tmp))
     db.connect()
     try:
@@ -369,11 +365,6 @@ def test_second_identical_insert_deduplicates():
         assert n == 1
     finally:
         db.close()
-        for suf in ("", "-wal", "-shm"):
-            try:
-                os.remove(tmp + suf)
-            except OSError:
-                pass
 
 
 def test_one_batch_uses_one_transaction():
@@ -384,10 +375,7 @@ def test_one_batch_uses_one_transaction():
         normalize_source_trade(_build_raw(transactionHash=_tx("3"), asset=_tx("4"))),
         normalize_source_trade(_build_raw(transactionHash=_tx("4"), asset=_tx("5"))),
     ]
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    os.remove(tmp)
+    tmp = str(_OWNED_SQLITE.new_path("pr24z-ingestion"))
     db = Database(Path(tmp))
     db.connect()
     try:
@@ -397,21 +385,13 @@ def test_one_batch_uses_one_transaction():
         assert res.inserted == 3
     finally:
         db.close()
-        for suf in ("", "-wal", "-shm"):
-            try:
-                os.remove(tmp + suf)
-            except OSError:
-                pass
 
 
 def test_failed_batch_rolls_back():
     # Simulate a failure by closing the connection mid-write is hard; instead
     # verify the rollback path triggers on a sqlite error (e.g. bad row).
     # We pass a valid row but corrupt the DB connection to force an error.
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    os.remove(tmp)
+    tmp = str(_OWNED_SQLITE.new_path("pr24z-ingestion"))
     db = Database(Path(tmp))
     db.connect()
     try:
@@ -427,11 +407,7 @@ def test_failed_batch_rolls_back():
         assert res.rolled_back
         assert res.errors >= 1
     finally:
-        for suf in ("", "-wal", "-shm"):
-            try:
-                os.remove(tmp + suf)
-            except OSError:
-                pass
+        db.close()
 
 
 def test_no_insert_or_replace():
@@ -452,10 +428,7 @@ def test_no_update_delete_path():
 
 def test_downstream_tables_untouched():
     c = normalize_source_trade(_build_raw())
-    fd, tmp = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    os.remove(tmp)
+    tmp = str(_OWNED_SQLITE.new_path("pr24z-ingestion"))
     db = Database(Path(tmp))
     db.connect()
     try:
@@ -472,11 +445,6 @@ def test_downstream_tables_untouched():
             assert n == 0
     finally:
         db.close()
-        for suf in ("", "-wal", "-shm"):
-            try:
-                os.remove(tmp + suf)
-            except OSError:
-                pass
 
 
 def test_writer_uses_database_connect_pragmas():
@@ -543,7 +511,7 @@ def test_malformed_wallet_rejected():
 def test_production_db_not_opened_in_dry_run():
     # Dry-run must not open the production DB for writing. We point --db-path
     # at a nonexistent path; dry-run should still succeed (never opened).
-    rc = _run_cli("--fixture", "--db-path", "/tmp/pr24z_nonexistent_dryrun.db")
+    rc = _run_cli("--fixture", "--db-path", str(_OWNED_SQLITE.path("pr24z_nonexistent_dryrun.db")))
     assert rc == 0
 
 
@@ -554,12 +522,12 @@ def test_fixture_mode_makes_no_network_calls():
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
     proc = subprocess.run(
         [sys.executable, "scripts/ingest_real_source_trades.py", "--fixture",
-         "--json", "--out", "/tmp/pr24z_fixture_net.json"],
+         "--json", "--out", str(_OWNED_SQLITE.path("pr24z_fixture_net.json"))],
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True, text=True, env=env,
     )
     assert proc.returncode == 0
-    data = json.loads(Path("/tmp/pr24z_fixture_net.json").read_text())
+    data = json.loads(Path(str(_OWNED_SQLITE.path("pr24z_fixture_net.json"))).read_text())
     assert data["network_calls_attempted"] == 0
     assert data["network_calls_succeeded"] == 0
 
@@ -570,7 +538,7 @@ def test_md_report_redacts_wallet():
     import os
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    out = "/tmp/pr24z_report.md"
+    out = str(_OWNED_SQLITE.path("pr24z_report.md"))
     proc = subprocess.run(
         [sys.executable, "scripts/ingest_real_source_trades.py", "--fixture",
          "--out", out],
@@ -588,7 +556,7 @@ def test_txt_report_redacts_wallet():
     import os
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    out = "/tmp/pr24z_report.txt"
+    out = str(_OWNED_SQLITE.path("pr24z_report.txt"))
     proc = subprocess.run(
         [sys.executable, "scripts/ingest_real_source_trades.py", "--fixture",
          "--out", out],
@@ -606,7 +574,7 @@ def test_json_retains_full_wallet_explicit():
     import os
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    out = "/tmp/pr24z_report.json"
+    out = str(_OWNED_SQLITE.path("pr24z_report.json"))
     wallet = "0x" + "1" * 40
     proc = subprocess.run(
         [sys.executable, "scripts/ingest_real_source_trades.py", "--fixture",
@@ -625,7 +593,7 @@ def test_identity_counters_serialize():
     import os
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
-    out = "/tmp/pr24z_ident.json"
+    out = str(_OWNED_SQLITE.path("pr24z_ident.json"))
     proc = subprocess.run(
         [sys.executable, "scripts/ingest_real_source_trades.py", "--fixture",
          "--json", "--out", out],
