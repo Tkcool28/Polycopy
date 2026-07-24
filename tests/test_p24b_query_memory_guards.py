@@ -27,7 +27,6 @@ big data.
 from __future__ import annotations
 
 import sqlite3
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -42,11 +41,23 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # ─────────────────────────────────────────────────────────────────────────
 
 
+_OWNED_SQLITE = None
+
+
+@pytest.fixture(autouse=True)
+def _use_owned_sqlite(owned_sqlite):
+    """Route every file-backed test database through the exact-path fixture."""
+    global _OWNED_SQLITE
+    _OWNED_SQLITE = owned_sqlite
+    try:
+        yield
+    finally:
+        _OWNED_SQLITE = None
+
+
 def _make_db() -> tuple[sqlite3.Connection, Path]:
-    """Create a temporary SQLite DB with the row_factory set."""
-    fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    fd.close()
-    path = Path(fd.name)
+    """Create a fixture-owned SQLite DB with the row_factory set."""
+    path = _OWNED_SQLITE.new_path("p24b")
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     return conn, path
@@ -73,7 +84,7 @@ class TestIterBatches:
     def test_empty_result_set(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
             conn.commit()
@@ -81,12 +92,11 @@ class TestIterBatches:
             assert batches == []
         finally:
             conn.close()
-            path.unlink()
 
     def test_single_batch_short(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 3)
             batches = list(iter_batches(conn, "SELECT id FROM t", batch_size=10))
@@ -94,12 +104,11 @@ class TestIterBatches:
             assert [row[0] for row in batches[0]] == [1, 2, 3]
         finally:
             conn.close()
-            path.unlink()
 
     def test_batch_size_honoured(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 25)
             batches = list(iter_batches(conn, "SELECT id FROM t", batch_size=10))
@@ -109,24 +118,22 @@ class TestIterBatches:
             assert [row[0] for row in batches[2]] == [21, 22, 23, 24, 25]
         finally:
             conn.close()
-            path.unlink()
 
     def test_final_partial_batch(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 23)
             batches = list(iter_batches(conn, "SELECT id FROM t", batch_size=10))
             assert [len(b) for b in batches] == [10, 10, 3]
         finally:
             conn.close()
-            path.unlink()
 
     def test_returns_all_rows_across_batches(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 47)
             flat = [r[0] for batch in iter_batches(conn, "SELECT id FROM t", batch_size=7)
@@ -134,12 +141,11 @@ class TestIterBatches:
             assert flat == list(range(1, 48))
         finally:
             conn.close()
-            path.unlink()
 
     def test_batch_size_validation(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             with pytest.raises(ValueError):
                 list(iter_batches(conn, "SELECT 1", batch_size=0))
@@ -147,13 +153,12 @@ class TestIterBatches:
                 list(iter_batches(conn, "SELECT 1", batch_size=-1))
         finally:
             conn.close()
-            path.unlink()
 
     def test_cursor_closed_on_early_break(self) -> None:
         """If the caller stops iterating, the underlying cursor closes."""
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 100)
             gen = iter_batches(conn, "SELECT id FROM t", batch_size=10)
@@ -166,7 +171,6 @@ class TestIterBatches:
             gen.close()  # type: ignore[attr-defined]
         finally:
             conn.close()
-            path.unlink()
 
 
 class TestIterRows:
@@ -175,7 +179,7 @@ class TestIterRows:
     def test_yields_all_rows_in_order(self) -> None:
         from polycopy.runtime.query_batches import iter_rows
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 12)
             ids = [row[0] for row in iter_rows(conn, "SELECT id FROM t ORDER BY id",
@@ -183,19 +187,17 @@ class TestIterRows:
             assert ids == list(range(1, 13))
         finally:
             conn.close()
-            path.unlink()
 
     def test_empty_result(self) -> None:
         from polycopy.runtime.query_batches import iter_rows
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             conn.commit()
             assert list(iter_rows(conn, "SELECT id FROM t", batch_size=10)) == []
         finally:
             conn.close()
-            path.unlink()
 
 
 class TestIterKeysetBatches:
@@ -204,7 +206,7 @@ class TestIterKeysetBatches:
     def test_first_page_descending(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 20)
             batches = list(
@@ -223,12 +225,11 @@ class TestIterKeysetBatches:
             assert len(batches[0]) == 7
         finally:
             conn.close()
-            path.unlink()
 
     def test_continues_from_last_value(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 10)
             # Resume from id=5 descending: should return {4, 3, 2, 1}.
@@ -246,12 +247,11 @@ class TestIterKeysetBatches:
             assert ids == [4, 3, 2, 1]
         finally:
             conn.close()
-            path.unlink()
 
     def test_extra_where_clause(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 10)
             batches = list(
@@ -269,12 +269,11 @@ class TestIterKeysetBatches:
             assert ids == [10, 9, 8, 7]
         finally:
             conn.close()
-            path.unlink()
 
     def test_ascending(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 5)
             batches = list(
@@ -291,12 +290,11 @@ class TestIterKeysetBatches:
             assert ids == [1, 2, 3, 4, 5]
         finally:
             conn.close()
-            path.unlink()
 
     def test_empty_database(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             conn.commit()
@@ -312,7 +310,6 @@ class TestIterKeysetBatches:
             assert batches == []
         finally:
             conn.close()
-            path.unlink()
 
 
 class TestIterOffsetBatches:
@@ -321,7 +318,7 @@ class TestIterOffsetBatches:
     def test_paginates_in_order(self) -> None:
         from polycopy.runtime.query_batches import iter_offset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 11)
             batches = list(iter_offset_batches(
@@ -332,12 +329,11 @@ class TestIterOffsetBatches:
             assert [len(b) for b in batches] == [4, 4, 3]
         finally:
             conn.close()
-            path.unlink()
 
     def test_empty(self) -> None:
         from polycopy.runtime.query_batches import iter_offset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             conn.commit()
@@ -345,7 +341,6 @@ class TestIterOffsetBatches:
             assert batches == []
         finally:
             conn.close()
-            path.unlink()
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -362,20 +357,15 @@ class TestDatabaseIterWrappers:
 
         from polycopy.db.database import Database
 
-        fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        fd.close()
-        path = Path(fd.name)
-        try:
-            db = Database(db_path=path).connect()
-            db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
-            db.execute("INSERT INTO u (name) VALUES ('a')")
-            db.execute("INSERT INTO u (name) VALUES ('b')")
-            db.conn.commit()
-            rows = list(db.iter_rows("SELECT id, name FROM u ORDER BY id", batch_size=1))
-            assert [r[1] for r in rows] == ["a", "b"]
-            db.close()
-        finally:
-            path.unlink()
+        path = _OWNED_SQLITE.new_path("p24b-wrapper")
+        db = Database(db_path=path).connect()
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+        db.execute("INSERT INTO u (name) VALUES ('a')")
+        db.execute("INSERT INTO u (name) VALUES ('b')")
+        db.conn.commit()
+        rows = list(db.iter_rows("SELECT id, name FROM u ORDER BY id", batch_size=1))
+        assert [r[1] for r in rows] == ["a", "b"]
+        db.close()
 
     def test_iter_batches_round_trip(self) -> None:
         import sys
@@ -383,22 +373,17 @@ class TestDatabaseIterWrappers:
 
         from polycopy.db.database import Database
 
-        fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        fd.close()
-        path = Path(fd.name)
-        try:
-            db = Database(db_path=path).connect()
-            db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)")
-            for i in range(7):
-                db.execute("INSERT INTO u (id) VALUES (?)", (i + 1,))
-            db.conn.commit()
-            batches = list(db.iter_batches(
-                "SELECT id FROM u ORDER BY id", batch_size=3
-            ))
-            assert [len(b) for b in batches] == [3, 3, 1]
-            db.close()
-        finally:
-            path.unlink()
+        path = _OWNED_SQLITE.new_path("p24b-wrapper")
+        db = Database(db_path=path).connect()
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)")
+        for i in range(7):
+            db.execute("INSERT INTO u (id) VALUES (?)", (i + 1,))
+        db.conn.commit()
+        batches = list(db.iter_batches(
+            "SELECT id FROM u ORDER BY id", batch_size=3
+        ))
+        assert [len(b) for b in batches] == [3, 3, 1]
+        db.close()
 
     def test_iter_keyset_batches_round_trip(self) -> None:
         import sys
@@ -406,28 +391,22 @@ class TestDatabaseIterWrappers:
 
         from polycopy.db.database import Database
 
-        fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        fd.close()
-        path = Path(fd.name)
-        try:
-            db = Database(db_path=path).connect()
-            db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, n INTEGER)")
-            for i in range(1, 11):
-                db.execute("INSERT INTO u (id, n) VALUES (?, ?)", (i, i * 10))
-            db.conn.commit()
-            batches = list(db.iter_keyset_batches(
-                base_sql="SELECT id, n FROM u",
-                keyset_col="id",
-                last_value=None,
-                batch_size=4,
-                descending=True,
-            ))
-            ids = [r[0] for b in batches for r in b]
-            assert ids == [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
-            db.close()
-        finally:
-            path.unlink()
-
+        path = _OWNED_SQLITE.new_path("p24b-wrapper")
+        db = Database(db_path=path).connect()
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, n INTEGER)")
+        for i in range(1, 11):
+            db.execute("INSERT INTO u (id, n) VALUES (?, ?)", (i, i * 10))
+        db.conn.commit()
+        batches = list(db.iter_keyset_batches(
+            base_sql="SELECT id, n FROM u",
+            keyset_col="id",
+            last_value=None,
+            batch_size=4,
+            descending=True,
+        ))
+        ids = [r[0] for b in batches for r in b]
+        assert ids == [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+        db.close()
 
 # ─────────────────────────────────────────────────────────────────────────
 # RSS guard
@@ -707,11 +686,10 @@ class TestHotPathNoLongerFetchall:
         from polycopy.db.database import Database
         from scripts.run_scan import _compute_wallet_metrics
 
-        fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        fd.close()
-        path = Path(fd.name)
+        path = _OWNED_SQLITE.new_path("p24b-wrapper")
+        db = Database(db_path=path)
         try:
-            db = Database(db_path=path).connect()
+            db.connect()
             # Database.connect() runs all migrations up to v13, which
             # creates the source_trades table in the right shape. We
             # just insert the test rows.
@@ -747,9 +725,8 @@ class TestHotPathNoLongerFetchall:
             assert metrics["first_trade_ts"] == datetime(
                 2024, 1, 1, tzinfo=timezone.utc
             )
-            db.close()
         finally:
-            path.unlink()
+            db.close()
 
     def test_run_scan_compute_wallet_metrics_markets_traded_count(
         self,
@@ -766,11 +743,10 @@ class TestHotPathNoLongerFetchall:
         from polycopy.db.database import Database
         from scripts.run_scan import _compute_wallet_metrics
 
-        fd = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        fd.close()
-        path = Path(fd.name)
+        path = _OWNED_SQLITE.new_path("p24b-wrapper")
+        db = Database(db_path=path)
         try:
-            db = Database(db_path=path).connect()
+            db.connect()
             # Database.connect() runs all migrations up to v13, which
             # creates the source_trades table in the right shape. We
             # just insert the test rows.
@@ -801,9 +777,8 @@ class TestHotPathNoLongerFetchall:
             assert metrics is not None
             assert metrics["trade_count"] == 7
             assert metrics["markets_traded"] == 4
-            db.close()
         finally:
-            path.unlink()
+            db.close()
 
     def test_update_paper_portfolio_open_positions_uses_iter_rows(self) -> None:
         text = _read("scripts/update_paper_portfolio.py")

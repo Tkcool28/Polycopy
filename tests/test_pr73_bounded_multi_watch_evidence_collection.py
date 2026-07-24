@@ -32,6 +32,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 for p in (str(ROOT / "src"), str(ROOT / "scripts")):
     if p not in sys.path:
@@ -62,7 +64,13 @@ SAMPLE_ADDR = "0xsample0000000000000000000000000000000sam"
 
 
 def _tmp() -> Path:
-    return Path(tempfile.mktemp(suffix=".db"))
+    raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(globals(), "_tmp", owned_sqlite.new_path)
 
 
 def _open() -> Database:

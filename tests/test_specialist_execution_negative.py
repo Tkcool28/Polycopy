@@ -16,7 +16,6 @@ All runs use temporary databases only.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -48,10 +47,17 @@ NEW_TABLES = [
 
 
 def _connect() -> Database:
-    fd, n = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    return Database(Path(n)).connect(), Path(n)
+    raise RuntimeError("_connect is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    def _connect_owned():
+        path = owned_sqlite.new_path()
+        return Database(path).connect(), path
+
+    monkeypatch.setitem(globals(), "_connect", _connect_owned)
 
 
 def _runtime(**overrides):
@@ -104,18 +110,17 @@ def _seed_score_authorize(tmp_path: Path):
 # Step 6 — schema contract
 # --------------------------------------------------------------------------- #
 def test_schema_v18_new_tables_exist():
-    db, n = _connect()
+    db, _n = _connect()
     for t in NEW_TABLES:
         row = db.fetchone(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (t,)
         )
         assert row is not None, f"missing table {t}"
     db.close()
-    n.unlink()
 
 
 def test_execution_risk_decision_pk_type_and_columns():
-    db, n = _connect()
+    db, _n = _connect()
     cols = {r["name"]: r for r in db.fetchall("PRAGMA table_info(execution_risk_decisions)")}
     assert cols["risk_decision_id"]["pk"] == 1
     for required in [
@@ -128,11 +133,10 @@ def test_execution_risk_decision_pk_type_and_columns():
     ]:
         assert required in cols, f"missing column {required}"
     db.close()
-    n.unlink()
 
 
 def test_invalid_fk_insert_fails():
-    db, n = _connect()
+    db, _n = _connect()
     with pytest.raises(Exception):
         db.execute(
             "INSERT INTO paper_orders (id, specialist_approval_id, source_trade_internal_id, "
@@ -146,7 +150,6 @@ def test_invalid_fk_insert_fails():
              1.0, 0.4, "fill_model_v1", "now", "v1"),
         )
     db.close()
-    n.unlink()
 
 
 # --------------------------------------------------------------------------- #

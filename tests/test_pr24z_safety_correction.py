@@ -61,26 +61,49 @@ from pathlib import Path
 from typing import Optional
 from unittest import mock
 
+import pytest
+
+from tests.sqlite_test_utils import OwnedSQLitePaths
+
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
 from polycopy.ingestion import source_trade_writer as writer_mod  # noqa: E402
-from polycopy.ingestion.source_trade_writer import (  # noqa: E402
-    create_verified_backup,
-    assert_unique_dedupe_constraint,
-    write_valid_rows,
-    BackupResult,
-)
 from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
-    normalize_source_trade,
-    generate_identity,
-    NormalizedSourceTrade,
-    SOURCE_NAME,
-    IDENTITY_SOURCE_PROVIDED,
     IDENTITY_SOURCE_FALLBACK,
+    IDENTITY_SOURCE_PROVIDED,
+    SOURCE_NAME,
+    NormalizedSourceTrade,
+    generate_identity,
+    normalize_source_trade,
 )
+from polycopy.ingestion.source_trade_writer import (  # noqa: E402
+    BackupResult,
+    assert_unique_dedupe_constraint,
+    create_verified_backup,
+    write_valid_rows,
+)
+
+
+_OWNED_SQLITE: Optional[OwnedSQLitePaths] = None
+
+
+@pytest.fixture(autouse=True)
+def _use_owned_sqlite(owned_sqlite):
+    """Route unittest file fixtures through pytest's owned directory."""
+    global _OWNED_SQLITE
+    _OWNED_SQLITE = owned_sqlite
+    try:
+        yield
+    finally:
+        _OWNED_SQLITE = None
+
+
+def _owned_sqlite() -> OwnedSQLitePaths:
+    assert _OWNED_SQLITE is not None
+    return _OWNED_SQLITE
 
 
 def _tx(i: str) -> str:
@@ -140,9 +163,7 @@ def _make_source_trades(conn: sqlite3.Connection) -> None:
 
 class BackupTests(unittest.TestCase):
     def _setup_wal_db(self, *, rows: int = 5) -> str:
-        fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24z_bk_")
-        os.close(fd)
-        os.remove(path)
+        path = str(_owned_sqlite().new_path("pr24z-bk"))
         c = sqlite3.connect(path)
         c.execute("PRAGMA journal_mode=WAL")
         _make_source_trades(c)
@@ -161,23 +182,15 @@ class BackupTests(unittest.TestCase):
 
     def test_1_online_backup_wal(self):
         path = self._setup_wal_db(rows=5)
-        try:
-            res = create_verified_backup(path)
-            self.assertIsInstance(res, BackupResult)
-            self.assertEqual(res.method, "sqlite_online_backup")
-            self.assertTrue(res.success)
-        finally:
-            for ext in ("", "-wal", "-shm"):
-                try:
-                    os.remove(path + ext)
-                except OSError:
-                    pass
+        res = create_verified_backup(
+            path, backup_path=str(_owned_sqlite().new_path("pr24z-bk-result"))
+        )
+        self.assertIsInstance(res, BackupResult)
+        self.assertEqual(res.method, "sqlite_online_backup")
+        self.assertTrue(res.success)
 
     def test_2_wal_committed_rows_in_backup(self):
-        fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24z_bk_")
-        os.close(fd)
-        os.remove(path)
-        res_path: Optional[str] = None
+        path = str(_owned_sqlite().new_path("pr24z-bk"))
         c = sqlite3.connect(path)
         c.execute("PRAGMA journal_mode=WAL")
         _make_source_trades(c)
@@ -192,82 +205,47 @@ class BackupTests(unittest.TestCase):
             )
         c.commit()
         c.close()
+        res = create_verified_backup(
+            path, backup_path=str(_owned_sqlite().new_path("pr24z-bk-result"))
+        )
+        self.assertTrue(res.success)
+        self.assertEqual(res.source_trades_count, 7)
+        # Open the backup independently and confirm count.
+        bk = sqlite3.connect(res.path)
         try:
-            res = create_verified_backup(path)
-            res_path = res.path
-            self.assertTrue(res.success)
-            self.assertEqual(res.source_trades_count, 7)
-            # Open the backup independently and confirm count.
-            bk = sqlite3.connect(res.path)
-            try:
-                cnt = bk.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
-                self.assertEqual(cnt, 7)
-            finally:
-                bk.close()
+            cnt = bk.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
+            self.assertEqual(cnt, 7)
         finally:
-            for ext in ("", "-wal", "-shm"):
-                try:
-                    os.remove(path + ext)
-                except OSError:
-                    pass
-            if res_path:
-                try:
-                    os.remove(res_path)
-                except OSError:
-                    pass
-            try:
-                os.remove(res.path)
-            except OSError:
-                pass
+            bk.close()
 
     def test_3_integrity_ok(self):
         path = self._setup_wal_db(rows=3)
-        try:
-            res = create_verified_backup(path)
-            self.assertEqual(res.integrity_check, "ok")
-        finally:
-            for ext in ("", "-wal", "-shm"):
-                try:
-                    os.remove(path + ext)
-                except OSError:
-                    pass
+        res = create_verified_backup(
+            path, backup_path=str(_owned_sqlite().new_path("pr24z-bk-result"))
+        )
+        self.assertEqual(res.integrity_check, "ok")
 
     def test_4_fk_zero(self):
         path = self._setup_wal_db(rows=3)
-        try:
-            res = create_verified_backup(path)
-            self.assertEqual(res.foreign_key_violations, 0)
-        finally:
-            for ext in ("", "-wal", "-shm"):
-                try:
-                    os.remove(path + ext)
-                except OSError:
-                    pass
+        res = create_verified_backup(
+            path, backup_path=str(_owned_sqlite().new_path("pr24z-bk-result"))
+        )
+        self.assertEqual(res.foreign_key_violations, 0)
 
     def test_5_count_equals_source(self):
         path = self._setup_wal_db(rows=11)
-        try:
-            res = create_verified_backup(path)
-            self.assertEqual(res.source_trades_count, 11)
-        finally:
-            for ext in ("", "-wal", "-shm"):
-                try:
-                    os.remove(path + ext)
-                except OSError:
-                    pass
+        res = create_verified_backup(
+            path, backup_path=str(_owned_sqlite().new_path("pr24z-bk-result"))
+        )
+        self.assertEqual(res.source_trades_count, 11)
 
     def test_6_sha256_populated(self):
         path = self._setup_wal_db(rows=2)
-        try:
-            res = create_verified_backup(path)
-            self.assertIsNotNone(res.sha256)
-            self.assertEqual(len(res.sha256), 64)
-        finally:
-            for ext in ("", "-wal", "-shm"):
-                try:
-                    os.remove(path + ext)
-                except OSError:
-                    pass
+        res = create_verified_backup(
+            path, backup_path=str(_owned_sqlite().new_path("pr24z-bk-result"))
+        )
+        self.assertIsNotNone(res.sha256)
+        self.assertEqual(len(res.sha256), 64)
 
     def test_7_backup_failure_blocks_writer(self):
         # Backup to a read-only directory path that cannot be created -> failure.
@@ -383,9 +361,7 @@ class IdentityTests(unittest.TestCase):
         # trade with a new source-provided canonical id must NOT be skipped via a
         # PR24Z-specific alias path. In an isolated temp DB it inserts a second
         # canonical row, proving normal writer dedupe is canonical-only.
-        fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24z_no_alias_")
-        os.close(fd)
-        os.remove(path)
+        path = str(_owned_sqlite().new_path("pr24z-no-alias"))
         db = _Conn(path)
         try:
             _make_source_trades(db.conn)
@@ -411,11 +387,6 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(final, 2)
         finally:
             db.close()
-            for ext in ("", "-wal", "-shm"):
-                try:
-                    os.remove(path + ext)
-                except OSError:
-                    pass
 
     def test_15_production_write_blocked_until_migration_complete(self):
         from scripts import ingest_real_source_trades as cli
@@ -423,7 +394,7 @@ class IdentityTests(unittest.TestCase):
         # The block is checked before backup/DB writer work. Patch the network
         # provider and process/timer gates so this stays fast and no production
         # DB write can occur.
-        marker = Path("/tmp/pr24z_missing_marker_for_test")
+        marker = _owned_sqlite().path("pr24z-missing-marker")
         if marker.exists():
             marker.unlink()
 
@@ -463,9 +434,7 @@ class IdentityTests(unittest.TestCase):
 
 class ConstraintTests(unittest.TestCase):
     def _db_with_unique(self, *, columns=("source", "source_trade_id"), table_unique=True, index_unique=True):
-        fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24z_cn_")
-        os.close(fd)
-        os.remove(path)
+        path = str(_owned_sqlite().new_path("pr24z-constraint"))
         c = sqlite3.connect(path)
         if table_unique:
             c.execute(
@@ -483,16 +452,16 @@ class ConstraintTests(unittest.TestCase):
         return _Conn(path), path
 
     def test_17_expected_unique_present(self):
-        db, path = self._db_with_unique()
+        db, _path = self._db_with_unique()
         try:
             res = assert_unique_dedupe_constraint(db)
             self.assertTrue(res.present)
             self.assertEqual(set(res.columns), {"source", "source_trade_id"})
         finally:
-            os.remove(path)
+            db.close()
 
     def test_18_missing_unique_blocks_write(self):
-        db, path = self._db_with_unique(table_unique=False, index_unique=False)
+        db, _path = self._db_with_unique(table_unique=False, index_unique=False)
         try:
             res = assert_unique_dedupe_constraint(db)
             self.assertFalse(res.present)
@@ -503,10 +472,10 @@ class ConstraintTests(unittest.TestCase):
             self.assertFalse(wr.unique_constraint_present)
             self.assertTrue(wr.errors >= 1)
         finally:
-            os.remove(path)
+            db.close()
 
     def test_19_wrong_columns_block_write(self):
-        db, path = self._db_with_unique(columns=("source_trade_id",), table_unique=False, index_unique=True)
+        db, _path = self._db_with_unique(columns=("source_trade_id",), table_unique=False, index_unique=True)
         try:
             res = assert_unique_dedupe_constraint(db)
             self.assertFalse(res.present)
@@ -515,7 +484,7 @@ class ConstraintTests(unittest.TestCase):
             wr = write_valid_rows(db, [cand], dry_run=False)
             self.assertFalse(wr.committed)
         finally:
-            os.remove(path)
+            db.close()
 
 
 class ProcessGateTests(unittest.TestCase):

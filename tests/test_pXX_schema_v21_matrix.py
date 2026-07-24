@@ -49,13 +49,11 @@ EXPECTED_V21_OBJECTS = [
 
 
 def _open_fresh(path: Path) -> "database.Database":
-    if path.exists():
-        path.unlink()
     return database.Database(path).connect()
 
 
-def test_fresh_db_is_v21():
-    db = _open_fresh(Path("/tmp/polycopy_v21_fresh.db"))
+def test_fresh_db_is_v21(tmp_path: Path):
+    db = _open_fresh(tmp_path / "polycopy_v21_fresh.db")
     try:
         ver = db.conn.execute(
             "SELECT value FROM _meta WHERE key='schema_version'"
@@ -94,8 +92,8 @@ def _build_at_v20(path: Path):
     return db
 
 
-def test_v20_to_v21_preserves_pr70_rows():
-    path = Path("/tmp/polycopy_v21_upgrade.db")
+def test_v20_to_v21_preserves_pr70_rows(tmp_path: Path):
+    path = tmp_path / "polycopy_v21_upgrade.db"
     db = _build_at_v20(path)
     try:
         ver = db.conn.execute(

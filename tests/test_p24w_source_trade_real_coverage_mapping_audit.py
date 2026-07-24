@@ -34,8 +34,9 @@ from __future__ import annotations
 import inspect
 import json
 import sqlite3
-import tempfile
 from pathlib import Path
+
+import pytest
 
 
 from polycopy.engine import source_trade_real_coverage_mapping_audit as mod
@@ -56,10 +57,24 @@ SYN_TOKEN2 = "0xsynthetic_token_second_do_not_use"
 SYN_MARKET2 = "sample-market-002"
 
 
+
+
+_OWNED_SQLITE = None
+
+
+@pytest.fixture(autouse=True)
+def _use_owned_sqlite(owned_sqlite):
+    """Route every file-backed test database through the exact-path fixture."""
+    global _OWNED_SQLITE
+    _OWNED_SQLITE = owned_sqlite
+    try:
+        yield
+    finally:
+        _OWNED_SQLITE = None
+
 def _make_db(rows, *, add_guarded_tables=False) -> str:
     """Build an isolated temp SQLite DB with a source_trades table + rows."""
-    fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24w_test_")
-    Path(path).unlink()  # mkstemp creates the file; recreate clean.
+    path = _OWNED_SQLITE.new_path("pr24w")
     con = sqlite3.connect(path)
     con.execute(
         """
@@ -403,15 +418,6 @@ def test_dry_run_creates_no_db_writes_and_no_production_objects():
         con.close()
     size_after = Path(db).stat().st_size
 
-    # Main DB file must be unchanged (read-only run).
-    fd, tmppath = tempfile.mkstemp(suffix=".db")
-    import os
-    os.close(fd)
-    con2 = sqlite3.connect(tmppath)
-    con2.execute(
-        "ATTACH DATABASE ? AS prod" if False else "SELECT 1"  # no-op guard
-    )
-    con2.close()
     # Direct byte comparison: the audit never writes the main file.
     assert Path(db).stat().st_size == size_after
 

@@ -14,7 +14,6 @@ import asyncio
 import contextlib
 from dataclasses import replace
 import sys
-import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -45,8 +44,15 @@ WUUID = ["uuid-wallet-0000000000000000000000000000000" + c for c in ("a", "b", "
 
 
 def _open():
-    p = Path(tempfile.mktemp(suffix=".db"))
-    return Database(p).connect()
+    raise RuntimeError("_open is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(
+        globals(), "_open", lambda: Database(owned_sqlite.new_path()).connect()
+    )
 
 
 def _seed_wallet(db, wid, address, is_sample=0):

@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from typing import Any
 
@@ -56,10 +57,24 @@ SYN_WALLET = "0xsynthetic_test_only"
 SYN_CONDITION = "0xabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"  # 64-hex
 
 
+
+
+_OWNED_SQLITE = None
+
+
+@pytest.fixture(autouse=True)
+def _use_owned_sqlite(owned_sqlite):
+    """Route every file-backed test database through the exact-path fixture."""
+    global _OWNED_SQLITE
+    _OWNED_SQLITE = owned_sqlite
+    try:
+        yield
+    finally:
+        _OWNED_SQLITE = None
+
 def _make_db(rows, *, add_extra_tables=False) -> str:
     """Build an isolated temp SQLite DB with a source_trades table + rows."""
-    fd, path = tempfile.mkstemp(suffix=".db", prefix="pr24v_test_")
-    Path(path).unlink()  # mkstemp creates the file; recreate clean.
+    path = _OWNED_SQLITE.new_path("pr24v")
     con = sqlite3.connect(path)
     con.execute(
         """

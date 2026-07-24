@@ -80,12 +80,20 @@ FORBIDDEN_TABLES = [
 
 
 def _fresh_v21_db() -> Path:
-    p = Path(tempfile.mktemp(suffix=".db"))
-    db = Database(p).connect()
-    ver = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
-    assert int(ver["value"]) == 21, "disposable DB must be schema v21"
-    db.close()
-    return p
+    raise RuntimeError("_fresh_v21_db is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    def _fresh() -> Path:
+        path = owned_sqlite.new_path()
+        db = Database(path).connect()
+        ver = db.fetchone("SELECT value FROM _meta WHERE key='schema_version'")
+        assert int(ver["value"]) == 21, "disposable DB must be schema v21"
+        db.close()
+        return path
+    monkeypatch.setitem(globals(), "_fresh_v21_db", _fresh)
 
 
 # ── Test helper: fake argparse.Namespace for the gate checks ──────────────────
@@ -940,7 +948,6 @@ def test_cli_write_branch_reachable():
 
     assert result == 0, f"CLI write branch failed with code {result}"
     assert "markets" in adapter_created, "Adapter was not used"
-    p.unlink()
 
 
 def test_cli_calls_discover_candidates():
@@ -985,7 +992,6 @@ def test_cli_calls_discover_candidates():
         discover_research_wallets.operational_job_lock = original_lock_func
 
     assert "discover_candidates" in calls, "discover_candidates was not called"
-    p.unlink()
 
 
 def test_cli_lock_contention_returns_nonzero():
@@ -1011,7 +1017,6 @@ def test_cli_lock_contention_returns_nonzero():
         discover_research_wallets.operational_job_lock = original_lock_func
 
     assert result == 4, f"Expected return code 4 for lock contention, got {result}"
-    p.unlink()
 
 
 def test_cli_output_json_accepts_path():
@@ -1063,12 +1068,10 @@ def test_cli_output_json_accepts_path():
     content = json.loads(json_path.read_text())
     assert "candidates" in content
     json_path.unlink()
-    p.unlink()
 
 
 def test_output_json_atomic_on_failure():
     """--output-json leaves no partial file on simulated write failure."""
-    p = _fresh_v21_db()
     json_path = Path(tempfile.mktemp(suffix=".json"))
 
     # Test the _write_json_atomic function directly with cleanup
@@ -1088,7 +1091,6 @@ def test_output_json_atomic_on_failure():
     assert content == out
 
     json_path.unlink()
-    p.unlink()
 
 
 # ── Call order tests ────────────────────────────────────────────────────────────
@@ -1140,7 +1142,6 @@ def test_lock_provider_network_db_order():
     # Verify order: lock → network → db_open (in main)
     assert "lock" in call_order, "Lock should be acquired"
     assert "network" in call_order, "Network should be called"
-    p.unlink()
 
 
 # ── adapter close tests ────────────────────────────────────────────────────────────
@@ -1230,7 +1231,6 @@ def test_pr71_selector_sees_five_watches():
     ).fetchone()[0]
     assert count == 5, f"PR #71 selector should see 5 watches, found {count}"
     conn.close()
-    p.unlink()
 
 
 # ── existing-wallet uses existing_wallet_id ────────────────────────────────────────────
@@ -1390,7 +1390,6 @@ def test_main_dry_run_success_closes_adapter_once():
         _restore_main_seams(orig)
     assert rc == 0
     assert adapter.close_calls == 1
-    p.unlink()
 
 
 def test_main_dry_run_network_failure_closes_adapter_once_and_fails():
@@ -1404,7 +1403,6 @@ def test_main_dry_run_network_failure_closes_adapter_once_and_fails():
         _restore_main_seams(orig)
     assert rc != 0
     assert adapter.close_calls == 1
-    p.unlink()
 
 
 def test_main_write_success_closes_adapter_once():
@@ -1419,7 +1417,6 @@ def test_main_write_success_closes_adapter_once():
         _restore_main_seams(orig)
     assert rc == 0
     assert adapter.close_calls == 1
-    p.unlink()
 
 
 def test_main_write_persistence_failure_closes_adapter_once_and_fails():
@@ -1438,7 +1435,6 @@ def test_main_write_persistence_failure_closes_adapter_once_and_fails():
         _restore_main_seams(orig)
     assert rc != 0
     assert adapter.close_calls == 1
-    p.unlink()
 
 
 def test_main_write_commit_failure_closes_adapter_once_and_fails():
@@ -1461,7 +1457,6 @@ def test_main_write_commit_failure_closes_adapter_once_and_fails():
         ed.open_writable = orig_open
     assert rc != 0
     assert adapter.close_calls == 1
-    p.unlink()
 
 
 # ── §7: structured failure JSON carries status=failed + original text ───────────────
@@ -1485,7 +1480,6 @@ def test_main_failure_emits_structured_failed_json(capsys):
     payload = json.loads(out)
     assert payload["status"] == "failed"
     assert "boom-original-text" in payload["error"]
-    p.unlink()
 
 
 # ── §10: lock contention -> rc 4, zero side effects ───────────────────────────────
@@ -1550,7 +1544,6 @@ def test_main_lock_contention_zero_side_effects(capsys):
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert payload == {"error": "lock_unavailable", "run_id": "", "status": "failed"}, payload
-    p.unlink()
 
 
 # ── §11: exact call-order proofs (write + dry-run) ────────────────────────────────
@@ -1609,7 +1602,6 @@ def test_main_write_call_order_exact():
     tail = order[order.index("lock"):]
     assert tail == ["lock", "network", "network", "writable_db_open", "persist",
                     "db_close", "adapter_close"], tail
-    p.unlink()
 
 
 def test_main_dry_run_call_order_exact():
@@ -1665,7 +1657,6 @@ def test_main_dry_run_call_order_exact():
     tail = order[order.index("lock"):]
     assert tail == ["lock", "network", "network", "readonly_db_open", "persist",
                     "db_close", "adapter_close"], tail
-    p.unlink()
 
 
 # ── §12: real PR #72 -> PR #71 build_status handoff via main() ───────────────────
@@ -1754,7 +1745,6 @@ def test_pr72_cli_creates_watches_visible_to_pr71_build_status():
             cnt = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             assert cnt == 0, f"execution-plane table {t} had {cnt} rows after CLI run"
     conn.close()
-    p.unlink()
 
 
 # ── §13: complete SQL write-trace parsing (exact allowed-set) ─────────────────────
@@ -1870,7 +1860,6 @@ async def test_case_new_wallet_no_watch():
     assert result.new_wallets == 1 and result.watches_existing == 0
     assert result.would_create_watches == 0 and result.watches_created == 0
     assert c["created_wallet_id"] is not None
-    p.unlink()
 
 
 @pytest.mark.asyncio
@@ -1891,7 +1880,6 @@ async def test_case_new_wallet_new_watch():
     })
     assert result.new_wallets == 1 and result.watches_created == 1
     assert c["created_wallet_id"] is not None and c["created_watch_id"] is not None
-    p.unlink()
 
 
 @pytest.mark.asyncio
@@ -1925,7 +1913,6 @@ async def test_case_existing_wallet_existing_watch():
     })
     assert result.existing_wallets == 1 and result.watches_existing == 1
     assert result.new_wallets == 0 and result.watches_created == 0
-    p.unlink()
 
 
 @pytest.mark.asyncio
@@ -1956,7 +1943,6 @@ async def test_case_existing_wallet_newly_created_watch():
     assert result.existing_wallets == 1 and result.watches_created == 1
     assert result.watches_existing == 0 and result.new_wallets == 0
     assert c["created_watch_id"] is not None
-    p.unlink()
 
 
 @pytest.mark.asyncio
@@ -1989,7 +1975,6 @@ async def test_case_dry_run_existing_wallet_existing_watch():
     })
     assert result.existing_wallets == 1 and result.watches_existing == 1
     assert result.would_create_watches == 0
-    p.unlink()
 
 
 @pytest.mark.asyncio
@@ -2018,7 +2003,6 @@ async def test_case_dry_run_existing_wallet_would_create_watch():
     })
     assert result.existing_wallets == 1
     assert result.would_create_watches == 1 and result.watches_existing == 0
-    p.unlink()
 
 
 # ── Helper: valid address generation ───────────────────────────────────────────────

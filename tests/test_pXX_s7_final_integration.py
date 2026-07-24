@@ -42,11 +42,12 @@ import json
 import os
 import sqlite3
 import sys
-import tempfile
 import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 for p in (str(ROOT / "src"), str(ROOT / "scripts")):
@@ -90,7 +91,13 @@ def _status_build(db_path, wid):
 
 
 def _tmp():
-    return Path(tempfile.mktemp(suffix=".db"))
+    raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(globals(), "_tmp", owned_sqlite.new_path)
 
 
 # ── fixtures / constants ──────────────────────────────────────────────────────
@@ -970,7 +977,7 @@ def test_s7_status_readonly_purity():
 # ── F. production-path refusal matrix (isolated fixtures ONLY) ─────────────────
 
 
-def test_s7_production_refusal_matrix():
+def test_s7_production_refusal_matrix(tmp_path: Path):
     """Every PR #71 write CLI, pointed at an ISOLATED fixture recognized as a
     production path (with --write but MISSING the full gate set), exits 2 and
     refuses BEFORE any DB open / provider / selector symbol is invoked.
@@ -990,7 +997,7 @@ def test_s7_production_refusal_matrix():
     repo_stat_before = os.stat(repo_prod) if repo_prod.exists() else None
 
     # Isolated fixture, OUTSIDE the repo.
-    fx_dir = Path(tempfile.mkdtemp(prefix="s7_prod_fx_"))
+    fx_dir = tmp_path / "s7_prod_fx"
     fx_canonical = fx_dir / "data" / "polycopy.db"
     fx_canonical.parent.mkdir(parents=True, exist_ok=True)
     # Make it a VALID v21 DB so any read-only preflight would succeed.
@@ -1086,8 +1093,6 @@ def test_s7_production_refusal_matrix():
                 setattr(obj, sym, val)
         ed.PRODUCTION_DB_ABSOLUTE = orig_abs
         ed.PRODUCTION_DB_REPO_RELATIVE = orig_rel
-        import shutil
-        shutil.rmtree(fx_dir, ignore_errors=True)
 
     # Repo production file must be untouched.
     repo_stat_after = os.stat(repo_prod) if repo_prod.exists() else None

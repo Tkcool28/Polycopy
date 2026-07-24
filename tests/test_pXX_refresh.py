@@ -16,7 +16,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
-import tempfile
 import asyncio
 import pytest
 from datetime import datetime, timezone
@@ -63,7 +62,13 @@ WATCH_SAMPLE = "wl-sample-0000000000000000000000000000003"
 
 
 def _tmp():
-    return Path(tempfile.mktemp(suffix=".db"))
+    raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
+
+
+@pytest.fixture(autouse=True)
+def _owned_sqlite_paths(monkeypatch, owned_sqlite):
+    """Route this module's disposable SQLite files through pytest ownership."""
+    monkeypatch.setitem(globals(), "_tmp", owned_sqlite.new_path)
 
 
 def _open():
@@ -1243,7 +1248,6 @@ def test_production_dry_run_allowed_readonly():
             _m.open_readonly = real_open_r
     finally:
         _m.is_production_db = real_is_prod
-        tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1305,7 +1309,6 @@ def test_unconfirmed_production_write_touches_no_symbols():
             _m._validate_selector_readonly = real_validate
     finally:
         _m.is_production_db = real_is_prod
-        tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
