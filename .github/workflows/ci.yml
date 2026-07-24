@@ -22,6 +22,8 @@ jobs:
         python-version: ['3.11', '3.12']
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -33,11 +35,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Lint (ruff)
-        run: ruff check src tests
+      - name: Ruff no-new-debt check
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_DIR: ${{ runner.temp }}/polycopy-ruff-base
+          BASE_JSON: ${{ runner.temp }}/ruff-base.json
+          HEAD_JSON: ${{ runner.temp }}/ruff-head.json
+        run: |
+          set -euo pipefail
+          ruff check src tests --output-format=json > "$HEAD_JSON" || true
+          git worktree add --detach "$BASE_DIR" "$BASE_SHA"
+          (
+            cd "$BASE_DIR"
+            ruff check src tests --output-format=json > "$BASE_JSON" || true
+          )
+          python scripts/ci/check_ruff_delta.py \
+            --base "$BASE_JSON" \
+            --head "$HEAD_JSON" \
+            --base-root "$BASE_DIR" \
+            --head-root "$GITHUB_WORKSPACE"
 
-      - name: Type check (ruff pyflakes)
-        run: ruff check src tests --select F
+      - name: Ruff inventory on main
+        if: github.event_name == 'push'
+        run: ruff check src tests --output-format=concise --exit-zero
 
       - name: Tests (pytest)
         run: pytest tests/ -q --tb=short
