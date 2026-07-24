@@ -170,6 +170,7 @@ class NormalizedSourceTrade:
     quantity: Optional[float] = None
     timestamp: Optional[datetime] = None
     outcome: Optional[str] = None
+    outcome_index: Optional[int] = None
     transaction_hash: Optional[str] = None
     market_title: Optional[str] = None
     market_slug: Optional[str] = None
@@ -487,6 +488,17 @@ def normalize_source_trade(
     # ── outcome / market metadata ──
     outcome = raw.get("outcome")
     candidate.outcome = str(outcome).strip() if isinstance(outcome, str) and outcome.strip() else None
+
+    # PR66+: preserve outcome_index from the raw trade response.
+    oi = raw.get("outcomeIndex")
+    if oi is not None:
+        try:
+            oi_int = int(oi)
+            if oi_int >= 0:
+                candidate.outcome_index = oi_int
+        except (TypeError, ValueError):
+            pass  # invalid -> None, keep candidate valid
+
     candidate.market_title = raw.get("title") if isinstance(raw.get("title"), str) else None
     candidate.market_slug = raw.get("slug") if isinstance(raw.get("slug"), str) else None
     candidate.metadata = normalize_source_trade_metadata(raw)

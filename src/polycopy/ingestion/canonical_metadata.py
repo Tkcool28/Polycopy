@@ -35,6 +35,10 @@ Design invariants
   the caller must NOT overwrite. Malformed / non-object existing metadata is
   likewise blocked (status ``unavailable``); the caller must preserve the
   original DB value (see ``merge_canonical_metadata`` return contract).
+* Snapshot contract version lives in ``SNAPSHOT_CONTRACT_VERSION``; an increment
+  means new top-level namespaces were added (``market``, ``outcomes``,
+  ``lifecycle``, ``provenance``). Existing consumers that only read
+  ``taxonomy``/``event``/``series`` remain unaffected.
 """
 
 from __future__ import annotations
@@ -212,7 +216,7 @@ def build_canonical_metadata(
     trade: Optional[Mapping[str, Any]],
     gamma_market: Optional[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Build the canonical PR66 metadata dict from a trusted Gamma market.
+    """Build the canonical PR66+ metadata dict from a trusted Gamma market.
 
     This is the shared producer: the existing approved-wallet collector's
     ``build_metadata_from_gamma_market`` delegates here, so collection,
@@ -222,11 +226,19 @@ def build_canonical_metadata(
 
     SOLE AUTHORITY: the canonical taxonomy/event/series is derived ONLY from the
     trusted Gamma market. The ``trade`` argument is accepted for call-site
-    compatibility but is NEVER used as a metadata source — we never read
+    compatibility but is NEVER used as a taxonomy source — we never read
     taxonomy, title, or question text from the raw trade row.
 
-    Returns the exact PR66 shape. Deterministic (``sort_keys``) so byte-equivalent
+    Returns the exact PR66+ shape. Deterministic (``sort_keys``) so byte-equivalent
     across call sites. Never infers taxonomy from title/question text.
+
+    NEW (v2 snapshot): when gamma_market is provided the builder also populates:
+
+      - ``market``        — condition_id, provider_market_id, question, slug
+      - ``outcomes``       — ordered labels + CLOB token IDs with length check
+      - ``lifecycle``      — active, closed, accepting_orders, end_date
+      - ``provenance``     — provider, lookup_kind, requested_condition_id,
+                            exact_match, retrieved_at, snapshot_contract_version
     """
     market = _mapping(gamma_market)
     source = dict(market)
@@ -239,7 +251,30 @@ def build_canonical_metadata(
     source["category"] = _official_category_for_v1_metadata(
         OfficialPolymarketTaxonomyResolverV1().resolve(source)
     )
-    return normalize_source_trade_metadata(source)
+    base = normalize_source_trade_metadata(source)
+
+    # ── Expanded snapshot namespaces (PR66+ v2) ─────────────────────────────
+    if market:  # only populate when we have an authoritative Gamma response
+        snapshot = _build_market_snapshot(market)
+        # Include trade-response supporting fields (title/slug/outcome_index)
+        # from the raw trade dict if available; these are trade-context, NOT
+        # market-authoritative taxonomy.
+        if trade and isinstance(trade, Mapping):
+            provenance = snapshot.get("provenance", {})
+            provenance["trade_response_title"] = _scalar(trade.get("title"))
+            provenance["trade_response_slug"] = _scalar(trade.get("slug"))
+            oi = trade.get("outcomeIndex")
+            if oi is not None:
+                try:
+                    provenance["trade_response_outcome_index"] = int(oi)
+                except (TypeError, ValueError):
+                    pass
+            tx = trade.get("transactionHash")
+            if tx and isinstance(tx, str) and tx.strip():
+                provenance["trade_response_transaction_hash"] = tx.strip()
+        base["_snapshot"] = snapshot
+
+    return base
 
 
 def _gamma_condition_id(gamma_market: Optional[Mapping[str, Any]]) -> Optional[str]:
@@ -357,7 +392,11 @@ def merge_canonical_metadata(
 
     new = build_canonical_metadata({}, gamma_market)
     new_taxonomy = new.get("taxonomy") or {}
-    if not new_taxonomy.get("raw_category"):
+
+    # PR66+: check if we have ANY useful data (taxonomy OR snapshot).
+    has_snapshot = "_snapshot" in new and isinstance(new["_snapshot"], dict)
+
+    if not new_taxonomy.get("raw_category") and not has_snapshot:
         reason_codes.append("taxonomy_unavailable")
         return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
 
@@ -365,7 +404,7 @@ def merge_canonical_metadata(
     changed = False
     conflict = False
 
-    for ns in ("taxonomy", "event", "series"):
+    for ns in ("taxonomy", "event", "series", "_snapshot"):
         if ns not in new:
             continue
         existing_ns = existing.get(ns)
@@ -446,3 +485,132 @@ def merge_canonical_metadata(
     reason_codes.append("no_change")
     out = _ensure_version(existing)
     return out, MERGE_UNCHANGED, reason_codes
+
+
+# ── Snapshot contract version (v2) ───────────────────────────────────────
+# Bumped from "1" to "2" when new top-level snapshot namespaces are added
+# (market, outcomes, lifecycle, provenance under _snapshot).  Existing consumers
+# that only read taxonomy/event/series remain unaffected.
+_SNAPSHOT_CONTRACT_VERSION = "2"
+
+
+def _as_bool(value: Any) -> Optional[bool]:
+    """Return boolean or None for values that may be truthy/falsy or missing."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return bool(value)
+
+
+def _parse_outcome_arrays(
+    outcome_labels_raw: Any, clob_ids_raw: Any
+) -> dict[str, Any]:
+    """Parse Gamma outcomes + clobTokenIds with structural validation.
+
+    Returns a dict:
+      {
+        "labels": [...],
+        "token_ids": [...],
+        "compatible": True|False,
+        "status": "complete" | "incomplete" | "invalid",
+      }
+    """
+    # Parse outcome labels (can be JSON string or already a list)
+    if isinstance(outcome_labels_raw, str):
+        try:
+            outcome_labels = json.loads(outcome_labels_raw)
+        except (json.JSONDecodeError, TypeError):
+            outcome_labels = []
+    elif isinstance(outcome_labels_raw, list):
+        outcome_labels = outcome_labels_raw
+    else:
+        outcome_labels = []
+
+    # Parse CLOB token IDs via the proven repository-wide contract
+    if not isinstance(clob_ids_raw, (list, str)):
+        clob_list: list[str] = []
+    else:
+        try:
+            if isinstance(clob_ids_raw, str):
+                token_objs = json.loads(clob_ids_raw)
+            else:
+                token_objs = clob_ids_raw
+            clob_list = [str(t) for t in token_objs if t]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            clob_list = []
+
+    compatible = False
+    if outcome_labels and clob_list:
+        compatible = len(outcome_labels) == len(clob_list)
+    elif not outcome_labels and not clob_list:
+        # Both empty -> technically compatible but no data (incomplete)
+        pass  # stays False
+
+    status = "complete" if compatible else ("invalid" if outcome_labels and clob_list and not compatible else "incomplete")
+
+    # Build ordered pairs only when compatible; otherwise preserve separately
+    if compatible:
+        ordered = [{"label": str(lbl), "clob_token_id": t} for lbl, t in zip(outcome_labels, clob_list)]
+    else:
+        ordered = []
+
+    return {
+        "labels": [str(lbl) for lbl in outcome_labels],
+        "token_ids": clob_list,
+        "ordered": ordered,
+        "compatible": compatible,
+        "status": status,
+    }
+
+
+def _build_market_snapshot(market: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the v2 snapshot from an authoritative Gamma market.
+
+    Returns a nested dict with four namespaces:
+
+      ``market``        — canonical identity fields
+      ``outcomes``       — ordered labels + CLOB token IDs
+      ``lifecycle``      — market state observations
+      ``provenance``     — how and when the snapshot was obtained
+    """
+    result: dict[str, Any] = {}
+
+    # ── market identity ──
+    result["market"] = {
+        "condition_id": _scalar(market.get("conditionId")),
+        "provider_market_id": _scalar(market.get("id")),
+        "question": _scalar(market.get("question")),
+        "slug": _scalar(market.get("slug")),
+    }
+
+    # ── outcomes ──
+    outcome_labels = market.get("outcomes")
+    clob_ids_raw = market.get("clobTokenIds")
+    outcomes_list = _parse_outcome_arrays(outcome_labels, clob_ids_raw)
+    result["outcomes"] = outcomes_list
+
+    # ── lifecycle ──
+    result["lifecycle"] = {
+        "active": _as_bool(market.get("active")),
+        "closed": _as_bool(market.get("closed")),
+        "accepting_orders": _as_bool(market.get("acceptingOrders")),
+        "end_date": _scalar(market.get("endDate")),
+    }
+
+    # ── provenance ──
+    from datetime import datetime, timezone  # late import to avoid circular import
+
+    result["provenance"] = {
+        "provider": "gamma",
+        "lookup_kind": "condition_id",
+        "requested_condition_id": _scalar(market.get("conditionId")),
+        "exact_match": True,
+        "retrieved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "snapshot_contract_version": _SNAPSHOT_CONTRACT_VERSION,
+    }
+
+    return result
+
+
+_SNAPSHOT_CONTRACT_VERSION = "2"
