@@ -438,7 +438,10 @@ def resolve_wallet_score_v1(db: Any, wallet_id: str, *, cutoff_timestamp: Option
         input=WalletScoreInputV1(wallet_id=evidence.wallet_id, **input_kwargs),
         now=now,
     )
-    idem = generate_idempotency_key(formula_name="wallet_score", formula_version=result.formula_version, wallet_id=wallet_id, source_data_timestamp=evidence.source_data_timestamp, extra_params={"evidence_fingerprint": evidence.evidence_fingerprint, "contract": AGGREGATION_CONTRACT_VERSION})
+    # Preserve formula version 1 for existing wallet-score consumers. The
+    # corrected mandatory eligibility semantics receive a distinct idempotency
+    # identity so a historical defective v1 decision is never silently reused.
+    idem = generate_idempotency_key(formula_name="wallet_score", formula_version=result.formula_version, wallet_id=wallet_id, source_data_timestamp=evidence.source_data_timestamp, extra_params={"evidence_fingerprint": evidence.evidence_fingerprint, "contract": AGGREGATION_CONTRACT_VERSION, "wallet_eligibility_contract": "2"})
     existing = _existing_id(db, "wallet_score_decisions", "wallet_id=? AND formula_name='wallet_score' AND formula_version=? AND idempotency_key=?", (wallet_id, result.formula_version, idem))
     if existing is not None:
         return ScoreResolution(result, existing, "wallet_score", result.formula_version, evidence.evidence_fingerprint, evidence.source_data_timestamp, tuple((*evidence.missing_reasons, *result.missing_essentials)), "complete" if result.verdict != WalletVerdict.INCOMPLETE else "incomplete", reused=True, persisted=True)

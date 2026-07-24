@@ -66,9 +66,9 @@ ARB_MULTI_MARKET_WINDOW_SECONDS = 60
 #: count as multi-leg arbitrage.
 ARB_MIN_DISTINCT_MARKETS = 3
 
-#: Distinct markets traded above this without a clear pattern
-#: suggests MIXED (not just "diversified directional").
-MIXED_DISTINCT_MARKETS = 20
+# Distinct-market volume is evidence depth, not behavioral dispersion. The
+# classifier detects mixed behavior only through positive conflicting patterns.
+BEHAVIOR_CLASSIFICATION_CONTRACT_VERSION = "2"
 
 #: Direct conflicts between MM and directional evidence
 #: yield MIXED. (Specifically: at least 2 two-sided markets
@@ -170,10 +170,9 @@ def classify_wallet_behavior(
 ) -> BehaviorClassificationResult:
     """Classify wallet behavior from trade evidence.
 
-    Pure function: no I/O, no hidden state. Reads every
-    threshold from the module-level constants. Order of
-    rules is fixed: HFT → MM → Arbitrage → Conflict → MIXED
-    → DIRECTIONAL (only with positive evidence).
+    Pure function: no I/O, no hidden state. Reads every threshold from the
+    module-level constants. Order of rules is fixed: HFT → MM → Arbitrage →
+    conflict → DIRECTIONAL (only with positive evidence).
 
     DIRECTIONAL is never the default. It is returned ONLY
     when positive directional evidence is present and no
@@ -293,21 +292,7 @@ def classify_wallet_behavior(
             is_skip=False,
         )
 
-    # ---- 6. MIXED detection (high market diversity w/o pattern) ---
-    if distinct > MIXED_DISTINCT_MARKETS:
-        reasons.append(
-            f"high_market_diversity_without_clear_pattern "
-            f"(distinct_markets={distinct}>{MIXED_DISTINCT_MARKETS})"
-        )
-        return BehaviorClassificationResult(
-            classification=BehaviorClassification.MIXED,
-            reasons=reasons,
-            is_eligible_for_copy=False,
-            is_watchlist_cap=True,
-            is_skip=False,
-        )
-
-    # ---- 7. DIRECTIONAL requires POSITIVE evidence -----------------
+    # ---- 6. DIRECTIONAL requires POSITIVE evidence -----------------
     #
     # A wallet with no exclusion pattern is NOT automatically
     # DIRECTIONAL. The wallet must have at least one

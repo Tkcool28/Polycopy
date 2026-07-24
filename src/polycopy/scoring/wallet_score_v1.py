@@ -474,15 +474,18 @@ def compute_wallet_score_v1(
     if input.win_rate is None:
         missing_essentials.append("win_rate")
 
-    # Check global eligibility gates (do not disqualify, but affect score)
-    if input.resolved_markets is not None and input.resolved_markets < GLOBAL_MIN_RESOLVED_MARKETS:
-        gate_failures.append(f"resolved_markets={input.resolved_markets} < {GLOBAL_MIN_RESOLVED_MARKETS}")
-
-    if input.active_trading_days is not None and input.active_trading_days < GLOBAL_MIN_ACTIVE_TRADING_DAYS:
-        gate_failures.append(f"active_trading_days={input.active_trading_days} < {GLOBAL_MIN_ACTIVE_TRADING_DAYS}")
-
-    if input.distinct_events is not None and input.distinct_events < GLOBAL_MIN_DISTINCT_EVENTS:
-        gate_failures.append(f"distinct_events={input.distinct_events} < {GLOBAL_MIN_DISTINCT_EVENTS}")
+    # Global evidence gates are mandatory for specialist qualification. Missing
+    # values are failures: absence cannot establish eligibility.
+    global_gate_specs = (
+        ("resolved_markets", input.resolved_markets, GLOBAL_MIN_RESOLVED_MARKETS),
+        ("active_trading_days", input.active_trading_days, GLOBAL_MIN_ACTIVE_TRADING_DAYS),
+        ("distinct_events", input.distinct_events, GLOBAL_MIN_DISTINCT_EVENTS),
+    )
+    for name, value, minimum in global_gate_specs:
+        if value is None:
+            gate_failures.append(f"{name}=missing < {minimum}")
+        elif value < minimum:
+            gate_failures.append(f"{name}={value} < {minimum}")
 
     # Check category eligibility gates
     if input.category_resolved_markets is not None and input.category_resolved_markets < CATEGORY_MIN_RESOLVED_MARKETS:
@@ -615,13 +618,19 @@ def compute_wallet_score_v1(
     weighted_total = sum(c.weighted_score for c in components)
     final_score = clamp(round(weighted_total, 4))
 
-    # Determine verdict
-    # If category gates failed, cap at WATCHLIST
+    # A global evidence shortfall is insufficient evidence, not a quality
+    # verdict. It must never produce COPY_CANDIDATE even with a high numeric
+    # score. Category-gate behavior remains unchanged.
+    global_gates_failed = any(
+        not failure.startswith("category_") for failure in gate_failures
+    ) if gate_failures else False
     category_gates_failed = any(
-        "category_" in f for f in gate_failures
+        failure.startswith("category_") for failure in gate_failures
     ) if gate_failures else False
 
-    if final_score >= VERDICT_COPY_CANDIDATE_MIN and not category_gates_failed:
+    if global_gates_failed:
+        verdict = WalletVerdict.INCOMPLETE
+    elif final_score >= VERDICT_COPY_CANDIDATE_MIN and not category_gates_failed:
         verdict = WalletVerdict.COPY_CANDIDATE
     elif final_score >= VERDICT_WATCHLIST_MIN:
         verdict = WalletVerdict.WATCHLIST

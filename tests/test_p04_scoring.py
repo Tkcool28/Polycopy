@@ -48,6 +48,7 @@ from typing import Optional
 import pytest
 
 from polycopy.scoring.helpers import linear_score, inverse_score, clamp
+from polycopy.scoring import wallet_score_v1 as wallet_score_module
 from polycopy.scoring.behavior_classification import (
     BehaviorClassification,
     BehaviorClassificationResult,
@@ -122,6 +123,101 @@ class TestHelpersNormalizationBoundaries:
     def test_clamp_above_maximum(self):
         assert clamp(150) == 100
         assert clamp(150, 0, 100) == 100
+
+
+class TestWalletScoreV1GlobalEligibilityBoundaries:
+    """Mandatory global evidence gates must block high-scoring candidates."""
+
+    @staticmethod
+    def _high_score_kwargs(**overrides):
+        values = {
+            "wallet_id": "global-gate-wallet",
+            "info_score": 1.0,
+            "win_rate": 1.0,
+            "profit_factor": 2.0,
+            "trade_intervals_std": 0.0,
+            "trade_count": 200,
+            "max_drawdown": 0.0,
+            "sharpe_ratio": 3.0,
+            "sample_fraction": 0.0,
+            "category_trade_count": 50,
+            "category_distinct_markets": 20,
+            "overall_trade_count": 100,
+            "largest_winner_share": 0.3,
+            "top_3_concentration": 0.5,
+            "resolved_markets": 30,
+            "active_trading_days": 20,
+            "distinct_events": 15,
+            "category_resolved_markets": 15,
+            "category_distinct_events": 8,
+            "category_active_days": 10,
+        }
+        values.update(overrides)
+        return values
+
+    @pytest.mark.parametrize(
+        ("field", "failing_value", "passing_value", "failure"),
+        [
+            ("resolved_markets", 29, 30, "resolved_markets=29 < 30"),
+            ("active_trading_days", 19, 20, "active_trading_days=19 < 20"),
+            ("distinct_events", 14, 15, "distinct_events=14 < 15"),
+        ],
+    )
+    def test_global_evidence_gate_boundary_blocks_copy_candidate(
+        self, field, failing_value, passing_value, failure
+    ):
+        failing = compute_wallet_score_v1(
+            **self._high_score_kwargs(**{field: failing_value})
+        )
+        passing = compute_wallet_score_v1(
+            **self._high_score_kwargs(**{field: passing_value})
+        )
+        assert failing.score >= VERDICT_COPY_CANDIDATE_MIN
+        assert failing.verdict != WalletVerdict.COPY_CANDIDATE
+        assert failing.eligibility_gate_failures == [failure]
+        assert passing.verdict == WalletVerdict.COPY_CANDIDATE
+        assert passing.eligibility_gate_failures == []
+
+    def test_multiple_global_evidence_failures_block_copy_candidate(self):
+        result = compute_wallet_score_v1(
+            **self._high_score_kwargs(
+                resolved_markets=29,
+                active_trading_days=19,
+                distinct_events=14,
+            )
+        )
+        assert result.score >= VERDICT_COPY_CANDIDATE_MIN
+        assert result.verdict != WalletVerdict.COPY_CANDIDATE
+        assert result.eligibility_gate_failures == [
+            "resolved_markets=29 < 30",
+            "active_trading_days=19 < 20",
+            "distinct_events=14 < 15",
+        ]
+
+    @pytest.mark.parametrize(
+        ("score", "expected_verdict"),
+        [(74.0, WalletVerdict.WATCHLIST), (75.0, WalletVerdict.COPY_CANDIDATE)],
+    )
+    def test_numeric_candidate_threshold_with_all_evidence_gates_passing(
+        self, monkeypatch, score, expected_verdict
+    ):
+        def component(*_args):
+            return score, "calculated", "controlled threshold fixture"
+
+        for name in (
+            "_info_price_improvement_component",
+            "_realized_performance_component",
+            "_chronological_consistency_component",
+            "_risk_drawdown_component",
+            "_sample_reliability_component",
+            "_category_specialization_component",
+            "_concentration_quality_component",
+        ):
+            monkeypatch.setattr(wallet_score_module, name, component)
+        result = compute_wallet_score_v1(**self._high_score_kwargs())
+        assert result.score == score
+        assert result.eligibility_gate_failures == []
+        assert result.verdict == expected_verdict
 
 
 class TestWalletScoreV1ComponentFormulas:
@@ -431,13 +527,39 @@ class TestBehaviorClassification:
         assert result.classification == BehaviorClassification.UNKNOWN
         assert result.is_watchlist_cap is True
 
-    def test_mixed_classification(self):
+    @pytest.mark.parametrize("distinct_markets", [30, 40, 100])
+    def test_high_distinct_market_count_does_not_override_directional_evidence(
+        self, distinct_markets
+    ):
+        evidence = BehaviorEvidence(
+            trade_count=200,
+            avg_time_between_trades_seconds=1000,
+            distinct_markets_traded=distinct_markets,
+            dominant_side_market_count=10,
+        )
+        result = classify_wallet_behavior(evidence)
+        assert result.classification == BehaviorClassification.DIRECTIONAL
+        assert result.is_eligible_for_copy is True
+
+    def test_genuine_conflicting_behavior_is_mixed(self):
         evidence = BehaviorEvidence(
             trade_count=100,
-            distinct_markets_traded=50,  # High diversity without pattern
+            distinct_markets_traded=30,
+            two_sided_market_count=2,
+            dominant_side_market_count=2,
         )
         result = classify_wallet_behavior(evidence)
         assert result.classification == BehaviorClassification.MIXED
+        assert result.is_watchlist_cap is True
+
+    def test_high_diversity_without_directional_evidence_is_unknown(self):
+        evidence = BehaviorEvidence(
+            trade_count=100,
+            distinct_markets_traded=50,
+            dominant_side_market_count=0,
+        )
+        result = classify_wallet_behavior(evidence)
+        assert result.classification == BehaviorClassification.UNKNOWN
         assert result.is_watchlist_cap is True
 
 

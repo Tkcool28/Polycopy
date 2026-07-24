@@ -26,6 +26,7 @@ from polycopy.db.database import Database as RealDatabase  # noqa: E402
 from tests.fixtures.specialist_paper_fixtures import (  # noqa: E402
     FakeClob,
     FakeGamma,
+    RESOLVED_MARKET_COUNT,
     create_approval_for_target,
     make_target_trade,
     seed_resolved_evidence,
@@ -943,14 +944,14 @@ def test_main_authoritative_fixture_real_enrichment_gamma_failure_then_retry(
     with pytest.raises(GammaResolutionError, match="fixture Gamma outage during enrichment"):
         cli.main(argv)
     assert _artifact_counts(db_path) == {
-        "source_trades": 41, "source_trade_enrichments": 0,
+        "source_trades": RESOLVED_MARKET_COUNT + 1, "source_trade_enrichments": 0,
         "approved_specialist_trade_dispatches": 0, "copy_candidates": 0,
         "candidate_price_snapshots": 0, "paper_signal_decisions": 0,
     }
 
     assert cli.main(argv) == 0
     assert _artifact_counts(db_path) == {
-        "source_trades": 41, "source_trade_enrichments": 1,
+        "source_trades": RESOLVED_MARKET_COUNT + 1, "source_trade_enrichments": 1,
         "approved_specialist_trade_dispatches": 1, "copy_candidates": 1,
         "candidate_price_snapshots": 1, "paper_signal_decisions": 1,
     }
@@ -983,7 +984,7 @@ def test_main_authoritative_fixture_dispatch_cache_miss_then_retry(
     with pytest.raises(RuntimeError, match="synchronous dispatch requested uncached Gamma market"):
         cli.main(argv)
     assert _artifact_counts(db_path) == {
-        "source_trades": 41, "source_trade_enrichments": 1,
+        "source_trades": RESOLVED_MARKET_COUNT + 1, "source_trade_enrichments": 1,
         "approved_specialist_trade_dispatches": 0, "copy_candidates": 0,
         "candidate_price_snapshots": 0, "paper_signal_decisions": 0,
     }
@@ -992,7 +993,7 @@ def test_main_authoritative_fixture_dispatch_cache_miss_then_retry(
 
     assert cli.main(argv) == 0
     assert _artifact_counts(db_path) == {
-        "source_trades": 41, "source_trade_enrichments": 1,
+        "source_trades": RESOLVED_MARKET_COUNT + 1, "source_trade_enrichments": 1,
         "approved_specialist_trade_dispatches": 1, "copy_candidates": 1,
         "candidate_price_snapshots": 1, "paper_signal_decisions": 1,
     }
