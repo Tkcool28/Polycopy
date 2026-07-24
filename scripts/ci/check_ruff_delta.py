@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Reject Ruff diagnostics added beyond the pull request's exact base revision.
 
 The repository currently has pre-existing Ruff debt. This module compares the
