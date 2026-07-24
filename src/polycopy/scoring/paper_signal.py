@@ -57,6 +57,7 @@ from polycopy.db.price_snapshot_persistence import (
     get_latest_price_snapshot as get_latest_snapshot_for_candidate,
 )
 from polycopy.scoring.behavior_classification import (
+    BEHAVIOR_CLASSIFICATION_CONTRACT_VERSION,
     BehaviorClassificationResult,
     BehaviorEvidence,
     classify_wallet_behavior,
@@ -1373,6 +1374,9 @@ def _evaluate_paper_signals_for_candidate_inner(
                 trade_score_result.verdict.value
             ),
             "trade_score": f"{float(trade_score_result.score):.2f}",
+            "behavior_classification_contract": (
+                BEHAVIOR_CLASSIFICATION_CONTRACT_VERSION
+            ),
         },
     )
     paper_signal_id: Optional[int] = None
@@ -1517,6 +1521,12 @@ def _persist_incomplete_signal(
             "depth_hash": inputs.depth_hash,
             "verdict": "INCOMPLETE",
             "reason": reason,
+            # Keep incomplete-decision replay semantics coherent with the
+            # full paper-signal path: a behavior-policy correction must not
+            # silently reuse a historical decision.
+            "behavior_classification_contract": (
+                BEHAVIOR_CLASSIFICATION_CONTRACT_VERSION
+            ),
         },
     )
     typed_input = PaperSignalDecisionInput(

@@ -675,6 +675,10 @@ def build_wallet_status(
             "decision_id": wallet_res.decision_id,
             "formula_name": wallet_res.formula_name,
             "formula_version": wallet_res.formula_version,
+            "eligibility_gate_failures": (
+                list(wallet_result.eligibility_gate_failures)
+                if wallet_result is not None else []
+            ),
             "source_data_timestamp": wallet_res.source_data_timestamp,
             "created": wallet_res.created,
             "reused": wallet_res.reused,

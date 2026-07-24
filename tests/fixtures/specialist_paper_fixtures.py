@@ -32,7 +32,7 @@ from polycopy.execution.specialist_approval import create_approval
 
 # Fixed constants (bounded, deterministic).
 FIXED_WALLET = "0x" + "a" * 40
-RESOLVED_MARKET_COUNT = 40  # >= 30 frozen gate, evenly split win/loss
+RESOLVED_MARKET_COUNT = 200  # reliable, qualifying evidence across 30 resolved markets
 SPECIALIST_CATEGORY = "politics"
 EVIDENCE_EVENT_PREFIX = "evt"
 
@@ -185,13 +185,10 @@ def seed_resolved_evidence(db: Any, *, wallet: str = FIXED_WALLET,
         ("w1", wallet, wallet, _iso(60)),
     )
     for i in range(count):
-        # Concentrate the resolved trades across a small set of markets so the
-        # wallet exhibits genuine one-sided (directional) dominance on at
-        # least one market — honest real-shaped evidence. A wallet spreading
-        # 40 trades over 40 distinct markets would read as UNKNOWN and
-        # never qualify as copyable, which is the correct frozen behavior.
-        market_idx = i % 15
-        cond = f"0x{market_idx:062x}"  # 15 distinct markets, ~2-3 trades each
+        # Thirty distinct resolved markets satisfy the global specialist gate;
+        # repeated observations on ten markets retain behavioral signal.
+        market_idx = i % 30
+        cond = f"0x{market_idx:062x}"
         meta = {
             "taxonomy": {"raw_category": SPECIALIST_CATEGORY},
             "event": {"id": f"{EVIDENCE_EVENT_PREFIX}{i:03d}", "slug": f"event-{i:03d}"},
@@ -206,9 +203,9 @@ def seed_resolved_evidence(db: Any, *, wallet: str = FIXED_WALLET,
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 f"st{i}", "polymarket_data_api_trades_user", f"poly.market:{cond}:{i}",
-                cond, "BUY", "Yes", 10.0, 0.4, wallet, _iso(40 - i), 0,
+                cond, "BUY", "Yes", 10.0, 0.4, wallet, _iso(35 - (i % 30)), 0,
                 f"0x{i:062x}", json.dumps(meta),
-                "won" if won else "lost", _iso(20 - i),
+                "won" if won else "lost", _iso(1),
                 f"0x{i:062x}" if won else "other", 1 if won else 0,
                 6.0 if won else -4.0, "fixture",
             ),

@@ -232,6 +232,10 @@ def evaluate_wallet(
         "wallet_source_data_timestamp": wallet_res.source_data_timestamp,
         "wallet_formula_name": wallet_res.formula_name,
         "wallet_formula_version": wallet_res.formula_version,
+        "wallet_eligibility_gate_failures": (
+            list(wallet_result.eligibility_gate_failures)
+            if wallet_result is not None else []
+        ),
         "wallet_missing_reasons": list(wallet_res.missing_reasons),
         "wallet_status": wallet_res.status,
         "supported_categories": sorted(classifications.keys()),

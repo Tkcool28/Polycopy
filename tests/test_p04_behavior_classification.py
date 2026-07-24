@@ -12,7 +12,8 @@ Covers:
   - clear multi-leg arbitrage
   - ordinary diversified directional wallet not arbitrage
   - conflicting directional and market-making evidence → MIXED
-  - high market diversity without clear pattern → MIXED
+  - high market count with positive directional evidence remains DIRECTIONAL
+- high market count without positive directional evidence remains UNKNOWN
   - malformed timestamps excluded
   - anonymous/sentinel rows excluded
   - sample/non-sample separation
@@ -44,7 +45,6 @@ from polycopy.scoring.behavior_classification import (
     MIN_TRADES_FOR_CLASSIFICATION,
     MIXED_CONFLICT_DOMINANT,
     MIXED_CONFLICT_TWO_SIDED,
-    MIXED_DISTINCT_MARKETS,
     TWO_SIDED_AVG_TRADES_PER_MARKET,
     TWO_SIDED_MARKET_MIN,
     TWO_SIDED_MARKET_SHARE,
@@ -113,7 +113,6 @@ class TestTransparentThresholds:
         assert DOMINANT_SIDE_MIN_TRADES == 3
 
     def test_mixed_constants(self) -> None:
-        assert MIXED_DISTINCT_MARKETS == 20
         assert MIXED_CONFLICT_TWO_SIDED == 2
         assert MIXED_CONFLICT_DOMINANT == 2
 
@@ -231,7 +230,7 @@ class TestDirectClassifier:
         assert result.classification == BehaviorClassification.MIXED
         assert result.is_watchlist_cap is True
 
-    def test_mixed_due_to_high_diversity(self) -> None:
+    def test_high_market_count_without_directional_evidence_is_unknown(self) -> None:
         result = classify_wallet_behavior(BehaviorEvidence(
             trade_count=200,
             avg_time_between_trades_seconds=300.0,
@@ -239,7 +238,7 @@ class TestDirectClassifier:
             two_sided_market_count=0,
             dominant_side_market_count=0,
         ))
-        assert result.classification == BehaviorClassification.MIXED
+        assert result.classification == BehaviorClassification.UNKNOWN
         assert result.is_watchlist_cap is True
 
     def test_directional_no_silent_default(self) -> None:
