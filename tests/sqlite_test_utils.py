@@ -7,7 +7,6 @@ cleanup: SQLite's three known files are handled explicitly.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
 
 
 class OwnedSQLitePaths:
@@ -23,7 +22,7 @@ class OwnedSQLitePaths:
         self._paths: list[Path] = []
         self._counter = 0
 
-    def path(self, name: Union[str, Path] = "test.db") -> Path:
+    def path(self, name: str | Path = "test.db") -> Path:
         """Register one exact, relative SQLite database name in the owned dir."""
         candidate_name = Path(name)
         if (

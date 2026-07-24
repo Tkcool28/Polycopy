@@ -62,6 +62,7 @@ from typing import Optional
 from unittest import mock
 
 import pytest
+
 from tests.sqlite_test_utils import OwnedSQLitePaths
 
 _HERE = Path(__file__).resolve().parent
@@ -70,19 +71,19 @@ if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
 from polycopy.ingestion import source_trade_writer as writer_mod  # noqa: E402
-from polycopy.ingestion.source_trade_writer import (  # noqa: E402
-    create_verified_backup,
-    assert_unique_dedupe_constraint,
-    write_valid_rows,
-    BackupResult,
-)
 from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
-    normalize_source_trade,
-    generate_identity,
-    NormalizedSourceTrade,
-    SOURCE_NAME,
-    IDENTITY_SOURCE_PROVIDED,
     IDENTITY_SOURCE_FALLBACK,
+    IDENTITY_SOURCE_PROVIDED,
+    SOURCE_NAME,
+    NormalizedSourceTrade,
+    generate_identity,
+    normalize_source_trade,
+)
+from polycopy.ingestion.source_trade_writer import (  # noqa: E402
+    BackupResult,
+    assert_unique_dedupe_constraint,
+    create_verified_backup,
+    write_valid_rows,
 )
 
 
@@ -451,7 +452,7 @@ class ConstraintTests(unittest.TestCase):
         return _Conn(path), path
 
     def test_17_expected_unique_present(self):
-        db, path = self._db_with_unique()
+        db, _path = self._db_with_unique()
         try:
             res = assert_unique_dedupe_constraint(db)
             self.assertTrue(res.present)
@@ -460,7 +461,7 @@ class ConstraintTests(unittest.TestCase):
             db.close()
 
     def test_18_missing_unique_blocks_write(self):
-        db, path = self._db_with_unique(table_unique=False, index_unique=False)
+        db, _path = self._db_with_unique(table_unique=False, index_unique=False)
         try:
             res = assert_unique_dedupe_constraint(db)
             self.assertFalse(res.present)
@@ -474,7 +475,7 @@ class ConstraintTests(unittest.TestCase):
             db.close()
 
     def test_19_wrong_columns_block_write(self):
-        db, path = self._db_with_unique(columns=("source_trade_id",), table_unique=False, index_unique=True)
+        db, _path = self._db_with_unique(columns=("source_trade_id",), table_unique=False, index_unique=True)
         try:
             res = assert_unique_dedupe_constraint(db)
             self.assertFalse(res.present)

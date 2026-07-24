@@ -84,7 +84,7 @@ class TestIterBatches:
     def test_empty_result_set(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
             conn.commit()
@@ -96,7 +96,7 @@ class TestIterBatches:
     def test_single_batch_short(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 3)
             batches = list(iter_batches(conn, "SELECT id FROM t", batch_size=10))
@@ -108,7 +108,7 @@ class TestIterBatches:
     def test_batch_size_honoured(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 25)
             batches = list(iter_batches(conn, "SELECT id FROM t", batch_size=10))
@@ -122,7 +122,7 @@ class TestIterBatches:
     def test_final_partial_batch(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 23)
             batches = list(iter_batches(conn, "SELECT id FROM t", batch_size=10))
@@ -133,7 +133,7 @@ class TestIterBatches:
     def test_returns_all_rows_across_batches(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 47)
             flat = [r[0] for batch in iter_batches(conn, "SELECT id FROM t", batch_size=7)
@@ -145,7 +145,7 @@ class TestIterBatches:
     def test_batch_size_validation(self) -> None:
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             with pytest.raises(ValueError):
                 list(iter_batches(conn, "SELECT 1", batch_size=0))
@@ -158,7 +158,7 @@ class TestIterBatches:
         """If the caller stops iterating, the underlying cursor closes."""
         from polycopy.runtime.query_batches import iter_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 100)
             gen = iter_batches(conn, "SELECT id FROM t", batch_size=10)
@@ -179,7 +179,7 @@ class TestIterRows:
     def test_yields_all_rows_in_order(self) -> None:
         from polycopy.runtime.query_batches import iter_rows
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 12)
             ids = [row[0] for row in iter_rows(conn, "SELECT id FROM t ORDER BY id",
@@ -191,7 +191,7 @@ class TestIterRows:
     def test_empty_result(self) -> None:
         from polycopy.runtime.query_batches import iter_rows
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             conn.commit()
@@ -206,7 +206,7 @@ class TestIterKeysetBatches:
     def test_first_page_descending(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 20)
             batches = list(
@@ -229,7 +229,7 @@ class TestIterKeysetBatches:
     def test_continues_from_last_value(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 10)
             # Resume from id=5 descending: should return {4, 3, 2, 1}.
@@ -251,7 +251,7 @@ class TestIterKeysetBatches:
     def test_extra_where_clause(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 10)
             batches = list(
@@ -273,7 +273,7 @@ class TestIterKeysetBatches:
     def test_ascending(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 5)
             batches = list(
@@ -294,7 +294,7 @@ class TestIterKeysetBatches:
     def test_empty_database(self) -> None:
         from polycopy.runtime.query_batches import iter_keyset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             conn.commit()
@@ -318,7 +318,7 @@ class TestIterOffsetBatches:
     def test_paginates_in_order(self) -> None:
         from polycopy.runtime.query_batches import iter_offset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             _seed(conn, 11)
             batches = list(iter_offset_batches(
@@ -333,7 +333,7 @@ class TestIterOffsetBatches:
     def test_empty(self) -> None:
         from polycopy.runtime.query_batches import iter_offset_batches
 
-        conn, path = _make_db()
+        conn, _path = _make_db()
         try:
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
             conn.commit()

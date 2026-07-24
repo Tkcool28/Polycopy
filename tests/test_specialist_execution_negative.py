@@ -110,7 +110,7 @@ def _seed_score_authorize(tmp_path: Path):
 # Step 6 — schema contract
 # --------------------------------------------------------------------------- #
 def test_schema_v18_new_tables_exist():
-    db, n = _connect()
+    db, _n = _connect()
     for t in NEW_TABLES:
         row = db.fetchone(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (t,)
@@ -120,7 +120,7 @@ def test_schema_v18_new_tables_exist():
 
 
 def test_execution_risk_decision_pk_type_and_columns():
-    db, n = _connect()
+    db, _n = _connect()
     cols = {r["name"]: r for r in db.fetchall("PRAGMA table_info(execution_risk_decisions)")}
     assert cols["risk_decision_id"]["pk"] == 1
     for required in [
@@ -136,7 +136,7 @@ def test_execution_risk_decision_pk_type_and_columns():
 
 
 def test_invalid_fk_insert_fails():
-    db, n = _connect()
+    db, _n = _connect()
     with pytest.raises(Exception):
         db.execute(
             "INSERT INTO paper_orders (id, specialist_approval_id, source_trade_internal_id, "

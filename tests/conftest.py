@@ -12,6 +12,7 @@ import sys
 from collections.abc import Generator
 
 import pytest
+
 from tests.sqlite_test_utils import OwnedSQLitePaths
 
 pytest_plugins = ("pytester",)
