@@ -64,6 +64,12 @@ def _canon(meta) -> str:
     return json.dumps(meta, sort_keys=True)
 
 
+def _without_retrieved_at(meta):
+    copied = json.loads(_canon(meta))
+    copied.get("_snapshot", {}).get("provenance", {}).pop("retrieved_at", None)
+    return copied
+
+
 # ---------------------------------------------------------------------------
 # Producer parity
 # ---------------------------------------------------------------------------
@@ -84,7 +90,9 @@ def test_merge_full_equals_collection_writer():
         _canon({}), GAMMA, condition_id="0xcond1"
     )
     assert status == MERGE_FILLED
-    assert _canon(merged) == _canon(build_canonical_metadata({}, GAMMA))
+    assert _canon(_without_retrieved_at(merged)) == _canon(
+        build_canonical_metadata({}, GAMMA)
+    )
 
 
 def test_all_three_producers_identical():
@@ -94,7 +102,8 @@ def test_all_three_producers_identical():
         _canon(writer), GAMMA, condition_id="0xcond1"
     )
     assert status == MERGE_UNCHANGED
-    assert _canon(writer) == _canon(merged) == _canon(remerged)
+    assert _canon(writer) == _canon(_without_retrieved_at(merged))
+    assert _canon(writer) == _canon(remerged)
 
 
 def test_metadata_version_present_everywhere():
@@ -115,8 +124,9 @@ def test_metadata_version_present_everywhere():
 def test_no_title_inference_in_any_producer():
     no_cat = FakeMarket({"conditionId": "0xc2", "question": "Who wins?"})
     merged, status, rc = merge_canonical_metadata(None, no_cat, condition_id="0xc2")
-    assert status == MERGE_UNAVAILABLE
-    assert "taxonomy_unavailable" in rc
+    assert status == MERGE_FILLED
+    assert merged["taxonomy"]["raw_category"] is None
+    assert merged["_snapshot"]["market"]["question"] == "Who wins?"
     built = build_canonical_metadata({}, no_cat)
     assert not built["taxonomy"].get("raw_category")
 
@@ -279,9 +289,10 @@ def test_missing_optional_gamma_field_preserves_existing():
     merged, status, rc = merge_canonical_metadata(
         existing, gamma, condition_id="0xc1", token_id="0xtok_a"
     )
-    assert status == MERGE_UNCHANGED
+    assert status == MERGE_FILLED
     assert merged["event"]["id"] == "evt_kept"
     assert merged["series"]["id"] == "s_kept"
+    assert "_snapshot" in merged
 
 
 def test_existing_empty_field_filled_from_gamma():

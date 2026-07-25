@@ -711,6 +711,11 @@ def test_s7_disposable_e2e_full_lifecycle():
     gamma_opp = dict(GAMMA_B)  # conditionId == COND_B, clobTokenIds == [TOK_A, TOK_B]
     gamma_opp["category"] = opp_cat
     gamma_opp["tags"] = ["election"]
+    # A lifecycle transition is substantive provider evidence; do not use
+    # provider/local audit timestamps merely to force snapshot inequality.
+    gamma_opp["closed"] = True
+    gamma_opp["active"] = False
+    gamma_opp["slug"] = "nba-conflicting-provider-evidence"
     _BACKFILL_ADAPTER_CALLS.clear()
     _BACKFILL_ADAPTER_INSTANCES.clear()
     backfill._make_adapter = _fake_backfill_adapter_factory(

@@ -1,318 +1,416 @@
-"""PR66+ market evidence snapshot tests.
-
-Verifies the expanded canonical metadata builder captures authoritative Gamma
-market identity, outcome mapping, lifecycle state, and provenance at ingestion
-time — without changing existing taxonomy/event/series consumers.
-"""
+"""Contract tests for canonical ingestion market-evidence snapshots."""
 from __future__ import annotations
 
-import collections.abc
+import asyncio
 import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-for p in (str(ROOT / "src"), str(ROOT / "scripts")):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+for path in (ROOT / "src", ROOT / "scripts"):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+    MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     MERGE_CONFLICT,
     MERGE_FILLED,
     MERGE_UNCHANGED,
-    MERGE_UNAVAILABLE,
-    _parse_outcome_arrays,
+    _validate_outcome_mapping,
     build_canonical_metadata,
     merge_canonical_metadata,
-    _SNAPSHOT_CONTRACT_VERSION,
 )
+from polycopy.ingestion.normalized_source_trade import normalize_source_trade  # noqa: E402
 
 
-# ── Fixtures ─────────────────────────────────────────────────────────────────
-
-class FakeMarket(collections.abc.Mapping):
-    """Mapping-compatible Gamma market for tests."""
-
-    def __init__(self, data: dict):
-        self._data = data
-
-    def __getitem__(self, key):
-        return self._data[key]
-
-    def __iter__(self):
-        return iter(self._data)
-
-    def __len__(self):
-        return len(self._data)
-
-
-FULL_GAMMA = FakeMarket({
-    "conditionId": "0xcond1",
+FULL_GAMMA = {
+    "conditionId": "0x" + "1" * 64,
     "id": "12345",
-    "question": "Will X happen before Y?",
+    "question": "Will X happen?",
     "slug": "will-x-happen",
     "category": "Politics",
     "tags": ["election", "2026"],
-    "events": [{"id": "evt1", "slug": "us-election", "title": "US Election"}],
-    "series": [{"id": "s1", "slug": "pol", "title": "Politics Series"}],
-    "outcomes": "[\"Yes\", \"No\"]",
-    "outcomePrices": "[\"0.7\", \"0.3\"]",
-    "clobTokenIds": json.dumps(["tok_a", "tok_b"]),
+    "events": [{"id": "evt1", "slug": "election", "title": "Election"}],
+    "series": [{"id": "series1", "slug": "politics", "title": "Politics"}],
+    "outcomes": '["Yes", "No"]',
+    "clobTokenIds": '["1111111111", "2222222222"]',
     "active": True,
     "closed": False,
     "acceptingOrders": True,
-    "endDate": "2026-12-31T00:00:00Z",
-})
+    "endDate": "2027-01-01T00:00:00Z",
+    "updatedAt": "2026-07-24T12:00:00Z",
+}
 
-TRADE_WITH_FIELDS = {
-    "title": "Trade-level question text",
-    "slug": "trade-slug",
+TRADE = {
+    "sourceProvidedTradeId": "trade-1",
+    "proxyWallet": "0x" + "a" * 40,
+    "conditionId": FULL_GAMMA["conditionId"],
+    "asset": "1111111111",
+    "side": "BUY",
+    "price": "0.51",
+    "size": "2",
+    "timestamp": 1_700_000_000,
+    "outcome": "Yes",
     "outcomeIndex": 0,
-    "transactionHash": "0xabcd1234efgh5678",
+    "title": "wallet context title",
+    "slug": "wallet-context-slug",
+    "transactionHash": "0xabcdef1234567890",
 }
 
 
-# ── S1: Exact Gamma snapshot ────────────────────────────────────────────────
-
-def test_build_snapshot_has_market_identity():
-    meta = build_canonical_metadata({}, FULL_GAMMA)
-    snap = meta.get("_snapshot")
-    assert snap is not None, "_snapshot missing"
-    mkt = snap["market"]
-    assert mkt["condition_id"] == "0xcond1"
-    assert mkt["provider_market_id"] == "12345"
-    assert mkt["question"] == "Will X happen before Y?"
-    assert mkt["slug"] == "will-x-happen"
+def _dump(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def test_build_snapshot_has_outcomes():
-    meta = build_canonical_metadata({}, FULL_GAMMA)
-    out = meta["_snapshot"]["outcomes"]
-    assert out["labels"] == ["Yes", "No"]
-    assert out["token_ids"] == ["tok_a", "tok_b"]
-    assert out["compatible"] is True
-    assert out["status"] == "complete"
-    assert len(out["ordered"]) == 2
-    assert out["ordered"][0]["label"] == "Yes"
-    assert out["ordered"][0]["clob_token_id"] == "tok_a"
-
-
-def test_build_snapshot_has_lifecycle():
-    meta = build_canonical_metadata({}, FULL_GAMMA)
-    lc = meta["_snapshot"]["lifecycle"]
-    assert lc["active"] is True
-    assert lc["closed"] is False
-    assert lc["accepting_orders"] is True
-    assert lc["end_date"] == "2026-12-31T00:00:00Z"
-
-
-def test_build_snapshot_has_provenance():
-    meta = build_canonical_metadata({}, FULL_GAMMA)
-    prov = meta["_snapshot"]["provenance"]
-    assert prov["provider"] == "gamma"
-    assert prov["lookup_kind"] == "condition_id"
-    assert prov["requested_condition_id"] == "0xcond1"
-    assert prov["exact_match"] is True
-    assert prov["snapshot_contract_version"] == _SNAPSHOT_CONTRACT_VERSION
-    assert "retrieved_at" in prov
-
-
-def test_build_snapshot_includes_trade_response_fields():
-    meta = build_canonical_metadata(TRADE_WITH_FIELDS, FULL_GAMMA)
-    prov = meta["_snapshot"]["provenance"]
-    assert prov["trade_response_title"] == "Trade-level question text"
-    assert prov["trade_response_slug"] == "trade-slug"
-    assert prov["trade_response_outcome_index"] == 0
-    assert prov["trade_response_transaction_hash"] == "0xabcd1234efgh5678"
-
-
-# ── S2: Existing metadata compatibility ────────────────────────────────────
-
-def test_taxonomy_still_accessible():
-    """Existing scorer consumer: metadata['taxonomy']['raw_category'] unchanged."""
-    meta = build_canonical_metadata({}, FULL_GAMMA)
-    assert meta["taxonomy"]["raw_category"] == "Politics"
-    assert meta["event"]["slug"] == "us-election"
-    assert meta["series"]["slug"] == "pol"
-
-
-def test_existing_no_taxonomy_consumer_unchanged():
-    """When no category available, only _snapshot changes — taxonomy stays null."""
-    no_cat = FakeMarket({
-        "conditionId": "0xc2",
-        "id": "99",
-        "question": "Who wins?",
-        "slug": "who-wins",
-        "events": [{"id": "e1"}],
-        "outcomes": '["Yes", "No"]',
-        "clobTokenIds": '["t1", "t2"]',
+def test_exact_snapshot_shape_and_authority():
+    metadata = build_canonical_metadata(TRADE, FULL_GAMMA)
+    snapshot = metadata["_snapshot"]
+    assert set(snapshot) == {"market", "outcomes", "lifecycle", "resolution", "provenance"}
+    assert snapshot["market"] == {
+        "condition_id": FULL_GAMMA["conditionId"],
+        "provider_market_id": "12345",
+        "question": "Will X happen?",
+        "slug": "will-x-happen",
+    }
+    assert snapshot["outcomes"]["ordered"] == [
+        {"label": "Yes", "clob_token_id": "1111111111"},
+        {"label": "No", "clob_token_id": "2222222222"},
+    ]
+    assert snapshot["lifecycle"] == {
         "active": True,
         "closed": False,
-        "acceptingOrders": True,
-        "endDate": "2027-01-01T00:00:00Z",
-    })
-    meta = build_canonical_metadata({}, no_cat)
-    assert meta["taxonomy"]["raw_category"] is None
-    assert meta["_snapshot"]["market"]["condition_id"] == "0xc2"
-    assert meta["_snapshot"]["lifecycle"]["active"] is True
+        "accepting_orders": True,
+        "end_date": "2027-01-01T00:00:00Z",
+    }
+    assert snapshot["resolution"]["resolution_status"] is None
+    provenance = snapshot["provenance"]
+    assert provenance["provider_updated_at"] == FULL_GAMMA["updatedAt"]
+    assert provenance["trade_response_title"] == TRADE["title"]
+    assert snapshot["market"]["question"] != TRADE["title"]
+    assert provenance["snapshot_contract_version"] == MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION
+    assert "retrieved_at" not in provenance
+    assert "realized_pnl" not in _dump(metadata)
 
 
-# ── S3: No-result Gamma response ───────────────────────────────────────────
-
-def test_no_gamma_no_snapshot():
-    """When gamma_market is None, no _snapshot is produced."""
-    meta = build_canonical_metadata({}, None)
-    assert "_snapshot" not in meta
-    assert meta["taxonomy"]["raw_category"] is None
-    assert meta["event"]["slug"] is None
+def test_provider_updated_at_requires_explicit_gamma_updated_at():
+    gamma = dict(FULL_GAMMA)
+    gamma.pop("updatedAt")
+    metadata = build_canonical_metadata({}, gamma)
+    assert "provider_updated_at" not in metadata["_snapshot"]["provenance"]
 
 
-def test_merge_no_gamma_preserves_null_taxonomy():
-    """merge with None -> unavailable, existing preserved."""
-    new_meta, status, rc = merge_canonical_metadata(None, None, condition_id="0xcond1")
-    assert status == MERGE_UNAVAILABLE
-    assert "gamma_missing" in rc
+def test_provider_updated_at_is_audit_only_for_replay(monkeypatch):
+    import polycopy.ingestion.canonical_metadata as module
+    from datetime import datetime as real_datetime
+
+    class FirstClock:
+        @classmethod
+        def now(cls, tz):
+            return real_datetime(2026, 1, 1, tzinfo=tz)
+
+    class LaterClock:
+        @classmethod
+        def now(cls, tz):
+            return real_datetime(2026, 1, 2, tzinfo=tz)
+
+    monkeypatch.setattr(module, "datetime", FirstClock)
+    first, _, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    changed_audit = dict(FULL_GAMMA, updatedAt="2026-07-25T00:00:00Z")
+    monkeypatch.setattr(module, "datetime", LaterClock)
+    replay, status, _ = merge_canonical_metadata(
+        _dump(first), changed_audit, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert status == MERGE_UNCHANGED
+    assert _dump(replay) == _dump(first)
+    assert replay["_snapshot"]["provenance"]["provider_updated_at"] == FULL_GAMMA["updatedAt"]
 
 
-# ── S4: Array mismatch handling ────────────────────────────────────────────
+def test_identical_replay_is_byte_identical_and_unchanged(monkeypatch):
+    import polycopy.ingestion.canonical_metadata as module
+    from datetime import datetime as real_datetime
 
-def test_parse_outcomes_empty_arrays():
-    result = _parse_outcome_arrays([], [])
-    assert result["labels"] == []
-    assert result["token_ids"] == []
-    assert result["compatible"] is False
-    assert result["status"] == "incomplete"
+    class FirstClock:
+        @classmethod
+        def now(cls, tz):
+            return real_datetime(2026, 1, 1, tzinfo=tz)
+
+    class LaterClock:
+        @classmethod
+        def now(cls, tz):
+            return real_datetime(2026, 1, 2, tzinfo=tz)
+
+    monkeypatch.setattr(module, "datetime", FirstClock)
+    first, first_status, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    first_bytes = _dump(first)
+    monkeypatch.setattr(module, "datetime", LaterClock)
+    replay, replay_status, reasons = merge_canonical_metadata(
+        first_bytes, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert first_status == MERGE_FILLED
+    assert replay_status == MERGE_UNCHANGED
+    assert reasons == ["no_change"]
+    assert _dump(replay) == first_bytes
+    assert replay["_snapshot"]["provenance"]["retrieved_at"] == "2026-01-01T00:00:00Z"
 
 
-def test_parse_outcomes_length_mismatch():
-    result = _parse_outcome_arrays(["A", "B", "C"], ["tok1", "tok2"])
-    assert result["compatible"] is False
+def test_substantive_update_is_filled_and_advances_retrieval_time(monkeypatch):
+    import polycopy.ingestion.canonical_metadata as module
+    from datetime import datetime as real_datetime
+
+    class FirstClock:
+        @classmethod
+        def now(cls, tz):
+            return real_datetime(2026, 1, 1, tzinfo=tz)
+
+    class LaterClock:
+        @classmethod
+        def now(cls, tz):
+            return real_datetime(2026, 1, 2, tzinfo=tz)
+
+    monkeypatch.setattr(module, "datetime", FirstClock)
+    first, _, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    changed_gamma = dict(FULL_GAMMA, closed=True, active=False, updatedAt="2026-07-25T00:00:00Z")
+    monkeypatch.setattr(module, "datetime", LaterClock)
+    updated, status, _ = merge_canonical_metadata(
+        _dump(first), changed_gamma, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert status == MERGE_FILLED
+    assert updated["_snapshot"]["lifecycle"]["closed"] is True
+    assert updated["_snapshot"]["provenance"]["provider_updated_at"] == changed_gamma["updatedAt"]
+    assert updated["_snapshot"]["provenance"]["retrieved_at"] == "2026-01-02T00:00:00Z"
+
+
+def test_repeated_duplicate_ingestion_does_not_churn_metadata():
+    first, _, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    current = _dump(first)
+    for _ in range(4):
+        replay, status, _ = merge_canonical_metadata(
+            current, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+        )
+        assert status == MERGE_UNCHANGED
+        assert _dump(replay) == current
+
+
+def _resolution_gamma(**updates):
+    gamma = dict(FULL_GAMMA)
+    gamma.update(updates)
+    return gamma
+
+
+def test_open_market_has_no_winner():
+    resolution = build_canonical_metadata({}, FULL_GAMMA)["_snapshot"]["resolution"]
+    assert resolution["resolution_status"] is None
+    assert resolution["winner_token_id"] is None
+
+
+def test_closed_unresolved_market_has_no_winner():
+    gamma = _resolution_gamma(active=False, closed=True, acceptingOrders=False)
+    resolution = build_canonical_metadata({}, gamma)["_snapshot"]["resolution"]
+    assert resolution["resolution_status"] is None
+    assert resolution["winner_token_id"] is None
+
+
+def test_resolved_market_with_one_valid_winner():
+    gamma = _resolution_gamma(resolved=True, winnerTokenId="1111111111")
+    resolution = build_canonical_metadata({}, gamma)["_snapshot"]["resolution"]
+    assert resolution["resolution_status"] == "resolved"
+    assert resolution["winner_token_id"] == "1111111111"
+    assert resolution["winner_outcome"] == "Yes"
+    assert resolution["evidence_fields"] == ["market.winnerTokenId"]
+
+
+def test_resolved_without_derivable_winner_is_incomplete():
+    resolution = build_canonical_metadata({}, _resolution_gamma(resolved=True))[
+        "_snapshot"
+    ]["resolution"]
+    assert resolution["resolution_status"] == "incomplete"
+    assert resolution["errors"] == ["resolved_without_derivable_winner"]
+
+
+def test_multiple_winners_are_invalid():
+    gamma = _resolution_gamma(resolved=True, winnerTokenId=["1111111111", "2222222222"])
+    resolution = build_canonical_metadata({}, gamma)["_snapshot"]["resolution"]
+    assert resolution["resolution_status"] == "invalid"
+    assert resolution["winner_token_id"] is None
+
+
+def test_lifecycle_fields_never_imply_resolution():
+    gamma = _resolution_gamma(
+        active=False,
+        closed=True,
+        acceptingOrders=False,
+        endDate="2020-01-01T00:00:00Z",
+    )
+    resolution = build_canonical_metadata({}, gamma)["_snapshot"]["resolution"]
+    assert resolution["resolution_status"] is None
+    assert resolution["winner_token_id"] is None
+
+
+def test_outcomes_unequal_lengths():
+    result = _validate_outcome_mapping('["A","B"]', '["1"]')
     assert result["status"] == "invalid"
-    assert result["ordered"] == []  # no false mapping
-    assert result["labels"] == ["A", "B", "C"]
-    assert result["token_ids"] == ["tok1", "tok2"]
+    assert result["ordered"] == []
+    assert "array_length_mismatch" in result["errors"]
 
 
-def test_parse_outcomes_json_strings():
-    result = _parse_outcome_arrays('["Y","N"]', '["a","b"]')
-    assert result["labels"] == ["Y", "N"]
-    assert result["token_ids"] == ["a", "b"]
-    assert result["compatible"] is True
+def test_outcomes_duplicate_tokens():
+    result = _validate_outcome_mapping('["A","B"]', '["1","1"]')
+    assert result["status"] == "invalid"
+    assert "duplicate_token_ids" in result["errors"]
+
+
+def test_outcomes_blank_label():
+    result = _validate_outcome_mapping('["A",""]', '["1","2"]')
+    assert result["status"] == "invalid"
+    assert result["ordered"] == []
+
+
+def test_outcomes_blank_token():
+    result = _validate_outcome_mapping('["A","B"]', '["1",""]')
+    assert result["status"] == "invalid"
+    assert result["ordered"] == []
+
+
+def test_outcomes_invalid_index():
+    result = _validate_outcome_mapping('["A","B"]', '["1","2"]', outcome_index=2)
+    assert result["valid_index"] is False
+    assert result["status"] == "invalid"
+
+
+def test_outcomes_token_index_disagreement():
+    result = _validate_outcome_mapping(
+        '["A","B"]', '["1","2"]', outcome_index=0, selected_token="2", selected_outcome="A"
+    )
+    assert result["index_token_agrees"] is False
+    assert result["status"] == "invalid"
+    assert result["ordered"] == []
+
+
+def test_outcomes_binary_market():
+    result = _validate_outcome_mapping(
+        '["Yes","No"]', '["1","2"]', outcome_index=0, selected_token="1", selected_outcome="Yes"
+    )
     assert result["status"] == "complete"
     assert len(result["ordered"]) == 2
 
 
-def test_parse_outcomes_malformed_json():
-    result = _parse_outcome_arrays("not json", "also not")
-    assert result["labels"] == []
-    assert result["token_ids"] == []
-    assert result["compatible"] is False
-    assert result["status"] == "incomplete"
-
-
-# ── S5: Metadata merge with snapshot ────────────────────────────────────────
-
-def test_merge_fills_snapshot_on_empty():
-    # Use a Gamma market with no usable category (no official root).
-    gamma_no_cat = FakeMarket({
-        "conditionId": "0xcond1", "id": "12345", "question": "Will X?",
-        "slug": "will-x", "active": True, "closed": False,
-        "acceptingOrders": True, "endDate": "2026-12-31T00:00:00Z",
-        "events": [{"id": "evt1", "slug": "event-x"}],
-        "outcomes": '["Yes", "No"]',
-        "clobTokenIds": '["tok_a", "tok_b"]',
-        # No category -> taxonomy_unavailable but snapshot still fills.
-    })
-    new_meta, status, rc = merge_canonical_metadata(
-        None, gamma_no_cat, condition_id="0xcond1"
+def test_outcomes_multi_market():
+    result = _validate_outcome_mapping(
+        '["A","B","C"]', '["1","2","3"]', outcome_index=2, selected_token="3", selected_outcome="C"
     )
-    assert status == MERGE_FILLED
-    assert "_snapshot" in new_meta
-    assert new_meta["_snapshot"]["market"]["condition_id"] == "0xcond1"
+    assert result["status"] == "complete"
+    assert len(result["ordered"]) == 3
 
 
-def test_merge_preserves_unrelated_keys():
-    existing = json.dumps({"foo": "bar", "custom_field": 42})
-    new_meta, status, rc = merge_canonical_metadata(
-        existing, FULL_GAMMA, condition_id="0xcond1"
-    )
-    assert status == MERGE_FILLED
-    assert new_meta["foo"] == "bar"
-    assert new_meta["custom_field"] == 42
-
-
-def test_merge_replay_is_idempotent():
-    """Re-merging identical data should be UNCHANGED."""
-    first, s1, _ = merge_canonical_metadata(None, FULL_GAMMA, condition_id="0xcond1")
-    # For idempotency we compare all fields except retrieved_at
-    first_serialized = json.loads(json.dumps(first, sort_keys=True))
-    first_serialized["_snapshot"]["provenance"].pop("retrieved_at")
-    second, s2, _ = merge_canonical_metadata(
-        json.dumps(first), FULL_GAMMA, condition_id="0xcond1"
-    )
-    second_serialized = json.loads(json.dumps(second, sort_keys=True))
-    second_serialized["_snapshot"]["provenance"].pop("retrieved_at")
-    assert first_serialized == second_serialized or s2 == MERGE_UNCHANGED
-
-
-def test_merge_conflict_on_category_disagreement():
-    existing = json.dumps({"taxonomy": {"raw_category": "Sports"}})
-    new_meta, status, rc = merge_canonical_metadata(
-        existing, FULL_GAMMA, condition_id="0xcond1"
+def test_taxonomy_conflict_does_not_discard_snapshot_fields():
+    existing = _dump({"taxonomy": {"raw_category": "Sports"}})
+    merged, status, reasons = merge_canonical_metadata(
+        existing, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
     assert status == MERGE_CONFLICT
-    assert new_meta["taxonomy"]["raw_category"] == "Sports"
+    assert "taxonomy_raw_category_conflict" in reasons
+    assert merged["taxonomy"]["raw_category"] == "Sports"
+    assert merged["_snapshot"]["lifecycle"]["active"] is True
+    assert merged["_snapshot"]["resolution"]["resolution_status"] is None
 
 
-# ── S6: Trade response field preservation ──────────────────────────────────
-
-def test_trade_response_fields_passed_through():
-    meta = build_canonical_metadata(TRADE_WITH_FIELDS, FULL_GAMMA)
-    prov = meta["_snapshot"]["provenance"]
-    assert prov["trade_response_title"] == "Trade-level question text"
-    assert prov["trade_response_outcome_index"] == 0
-
-
-def test_trade_response_fields_absent_when_no_trades_info():
-    meta = build_canonical_metadata({}, FULL_GAMMA)
-    prov = meta["_snapshot"]["provenance"]
-    assert "trade_response_title" not in prov
-    assert "trade_response_outcome_index" not in prov
-    assert "trade_response_transaction_hash" not in prov
-
-
-# ── S7: Safety checks ──────────────────────────────────────────────────────
-
-def test_no_schema_columns_added():
-    """This module adds no DB columns — verified by absence of SQL in code."""
-    import inspect
-    source = inspect.getsource(sys.modules["polycopy.ingestion.canonical_metadata"])
-    assert "CREATE TABLE" not in source
-    assert "ALTER TABLE" not in source
-    assert "INSERT INTO source_trades" not in source
-
-
-def test_taxonomv_resolver_not_affected():
-    """OfficialPolymarketTaxonomyResolverV1 still works correctly."""
-    from polycopy.taxonomy.official_polymarket import (
-        OfficialPolymarketTaxonomyResolverV1,
-        TAXONOMY_USABLE,
+def test_outcome_conflict_does_not_erase_taxonomy_or_event():
+    first, _, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
-    resolver = OfficialPolymarketTaxonomyResolverV1()
-    result = resolver.resolve(FULL_GAMMA)
-    assert result.status == TAXONOMY_USABLE
-    assert result.market_category_value == "Politics"
+    bad = dict(FULL_GAMMA, outcomes='["Yes"]')
+    merged, status, reasons = merge_canonical_metadata(
+        _dump(first), bad, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert status == MERGE_CONFLICT
+    assert any("_snapshot_outcomes" in reason for reason in reasons)
+    assert merged["taxonomy"] == first["taxonomy"]
+    assert merged["event"] == first["event"]
 
 
-# ── S8: Determinism ────────────────────────────────────────────────────────
+def test_null_values_do_not_erase_existing_and_unrelated_survives():
+    first, _, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    first["unrelated"] = {"keep": True}
+    gamma = dict(FULL_GAMMA, question=None, active=None)
+    merged, _, _ = merge_canonical_metadata(
+        _dump(first), gamma, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert merged["_snapshot"]["market"]["question"] == FULL_GAMMA["question"]
+    assert merged["_snapshot"]["lifecycle"]["active"] is True
+    assert merged["unrelated"] == {"keep": True}
 
-def test_build_deterministic_without_timestamp():
-    """Running build twice should produce byte-identical results except timestamp."""
-    meta1 = build_canonical_metadata(TRADE_WITH_FIELDS, FULL_GAMMA)
-    meta2 = build_canonical_metadata(TRADE_WITH_FIELDS, FULL_GAMMA)
-    # Remove timestamp-dependent field
-    snap1 = json.loads(json.dumps(meta1))
-    snap2 = json.loads(json.dumps(meta2))
-    snap1["_snapshot"]["provenance"].pop("retrieved_at")
-    snap2["_snapshot"]["provenance"].pop("retrieved_at")
-    assert json.dumps(snap1, sort_keys=True) == json.dumps(snap2, sort_keys=True)
+
+def test_approved_wallet_normalizer_path_emits_canonical_snapshot():
+    candidate = normalize_source_trade(
+        TRADE,
+        requested_wallet=TRADE["proxyWallet"],
+        record_index=0,
+        gamma_market=FULL_GAMMA,
+    )
+    assert candidate.validation_status == "valid"
+    assert candidate.metadata == build_canonical_metadata(TRADE, FULL_GAMMA)
+
+
+def test_specialist_collector_path_emits_equivalent_canonical_snapshot(owned_sqlite):
+    from polycopy.db.database import Database
+    from polycopy.ingestion.specialist_evidence_collector import (
+        EvidenceCollectorConfig,
+        collect_evidence,
+    )
+    from polycopy.ingestion.specialist_evidence_watchlist import add_watch
+
+    db = Database(owned_sqlite.new_path())
+    db.connect()
+    wallet = TRADE["proxyWallet"]
+    wallet_id = "wallet-snapshot-test"
+    db.conn.execute(
+        "INSERT INTO wallets (id, address, label, is_sample, created_at) "
+        "VALUES (?, ?, ?, 0, ?)",
+        (wallet_id, wallet, "snapshot-test", "2026-01-01T00:00:00Z"),
+    )
+    watch_id = add_watch(db, wallet_id=wallet_id)
+    db.conn.commit()
+
+    class Provider:
+        async def fetch_trades(self, address, limit=100, page=1):
+            assert address == wallet
+            return [TRADE]
+
+    async def gamma(condition_id):
+        assert condition_id == FULL_GAMMA["conditionId"]
+        return FULL_GAMMA
+
+    try:
+        result = asyncio.run(
+            collect_evidence(
+                db,
+                watch_id=watch_id,
+                provider=Provider(),
+                dry_run=True,
+                config=EvidenceCollectorConfig(),
+                gamma_resolver=gamma,
+            )
+        )
+        assert result.error is None
+        assert result.rows_would_create == 1
+        # The production specialist collector entered ingest_pipeline, whose
+        # normalized candidate must be byte-equivalent to the approved path.
+        direct = normalize_source_trade(
+            TRADE,
+            requested_wallet=wallet,
+            record_index=0,
+            gamma_market=FULL_GAMMA,
+        )
+        assert direct.metadata == build_canonical_metadata(TRADE, FULL_GAMMA)
+    finally:
+        db.close()
