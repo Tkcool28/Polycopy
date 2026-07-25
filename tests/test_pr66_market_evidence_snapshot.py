@@ -291,17 +291,34 @@ def test_outcomes_numeric_token_is_invalid():
 
 def test_outcomes_invalid_index():
     result = _validate_outcome_mapping('["A","B"]', '["1","2"]', outcome_index=2)
+    # Trade-context validation diagnostics live under trade_validation now.
+    # ``outcome_index=2`` is out of range so a contextual diagnostic is
+    # produced; the Gamma-shape error list is empty (labels and tokens are
+    # well-formed). ``trade_validation_errors`` carries the diagnostic.
+    assert result["trade_validation_errors"] == ["outcome_index_out_of_range=2"]
+    assert result["errors"] == []
     assert result["valid_index"] is False
-    assert result["status"] == "invalid"
+    assert result["status"] == "complete"
 
 
 def test_outcomes_token_index_disagreement():
     result = _validate_outcome_mapping(
         '["A","B"]', '["1","2"]', outcome_index=0, selected_token="2", selected_outcome="A"
     )
+    # Authoritative Gamma-shape evidence is well-formed so ``ordered`` is
+    # built; the index / token disagreement is a context-only diagnostic.
+    # ``selected_outcome="A"`` happens to match the label at ``outcome_index=0``
+    # so ``index_outcome_agrees`` is True and only the token disagreement is
+    # reported.
+    assert result["trade_validation_errors"] == ["index_token_disagreement"]
+    assert result["errors"] == []
     assert result["index_token_agrees"] is False
-    assert result["status"] == "invalid"
-    assert result["ordered"] == []
+    assert result["index_outcome_agrees"] is True
+    assert result["status"] == "complete"
+    assert result["ordered"] == [
+        {"label": "A", "clob_token_id": "1"},
+        {"label": "B", "clob_token_id": "2"},
+    ]
 
 
 def test_outcomes_token_outcome_disagreement_without_index():
@@ -311,15 +328,32 @@ def test_outcomes_token_outcome_disagreement_without_index():
         selected_token="2",
         selected_outcome="A",
     )
-    assert result["status"] == "invalid"
-    assert "selected_token_outcome_disagreement" in result["errors"]
+    # Without ``outcome_index``, the agreement check between selected token
+    # and selected outcome is also a context-only diagnostic. The labels /
+    # tokens are still well-formed so ``ordered`` is built and the
+    # authoritative evidence is complete.
+    assert "selected_token_outcome_disagreement" in result["trade_validation_errors"]
+    assert result["errors"] == []
+    assert result["status"] == "complete"
 
 
 def test_trade_float_outcome_index_is_not_truncated():
     trade = dict(TRADE, outcomeIndex=0.5)
-    outcomes = build_canonical_metadata(trade, FULL_GAMMA)["_snapshot"]["outcomes"]
-    assert outcomes["valid_index"] is False
-    assert outcomes["status"] == "invalid"
+    metadata = build_canonical_metadata(trade, FULL_GAMMA)
+    outcomes = metadata["_snapshot"]["outcomes"]
+    provenance = metadata["_snapshot"]["provenance"]
+    # The strict parser rejects floats outright, so the snapshot is fed
+    # ``outcome_index=None``. The outcomes mapping is well-formed in its own
+    # right (labels/tokens are non-empty and consistent), so the validator
+    # reports ``complete`` with no ordered index; the validator and
+    # persisted-provenance paths agree because BOTH go through the same
+    # strict parser. The crucial regression is that the invalid index is
+    # NEVER persisted as provenance.
+    trade_validation = provenance["trade_validation"]
+    assert trade_validation["valid_index"] is None
+    assert trade_validation["outcome_index_supplied"] is False
+    assert outcomes["status"] == "complete"
+    assert "trade_response_outcome_index" not in provenance, provenance
 
 
 def test_outcomes_binary_market():

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, Optional
+from typing import Any
 
 from polycopy.adapters.polymarket import parse_clob_token_ids
 from polycopy.taxonomy.official_polymarket import (
@@ -41,7 +41,7 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _scalar(value: Any) -> Optional[str]:
+def _scalar(value: Any) -> str | None:
     if isinstance(value, str):
         value = value.strip()
         return value or None
@@ -50,7 +50,7 @@ def _scalar(value: Any) -> Optional[str]:
     return None
 
 
-def _first_scalar(*values: Any) -> Optional[str]:
+def _first_scalar(*values: Any) -> str | None:
     for value in values:
         normalized = _scalar(value)
         if normalized is not None:
@@ -100,8 +100,29 @@ def _validate_outcome_mapping(
     selected_token: str | None = None,
     selected_outcome: str | None = None,
 ) -> dict[str, Any]:
-    """Return a complete ordered mapping only when every consistency check passes."""
+    """Return a complete ordered mapping only when every consistency check passes.
+
+    The result separates two error streams so the snapshot can distinguish
+    authoritative Gamma-shape evidence from optional source-trade context:
+
+    * ``errors`` — substantive Gamma-shape diagnostics (label blanks, token
+      blanks, missing labels, missing tokens, array-length mismatch,
+      duplicate token IDs). These stay inside ``_snapshot.outcomes`` and
+      are compared during substantive replay.
+    * ``trade_validation`` — caller-context diagnostics (outcome-index range,
+      index / token agreement, index / outcome agreement, selected-token
+      membership, selected-outcome membership, selected token-outcome
+      disagreement). These depend on the optional trade fields the caller
+      supplied (selected_token / selected_outcome / outcome_index) and the
+      value of the booleans (``valid_index`` / ``index_token_agrees`` /
+      ``index_outcome_agrees``) likewise depend on that context. They are
+      returned on the top level too for backward compatibility but the
+      builder routes them into ``_snapshot.provenance.trade_validation``
+      so that two otherwise identical Gamma responses produce substantively
+      equivalent authoritative evidence regardless of caller context.
+    """
     errors: list[str] = []
+    trade_validation_errors: list[str] = []
     raw_labels = _parse_array(labels_raw)
     raw_tokens = _parse_array(clob_raw)
 
@@ -135,7 +156,7 @@ def _validate_outcome_mapping(
 
     valid_index: bool | None = None
     index_token_agrees: bool | None = None
-    index_outcome_agrees: Optional[bool] = None
+    index_outcome_agrees: bool | None = None
     if outcome_index is not None:
         valid_index = (
             isinstance(outcome_index, int)
@@ -144,18 +165,24 @@ def _validate_outcome_mapping(
             and outcome_index < len(token_ids)
         )
         if not valid_index:
-            errors.append(f"outcome_index_out_of_range={outcome_index}")
+            trade_validation_errors.append(
+                f"outcome_index_out_of_range={outcome_index}"
+            )
         else:
             if selected_token is not None:
-                index_token_agrees = token_ids[outcome_index] == str(selected_token).strip().lower()
+                index_token_agrees = (
+                    token_ids[outcome_index]
+                    == str(selected_token).strip().lower()
+                )
                 if not index_token_agrees:
-                    errors.append("index_token_disagreement")
+                    trade_validation_errors.append("index_token_disagreement")
             if selected_outcome is not None:
                 index_outcome_agrees = (
-                    labels[outcome_index].casefold() == str(selected_outcome).strip().casefold()
+                    labels[outcome_index].casefold()
+                    == str(selected_outcome).strip().casefold()
                 )
                 if not index_outcome_agrees:
-                    errors.append("index_outcome_disagreement")
+                    trade_validation_errors.append("index_outcome_disagreement")
     else:
         normalized_token = (
             selected_token.strip().lower()
@@ -176,16 +203,19 @@ def _validate_outcome_mapping(
             if label.casefold() == normalized_outcome
         ]
         if normalized_token is not None and len(token_matches) != 1:
-            errors.append("selected_token_not_in_mapping")
+            trade_validation_errors.append("selected_token_not_in_mapping")
         if normalized_outcome is not None and not outcome_matches:
-            errors.append("selected_outcome_not_in_mapping")
+            trade_validation_errors.append("selected_outcome_not_in_mapping")
         if (
             normalized_token is not None
             and normalized_outcome is not None
             and not set(token_matches).intersection(outcome_matches)
         ):
-            errors.append("selected_token_outcome_disagreement")
+            trade_validation_errors.append("selected_token_outcome_disagreement")
 
+    # The authoritative outcome mapping is "Gamma-compatible" only when the
+    # Gamma-shape errors list is empty. The trade-context diagnostics are
+    # informational and never gate ``compatible`` / ``status`` / ``ordered``.
     compatible = not errors
     if compatible:
         status = "complete"
@@ -207,6 +237,7 @@ def _validate_outcome_mapping(
         "index_outcome_agrees": index_outcome_agrees,
         "status": status,
         "errors": errors,
+        "trade_validation_errors": trade_validation_errors,
     }
 
 
@@ -304,7 +335,7 @@ def _parse_resolution_fields(
     return result
 
 
-def normalize_source_trade_metadata(raw: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+def normalize_source_trade_metadata(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     source = _mapping(raw)
     event = _mapping(source.get("event"))
     taxonomy = _mapping(source.get("taxonomy"))
@@ -333,7 +364,7 @@ def normalize_source_trade_metadata(raw: Optional[Mapping[str, Any]]) -> dict[st
     }
 
 
-def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> Optional[str]:
+def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> str | None:
     if result.status != TAXONOMY_USABLE:
         return None
     if result.source == "market.category":
@@ -345,34 +376,123 @@ def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> Option
     return result.category_label
 
 
-def _trade_index(trade: Optional[Mapping[str, Any]]) -> Optional[int]:
-    if not trade or "outcomeIndex" not in trade:
-        return None
-    value = trade.get("outcomeIndex")
+def _strict_trade_index_value(value: Any) -> int | None:
+    """Return ``value`` if it is a strict integer index; otherwise ``None``.
+
+    Accepts ONLY a real Python ``int`` that is non-negative and not a
+    boolean. Floats (including integral-looking ``0.0``), bools, decimal
+    strings, scientific-notation strings, empty strings, negative integers,
+    ``None`` and any other non-int shape are rejected. The function never
+    coerces fractional or ambiguous values; an absent or unusable value
+    yields ``None`` and is therefore omitted from any persisted provenance.
+
+    This is the SINGLE strict outcome-index parser used by both the outcome
+    mapping validation and the persisted provenance field; the two consumers
+    cannot disagree on what counts as a valid index.
+    """
     if isinstance(value, bool):
         return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+    if not isinstance(value, int):
         return None
+    if value < 0:
+        return None
+    return value
+
+
+def _trade_index(trade: Mapping[str, Any] | None) -> int | None:
+    if not trade or "outcomeIndex" not in trade:
+        return None
+    return _strict_trade_index_value(trade.get("outcomeIndex"))
 
 
 def _build_market_snapshot(
-    market: Mapping[str, Any], trade: Optional[Mapping[str, Any]]
+    market: Mapping[str, Any],
+    trade: Mapping[str, Any] | None,
+    *,
+    requested_condition_id: str | None = None,
+    enforce_exact_condition_match: bool = False,
 ) -> dict[str, Any]:
+    """Build the canonical market-evidence snapshot for one trade + Gamma.
+
+    ``enforce_exact_condition_match`` is the initial-ingestion safety gate:
+    when True, the snapshot's ``exact_match`` is False unless the caller's
+    ``requested_condition_id`` is present and matches the Gamma market's
+    ``conditionId`` after canonical normalization. When False (legacy
+    backfill contract), ``exact_match`` reflects whether the Gamma market
+    itself carries a condition id — never an unknown trade's requested
+    condition id (the merge layer enforces identity upstream).
+
+    The authoritative Gamma-shape evidence lives in ``snapshot.outcomes``
+    (its ``errors`` list, ``labels`` / ``token_ids`` / ``ordered``
+    / ``compatible`` / ``status``). Trade-context validation diagnostics
+    — outcome-index range, index/token agreement, index/outcome agreement,
+    selected token/outcome membership and disagreement, plus the matching
+    booleans (``valid_index`` / ``index_token_agrees`` /
+    ``index_outcome_agrees``) — are split out into
+    ``snapshot.provenance.trade_validation`` so that two otherwise
+    identical Gamma responses produce substantively equivalent
+    authoritative evidence regardless of whether the caller supplied
+    trade context. The booleans are emitted under
+    ``trade_validation`` together with their error list. The validator's
+    Gamma-shape ``errors`` list is never polluted by caller context.
+    """
     outcomes = _validate_outcome_mapping(
         market.get("outcomes"),
         market.get("clobTokenIds"),
-        outcome_index=trade.get("outcomeIndex") if trade else None,
+        outcome_index=_strict_trade_index_value(
+            trade.get("outcomeIndex")
+        )
+        if trade
+        else None,
         selected_token=_first_scalar(
             trade.get("asset") if trade else None,
             trade.get("token_id") if trade else None,
         ),
         selected_outcome=_scalar(trade.get("outcome")) if trade else None,
     )
+    # Capture the trade-validation diagnostics before the authoritative
+    # ``outcomes`` namespace is rewritten — these are no longer part of
+    # the authoritative Gamma-shape evidence.
+    trade_validation: dict[str, Any] = {
+        "errors": list(outcomes.pop("trade_validation_errors", []) or []),
+        "valid_index": outcomes.get("valid_index"),
+        "index_token_agrees": outcomes.get("index_token_agrees"),
+        "index_outcome_agrees": outcomes.get("index_outcome_agrees"),
+        "outcome_index_supplied": bool(
+            trade is not None
+            and "outcomeIndex" in trade
+            and _strict_trade_index_value(trade.get("outcomeIndex")) is not None
+        ),
+    }
+    # Strip the trade-context booleans from ``outcomes`` so they live ONLY
+    # under ``provenance.trade_validation``. ``outcomes`` is now purely the
+    # authoritative Gamma-shape evidence.
+    for key in ("valid_index", "index_token_agrees", "index_outcome_agrees"):
+        outcomes.pop(key, None)
+    normalized_gamma_condition_id = _normalize_condition_id(market.get("conditionId"))
+    if enforce_exact_condition_match:
+        # Initial-ingestion contract: ``requested_condition_id`` MUST be
+        # present and match the Gamma market's conditionId after
+        # normalization. Any other shape means we cannot prove identity, so
+        # ``exact_match=False`` and authoritative evidence is cleared.
+        if (
+            requested_condition_id is None
+            or not _exact_condition_match(requested_condition_id, market)
+        ):
+            requested_for_provenance = requested_condition_id
+            exact_match = False
+        else:
+            requested_for_provenance = requested_condition_id
+            exact_match = True
+    else:
+        # Legacy backfill contract: identity has already been verified
+        # upstream by ``merge_canonical_metadata``. ``exact_match`` simply
+        # reflects whether the Gamma market carries a conditionId.
+        requested_for_provenance = normalized_gamma_condition_id
+        exact_match = requested_for_provenance is not None
     snapshot: dict[str, Any] = {
         "market": {
-            "condition_id": _scalar(market.get("conditionId")),
+            "condition_id": normalized_gamma_condition_id,
             "provider_market_id": _scalar(market.get("id")),
             "question": _scalar(market.get("question")),
             "slug": _scalar(market.get("slug")),
@@ -388,20 +508,52 @@ def _build_market_snapshot(
         "provenance": {
             "provider": "gamma",
             "lookup_kind": "condition_id",
-            "requested_condition_id": _scalar(market.get("conditionId")),
-            "exact_match": True,
+            "requested_condition_id": requested_for_provenance,
+            "exact_match": exact_match,
             "snapshot_contract_version": MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
         },
     }
+    if not exact_match:
+        # Fail-closed: a Gamma mapping without a verified condition-id
+        # match MUST NOT carry authoritative evidence. Clear the populated
+        # namespaces so we never silently stamp ``exact_match=False`` while
+        # still persisting the mapping as authoritative. Provenance is
+        # preserved so callers can see exactly why.
+        snapshot["market"] = {key: None for key in snapshot["market"]}
+        snapshot["lifecycle"] = {key: None for key in snapshot["lifecycle"]}
+        snapshot["outcomes"] = {
+            "labels": [],
+            "token_ids": [],
+            "ordered": [],
+            "compatible": False,
+            "status": "invalid",
+            "errors": ["exact_match_false_evidence_unavailable"],
+        }
+        snapshot["resolution"] = {
+            "resolution_status": None,
+            "winner_token_id": None,
+            "winner_outcome": None,
+            "evidence_fields": [],
+            "errors": ["exact_match_false_evidence_unavailable"],
+        }
     provider_updated_at = _scalar(market.get("updatedAt"))
     if provider_updated_at is not None:
         snapshot["provenance"]["provider_updated_at"] = provider_updated_at
+    # Trade-context provenance: wallet fields live at the top of
+    # ``provenance``; trade-validation diagnostics live under a nested
+    # object so they survive the deterministic JSON contract and are
+    # never confused with substantive Gamma-shape errors. An absent
+    # trade-context produces a minimal ``trade_validation`` namespace
+    # with an empty errors list and ``outcome_index_supplied=False``.
+    snapshot["provenance"]["trade_validation"] = trade_validation
     if trade:
         provenance = snapshot["provenance"]
         context = {
             "trade_response_title": _scalar(trade.get("title")),
             "trade_response_slug": _scalar(trade.get("slug")),
-            "trade_response_outcome_index": _trade_index(trade),
+            "trade_response_outcome_index": _strict_trade_index_value(
+                trade.get("outcomeIndex")
+            ),
             "trade_response_transaction_hash": _scalar(trade.get("transactionHash")),
         }
         provenance.update({key: value for key, value in context.items() if value is not None})
@@ -409,8 +561,33 @@ def _build_market_snapshot(
 
 
 def build_canonical_metadata(
-    trade: Optional[Mapping[str, Any]], gamma_market: Optional[Mapping[str, Any]]
+    trade: Mapping[str, Any] | None,
+    gamma_market: Mapping[str, Any] | None,
+    *,
+    requested_condition_id: str | None = None,
+    enforce_exact_condition_match: bool = False,
 ) -> dict[str, Any]:
+    """Build the canonical PR66 metadata payload from a trusted Gamma market.
+
+    Parameters
+    ----------
+    trade:
+        Raw upstream trade dict, or ``None`` for metadata-only call sites.
+    gamma_market:
+        Raw Gamma market dict, or ``None`` for metadata-only call sites.
+    requested_condition_id:
+        The trade's requested condition id after canonical normalization.
+        When ``None`` the function derives it from ``trade`` (using the
+        ``conditionId`` or ``market_source_id`` field). Initial-ingestion
+        callers pass the value explicitly to drive the new gate.
+    enforce_exact_condition_match:
+        When True, the snapshot is ONLY emitted when the canonical requested
+        condition id matches the Gamma market's ``conditionId`` after
+        normalization. When False (default — backfill semantics), the
+        snapshot is always emitted and ``exact_match`` reflects whether the
+        Gamma market itself carries a condition id. Initial-ingestion
+        callers pass ``True`` to enforce the safety gate.
+    """
     market = _mapping(gamma_market)
     source = dict(market)
     events = market.get("events")
@@ -423,18 +600,84 @@ def build_canonical_metadata(
         OfficialPolymarketTaxonomyResolverV1().resolve(source)
     )
     result = normalize_source_trade_metadata(source)
-    if market:
-        result["_snapshot"] = _build_market_snapshot(market, trade)
+    if not market:
+        return result
+    if requested_condition_id is None:
+        requested_condition_id = _requested_condition_id(trade)
+    if enforce_exact_condition_match:
+        # Initial-ingestion safety gate: a requested condition id MUST
+        # normalize-match the Gamma market's ``conditionId``; otherwise we
+        # drop the snapshot entirely so the persisted row never stamps
+        # ``exact_match=false`` with authoritative evidence attached. We
+        # also refuse to enrich the v1 (event/taxonomy/series) namespaces
+        # from the mismatched Gamma so no Gamma-authoritative field leaks
+        # into the persisted row at all.
+        if requested_condition_id is None:
+            return normalize_source_trade_metadata(trade)
+        if not _exact_condition_match(requested_condition_id, market):
+            return normalize_source_trade_metadata(trade)
+    result["_snapshot"] = _build_market_snapshot(
+        market,
+        trade,
+        requested_condition_id=requested_condition_id,
+        enforce_exact_condition_match=enforce_exact_condition_match,
+    )
     return result
 
 
-def _gamma_condition_id(gamma_market: Mapping[str, Any]) -> Optional[str]:
+def _gamma_condition_id(gamma_market: Mapping[str, Any]) -> str | None:
     value = gamma_market.get("conditionId")
     return str(value).lower() if value is not None else None
 
 
 def _gamma_token_ids(gamma_market: Mapping[str, Any]) -> list[str]:
     return [str(token).lower() for token in parse_clob_token_ids(dict(gamma_market)) if token]
+
+
+def _normalize_condition_id(value: Any) -> str | None:
+    """Return a lowercased canonical condition-id string, or ``None`` for empty.
+
+    Whitespace is stripped and the value must be a non-empty string. Any
+    non-string (or empty after strip) yields ``None`` so the comparison is
+    fail-closed: only normalized non-empty strings can prove an identity
+    match. This is the single condition-id normalization rule for both the
+    backfill merge path and the initial-ingestion canonical builder.
+    """
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip().lower()
+    return stripped or None
+
+
+def _requested_condition_id(trade: Mapping[str, Any] | None) -> str | None:
+    """Return the requested trade condition id, normalized.
+
+    Accepts the raw ``conditionId`` field or, for DB-row-shaped inputs, the
+    ``market_source_id`` field. Any other value yields ``None`` so the
+    canonical builder cannot infer identity from any secondary field.
+    """
+    if not isinstance(trade, Mapping):
+        return None
+    raw = trade.get("conditionId")
+    if raw is None:
+        raw = trade.get("market_source_id")
+    return _normalize_condition_id(raw)
+
+
+def _exact_condition_match(
+    requested: str | None, gamma_market: Mapping[str, Any]
+) -> bool:
+    """Return True iff requested and gamma condition ids match after normalization.
+
+    A normalized requested condition id AND a gamma condition id must both
+    be present and byte-equal after strip/lower. Empty or missing either
+    side fails closed. The function is intentionally pure: it never infers
+    identity from any other Gamma field (slug, title, question, token).
+    """
+    return (
+        requested is not None
+        and _normalize_condition_id(gamma_market.get("conditionId")) == requested
+    )
 
 
 def _merge_standard_namespace(
@@ -490,6 +733,7 @@ def _merge_refreshable_dict(
         if _is_empty(old):
             output[key] = value
             changed = True
+            continue
         elif old == value:
             continue
         elif (
@@ -503,6 +747,61 @@ def _merge_refreshable_dict(
             changed = True
     return output, changed, reasons
 
+def _merge_trade_validation(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Union-merge two ``provenance.trade_validation`` payloads.
+
+    The diagnostics are caller-context only: an earlier build may have
+    observed trade-context errors (selected token/outcome disagreement) that
+    a later no-context build cannot observe. The audit demands:
+
+      * existing diagnostics are preserved through replay;
+      * new diagnostics from a later trade-context build are merged in;
+      * contradictory context does NOT silently overwrite accepted
+        diagnostics;
+      * null / missing context does NOT erase existing diagnostics.
+
+    Return the merged dict, or ``existing`` unchanged when the merge is a
+    no-op (callers rely on identity to skip downstream writes).
+    """
+    if not isinstance(incoming, dict):
+        return existing
+    merged = dict(existing)
+    # ``errors`` is the union, preserving insertion order so the deterministic
+    # JSON contract stays stable. Already-present diagnostics are never
+    # overwritten.
+    existing_errors = list(existing.get("errors") or [])
+    incoming_errors = list(incoming.get("errors") or [])
+    seen = set(existing_errors)
+    for item in incoming_errors:
+        if item not in seen:
+            existing_errors.append(item)
+            seen.add(item)
+    if existing_errors != list(existing.get("errors") or []):
+        merged["errors"] = existing_errors
+    # Booleans: if the existing context already observed a value, keep it;
+    # only fill when the existing value is ``None`` and the incoming value is
+    # informative. This protects against contradictory later context silently
+    # overwriting accepted diagnostics; a later ``None`` never clears an
+    # already-observed True/False.
+    for key in ("valid_index", "index_token_agrees", "index_outcome_agrees"):
+        if key not in incoming:
+            continue
+        new_value = incoming[key]
+        old_value = existing.get(key)
+        if old_value is None and new_value is not None:
+            merged[key] = new_value
+    # ``outcome_index_supplied`` is informative only: prefer True (we observed
+    # one); False is recorded when explicitly False; never overwritten
+    # forward from True to False because the caller may simply have lacked
+    # context.
+    if incoming.get("outcome_index_supplied") is True:
+        merged.setdefault("outcome_index_supplied", True)
+    if merged == existing:
+        return existing
+    return merged
+
 
 def _merge_snapshot(
     existing_snapshot: Any, incoming: Mapping[str, Any]
@@ -515,10 +814,53 @@ def _merge_snapshot(
     output = dict(existing_snapshot)
     changed = False
     reasons: list[str] = []
+
+    # Preserve ``provenance.trade_validation`` from the existing record when
+    # the incoming build carries a different (or absent) trade context —
+    # union of diagnostics, no churn. Substantive equality is gated ONLY on
+    # the authoritative Gamma-shape namespaces below.
+    existing_provenance = existing_snapshot.get("provenance")
+    incoming_provenance = incoming.get("provenance")
+    existing_tv = (
+        existing_provenance.get("trade_validation")
+        if isinstance(existing_provenance, dict)
+        else None
+    )
+    incoming_tv = (
+        incoming_provenance.get("trade_validation")
+        if isinstance(incoming_provenance, dict)
+        else None
+    )
+    if isinstance(incoming_tv, dict) and isinstance(existing_tv, dict):
+        merged_tv = _merge_trade_validation(existing_tv, incoming_tv)
+        if merged_tv is not existing_tv:
+            output_prov = output.setdefault("provenance", {})
+            if isinstance(output_prov, dict):
+                output_prov["trade_validation"] = merged_tv
+                changed = True
+    elif isinstance(incoming_tv, dict):
+        output_prov = output.setdefault("provenance", {})
+        if isinstance(output_prov, dict):
+            output_prov["trade_validation"] = dict(incoming_tv)
+            changed = True
+
     for namespace in ("market", "outcomes", "lifecycle", "resolution", "provenance"):
         new_namespace = incoming.get(namespace)
         if not isinstance(new_namespace, Mapping):
             continue
+        # Exclude ``trade_validation`` from the substantive namespace merge:
+        # its ``errors`` list and booleans are context-dependent and must
+        # never produce a ``_snapshot_provenance_*_conflict`` reason. The
+        # namespace-level merge above already preserved them with union
+        # semantics, so we simply skip the field here.
+        if namespace == "provenance":
+            new_namespace = {
+                key: value
+                for key, value in new_namespace.items()
+                if key != "trade_validation"
+            }
+            if not new_namespace:
+                continue
         merged_namespace, namespace_changed, namespace_reasons = _merge_refreshable_dict(
             existing_snapshot.get(namespace),
             new_namespace,
@@ -537,7 +879,7 @@ def _merge_snapshot(
 
 
 def _snapshot_for_replay_comparison(snapshot: Any) -> Any:
-    """Remove audit-only timestamps before substantive replay comparison."""
+    """Remove audit-only timestamps, caller-only context, before replay."""
     if not isinstance(snapshot, dict):
         return snapshot
     output = json.loads(json.dumps(snapshot))
@@ -545,15 +887,33 @@ def _snapshot_for_replay_comparison(snapshot: Any) -> Any:
     if isinstance(provenance, dict):
         provenance.pop("retrieved_at", None)
         provenance.pop("provider_updated_at", None)
+        # ``trade_validation`` carries the caller's optional context
+        # diagnostics (selected token / outcome / index). Two builds of the
+        # same authoritative Gamma evidence with different caller contexts
+        # are substantively equivalent — only the substantive Gamma-shape
+        # fields drive replay comparison. We strip this entire nested
+        # object so replay equality is gated on Gamma evidence only; the
+        # ``_merge_snapshot`` layer still preserves it on every merge
+        # without using it as a substantive-equality signal.
+        provenance.pop("trade_validation", None)
+        # Wallet-context fields (``trade_response_*``) are caller-only
+        # echoes too: a Gamma fetch with vs without trade context produces
+        # different ``trade_response_*`` strings even though the substantive
+        # evidence is identical. The merge layer preserves them on every
+        # merge via ``_merge_trade_validation`` / per-key handling, so the
+        # replay layer ignores them.
+        for key in list(provenance):
+            if key.startswith("trade_response_"):
+                provenance.pop(key)
     return output
 
 
 def merge_canonical_metadata(
-    existing_json: Optional[str],
-    gamma_market: Optional[Mapping[str, Any]],
+    existing_json: str | None,
+    gamma_market: Mapping[str, Any] | None,
     *,
     condition_id: str,
-    token_id: Optional[str] = None,
+    token_id: str | None = None,
 ) -> tuple[dict[str, Any], str, list[str]]:
     if not existing_json:
         existing: dict[str, Any] = {}
@@ -630,8 +990,8 @@ def merge_canonical_metadata(
 
 
 def build_metadata_from_gamma_market(
-    raw: Optional[Mapping[str, Any]],
-    gamma_market: Optional[Mapping[str, Any]],
+    raw: Mapping[str, Any] | None,
+    gamma_market: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Compatibility alias for callers that have not moved to the canonical name."""
     return build_canonical_metadata(raw, gamma_market)

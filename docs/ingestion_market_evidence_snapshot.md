@@ -30,7 +30,7 @@ snapshot contract-version constant.
       "labels": ["string"],
       "token_ids": ["string"],
       "ordered": [{"label": "string", "clob_token_id": "string"}],
-      "compatible": true,
+      "compatible": "bool|null",
       "valid_index": "true|false|null",
       "index_token_agrees": "true|false|null",
       "index_outcome_agrees": "true|false|null",
@@ -54,7 +54,7 @@ snapshot contract-version constant.
       "provider": "gamma",
       "lookup_kind": "condition_id",
       "requested_condition_id": "string|null",
-      "exact_match": true,
+      "exact_match": "true|false",
       "snapshot_contract_version": "2",
       "provider_updated_at": "string (optional)",
       "retrieved_at": "UTC ISO-8601 string (persisted merges only)",
@@ -67,20 +67,29 @@ snapshot contract-version constant.
 }
 ```
 
+When the canonical builder refuses to emit `_snapshot` (initial-ingestion
+fail-closed case, see "Condition-id exact-match validation" below) the
+persisted metadata row is the v1 PR66 shape (`metadata_version`, `event`,
+`taxonomy`, `series`) with no `_snapshot` key.  When `_snapshot` IS emitted
+but `exact_match=false`, the authoritative namespaces (`market`, `outcomes`,
+`lifecycle`, `resolution`) are explicitly nulled/cleared so a
+`exact_match=false` row carries no Gamma-authoritative evidence; only the
+provenance key is preserved.
+
 ## Field authority
 
 | Snapshot field | Authority |
 |---|---|
-| `market.condition_id` | Gamma `conditionId` |
-| `market.provider_market_id` | Gamma `id` |
-| `market.question` | Gamma `question` |
-| `market.slug` | Gamma `slug` |
-| `outcomes.labels` | Gamma `outcomes` |
-| `outcomes.token_ids` | Gamma `clobTokenIds` |
-| `lifecycle.active` | Gamma `active` when boolean |
-| `lifecycle.closed` | Gamma `closed` when boolean |
-| `lifecycle.accepting_orders` | Gamma `acceptingOrders` when boolean |
-| `lifecycle.end_date` | Gamma `endDate` |
+| `market.condition_id` | Gamma `conditionId` (only after condition-id match) |
+| `market.provider_market_id` | Gamma `id` (only after condition-id match) |
+| `market.question` | Gamma `question` (only after condition-id match) |
+| `market.slug` | Gamma `slug` (only after condition-id match) |
+| `outcomes.labels` | Gamma `outcomes` (only after condition-id match) |
+| `outcomes.token_ids` | Gamma `clobTokenIds` (only after condition-id match) |
+| `lifecycle.active` | Gamma `active` when boolean (only after match) |
+| `lifecycle.closed` | Gamma `closed` when boolean (only after match) |
+| `lifecycle.accepting_orders` | Gamma `acceptingOrders` when boolean (only after match) |
+| `lifecycle.end_date` | Gamma `endDate` (only after match) |
 | resolution status | Gamma `resolved` only |
 | winner token | Gamma `winnerTokenId` or `winningClobTokenId` |
 | winner outcome | Gamma `winnerOutcome` or `resolutionOutcome` |
@@ -130,10 +139,64 @@ A complete ordered mapping requires:
 4. nonblank string labels;
 5. nonblank usable string token IDs;
 6. unique token IDs;
-7. a valid optional integer outcome index within both arrays;
+7. a valid optional strict integer outcome index within both arrays;
 8. agreement between index, trade token, and trade outcome whenever supplied.
 
 Any invalid mapping has an empty `ordered` list. It is never guessed.
+
+## Strict outcome-index contract
+
+`outcomeIndex` is parsed through the SINGLE strict parser
+`_strict_trade_index_value` in `canonical_metadata.py`. The same parser feeds
+both consumers; the two paths cannot disagree:
+
+| Input | Accepted | Persisted as `trade_response_outcome_index` |
+|---|---|---|
+| `int` (e.g. `0`, `1`) ≥ 0 | yes | the integer |
+| `bool` (`True`/`False`) | no | omitted |
+| `float` (including `0.0`, `1.0`) | no | omitted |
+| fractional float (e.g. `0.5`, `1.5`) | no | omitted |
+| `str` (`"0"`, `"1"`, `"0.5"`, `"0.5.0"`, scientific, `""`) | no | omitted |
+| decimal / scientific-notation string | no | omitted |
+| negative integer | no | omitted |
+| `None` / absent | no | omitted |
+| any other shape (list, dict, tuple) | no | omitted |
+
+Invalid values are never persisted as provenance indices. They also never
+truncate the validator's view (`0.5` is not coerced to `0`); the strict
+parser returns `None` and both paths see `None`, so the validator's
+`outcome_index_out_of_range` error does not coexist with a truncated
+`trade_response_outcome_index` in the persisted row.
+
+## Condition-id exact-match validation
+
+Initial ingestion calls the canonical builder with
+`enforce_exact_condition_match=True`. The builder refuses to emit
+`_snapshot` whenever the trade's requested condition id (the trade's
+`conditionId` / `market_source_id` after `strip().lower()`) does not match
+the supplied Gamma market's `conditionId` after the same normalization.
+The two normalization rules are the same rule used by the merge layer
+(`_normalize_condition_id`, `_exact_condition_match` in
+`canonical_metadata.py`).
+
+Fail-closed behaviour:
+
+* Matching condition ids: snapshot accepted, `provenance.exact_match = true`.
+* Mismatched condition ids: NO snapshot emitted (and the v1 namespaces are
+  NOT enriched from the Gamma object at all).
+* Gamma `conditionId` missing: NO snapshot emitted.
+* Requested trade condition id missing: snapshot is emitted (legacy
+  contract) but `provenance.exact_match = false`; every authoritative
+  namespace (`market`, `outcomes`, `lifecycle`, `resolution`) is explicitly
+  nulled/cleared and the namespaces report the
+  `exact_match_false_evidence_unavailable` error.
+
+Identity is never inferred from any other Gamma field (slug, question, title,
+token). The same condition-id normalization handles casing variations
+(uppercase / mixed-case collapse to lowercase) and surrounding whitespace
+(strip before compare). Two strings that differ only by case or whitespace
+and a Gamma `conditionId` that differs in those dimensions are the same
+identity.
 
 ## Resolution rules
 
@@ -150,13 +213,63 @@ Only the official Gamma taxonomy resolver populates taxonomy. Titles,
 questions, and slugs identify content; they are not taxonomy evidence and are
 never used to infer a category.
 
+## Persistence boundary
+
+The canonical serializer is
+`polycopy.ingestion.source_trade_metadata.serialize_source_trade_metadata`.
+It is the SINGLE deterministic JSON boundary between in-memory canonical
+metadata and the `source_trades.metadata_json` column:
+
+* When the input dict is a canonical PR66 payload (carries `_snapshot`), the
+  serializer emits the exact bytes of that payload with `sort_keys=True` and
+  `separators=(",", ":")`. `_snapshot` and every other canonical key survive
+  persistence.
+* When the input is an upstream-like raw dict (no `_snapshot`), the
+  serializer routes through `normalize_source_trade_metadata` to preserve
+  the legacy PR66 v1 contract.
+
+The `source_trade_writer._row_tuple` helper is the only caller of the
+serializer; the writer itself makes NO normalization, NO validation, NO
+network access. The serializer is therefore the entire persistence-boundary
+contract — no duplicates, no fallback paths.
+
 ## Ingestion paths
 
-The approved-wallet path enters `normalize_source_trade(..., gamma_market=...)`,
-which delegates to the canonical builder. The specialist evidence collector
-enters `ingest_pipeline.run_ingestion`, which reaches the same normalizer and
-builder. Tests execute both production boundaries and compare the canonical
-snapshot output.
+Both the approved-wallet ingestion path AND the specialist evidence
+ingestion path converge on the same canonical writer and serializer
+boundary:
+
+* **Approved-wallet path**: `approve_wallet_collector.collect` →
+  `ingest_pipeline.run_ingestion` → `normalize_source_trade(gamma_market=...)`
+  with `enforce_exact_condition_match=True` → canonical builder →
+  `source_trade_writer.write_valid_rows(dry_run=False)` →
+  `serialize_source_trade_metadata` → `source_trades.metadata_json`.
+* **Specialist / cohort path**: `collect_evidence` →
+  `ingest_pipeline.run_ingestion` → `normalize_source_trade(gamma_market=...)`
+  with `enforce_exact_condition_match=True` → canonical builder →
+  `write_valid_rows(dry_run=False)` → `serialize_source_trade_metadata` →
+  `source_trades.metadata_json`. The cohort then runs
+  `enrich_source_trade_async` for idempotent enrichment, which routes
+  through the merge layer (which already enforces condition-id identity
+  upstream of the canonical builder).
+
+The PR #79 persisted-row test suite (`tests/test_pr79_merge_blocker_persisted_row.py`)
+exercises both paths end-to-end:
+
+* `test_approved_wallet_writer_persists_full_snapshot_through_real_db` —
+  approved-wallet boundary, `dry_run=False`, isolated temp DB, real
+  readback of `metadata_json` to verify `_snapshot.market`,
+  `_snapshot.outcomes`, `_snapshot.lifecycle`, `_snapshot.resolution`,
+  `_snapshot.provenance`, plus `trade_response_*` provenance context.
+* `test_specialist_cohort_writer_persists_full_snapshot_through_real_db` —
+  specialist cohort boundary, `dry_run=False`, isolated temp DB, real
+  readback. Equivalent snapshot semantics for equivalent inputs.
+
+Both tests are TRUE write-mode database round-trip tests; neither uses
+`dry_run=True`, neither compares only in-memory candidates. They prove
+the canonical serialization boundary is real for both ingestion
+boundaries and that the condition-id exact-match validation gates both
+paths through the same canonical builder.
 
 ## Guarantees and limitations
 

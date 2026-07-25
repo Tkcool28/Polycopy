@@ -492,12 +492,23 @@ def normalize_source_trade(
     candidate.metadata = normalize_source_trade_metadata(raw)
     # PR68: when a trusted Gamma market is supplied, rebuild canonical metadata
     # from it (the trade endpoint carries no event/taxonomy/series fields).
+    # Initial-ingestion safety gate: ``enforce_exact_condition_match=True`` so
+    # the canonical builder refuses to emit authoritative ``_snapshot``
+    # evidence unless the trade's requested condition id (normalized) exactly
+    # matches the Gamma market's ``conditionId``. A mismatched or missing
+    # Gamma ``conditionId`` is fail-closed; the trade degrades to the v1
+    # metadata contract (no ``_snapshot``) and is never persisted as an
+    # authoritative exact match.
     if gamma_market is not None:
         from polycopy.ingestion.source_trade_metadata import (
             build_metadata_from_gamma_market,
         )
 
-        candidate.metadata = build_metadata_from_gamma_market(raw, gamma_market)
+        candidate.metadata = build_metadata_from_gamma_market(
+            raw,
+            gamma_market,
+            enforce_exact_condition_match=True,
+        )
 
     # ── raw provenance: keep source-provided id and tx hash SEPARATE ──
     sp = raw.get("sourceProvidedTradeId")
