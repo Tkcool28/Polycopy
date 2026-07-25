@@ -995,3 +995,78 @@ def build_metadata_from_gamma_market(
 ) -> dict[str, Any]:
     """Compatibility alias for callers that have not moved to the canonical name."""
     return build_canonical_metadata(raw, gamma_market)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical-metadata trust boundary
+#
+# A payload may be serialized as an already-canonical source-trade metadata
+# snapshot only when its structure proves it was produced under the canonical
+# metadata contract. This is the SINGLE authoritative validator: the legacy
+# serializer (and any other caller that wants to snapshot a raw mapping
+# verbatim) MUST route through this function instead of inspecting the
+# ``_snapshot`` key on its own. Two assertions must hold:
+#
+#   1. The map is the exact canonical shape produced by
+#      ``build_canonical_metadata`` (top-level keys, ``metadata_version``,
+#      ``_snapshot`` namespaces, Gamma provenance identity).
+#   2. No arbitrary unknown top-level or snapshot keys are smuggled in.
+#
+# The validator is deliberately pure: it accepts the mapping by reference and
+# reads it only. It never mutates the input, never calls back into the
+# builder, and never logs. Failed validation returns ``False``; the caller
+# decides what to do (the serializer routes the payload through legacy v1
+# normalization and strips ``_snapshot``).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CANONICAL_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
+    {"metadata_version", "taxonomy", "event", "series", "_snapshot"}
+)
+_CANONICAL_SNAPSHOT_NAMESPACES: frozenset[str] = frozenset(
+    {"market", "outcomes", "lifecycle", "resolution", "provenance"}
+)
+
+
+def is_canonical_source_trade_metadata(raw: Any) -> bool:
+    """Return True iff ``raw`` is a canonical source-trade metadata payload.
+
+    The canonical contract is:
+
+      * Top-level keys are exactly
+        ``{"metadata_version", "taxonomy", "event", "series", "_snapshot"}``
+        — no other keys may be present.
+      * ``metadata_version`` equals :data:`METADATA_VERSION`.
+      * ``_snapshot`` is a mapping whose keys are exactly
+        ``{"market", "outcomes", "lifecycle", "resolution", "provenance"}``.
+      * ``_snapshot.provenance.provider == "gamma"``.
+      * ``_snapshot.provenance.snapshot_contract_version`` equals
+        :data:`MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION`.
+
+    Any deviation fails closed: the caller MUST route the mapping through
+    legacy v1 normalization and drop ``_snapshot`` rather than persist the
+    payload verbatim. The validator never mutates the input.
+    """
+    if not isinstance(raw, Mapping):
+        return False
+    # Reject any top-level key outside the bounded canonical set first; this
+    # is the simplest, most robust way to refuse a forged/smuggled payload
+    # even when it names the right keys (e.g. {"_snapshot": {...}, "secret": ...}).
+    if set(raw.keys()) != _CANONICAL_TOP_LEVEL_KEYS:
+        return False
+    if raw.get("metadata_version") != METADATA_VERSION:
+        return False
+    snapshot = raw.get("_snapshot")
+    if not isinstance(snapshot, Mapping):
+        return False
+    if set(snapshot.keys()) != _CANONICAL_SNAPSHOT_NAMESPACES:
+        return False
+    if not all(isinstance(snapshot.get(ns), Mapping) for ns in _CANONICAL_SNAPSHOT_NAMESPACES):
+        return False
+    provenance = snapshot.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    if provenance.get("provider") != "gamma":
+        return False
+    if provenance.get("snapshot_contract_version") != MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION:
+        return False
+    return True

@@ -12,7 +12,7 @@ for path in (ROOT / "src", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from polycopy.ingestion.canonical_metadata import (
+from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     MERGE_CONFLICT,
     MERGE_FILLED,
@@ -21,7 +21,7 @@ from polycopy.ingestion.canonical_metadata import (
     build_canonical_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import normalize_source_trade
+from polycopy.ingestion.normalized_source_trade import normalize_source_trade  # noqa: E402
 
 FULL_GAMMA = {
     "conditionId": "0x" + "1" * 64,

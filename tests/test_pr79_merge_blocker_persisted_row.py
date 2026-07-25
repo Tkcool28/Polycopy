@@ -25,13 +25,15 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 for path in (ROOT / "src", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from polycopy.db.database import Database
-from polycopy.ingestion.canonical_metadata import (
+from polycopy.db.database import Database  # noqa: E402
+from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MERGE_CONFLICT,
     MERGE_FILLED,
     MERGE_UNAVAILABLE,
@@ -40,16 +42,16 @@ from polycopy.ingestion.canonical_metadata import (
     build_canonical_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import normalize_source_trade
-from polycopy.ingestion.source_trade_metadata import (
+from polycopy.ingestion.normalized_source_trade import normalize_source_trade  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import (  # noqa: E402
     serialize_source_trade_metadata,
 )
-from polycopy.ingestion.source_trade_writer import write_valid_rows
-from polycopy.ingestion.specialist_evidence_collector import (
+from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
+from polycopy.ingestion.specialist_evidence_collector import (  # noqa: E402
     EvidenceCollectorConfig,
     collect_evidence,
 )
-from polycopy.ingestion.specialist_evidence_watchlist import add_watch
+from polycopy.ingestion.specialist_evidence_watchlist import add_watch  # noqa: E402
 
 # ── Test fixture Gamma market ──────────────────────────────────────────────────
 COND_ID = "0x" + "1" * 64
@@ -549,9 +551,6 @@ def test_mismatched_gamma_persisted_row_is_impossible_through_writer(
 # ════════════════════════════════════════════════════════════════════════════
 # Blocker 3 — Strict ``outcomeIndex`` parsing
 # ════════════════════════════════════════════════════════════════════════════
-
-
-import pytest
 
 
 @pytest.mark.parametrize(
