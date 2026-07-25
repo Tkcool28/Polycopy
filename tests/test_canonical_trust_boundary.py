@@ -29,20 +29,22 @@ for path in (ROOT / "src", ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 
-from polycopy.db.database import Database  # noqa: E402
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+from polycopy.db.database import Database
+from polycopy.ingestion.canonical_metadata import (
     MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     METADATA_VERSION,
     build_canonical_metadata,
     is_canonical_source_trade_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import normalize_source_trade  # noqa: E402
-from polycopy.ingestion.source_trade_metadata import (  # noqa: E402
+from polycopy.ingestion.normalized_source_trade import normalize_source_trade
+from polycopy.ingestion.source_trade_metadata import (
     METADATA_VERSION as LEGACY_METADATA_VERSION,
+)
+from polycopy.ingestion.source_trade_metadata import (
     serialize_source_trade_metadata,
 )
-from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
+from polycopy.ingestion.source_trade_writer import write_valid_rows
 
 # All PR #79 fixtures must use the SAME constants the canonical builder
 # uses (don't redeclare per-test).
@@ -354,9 +356,7 @@ def test_genuine_canonical_payload_serialization_is_deterministic() -> None:
     second = serialize_source_trade_metadata(metadata)
     assert first == second
     # Deterministic key ordering: keys appear sorted.
-    keys_in_order = []
-    for token in json.loads(first):
-        keys_in_order.append(token)
+    keys_in_order = list(json.loads(first))
     assert keys_in_order == sorted(keys_in_order)
 
 
@@ -505,6 +505,7 @@ def test_serializer_uses_the_canonical_validator_only() -> None:
     """
     import ast
     import inspect
+
     from polycopy.ingestion import source_trade_metadata as stm
 
     source = inspect.getsource(stm)
@@ -512,16 +513,13 @@ def test_serializer_uses_the_canonical_validator_only() -> None:
     # docstring isn't matched by the source-text check.
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        if isinstance(
-            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
         ):
-            if (
-                node.body
-                and isinstance(node.body[0], ast.Expr)
-                and isinstance(node.body[0].value, ast.Constant)
-                and isinstance(node.body[0].value.value, str)
-            ):
-                node.body[0].value.value = ""
+            node.body[0].value.value = ""
     code_only = ast.unparse(tree)
     # The presence-only check must be gone from the executable code.
     assert '"_snapshot" in raw' not in code_only, (

@@ -1067,6 +1067,7 @@ def is_canonical_source_trade_metadata(raw: Any) -> bool:
         return False
     if provenance.get("provider") != "gamma":
         return False
-    if provenance.get("snapshot_contract_version") != MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION:
-        return False
-    return True
+    return (
+        provenance.get("snapshot_contract_version")
+        == MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION
+    )
