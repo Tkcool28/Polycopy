@@ -123,7 +123,7 @@ def test_metadata_version_present_everywhere():
 
 def test_no_title_inference_in_any_producer():
     no_cat = FakeMarket({"conditionId": "0xc2", "question": "Who wins?"})
-    merged, status, rc = merge_canonical_metadata(None, no_cat, condition_id="0xc2")
+    merged, status, _ = merge_canonical_metadata(None, no_cat, condition_id="0xc2")
     assert status == MERGE_FILLED
     assert merged["taxonomy"]["raw_category"] is None
     assert merged["_snapshot"]["market"]["question"] == "Who wins?"

@@ -1,4 +1,5 @@
 """Contract tests for canonical ingestion market-evidence snapshots."""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +12,7 @@ for path in (ROOT / "src", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+from polycopy.ingestion.canonical_metadata import (
     MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     MERGE_CONFLICT,
     MERGE_FILLED,
@@ -20,8 +21,7 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     build_canonical_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import normalize_source_trade  # noqa: E402
-
+from polycopy.ingestion.normalized_source_trade import normalize_source_trade
 
 FULL_GAMMA = {
     "conditionId": "0x" + "1" * 64,
@@ -100,8 +100,9 @@ def test_provider_updated_at_requires_explicit_gamma_updated_at():
 
 
 def test_provider_updated_at_is_audit_only_for_replay(monkeypatch):
-    import polycopy.ingestion.canonical_metadata as module
     from datetime import datetime as real_datetime
+
+    import polycopy.ingestion.canonical_metadata as module
 
     class FirstClock:
         @classmethod
@@ -128,8 +129,9 @@ def test_provider_updated_at_is_audit_only_for_replay(monkeypatch):
 
 
 def test_identical_replay_is_byte_identical_and_unchanged(monkeypatch):
-    import polycopy.ingestion.canonical_metadata as module
     from datetime import datetime as real_datetime
+
+    import polycopy.ingestion.canonical_metadata as module
 
     class FirstClock:
         @classmethod
@@ -158,8 +160,9 @@ def test_identical_replay_is_byte_identical_and_unchanged(monkeypatch):
 
 
 def test_substantive_update_is_filled_and_advances_retrieval_time(monkeypatch):
-    import polycopy.ingestion.canonical_metadata as module
     from datetime import datetime as real_datetime
+
+    import polycopy.ingestion.canonical_metadata as module
 
     class FirstClock:
         @classmethod
@@ -279,6 +282,13 @@ def test_outcomes_blank_token():
     assert result["ordered"] == []
 
 
+def test_outcomes_numeric_token_is_invalid():
+    result = _validate_outcome_mapping('["A","B"]', '["1",2]')
+    assert result["status"] == "invalid"
+    assert result["ordered"] == []
+    assert "blank_or_invalid_token_at_index=1" in result["errors"]
+
+
 def test_outcomes_invalid_index():
     result = _validate_outcome_mapping('["A","B"]', '["1","2"]', outcome_index=2)
     assert result["valid_index"] is False
@@ -292,6 +302,24 @@ def test_outcomes_token_index_disagreement():
     assert result["index_token_agrees"] is False
     assert result["status"] == "invalid"
     assert result["ordered"] == []
+
+
+def test_outcomes_token_outcome_disagreement_without_index():
+    result = _validate_outcome_mapping(
+        '["A","B"]',
+        '["1","2"]',
+        selected_token="2",
+        selected_outcome="A",
+    )
+    assert result["status"] == "invalid"
+    assert "selected_token_outcome_disagreement" in result["errors"]
+
+
+def test_trade_float_outcome_index_is_not_truncated():
+    trade = dict(TRADE, outcomeIndex=0.5)
+    outcomes = build_canonical_metadata(trade, FULL_GAMMA)["_snapshot"]["outcomes"]
+    assert outcomes["valid_index"] is False
+    assert outcomes["status"] == "invalid"
 
 
 def test_outcomes_binary_market():
@@ -320,6 +348,46 @@ def test_taxonomy_conflict_does_not_discard_snapshot_fields():
     assert merged["taxonomy"]["raw_category"] == "Sports"
     assert merged["_snapshot"]["lifecycle"]["active"] is True
     assert merged["_snapshot"]["resolution"]["resolution_status"] is None
+
+
+def test_conflict_without_unrelated_fill_is_never_mislabeled_unchanged():
+    first, _, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    first["taxonomy"]["raw_category"] = "Sports"
+    merged, status, reasons = merge_canonical_metadata(
+        _dump(first), FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert status == MERGE_CONFLICT
+    assert reasons == ["taxonomy_raw_category_conflict"]
+    assert merged["taxonomy"]["raw_category"] == "Sports"
+    assert merged["_snapshot"] == first["_snapshot"]
+
+
+def test_immutable_snapshot_provenance_conflicts_and_is_preserved():
+    first, _, _ = merge_canonical_metadata(
+        None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    first["_snapshot"]["provenance"]["provider"] = "not-gamma"
+    merged, status, reasons = merge_canonical_metadata(
+        _dump(first), FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert status == MERGE_CONFLICT
+    assert "_snapshot_provenance_provider_conflict" in reasons
+    assert merged["_snapshot"]["provenance"]["provider"] == "not-gamma"
+
+
+def test_provider_market_id_cannot_substitute_for_missing_condition_id():
+    gamma = dict(FULL_GAMMA)
+    gamma.pop("conditionId")
+    gamma["id"] = FULL_GAMMA["conditionId"]
+    existing = _dump({"unrelated": {"keep": True}})
+    merged, status, reasons = merge_canonical_metadata(
+        existing, gamma, condition_id=FULL_GAMMA["conditionId"]
+    )
+    assert status == "unavailable"
+    assert reasons == ["condition_id_mismatch"]
+    assert merged["unrelated"] == {"keep": True}
 
 
 def test_outcome_conflict_does_not_erase_taxonomy_or_event():

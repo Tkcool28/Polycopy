@@ -78,6 +78,11 @@ def _fake_resolver(_cid):
     return dict(GAMMA_PAYLOAD)
 
 
+async def _async_fake_resolver(_cid):
+    """Async CLI seam for the same deterministic Gamma fixture."""
+    return dict(GAMMA_PAYLOAD)
+
+
 def _tmp():
     raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
 
@@ -936,10 +941,11 @@ def test_cli_persistence_failure_nonzero():
 
     async def _enrich(db_arg, st_id, **kw):
         # Exercise the real native async enrichment with write_provenance boomed.
+        kw["gamma_resolver"] = _async_fake_resolver
         return await orig_enrich(db_arg, st_id, **kw)
 
     ste.enrich_source_trade_async = _enrich
-    cli.enrichment_async_fn = orig_enrich
+    cli.enrichment_async_fn = _enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -1237,7 +1243,12 @@ def test_cli_honest_outcomes_exit0():
 
     orig_enrich = ste.enrich_source_trade_async
     orig_cli_enrich = cli.enrichment_async_fn
-    cli.enrichment_async_fn = orig_enrich
+
+    async def _enrich(db_arg, st_id, **kw):
+        kw["gamma_resolver"] = _async_fake_resolver
+        return await orig_enrich(db_arg, st_id, **kw)
+
+    cli.enrichment_async_fn = _enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -1272,7 +1283,12 @@ def test_cli_equivalent_replay_still_zero_write_exit0():
     _seed_trade(db, "polymarket:st1", COND, {})
     orig_enrich = ste.enrich_source_trade_async
     orig_cli_enrich = cli.enrichment_async_fn
-    cli.enrichment_async_fn = orig_enrich
+
+    async def _enrich(db_arg, st_id, **kw):
+        kw["gamma_resolver"] = _async_fake_resolver
+        return await orig_enrich(db_arg, st_id, **kw)
+
+    cli.enrichment_async_fn = _enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 

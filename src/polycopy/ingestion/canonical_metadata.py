@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Optional
 
 from polycopy.adapters.polymarket import parse_clob_token_ids
@@ -25,6 +25,16 @@ MERGE_FILLED = "filled"
 MERGE_UNCHANGED = "unchanged"
 MERGE_CONFLICT = "conflict"
 MERGE_UNAVAILABLE = "unavailable"
+
+_IMMUTABLE_PROVENANCE_FIELDS = frozenset(
+    {
+        "provider",
+        "lookup_kind",
+        "requested_condition_id",
+        "exact_match",
+        "snapshot_contract_version",
+    }
+)
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -55,7 +65,7 @@ def _tags(value: Any) -> list[str]:
     return sorted(tag for tag in normalized if tag is not None)
 
 
-def _as_bool(value: Any) -> Optional[bool]:
+def _as_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
@@ -71,7 +81,7 @@ def _ensure_version(meta: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _parse_array(value: Any) -> Optional[list[Any]]:
+def _parse_array(value: Any) -> list[Any] | None:
     if isinstance(value, list):
         return value
     if isinstance(value, str):
@@ -86,9 +96,9 @@ def _parse_array(value: Any) -> Optional[list[Any]]:
 def _validate_outcome_mapping(
     labels_raw: Any,
     clob_raw: Any,
-    outcome_index: Optional[int] = None,
-    selected_token: Optional[str] = None,
-    selected_outcome: Optional[str] = None,
+    outcome_index: Any = None,
+    selected_token: str | None = None,
+    selected_outcome: str | None = None,
 ) -> dict[str, Any]:
     """Return a complete ordered mapping only when every consistency check passes."""
     errors: list[str] = []
@@ -107,12 +117,11 @@ def _validate_outcome_mapping(
     token_ids: list[str] = []
     if raw_tokens is not None:
         for index, value in enumerate(raw_tokens):
-            token = _scalar(value)
-            if token is None:
+            if not isinstance(value, str) or not value.strip():
                 errors.append(f"blank_or_invalid_token_at_index={index}")
                 token_ids.append("")
             else:
-                token_ids.append(token.lower())
+                token_ids.append(value.strip().lower())
 
     if not labels:
         errors.append("labels_missing_or_empty")
@@ -124,8 +133,8 @@ def _validate_outcome_mapping(
     if len(usable_tokens) != len(set(usable_tokens)):
         errors.append("duplicate_token_ids")
 
-    valid_index: Optional[bool] = None
-    index_token_agrees: Optional[bool] = None
+    valid_index: bool | None = None
+    index_token_agrees: bool | None = None
     index_outcome_agrees: Optional[bool] = None
     if outcome_index is not None:
         valid_index = (
@@ -147,6 +156,35 @@ def _validate_outcome_mapping(
                 )
                 if not index_outcome_agrees:
                     errors.append("index_outcome_disagreement")
+    else:
+        normalized_token = (
+            selected_token.strip().lower()
+            if isinstance(selected_token, str) and selected_token.strip()
+            else None
+        )
+        normalized_outcome = (
+            selected_outcome.strip().casefold()
+            if isinstance(selected_outcome, str) and selected_outcome.strip()
+            else None
+        )
+        token_matches = [
+            index for index, token in enumerate(token_ids) if token == normalized_token
+        ]
+        outcome_matches = [
+            index
+            for index, label in enumerate(labels)
+            if label.casefold() == normalized_outcome
+        ]
+        if normalized_token is not None and len(token_matches) != 1:
+            errors.append("selected_token_not_in_mapping")
+        if normalized_outcome is not None and not outcome_matches:
+            errors.append("selected_outcome_not_in_mapping")
+        if (
+            normalized_token is not None
+            and normalized_outcome is not None
+            and not set(token_matches).intersection(outcome_matches)
+        ):
+            errors.append("selected_token_outcome_disagreement")
 
     compatible = not errors
     if compatible:
@@ -325,7 +363,7 @@ def _build_market_snapshot(
     outcomes = _validate_outcome_mapping(
         market.get("outcomes"),
         market.get("clobTokenIds"),
-        outcome_index=_trade_index(trade),
+        outcome_index=trade.get("outcomeIndex") if trade else None,
         selected_token=_first_scalar(
             trade.get("asset") if trade else None,
             trade.get("token_id") if trade else None,
@@ -391,7 +429,7 @@ def build_canonical_metadata(
 
 
 def _gamma_condition_id(gamma_market: Mapping[str, Any]) -> Optional[str]:
-    value = gamma_market.get("conditionId") or gamma_market.get("id")
+    value = gamma_market.get("conditionId")
     return str(value).lower() if value is not None else None
 
 
@@ -432,7 +470,11 @@ def _merge_standard_namespace(
 
 
 def _merge_refreshable_dict(
-    current: Any, incoming: Mapping[str, Any], namespace: str
+    current: Any,
+    incoming: Mapping[str, Any],
+    namespace: str,
+    *,
+    immutable_fields: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], bool, list[str]]:
     if not isinstance(current, dict):
         if _is_empty(current):
@@ -450,7 +492,11 @@ def _merge_refreshable_dict(
             changed = True
         elif old == value:
             continue
-        elif isinstance(old, (dict, list)) or isinstance(value, (dict, list)):
+        elif (
+            key in immutable_fields
+            or isinstance(old, (dict, list))
+            or isinstance(value, (dict, list))
+        ):
             reasons.append(f"_snapshot_{namespace}_{key}_conflict")
         else:
             output[key] = value
@@ -474,7 +520,14 @@ def _merge_snapshot(
         if not isinstance(new_namespace, Mapping):
             continue
         merged_namespace, namespace_changed, namespace_reasons = _merge_refreshable_dict(
-            existing_snapshot.get(namespace), new_namespace, namespace
+            existing_snapshot.get(namespace),
+            new_namespace,
+            namespace,
+            immutable_fields=(
+                _IMMUTABLE_PROVENANCE_FIELDS
+                if namespace == "provenance"
+                else frozenset()
+            ),
         )
         if namespace_changed:
             output[namespace] = merged_namespace
@@ -562,17 +615,18 @@ def merge_canonical_metadata(
     if snapshot_changed:
         assert isinstance(snapshot, dict)
         provenance = snapshot.setdefault("provenance", {})
-        provenance["retrieved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        provenance["retrieved_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         merged["_snapshot"] = snapshot
         changed = True
     reasons.extend(snapshot_reasons)
 
     merged["metadata_version"] = METADATA_VERSION
+    if reasons:
+        return json.loads(json.dumps(merged, sort_keys=True)), MERGE_CONFLICT, reasons
     if not changed:
         reasons.append("no_change")
         return _ensure_version(existing), MERGE_UNCHANGED, reasons
-    status = MERGE_CONFLICT if reasons else MERGE_FILLED
-    return json.loads(json.dumps(merged, sort_keys=True)), status, reasons
+    return json.loads(json.dumps(merged, sort_keys=True)), MERGE_FILLED, reasons
 
 
 def build_metadata_from_gamma_market(
