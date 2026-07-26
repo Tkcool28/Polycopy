@@ -29,22 +29,25 @@ for path in (ROOT / "src", ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 
-from polycopy.db.database import Database
-from polycopy.ingestion.canonical_metadata import (
+from polycopy.db.database import Database  # noqa: E402
+from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+    CanonicalSourceTradeMetadata,
     MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     METADATA_VERSION,
     build_canonical_metadata,
     is_canonical_source_trade_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import normalize_source_trade
-from polycopy.ingestion.source_trade_metadata import (
+from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
+    normalize_source_trade,
+)
+from polycopy.ingestion.source_trade_metadata import (  # noqa: E402
     METADATA_VERSION as LEGACY_METADATA_VERSION,
 )
-from polycopy.ingestion.source_trade_metadata import (
+from polycopy.ingestion.source_trade_metadata import (  # noqa: E402
     serialize_source_trade_metadata,
 )
-from polycopy.ingestion.source_trade_writer import write_valid_rows
+from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
 
 # All PR #79 fixtures must use the SAME constants the canonical builder
 # uses (don't redeclare per-test).
@@ -98,19 +101,31 @@ def _raw_trade(
     }
 
 
-def _genuine_canonical_payload() -> dict:
-    """Return a metadata dict produced by the real canonical builder."""
+def _genuine_canonical_payload() -> CanonicalSourceTradeMetadata:
+    """Return trusted metadata produced by the real canonical builder."""
     metadata = build_canonical_metadata(
         _raw_trade(),
         dict(FULL_GAMMA),
         requested_condition_id=CON_ID,
         enforce_exact_condition_match=True,
     )
-    assert is_canonical_source_trade_metadata(metadata), (
-        "fixture self-check: canonical builder must produce a payload that "
-        "passes the strict validator"
-    )
+    assert type(metadata) is CanonicalSourceTradeMetadata
     return metadata
+
+
+class _ChangingDict(dict):
+    """Expose a benign first key view, then reveal forged contents."""
+
+    def __init__(self, benign: dict, forged: dict) -> None:
+        super().__init__(forged)
+        self._benign = benign
+        self._keys_calls = 0
+
+    def keys(self):
+        self._keys_calls += 1
+        if self._keys_calls == 1:
+            return self._benign.keys()
+        return super().keys()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -173,6 +188,61 @@ def test_forged_raw_mapping_does_not_mutate_input() -> None:
     assert forged == snapshot_before, (
         "serialize_source_trade_metadata must not mutate the input mapping"
     )
+
+
+def test_fully_compliant_forged_mapping_fails_closed() -> None:
+    forged = {
+        "metadata_version": "1",
+        "taxonomy": {},
+        "event": {},
+        "series": {},
+        "_snapshot": {
+            "market": {"condition_id": "forged"},
+            "outcomes": {"forged": "evidence"},
+            "lifecycle": {},
+            "resolution": {},
+            "provenance": {
+                "provider": "gamma",
+                "snapshot_contract_version": "2",
+                "exact_match": True,
+                "secret": "must-not-pass",
+            },
+        },
+    }
+
+    serialized = serialize_source_trade_metadata(forged)
+    assert "_snapshot" not in serialized
+    for forbidden in (
+        "exact_match",
+        "snapshot_contract_version",
+        "secret",
+        "forged",
+        "evidence",
+        "gamma",
+    ):
+        assert forbidden not in serialized
+
+
+def test_hostile_dict_subclass_cannot_select_trusted_path() -> None:
+    benign = dict(_genuine_canonical_payload())
+    forged = copy.deepcopy(benign)
+    forged["_snapshot"]["provenance"]["secret"] = "must-not-pass"
+    hostile = _ChangingDict(benign, forged)
+
+    serialized = serialize_source_trade_metadata(hostile)
+    assert "_snapshot" not in serialized
+    assert "secret" not in serialized
+    assert "must-not-pass" not in serialized
+
+
+def test_copied_builder_mapping_loses_trust() -> None:
+    trusted = _genuine_canonical_payload()
+    ordinary = copy.deepcopy(dict(trusted))
+
+    serialized = serialize_source_trade_metadata(ordinary)
+    assert "_snapshot" not in serialized
+    assert "exact_match" not in serialized
+    assert "gamma" not in serialized
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -496,35 +566,14 @@ def test_genuine_canonical_payload_merges_unchanged() -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def test_serializer_uses_the_canonical_validator_only() -> None:
-    """The serializer must delegate canonical detection to the single helper.
-
-    Pin against anyone future-creating a second ``_has_snapshot`` /
-    ``_is_canonical_*`` shape inside source_trade_metadata. The only
-    canonical definition lives in canonical_metadata.
-    """
-    import ast
+def test_serializer_uses_exact_trusted_type_identity() -> None:
+    """Pin the serializer contract without broad source-code grepping."""
     import inspect
 
     from polycopy.ingestion import source_trade_metadata as stm
 
-    source = inspect.getsource(stm)
-    # Strip docstrings so the literal substring inside the warning
-    # docstring isn't matched by the source-text check.
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
-            node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)
-        ):
-            node.body[0].value.value = ""
-    code_only = ast.unparse(tree)
-    # The presence-only check must be gone from the executable code.
-    assert '"_snapshot" in raw' not in code_only, (
-        "source_trade_metadata must not re-implement the presence-only "
-        "_snapshot check in code; delegate to is_canonical_source_trade_metadata"
-    )
-    # The serializer must reference the single authoritative validator.
-    assert "is_canonical_source_trade_metadata" in code_only
+    detector_source = inspect.getsource(stm._is_trusted_canonical)
+    assert "type(raw) is CanonicalSourceTradeMetadata" in detector_source
+    serializer_source = inspect.getsource(stm.serialize_source_trade_metadata)
+    assert "_is_trusted_canonical(raw)" in serializer_source
+    assert "is_canonical_source_trade_metadata" not in serializer_source

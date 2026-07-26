@@ -17,8 +17,8 @@ from collections.abc import Mapping
 from typing import Any
 
 from polycopy.ingestion.canonical_metadata import (
+    CanonicalSourceTradeMetadata,
     build_canonical_metadata,
-    is_canonical_source_trade_metadata,
     normalize_source_trade_metadata as _normalize_source_trade_metadata,
 )
 from polycopy.taxonomy.official_polymarket import (
@@ -70,26 +70,9 @@ def normalize_source_trade_metadata(raw: Mapping[str, Any] | None) -> dict[str, 
     return _normalize_source_trade_metadata(raw)
 
 
-def _has_snapshot(raw: Mapping[str, Any] | None) -> bool:
-    """CANONICAL TRUST BOUNDARY — delegate to the single authoritative validator.
-
-    The writer passes already-built canonical metadata (including any
-    ``_snapshot``) into the serializer. A payload may be serialized
-    verbatim as an already-canonical snapshot ONLY when its structure
-    proves it was produced under the canonical metadata contract. The
-    single authoritative check lives in
-    :func:`polycopy.ingestion.canonical_metadata.is_canonical_source_trade_metadata`
-    — this module must NOT grow a second definition of "canonical".
-
-    The legacy presence-only ``"_snapshot" in raw`` discriminator was a
-    trust-boundary bug: any upstream-shaped mapping that happened to name
-    the key bypassed normalization and was serialized verbatim. See
-    ``tests/test_pXX_pr79_canonical_trust_boundary.py`` for the forged /
-    nearly-canonical failure modes it allowed.
-    """
-    if not isinstance(raw, Mapping):
-        return False
-    return is_canonical_source_trade_metadata(raw)
+def _is_trusted_canonical(raw: Any) -> bool:
+    """Select the full-snapshot path only by exact internal type identity."""
+    return type(raw) is CanonicalSourceTradeMetadata
 
 
 def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> str | None:
@@ -116,7 +99,7 @@ def build_metadata_from_gamma_market(
     *,
     requested_condition_id: str | None = None,
     enforce_exact_condition_match: bool = False,
-) -> dict[str, Any]:
+) -> dict[str, Any] | CanonicalSourceTradeMetadata:
     """Build the canonical PR66 metadata contract from a trusted Gamma market.
 
     Thin delegation to :func:`polycopy.ingestion.canonical_metadata.build_canonical_metadata`
@@ -137,51 +120,20 @@ def build_metadata_from_gamma_market(
 
 
 def serialize_source_trade_metadata(raw: Mapping[str, Any] | None) -> str:
-    """Serialize canonical source-trade evidence deterministically.
+    """Serialize source-trade metadata through one fail-closed boundary.
 
-    THIS IS THE SINGLE CANONICAL SERIALIZATION BOUNDARY. The writer
-    (``source_trade_writer._row_tuple``) calls only this function.
-
-    Two paths:
-
-    1. **Canonical snapshot path.** When ``raw`` proves it was produced
-       under the canonical metadata contract
-       (``is_canonical_source_trade_metadata(raw)`` is True), the
-       function emits the exact bytes of that payload with deterministic
-       key ordering so the writer can persist the canonical
-       ``_snapshot`` alongside the v1 namespaces. The contract is
-       strict: top-level keys, ``metadata_version``, ``_snapshot``
-       namespaces, and Gamma provenance identity are all checked.
-
-    2. **Legacy v1 path.** Otherwise, the payload is routed through
-       :func:`normalize_source_trade_metadata`, which:
-
-         * strips ``_snapshot`` (the canonical builder never emits one
-           for non-canonical inputs, so a stray ``_snapshot`` is dropped);
-         * strips arbitrary unknown top-level keys (only the bounded
-           canonical top-level set is preserved);
-         * does not preserve any asserted authoritative market evidence.
-
-    The serializer never mutates the input mapping. The function is pure
-    with respect to the writer's ``c.metadata``; the writer's printer
-    re-runs ``serialize_source_trade_metadata(c.metadata)`` after a
-    write and the input dict is unchanged.
+    Only the exact builder-owned :class:`CanonicalSourceTradeMetadata` type
+    receives full-snapshot serialization. Every ordinary mapping, including
+    dict subclasses and schema-perfect copies, is treated as untrusted and
+    routed through bounded metadata-v1 normalization.
     """
-    if _has_snapshot(raw):
-        # Verbatim path: the canonical validator already proved this is
-        # the bounded canonical shape. Serialize as-is under deterministic
-        # key ordering so the persisted bytes are stable.
+    if _is_trusted_canonical(raw):
+        assert type(raw) is CanonicalSourceTradeMetadata
         return json.dumps(
-            raw,
+            raw.to_plain_dict(),
             sort_keys=True,
             separators=_CANONICAL_SEPARATORS,
         )
-    # Legacy path: ``normalize_source_trade_metadata`` is the bounded
-    # canonical builder for upstream-like inputs. It produces exactly
-    # the v1 contract (``metadata_version`` + ``event`` + ``taxonomy`` +
-    # ``series``), unconditionally drops any ``_snapshot`` and any
-    # arbitrary unknown top-level keys, and never stamps authoritative
-    # Gamma evidence.
     normalized = _normalize_source_trade_metadata(raw)
     return json.dumps(
         normalized,

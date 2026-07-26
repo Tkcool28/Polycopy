@@ -6,10 +6,11 @@ resolution, and provider update time. Wallet-trade fields are context only.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, final
 
 from polycopy.adapters.polymarket import parse_clob_token_ids
 from polycopy.taxonomy.official_polymarket import (
@@ -25,6 +26,35 @@ MERGE_FILLED = "filled"
 MERGE_UNCHANGED = "unchanged"
 MERGE_CONFLICT = "conflict"
 MERGE_UNAVAILABLE = "unavailable"
+
+
+_CANONICAL_TRUST_TOKEN = object()
+
+
+@final
+class CanonicalSourceTradeMetadata(dict[str, Any]):
+    """Trusted dictionary created only by the canonical builder.
+
+    Construction requires a module-private identity token and snapshots the
+    builder-owned dictionary. Exact type identity selects trusted serialization;
+    ordinary dicts and all subclasses remain untrusted. ``deepcopy`` deliberately
+    returns a plain dict so copied payloads lose trust.
+    """
+
+    def __init__(self, value: dict[str, Any], *, _token: object) -> None:
+        if _token is not _CANONICAL_TRUST_TOKEN:
+            raise TypeError("CanonicalSourceTradeMetadata is builder-only")
+        super().__init__(copy.deepcopy(value))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "CanonicalSourceTradeMetadata":
+        return CanonicalSourceTradeMetadata(
+            copy.deepcopy(dict(self), memo), _token=_CANONICAL_TRUST_TOKEN
+        )
+
+    def to_plain_dict(self) -> dict[str, Any]:
+        """Return an untrusted deep copy for inspection or legacy handling."""
+        return copy.deepcopy(dict(self))
+
 
 _IMMUTABLE_PROVENANCE_FIELDS = frozenset(
     {
@@ -566,7 +596,7 @@ def build_canonical_metadata(
     *,
     requested_condition_id: str | None = None,
     enforce_exact_condition_match: bool = False,
-) -> dict[str, Any]:
+) -> dict[str, Any] | CanonicalSourceTradeMetadata:
     """Build the canonical PR66 metadata payload from a trusted Gamma market.
 
     Parameters
@@ -622,7 +652,7 @@ def build_canonical_metadata(
         requested_condition_id=requested_condition_id,
         enforce_exact_condition_match=enforce_exact_condition_match,
     )
-    return result
+    return CanonicalSourceTradeMetadata(result, _token=_CANONICAL_TRUST_TOKEN)
 
 
 def _gamma_condition_id(gamma_market: Mapping[str, Any]) -> str | None:
@@ -992,7 +1022,7 @@ def merge_canonical_metadata(
 def build_metadata_from_gamma_market(
     raw: Mapping[str, Any] | None,
     gamma_market: Mapping[str, Any] | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | CanonicalSourceTradeMetadata:
     """Compatibility alias for callers that have not moved to the canonical name."""
     return build_canonical_metadata(raw, gamma_market)
 
@@ -1000,74 +1030,17 @@ def build_metadata_from_gamma_market(
 # ─────────────────────────────────────────────────────────────────────────────
 # Canonical-metadata trust boundary
 #
-# A payload may be serialized as an already-canonical source-trade metadata
-# snapshot only when its structure proves it was produced under the canonical
-# metadata contract. This is the SINGLE authoritative validator: the legacy
-# serializer (and any other caller that wants to snapshot a raw mapping
-# verbatim) MUST route through this function instead of inspecting the
-# ``_snapshot`` key on its own. Two assertions must hold:
-#
-#   1. The map is the exact canonical shape produced by
-#      ``build_canonical_metadata`` (top-level keys, ``metadata_version``,
-#      ``_snapshot`` namespaces, Gamma provenance identity).
-#   2. No arbitrary unknown top-level or snapshot keys are smuggled in.
-#
-# The validator is deliberately pure: it accepts the mapping by reference and
-# reads it only. It never mutates the input, never calls back into the
-# builder, and never logs. Failed validation returns ``False``; the caller
-# decides what to do (the serializer routes the payload through legacy v1
-# normalization and strips ``_snapshot``).
+# Trust is represented by ``CanonicalSourceTradeMetadata`` type identity, not
+# payload contents. The canonical builder is the only production constructor.
+# Ordinary mappings — even schema-perfect copies — always remain untrusted and
+# must pass through bounded metadata-v1 normalization.
 # ─────────────────────────────────────────────────────────────────────────────
-
-_CANONICAL_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
-    {"metadata_version", "taxonomy", "event", "series", "_snapshot"}
-)
-_CANONICAL_SNAPSHOT_NAMESPACES: frozenset[str] = frozenset(
-    {"market", "outcomes", "lifecycle", "resolution", "provenance"}
-)
 
 
 def is_canonical_source_trade_metadata(raw: Any) -> bool:
-    """Return True iff ``raw`` is a canonical source-trade metadata payload.
+    """Return whether ``raw`` has trusted canonical type identity.
 
-    The canonical contract is:
-
-      * Top-level keys are exactly
-        ``{"metadata_version", "taxonomy", "event", "series", "_snapshot"}``
-        — no other keys may be present.
-      * ``metadata_version`` equals :data:`METADATA_VERSION`.
-      * ``_snapshot`` is a mapping whose keys are exactly
-        ``{"market", "outcomes", "lifecycle", "resolution", "provenance"}``.
-      * ``_snapshot.provenance.provider == "gamma"``.
-      * ``_snapshot.provenance.snapshot_contract_version`` equals
-        :data:`MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION`.
-
-    Any deviation fails closed: the caller MUST route the mapping through
-    legacy v1 normalization and drop ``_snapshot`` rather than persist the
-    payload verbatim. The validator never mutates the input.
+    Ordinary mappings always return ``False`` regardless of their contents.
+    This helper exists for compatibility and must never inspect mapping fields.
     """
-    if not isinstance(raw, Mapping):
-        return False
-    # Reject any top-level key outside the bounded canonical set first; this
-    # is the simplest, most robust way to refuse a forged/smuggled payload
-    # even when it names the right keys (e.g. {"_snapshot": {...}, "secret": ...}).
-    if set(raw.keys()) != _CANONICAL_TOP_LEVEL_KEYS:
-        return False
-    if raw.get("metadata_version") != METADATA_VERSION:
-        return False
-    snapshot = raw.get("_snapshot")
-    if not isinstance(snapshot, Mapping):
-        return False
-    if set(snapshot.keys()) != _CANONICAL_SNAPSHOT_NAMESPACES:
-        return False
-    if not all(isinstance(snapshot.get(ns), Mapping) for ns in _CANONICAL_SNAPSHOT_NAMESPACES):
-        return False
-    provenance = snapshot.get("provenance")
-    if not isinstance(provenance, Mapping):
-        return False
-    if provenance.get("provider") != "gamma":
-        return False
-    return (
-        provenance.get("snapshot_contract_version")
-        == MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION
-    )
+    return type(raw) is CanonicalSourceTradeMetadata

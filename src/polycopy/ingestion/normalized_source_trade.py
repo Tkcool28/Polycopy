@@ -174,7 +174,7 @@ class NormalizedSourceTrade:
     market_title: Optional[str] = None
     market_slug: Optional[str] = None
     # Versioned source evidence; event.slug is identity/provenance, never a category.
-    metadata: Optional[dict[str, Any]] = None
+    metadata: Optional[Mapping[str, Any]] = None
 
     # Provenance flags (always 0 for live records).
     is_sample: int = 0
