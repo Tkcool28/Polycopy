@@ -1,9 +1,13 @@
 name: Recover canonical source trade writer
 
 on:
-  push:
+  pull_request:
     branches:
-      - feat/canonical-source-trade-write-architecture
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
   workflow_dispatch:
 
 permissions:
@@ -11,6 +15,7 @@ permissions:
 
 jobs:
   recover:
+    if: github.head_ref == 'feat/canonical-source-trade-write-architecture' || github.ref_name == 'feat/canonical-source-trade-write-architecture'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +38,7 @@ jobs:
         env:
           BASE_SHA: 8ba2d3307143dcc5399854af65ad83b35f3fee93
           TARGET_BRANCH: feat/canonical-source-trade-write-architecture
+          EXPECTED_REMOTE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           git config user.name "Codex"
@@ -71,4 +77,4 @@ jobs:
           test "$(git rev-parse HEAD^)" = "$BASE_SHA"
           test -z "$(git status --porcelain)"
           git push origin "HEAD:refs/heads/$TARGET_BRANCH" \
-            --force-with-lease="refs/heads/$TARGET_BRANCH:${GITHUB_SHA}"
+            --force-with-lease="refs/heads/$TARGET_BRANCH:${EXPECTED_REMOTE_SHA}"
