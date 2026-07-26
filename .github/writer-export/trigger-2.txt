@@ -1,0 +1,1 @@
+Synchronize recovery trigger after trusted workflow update.
