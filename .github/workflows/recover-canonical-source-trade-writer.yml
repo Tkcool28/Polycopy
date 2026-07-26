@@ -6,6 +6,11 @@ on:
       - feat/canonical-source-trade-write-architecture
     paths:
       - .github/workflows/recover-canonical-source-trade-writer.yml
+  pull_request:
+    branches:
+      - main
+    types:
+      - synchronize
   workflow_dispatch:
 
 permissions:
@@ -13,6 +18,7 @@ permissions:
 
 jobs:
   recover:
+    if: github.head_ref == 'feat/canonical-source-trade-write-architecture' || github.ref_name == 'feat/canonical-source-trade-write-architecture'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,5 +79,3 @@ EOF
 
           git push origin "HEAD:refs/heads/$TARGET_BRANCH" \
             --force-with-lease="refs/heads/$TARGET_BRANCH:$old_sha"
-
-# Triggered after the complete verified patch blob was attached.
