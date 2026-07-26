@@ -4,8 +4,7 @@ on:
   push:
     branches:
       - feat/canonical-source-trade-write-architecture
-    paths:
-      - .github/workflows/recover-canonical-source-trade-writer.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
