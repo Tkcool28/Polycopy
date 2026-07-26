@@ -1,13 +1,11 @@
 name: Recover canonical source trade writer
 
 on:
-  pull_request:
+  push:
     branches:
-      - main
-    types:
-      - opened
-      - synchronize
-      - reopened
+      - feat/canonical-source-trade-write-architecture
+    paths:
+      - .github/workflows/recover-canonical-source-trade-writer.yml
   workflow_dispatch:
 
 permissions:
@@ -15,7 +13,6 @@ permissions:
 
 jobs:
   recover:
-    if: github.head_ref == 'feat/canonical-source-trade-write-architecture' || github.ref_name == 'feat/canonical-source-trade-write-architecture'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
