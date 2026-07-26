@@ -23,44 +23,56 @@ jobs:
           fetch-depth: 0
           ref: feat/canonical-source-trade-write-architecture
 
-      - name: Diagnose exported patch transport
+      - name: Reconstruct and verify exported patch
         shell: bash
-        env:
-          TARGET_BRANCH: feat/canonical-source-trade-write-architecture
         run: |
           set -euo pipefail
-          if test -f .github/writer-export/diagnostic.txt; then
-            cat .github/writer-export/diagnostic.txt
-            exit 0
-          fi
+          base64 --decode .github/writer-export/full.b64 > /tmp/commit.patch
+          test "$(wc -c < /tmp/commit.patch)" = "56108"
+          echo "548d4953eacf1af233e6c8ba320fe2ec37ce1c79b9925a27404c0dd69d15a5ca  /tmp/commit.patch" | sha256sum -c -
 
-          cat .github/writer-export/part-00 \
-              .github/writer-export/part-01 \
-              .github/writer-export/part-02 > /tmp/commit.patch.b64
-
-          set +e
-          base64 --decode /tmp/commit.patch.b64 > /tmp/commit.patch
-          decode_status=$?
-          set -e
-
-          {
-            printf 'part00_bytes=%s\n' "$(wc -c < .github/writer-export/part-00)"
-            printf 'part01_bytes=%s\n' "$(wc -c < .github/writer-export/part-01)"
-            printf 'part02_bytes=%s\n' "$(wc -c < .github/writer-export/part-02)"
-            printf 'combined_bytes=%s\n' "$(wc -c < /tmp/commit.patch.b64)"
-            printf 'decode_status=%s\n' "$decode_status"
-            printf 'decoded_bytes=%s\n' "$(wc -c < /tmp/commit.patch)"
-            printf 'decoded_sha256=%s\n' "$(sha256sum /tmp/commit.patch | awk '{print $1}')"
-            printf 'part00_head=%s\n' "$(head -c 24 .github/writer-export/part-00)"
-            printf 'part00_tail=%s\n' "$(tail -c 24 .github/writer-export/part-00)"
-            printf 'part01_head=%s\n' "$(head -c 24 .github/writer-export/part-01)"
-            printf 'part01_tail=%s\n' "$(tail -c 24 .github/writer-export/part-01)"
-            printf 'part02_head=%s\n' "$(head -c 24 .github/writer-export/part-02)"
-            printf 'part02_tail=%s\n' "$(tail -c 24 .github/writer-export/part-02)"
-          } > .github/writer-export/diagnostic.txt
-
+      - name: Rebuild clean branch from required base
+        shell: bash
+        env:
+          BASE_SHA: 8ba2d3307143dcc5399854af65ad83b35f3fee93
+          TARGET_BRANCH: feat/canonical-source-trade-write-architecture
+          EXPECTED_REMOTE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
           git config user.name "Codex"
           git config user.email "codex@openai.com"
-          git add .github/writer-export/diagnostic.txt
-          git commit -m "Record recovery transport diagnostics"
-          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          git reset --hard "$BASE_SHA"
+          git apply --check /tmp/commit.patch
+          git apply --index /tmp/commit.patch
+          git diff --cached --check
+
+          expected="$(cat <<'EOF' | sort
+          docs/canonical_source_trade_write_architecture.md
+          scripts/backfill_resolution_truth.py
+          scripts/backfill_specialist_trade_taxonomy.py
+          scripts/collect_approved_wallet_trades.py
+          scripts/collect_smart_money_data.py
+          scripts/collect_specialist_evidence_cohort.py
+          scripts/evidence_db.py
+          scripts/live_smoke_pr3_fixes.py
+          scripts/run_scan.py
+          scripts/seed_demo_data.py
+          src/polycopy/config/settings.py
+          src/polycopy/engine/source_trade_ingestion_writer_audit.py
+          src/polycopy/ingestion/source_trade_enrichment.py
+          src/polycopy/ingestion/source_trade_metadata_reconciliation.py
+          src/polycopy/ingestion/source_trade_resolution.py
+          tests/test_p24d_global_job_lock.py
+          tests/test_p24x_source_trade_ingestion_writer_audit.py
+          tests/test_pr24z_manual_real_source_trade_ingestion.py
+          tests/test_source_trade_write_architecture.py
+          EOF
+          )"
+          actual="$(git diff --cached --name-only | sort)"
+          test "$actual" = "$expected"
+
+          git commit -m "Establish canonical source trade write architecture"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test -z "$(git status --porcelain)"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH" \
+            --force-with-lease="refs/heads/$TARGET_BRANCH:${EXPECTED_REMOTE_SHA}"
