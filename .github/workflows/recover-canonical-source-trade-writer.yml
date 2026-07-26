@@ -30,7 +30,11 @@ jobs:
           cat .github/writer-export/part-00 \
               .github/writer-export/part-01 \
               .github/writer-export/part-02 > /tmp/commit.patch.b64
+          echo "encoded_bytes=$(wc -c < /tmp/commit.patch.b64)"
           base64 --decode /tmp/commit.patch.b64 > /tmp/commit.patch
+          echo "decoded_bytes=$(wc -c < /tmp/commit.patch)"
+          echo -n "decoded_sha256="
+          sha256sum /tmp/commit.patch | awk '{print $1}'
           echo "548d4953eacf1af233e6c8ba320fe2ec37ce1c79b9925a27404c0dd69d15a5ca  /tmp/commit.patch" | sha256sum -c -
 
       - name: Rebuild clean branch from required base
