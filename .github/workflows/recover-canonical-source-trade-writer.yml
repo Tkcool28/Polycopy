@@ -73,3 +73,5 @@ EOF
 
           git push origin "HEAD:refs/heads/$TARGET_BRANCH" \
             --force-with-lease="refs/heads/$TARGET_BRANCH:$old_sha"
+
+# Triggered after the complete verified patch blob was attached.
