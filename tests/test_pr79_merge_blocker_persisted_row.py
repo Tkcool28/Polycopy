@@ -32,8 +32,8 @@ for path in (ROOT / "src", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from polycopy.db.database import Database  # noqa: E402
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+from polycopy.db.database import Database
+from polycopy.ingestion.canonical_metadata import (
     MERGE_CONFLICT,
     MERGE_FILLED,
     MERGE_UNAVAILABLE,
@@ -42,18 +42,18 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     build_canonical_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
+from polycopy.ingestion.normalized_source_trade import (
     normalize_source_trade,
 )
-from polycopy.ingestion.source_trade_metadata import (  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import (
     serialize_source_trade_metadata,
 )
-from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
-from polycopy.ingestion.specialist_evidence_collector import (  # noqa: E402
+from polycopy.ingestion.source_trade_writer import write_valid_rows
+from polycopy.ingestion.specialist_evidence_collector import (
     EvidenceCollectorConfig,
     collect_evidence,
 )
-from polycopy.ingestion.specialist_evidence_watchlist import add_watch  # noqa: E402
+from polycopy.ingestion.specialist_evidence_watchlist import add_watch
 
 # ── Test fixture Gamma market ──────────────────────────────────────────────────
 COND_ID = "0x" + "1" * 64

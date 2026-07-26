@@ -46,7 +46,7 @@ class CanonicalSourceTradeMetadata(dict[str, Any]):
             raise TypeError("CanonicalSourceTradeMetadata is builder-only")
         super().__init__(copy.deepcopy(value))
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> "CanonicalSourceTradeMetadata":
+    def __deepcopy__(self, memo: dict[int, Any]) -> CanonicalSourceTradeMetadata:
         return CanonicalSourceTradeMetadata(
             copy.deepcopy(dict(self), memo), _token=_CANONICAL_TRUST_TOKEN
         )

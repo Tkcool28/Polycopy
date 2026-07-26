@@ -12,7 +12,7 @@ for path in (ROOT / "src", ROOT / "scripts"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+from polycopy.ingestion.canonical_metadata import (
     MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     MERGE_CONFLICT,
     MERGE_FILLED,
@@ -21,7 +21,7 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     build_canonical_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
+from polycopy.ingestion.normalized_source_trade import (
     normalize_source_trade,
 )
 

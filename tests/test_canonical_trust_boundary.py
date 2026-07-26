@@ -29,25 +29,25 @@ for path in (ROOT / "src", ROOT / "scripts"):
         sys.path.insert(0, str(path))
 
 
-from polycopy.db.database import Database  # noqa: E402
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
-    CanonicalSourceTradeMetadata,
+from polycopy.db.database import Database
+from polycopy.ingestion.canonical_metadata import (
     MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     METADATA_VERSION,
+    CanonicalSourceTradeMetadata,
     build_canonical_metadata,
     is_canonical_source_trade_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
+from polycopy.ingestion.normalized_source_trade import (
     normalize_source_trade,
 )
-from polycopy.ingestion.source_trade_metadata import (  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import (
     METADATA_VERSION as LEGACY_METADATA_VERSION,
 )
-from polycopy.ingestion.source_trade_metadata import (  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import (
     serialize_source_trade_metadata,
 )
-from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
+from polycopy.ingestion.source_trade_writer import write_valid_rows
 
 # All PR #79 fixtures must use the SAME constants the canonical builder
 # uses (don't redeclare per-test).
