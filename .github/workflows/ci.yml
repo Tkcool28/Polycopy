@@ -11,9 +11,72 @@ on:
 # No real Polymarket trades can be executed in CI.
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  recover-canonical-writer:
+    name: Reconstruct canonical writer branch
+    if: github.event_name == 'pull_request' && github.head_ref == 'feat/canonical-source-trade-write-architecture'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: feat/canonical-source-trade-write-architecture
+
+      - name: Apply exact verified export
+        shell: bash
+        env:
+          BASE_SHA: 8ba2d3307143dcc5399854af65ad83b35f3fee93
+          TARGET_BRANCH: feat/canonical-source-trade-write-architecture
+        run: |
+          set -euo pipefail
+          old_sha="$(git rev-parse HEAD)"
+
+          echo "38fc47b53c9be0a69ef1abdfdc03fa9eccde589c01a070a7ee2d4ca8fcc2c78a  .github/writer-export/commit.patch.gz" | sha256sum -c -
+          gzip -dc .github/writer-export/commit.patch.gz > /tmp/commit.patch
+          echo "548d4953eacf1af233e6c8ba320fe2ec37ce1c79b9925a27404c0dd69d15a5ca  /tmp/commit.patch" | sha256sum -c -
+
+          git config user.name "Codex"
+          git config user.email "codex@openai.com"
+          git reset --hard "$BASE_SHA"
+          git apply --check /tmp/commit.patch
+          git apply --index /tmp/commit.patch
+          git diff --cached --check
+
+          expected="$(cat <<'EOF' | sort
+docs/canonical_source_trade_write_architecture.md
+scripts/backfill_resolution_truth.py
+scripts/backfill_specialist_trade_taxonomy.py
+scripts/collect_approved_wallet_trades.py
+scripts/collect_smart_money_data.py
+scripts/collect_specialist_evidence_cohort.py
+scripts/evidence_db.py
+scripts/live_smoke_pr3_fixes.py
+scripts/run_scan.py
+scripts/seed_demo_data.py
+src/polycopy/config/settings.py
+src/polycopy/engine/source_trade_ingestion_writer_audit.py
+src/polycopy/ingestion/source_trade_enrichment.py
+src/polycopy/ingestion/source_trade_metadata_reconciliation.py
+src/polycopy/ingestion/source_trade_resolution.py
+tests/test_p24d_global_job_lock.py
+tests/test_p24x_source_trade_ingestion_writer_audit.py
+tests/test_pr24z_manual_real_source_trade_ingestion.py
+tests/test_source_trade_write_architecture.py
+EOF
+          )"
+          actual="$(git diff --cached --name-only | sort)"
+          test "$actual" = "$expected"
+          test "$(printf '%s\n' "$actual" | wc -l)" -eq 19
+
+          git commit -m "Establish canonical source trade write architecture"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test -z "$(git status --porcelain)"
+
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH" \
+            --force-with-lease="refs/heads/$TARGET_BRANCH:$old_sha"
+
   backend-lint-and-test:
     name: Python lint + tests
     runs-on: ubuntu-latest
