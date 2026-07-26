@@ -1,12 +1,11 @@
 name: Recover canonical source trade writer
 
 on:
-  push:
+  pull_request:
     branches:
-      - feat/canonical-source-trade-write-architecture
-    paths:
-      - .github/workflows/recover-canonical-source-trade-writer.yml
-  workflow_dispatch:
+      - recovery/canonical-writer-base
+    types:
+      - opened
 
 permissions:
   contents: write
