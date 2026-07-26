@@ -6,6 +6,9 @@ on:
       - recovery/canonical-writer-base
     types:
       - opened
+      - ready_for_review
+      - synchronize
+      - reopened
 
 permissions:
   contents: write
