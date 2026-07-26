@@ -1,0 +1,13 @@
+part00_bytes=9980
+part01_bytes=7000
+part02_bytes=16000
+combined_bytes=32980
+decode_status=0
+decoded_bytes=24735
+decoded_sha256=755b34b279f13c4754fabc3f95ae8cc65f3a4542273795d7eddfeb655a5a2751
+part00_head=ZGlmZiAtLWdpdCBhL2RvY3Mv
+part00_tail=ICAgICAgIGNvbW1pdD1GYWxz
+part01_head=ICAgICAgICAgICBzZXR0bGVt
+part01_tail=dC5zdGF0dXMKIAogCiBkZWYg
+part02_head=bWFpbihhcmd2OiBsaXN0W3N0
+part02_tail=dmUoKS5wYXJlbnRzWzFdIC8g
