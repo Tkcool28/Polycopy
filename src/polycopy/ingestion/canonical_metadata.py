@@ -1,47 +1,16 @@
-"""Single canonical metadata builder for the research evidence plane.
+"""Canonical market-evidence metadata for source-trade ingestion.
 
-This module is the ONE authoritative producer of the nested canonical
-``metadata_json`` shape that the specialist taxonomy scorer reads
-(``source_trades.metadata_json["taxonomy"]["raw_category"]``). Every
-evidence path MUST route Gamma-derived metadata through this builder so the
-output is byte-equivalent across:
-
-  * new research collection (``specialist_evidence_collector``)
-  * historical taxonomy backfill (``backfill_specialist_trade_taxonomy``)
-  * repaired per-trade enrichment (``enrich_approved_source_trade``)
-  * existing approved-wallet collector (``source_trade_metadata`` delegates here)
-
-Design invariants
------------------
-* The scorer-facing taxonomy lives ONLY in ``metadata["taxonomy"]["raw_category"]``.
-  ``source_trade_enrichments.normalized_category`` is audit-only and is never a
-  scoring authority.
-* We NEVER infer taxonomy from a market title or question text, and we NEVER
-  read taxonomy from the raw trade row. The SOLE authority for canonical
-  taxonomy/event/series is the trusted Gamma market.
-* Immutable identity/economic columns (side, outcome, price, quantity,
-  timestamp, token_id, market_source_id, source_trade_id) are never written by
-  this module.
-* Gamma markets are accepted as ``collections.abc.Mapping``. Trusted token
-  membership is read from the real Gamma ``clobTokenIds`` field (JSON-encoded
-  list string OR bare list) via the proven repository-wide
-  ``parse_clob_token_ids`` contract — never a synthetic token dict.
-* ``metadata_version`` is stamped on EVERY merge output (filled, unchanged, and
-  preserved-existing shapes) so downstream consumers can detect drift. An
-  existing non-empty version that differs from the canonical ``"1"`` is a
-  version conflict (never silently rewritten).
-* Conflicts are fail-closed: any non-empty, differing value across the
-  taxonomy / event / series namespaces blocks the merge (status ``conflict``);
-  the caller must NOT overwrite. Malformed / non-object existing metadata is
-  likewise blocked (status ``unavailable``); the caller must preserve the
-  original DB value (see ``merge_canonical_metadata`` return contract).
+Gamma is authoritative for market identity, taxonomy, outcomes, lifecycle,
+resolution, and provider update time. Wallet-trade fields are context only.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Mapping
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any, final
 
 from polycopy.adapters.polymarket import parse_clob_token_ids
 from polycopy.taxonomy.official_polymarket import (
@@ -51,20 +20,58 @@ from polycopy.taxonomy.official_polymarket import (
 )
 
 METADATA_VERSION = "1"
+MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION = "2"
 
-# Status returned by merge_canonical_metadata.
 MERGE_FILLED = "filled"
 MERGE_UNCHANGED = "unchanged"
 MERGE_CONFLICT = "conflict"
 MERGE_UNAVAILABLE = "unavailable"
 
 
+_CANONICAL_TRUST_TOKEN = object()
+
+
+@final
+class CanonicalSourceTradeMetadata(dict[str, Any]):
+    """Trusted dictionary created only by the canonical builder.
+
+    Construction requires a module-private identity token and snapshots the
+    builder-owned dictionary. Exact type identity selects trusted serialization;
+    ordinary dicts and all subclasses remain untrusted. ``deepcopy`` deliberately
+    returns a plain dict so copied payloads lose trust.
+    """
+
+    def __init__(self, value: dict[str, Any], *, _token: object) -> None:
+        if _token is not _CANONICAL_TRUST_TOKEN:
+            raise TypeError("CanonicalSourceTradeMetadata is builder-only")
+        super().__init__(copy.deepcopy(value))
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> CanonicalSourceTradeMetadata:
+        return CanonicalSourceTradeMetadata(
+            copy.deepcopy(dict(self), memo), _token=_CANONICAL_TRUST_TOKEN
+        )
+
+    def to_plain_dict(self) -> dict[str, Any]:
+        """Return an untrusted deep copy for inspection or legacy handling."""
+        return copy.deepcopy(dict(self))
+
+
+_IMMUTABLE_PROVENANCE_FIELDS = frozenset(
+    {
+        "provider",
+        "lookup_kind",
+        "requested_condition_id",
+        "exact_match",
+        "snapshot_contract_version",
+    }
+)
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _scalar(value: Any) -> Optional[str]:
-    """Return a normalized scalar string, or ``None`` for unusable values."""
+def _scalar(value: Any) -> str | None:
     if isinstance(value, str):
         value = value.strip()
         return value or None
@@ -73,7 +80,7 @@ def _scalar(value: Any) -> Optional[str]:
     return None
 
 
-def _first_scalar(*values: Any) -> Optional[str]:
+def _first_scalar(*values: Any) -> str | None:
     for value in values:
         normalized = _scalar(value)
         if normalized is not None:
@@ -82,53 +89,287 @@ def _first_scalar(*values: Any) -> Optional[str]:
 
 
 def _tags(value: Any) -> list[str]:
-    """Normalize raw tags to a deterministic, de-duplicated string list.
-
-    Fillable/empty input (``None``, ``""``, ``[]``) yields ``[]`` so the
-    builder never emits a populated tags list for an empty source. A
-    non-empty scalar/dict/list-of-non-scalars is returned as ``[]`` here too
-    (the merge layer is where a non-empty wrong-type *existing* tags value is
-    detected as a type conflict, not silently coerced).
-    """
-    if value is None or value == "":
-        return []
     if not isinstance(value, (list, tuple, set, frozenset)):
-        # Non-empty wrong type (str/dict/scalar) -> treated as no usable tags.
         return []
     normalized = {_scalar(item) for item in value}
     return sorted(tag for tag in normalized if tag is not None)
 
 
-def _tags_conflict(value: Any) -> bool:
-    """True iff ``value`` is a NON-EMPTY tags value that is NOT a list.
+def _as_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
 
-    Per the canonical-metadata contract:
-      * missing / None / "" / empty list / empty tuple -> fillable (no conflict)
-      * non-empty non-list (str, dict, scalar, etc.) -> TYPE CONFLICT
 
-    A populated list is never a conflict (it is compared as a normalized
-    order-insensitive set by the merge layer).
+def _is_empty(value: Any) -> bool:
+    return value is None or value == "" or (
+        isinstance(value, (list, tuple, set, frozenset, dict)) and not value
+    )
+
+
+def _ensure_version(meta: dict[str, Any]) -> dict[str, Any]:
+    out = dict(meta)
+    out["metadata_version"] = METADATA_VERSION
+    return out
+
+
+def _parse_array(value: Any) -> list[Any] | None:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return parsed if isinstance(parsed, list) else None
+    return None
+
+
+def _validate_outcome_mapping(
+    labels_raw: Any,
+    clob_raw: Any,
+    outcome_index: Any = None,
+    selected_token: str | None = None,
+    selected_outcome: str | None = None,
+) -> dict[str, Any]:
+    """Return a complete ordered mapping only when every consistency check passes.
+
+    The result separates two error streams so the snapshot can distinguish
+    authoritative Gamma-shape evidence from optional source-trade context:
+
+    * ``errors`` — substantive Gamma-shape diagnostics (label blanks, token
+      blanks, missing labels, missing tokens, array-length mismatch,
+      duplicate token IDs). These stay inside ``_snapshot.outcomes`` and
+      are compared during substantive replay.
+    * ``trade_validation`` — caller-context diagnostics (outcome-index range,
+      index / token agreement, index / outcome agreement, selected-token
+      membership, selected-outcome membership, selected token-outcome
+      disagreement). These depend on the optional trade fields the caller
+      supplied (selected_token / selected_outcome / outcome_index) and the
+      value of the booleans (``valid_index`` / ``index_token_agrees`` /
+      ``index_outcome_agrees``) likewise depend on that context. They are
+      returned on the top level too for backward compatibility but the
+      builder routes them into ``_snapshot.provenance.trade_validation``
+      so that two otherwise identical Gamma responses produce substantively
+      equivalent authoritative evidence regardless of caller context.
     """
-    if value is None or value == "":
-        return False
-    if isinstance(value, (list, tuple, set, frozenset)):
-        # Empty collection -> fillable; non-empty list -> compared as a set.
-        return len(value) == 0
-    # Non-empty non-list value -> wrong type conflict.
-    return True
+    errors: list[str] = []
+    trade_validation_errors: list[str] = []
+    raw_labels = _parse_array(labels_raw)
+    raw_tokens = _parse_array(clob_raw)
+
+    labels: list[str] = []
+    if raw_labels is not None:
+        for index, value in enumerate(raw_labels):
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"blank_or_invalid_label_at_index={index}")
+                labels.append("")
+            else:
+                labels.append(value.strip())
+
+    token_ids: list[str] = []
+    if raw_tokens is not None:
+        for index, value in enumerate(raw_tokens):
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"blank_or_invalid_token_at_index={index}")
+                token_ids.append("")
+            else:
+                token_ids.append(value.strip().lower())
+
+    if not labels:
+        errors.append("labels_missing_or_empty")
+    if not token_ids:
+        errors.append("token_ids_missing_or_empty")
+    if labels and token_ids and len(labels) != len(token_ids):
+        errors.append("array_length_mismatch")
+    usable_tokens = [token for token in token_ids if token]
+    if len(usable_tokens) != len(set(usable_tokens)):
+        errors.append("duplicate_token_ids")
+
+    valid_index: bool | None = None
+    index_token_agrees: bool | None = None
+    index_outcome_agrees: bool | None = None
+    if outcome_index is not None:
+        valid_index = (
+            isinstance(outcome_index, int)
+            and not isinstance(outcome_index, bool)
+            and 0 <= outcome_index < len(labels)
+            and outcome_index < len(token_ids)
+        )
+        if not valid_index:
+            trade_validation_errors.append(
+                f"outcome_index_out_of_range={outcome_index}"
+            )
+        else:
+            if selected_token is not None:
+                index_token_agrees = (
+                    token_ids[outcome_index]
+                    == str(selected_token).strip().lower()
+                )
+                if not index_token_agrees:
+                    trade_validation_errors.append("index_token_disagreement")
+            if selected_outcome is not None:
+                index_outcome_agrees = (
+                    labels[outcome_index].casefold()
+                    == str(selected_outcome).strip().casefold()
+                )
+                if not index_outcome_agrees:
+                    trade_validation_errors.append("index_outcome_disagreement")
+    else:
+        normalized_token = (
+            selected_token.strip().lower()
+            if isinstance(selected_token, str) and selected_token.strip()
+            else None
+        )
+        normalized_outcome = (
+            selected_outcome.strip().casefold()
+            if isinstance(selected_outcome, str) and selected_outcome.strip()
+            else None
+        )
+        token_matches = [
+            index for index, token in enumerate(token_ids) if token == normalized_token
+        ]
+        outcome_matches = [
+            index
+            for index, label in enumerate(labels)
+            if label.casefold() == normalized_outcome
+        ]
+        if normalized_token is not None and len(token_matches) != 1:
+            trade_validation_errors.append("selected_token_not_in_mapping")
+        if normalized_outcome is not None and not outcome_matches:
+            trade_validation_errors.append("selected_outcome_not_in_mapping")
+        if (
+            normalized_token is not None
+            and normalized_outcome is not None
+            and not set(token_matches).intersection(outcome_matches)
+        ):
+            trade_validation_errors.append("selected_token_outcome_disagreement")
+
+    # The authoritative outcome mapping is "Gamma-compatible" only when the
+    # Gamma-shape errors list is empty. The trade-context diagnostics are
+    # informational and never gate ``compatible`` / ``status`` / ``ordered``.
+    compatible = not errors
+    if compatible:
+        status = "complete"
+        ordered = [
+            {"label": label, "clob_token_id": token_ids[index]}
+            for index, label in enumerate(labels)
+        ]
+    else:
+        status = "invalid" if labels and token_ids else "incomplete"
+        ordered = []
+
+    return {
+        "labels": labels,
+        "token_ids": token_ids,
+        "ordered": ordered,
+        "compatible": compatible,
+        "valid_index": valid_index,
+        "index_token_agrees": index_token_agrees,
+        "index_outcome_agrees": index_outcome_agrees,
+        "status": status,
+        "errors": errors,
+        "trade_validation_errors": trade_validation_errors,
+    }
 
 
-def normalize_source_trade_metadata(raw: Optional[Mapping[str, Any]]) -> dict[str, Any]:
-    """Return the exact PR66 metadata contract from an upstream-like mapping.
+def _winner_candidates(market: Mapping[str, Any]) -> tuple[list[str], list[str], list[str]]:
+    token_fields = ("winnerTokenId", "winningClobTokenId")
+    outcome_fields = ("winnerOutcome", "resolutionOutcome")
+    tokens: list[str] = []
+    outcomes: list[str] = []
+    sources: list[str] = []
 
-    Accepts either raw upstream fields (``eventId``, ``category``, ``series``)
-    or an already canonical-shaped mapping. Never copies unknown fields.
-    """
+    containers: list[tuple[str, Mapping[str, Any]]] = [("market", market)]
+    resolution = market.get("resolution")
+    if isinstance(resolution, Mapping):
+        containers.append(("market.resolution", resolution))
+
+    for prefix, container in containers:
+        for field in token_fields:
+            value = container.get(field)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                normalized = _scalar(item)
+                if normalized is not None:
+                    tokens.append(normalized.lower())
+                    sources.append(f"{prefix}.{field}")
+        for field in outcome_fields:
+            value = container.get(field)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                normalized = _scalar(item)
+                if normalized is not None:
+                    outcomes.append(normalized)
+                    sources.append(f"{prefix}.{field}")
+    return tokens, outcomes, sources
+
+
+def _parse_resolution_fields(
+    market: Mapping[str, Any], outcomes: Mapping[str, Any]
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "resolution_status": None,
+        "winner_token_id": None,
+        "winner_outcome": None,
+        "evidence_fields": [],
+        "errors": [],
+    }
+    if market.get("resolved") is not True:
+        return result
+
+    tokens, labels, fields = _winner_candidates(market)
+    unique_tokens = list(dict.fromkeys(tokens))
+    unique_labels = list(dict.fromkeys(labels))
+    result["evidence_fields"] = sorted(set(fields))
+
+    if len(unique_tokens) > 1 or len(unique_labels) > 1:
+        result["resolution_status"] = "invalid"
+        result["errors"].append("multiple_or_contradictory_winners")
+        return result
+
+    pairs = outcomes.get("ordered") if outcomes.get("compatible") else []
+    token = unique_tokens[0] if unique_tokens else None
+    label = unique_labels[0] if unique_labels else None
+
+    if token is not None and label is None:
+        matches = [pair["label"] for pair in pairs if pair["clob_token_id"] == token]
+        label = matches[0] if len(matches) == 1 else None
+    if label is not None and token is None:
+        matches = [
+            pair["clob_token_id"]
+            for pair in pairs
+            if pair["label"].casefold() == label.casefold()
+        ]
+        token = matches[0] if len(matches) == 1 else None
+
+    if token is None or label is None:
+        result["resolution_status"] = "incomplete"
+        result["errors"].append("resolved_without_derivable_winner")
+        return result
+
+    matching_pairs = [
+        pair
+        for pair in pairs
+        if pair["clob_token_id"] == token
+        and pair["label"].casefold() == label.casefold()
+    ]
+    if token is not None and label is not None and len(matching_pairs) != 1:
+        result["resolution_status"] = "invalid"
+        result["errors"].append("winner_token_outcome_disagreement")
+        return result
+
+    result.update(
+        resolution_status="resolved",
+        winner_token_id=token,
+        winner_outcome=label,
+    )
+    return result
+
+
+def normalize_source_trade_metadata(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     source = _mapping(raw)
     event = _mapping(source.get("event"))
     taxonomy = _mapping(source.get("taxonomy"))
     series = _mapping(source.get("series"))
-
     return {
         "metadata_version": METADATA_VERSION,
         "event": {
@@ -140,7 +381,9 @@ def normalize_source_trade_metadata(raw: Optional[Mapping[str, Any]]) -> dict[st
             "raw_category": _first_scalar(
                 taxonomy.get("raw_category"), taxonomy.get("category"), source.get("category")
             ),
-            "tags": _tags(taxonomy.get("tags") if "tags" in taxonomy else source.get("tags")),
+            "tags": _tags(
+                taxonomy.get("tags") if "tags" in taxonomy else source.get("tags")
+            ),
         },
         "series": {
             "id": _first_scalar(series.get("id"), source.get("seriesId")),
@@ -151,8 +394,7 @@ def normalize_source_trade_metadata(raw: Optional[Mapping[str, Any]]) -> dict[st
     }
 
 
-def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> Optional[str]:
-    """Return only a conflict-free trusted broad category for metadata v1."""
+def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> str | None:
     if result.status != TAXONOMY_USABLE:
         return None
     if result.source == "market.category":
@@ -164,69 +406,217 @@ def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> Option
     return result.category_label
 
 
-def _as_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True)
+def _strict_trade_index_value(value: Any) -> int | None:
+    """Return ``value`` if it is a strict integer index; otherwise ``None``.
 
+    Accepts ONLY a real Python ``int`` that is non-negative and not a
+    boolean. Floats (including integral-looking ``0.0``), bools, decimal
+    strings, scientific-notation strings, empty strings, negative integers,
+    ``None`` and any other non-int shape are rejected. The function never
+    coerces fractional or ambiguous values; an absent or unusable value
+    yields ``None`` and is therefore omitted from any persisted provenance.
 
-def _parse_metadata(existing_json: Optional[str]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Parse ``existing_json`` with fail-closed validation.
-
-    Returns ``(parsed_dict, error_reason)``. ``parsed_dict`` is ``None`` and
-    ``error_reason`` is set when the stored value is malformed JSON or a
-    non-object top level. Empty / ``None`` input is valid and yields ``({}, None)``
-    (an empty-but-valid existing row that may be safely filled).
+    This is the SINGLE strict outcome-index parser used by both the outcome
+    mapping validation and the persisted provenance field; the two consumers
+    cannot disagree on what counts as a valid index.
     """
-    if not existing_json:
-        return {}, None
-    try:
-        parsed = json.loads(existing_json)
-    except (json.JSONDecodeError, TypeError):
-        return None, "existing_metadata_malformed_json"
-    if not isinstance(parsed, dict):
-        return None, "existing_metadata_not_object"
-    return parsed, None
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
 
 
-def _ensure_version(meta: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of ``meta`` guaranteed to carry ``metadata_version``."""
-    out = dict(meta)
-    out["metadata_version"] = METADATA_VERSION
-    return out
+def _trade_index(trade: Mapping[str, Any] | None) -> int | None:
+    if not trade or "outcomeIndex" not in trade:
+        return None
+    return _strict_trade_index_value(trade.get("outcomeIndex"))
 
 
-def _preserve_opt(existing_json: Optional[str]) -> dict[str, Any]:
-    """Return the original stored value when it cannot be parsed.
+def _build_market_snapshot(
+    market: Mapping[str, Any],
+    trade: Mapping[str, Any] | None,
+    *,
+    requested_condition_id: str | None = None,
+    enforce_exact_condition_match: bool = False,
+) -> dict[str, Any]:
+    """Build the canonical market-evidence snapshot for one trade + Gamma.
 
-    Callers pass this on ``unavailable``/``conflict`` so they can preserve the
-    DB row verbatim. If the stored value is a string (even malformed), it is
-    returned as-is; otherwise an empty dict is returned.
+    ``enforce_exact_condition_match`` is the initial-ingestion safety gate:
+    when True, the snapshot's ``exact_match`` is False unless the caller's
+    ``requested_condition_id`` is present and matches the Gamma market's
+    ``conditionId`` after canonical normalization. When False (legacy
+    backfill contract), ``exact_match`` reflects whether the Gamma market
+    itself carries a condition id — never an unknown trade's requested
+    condition id (the merge layer enforces identity upstream).
+
+    The authoritative Gamma-shape evidence lives in ``snapshot.outcomes``
+    (its ``errors`` list, ``labels`` / ``token_ids`` / ``ordered``
+    / ``compatible`` / ``status``). Trade-context validation diagnostics
+    — outcome-index range, index/token agreement, index/outcome agreement,
+    selected token/outcome membership and disagreement, plus the matching
+    booleans (``valid_index`` / ``index_token_agrees`` /
+    ``index_outcome_agrees``) — are split out into
+    ``snapshot.provenance.trade_validation`` so that two otherwise
+    identical Gamma responses produce substantively equivalent
+    authoritative evidence regardless of whether the caller supplied
+    trade context. The booleans are emitted under
+    ``trade_validation`` together with their error list. The validator's
+    Gamma-shape ``errors`` list is never polluted by caller context.
     """
-    if isinstance(existing_json, str):
-        return existing_json  # type: ignore[return-value]
-    if existing_json is None:
-        return {}
-    return existing_json  # type: ignore[return-value]
+    outcomes = _validate_outcome_mapping(
+        market.get("outcomes"),
+        market.get("clobTokenIds"),
+        outcome_index=_strict_trade_index_value(
+            trade.get("outcomeIndex")
+        )
+        if trade
+        else None,
+        selected_token=_first_scalar(
+            trade.get("asset") if trade else None,
+            trade.get("token_id") if trade else None,
+        ),
+        selected_outcome=_scalar(trade.get("outcome")) if trade else None,
+    )
+    # Capture the trade-validation diagnostics before the authoritative
+    # ``outcomes`` namespace is rewritten — these are no longer part of
+    # the authoritative Gamma-shape evidence.
+    trade_validation: dict[str, Any] = {
+        "errors": list(outcomes.pop("trade_validation_errors", []) or []),
+        "valid_index": outcomes.get("valid_index"),
+        "index_token_agrees": outcomes.get("index_token_agrees"),
+        "index_outcome_agrees": outcomes.get("index_outcome_agrees"),
+        "outcome_index_supplied": bool(
+            trade is not None
+            and "outcomeIndex" in trade
+            and _strict_trade_index_value(trade.get("outcomeIndex")) is not None
+        ),
+    }
+    # Strip the trade-context booleans from ``outcomes`` so they live ONLY
+    # under ``provenance.trade_validation``. ``outcomes`` is now purely the
+    # authoritative Gamma-shape evidence.
+    for key in ("valid_index", "index_token_agrees", "index_outcome_agrees"):
+        outcomes.pop(key, None)
+    normalized_gamma_condition_id = _normalize_condition_id(market.get("conditionId"))
+    if enforce_exact_condition_match:
+        # Initial-ingestion contract: ``requested_condition_id`` MUST be
+        # present and match the Gamma market's conditionId after
+        # normalization. Any other shape means we cannot prove identity, so
+        # ``exact_match=False`` and authoritative evidence is cleared.
+        if (
+            requested_condition_id is None
+            or not _exact_condition_match(requested_condition_id, market)
+        ):
+            requested_for_provenance = requested_condition_id
+            exact_match = False
+        else:
+            requested_for_provenance = requested_condition_id
+            exact_match = True
+    else:
+        # Legacy backfill contract: identity has already been verified
+        # upstream by ``merge_canonical_metadata``. ``exact_match`` simply
+        # reflects whether the Gamma market carries a conditionId.
+        requested_for_provenance = normalized_gamma_condition_id
+        exact_match = requested_for_provenance is not None
+    snapshot: dict[str, Any] = {
+        "market": {
+            "condition_id": normalized_gamma_condition_id,
+            "provider_market_id": _scalar(market.get("id")),
+            "question": _scalar(market.get("question")),
+            "slug": _scalar(market.get("slug")),
+        },
+        "outcomes": outcomes,
+        "lifecycle": {
+            "active": _as_bool(market.get("active")),
+            "closed": _as_bool(market.get("closed")),
+            "accepting_orders": _as_bool(market.get("acceptingOrders")),
+            "end_date": _scalar(market.get("endDate")),
+        },
+        "resolution": _parse_resolution_fields(market, outcomes),
+        "provenance": {
+            "provider": "gamma",
+            "lookup_kind": "condition_id",
+            "requested_condition_id": requested_for_provenance,
+            "exact_match": exact_match,
+            "snapshot_contract_version": MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
+        },
+    }
+    if not exact_match:
+        # Fail-closed: a Gamma mapping without a verified condition-id
+        # match MUST NOT carry authoritative evidence. Clear the populated
+        # namespaces so we never silently stamp ``exact_match=False`` while
+        # still persisting the mapping as authoritative. Provenance is
+        # preserved so callers can see exactly why.
+        snapshot["market"] = {key: None for key in snapshot["market"]}
+        snapshot["lifecycle"] = {key: None for key in snapshot["lifecycle"]}
+        snapshot["outcomes"] = {
+            "labels": [],
+            "token_ids": [],
+            "ordered": [],
+            "compatible": False,
+            "status": "invalid",
+            "errors": ["exact_match_false_evidence_unavailable"],
+        }
+        snapshot["resolution"] = {
+            "resolution_status": None,
+            "winner_token_id": None,
+            "winner_outcome": None,
+            "evidence_fields": [],
+            "errors": ["exact_match_false_evidence_unavailable"],
+        }
+    provider_updated_at = _scalar(market.get("updatedAt"))
+    if provider_updated_at is not None:
+        snapshot["provenance"]["provider_updated_at"] = provider_updated_at
+    # Trade-context provenance: wallet fields live at the top of
+    # ``provenance``; trade-validation diagnostics live under a nested
+    # object so they survive the deterministic JSON contract and are
+    # never confused with substantive Gamma-shape errors. An absent
+    # trade-context produces a minimal ``trade_validation`` namespace
+    # with an empty errors list and ``outcome_index_supplied=False``.
+    snapshot["provenance"]["trade_validation"] = trade_validation
+    if trade:
+        provenance = snapshot["provenance"]
+        context = {
+            "trade_response_title": _scalar(trade.get("title")),
+            "trade_response_slug": _scalar(trade.get("slug")),
+            "trade_response_outcome_index": _strict_trade_index_value(
+                trade.get("outcomeIndex")
+            ),
+            "trade_response_transaction_hash": _scalar(trade.get("transactionHash")),
+        }
+        provenance.update({key: value for key, value in context.items() if value is not None})
+    return snapshot
 
 
 def build_canonical_metadata(
-    trade: Optional[Mapping[str, Any]],
-    gamma_market: Optional[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Build the canonical PR66 metadata dict from a trusted Gamma market.
+    trade: Mapping[str, Any] | None,
+    gamma_market: Mapping[str, Any] | None,
+    *,
+    requested_condition_id: str | None = None,
+    enforce_exact_condition_match: bool = False,
+) -> dict[str, Any] | CanonicalSourceTradeMetadata:
+    """Build the canonical PR66 metadata payload from a trusted Gamma market.
 
-    This is the shared producer: the existing approved-wallet collector's
-    ``build_metadata_from_gamma_market`` delegates here, so collection,
-    backfill, per-trade enrichment, and the approved-wallet collector emit a
-    byte-identical nested shape (``metadata_version``, ``event``, ``taxonomy``,
-    ``series``). The scorer reads ``metadata["taxonomy"]["raw_category"]``.
-
-    SOLE AUTHORITY: the canonical taxonomy/event/series is derived ONLY from the
-    trusted Gamma market. The ``trade`` argument is accepted for call-site
-    compatibility but is NEVER used as a metadata source — we never read
-    taxonomy, title, or question text from the raw trade row.
-
-    Returns the exact PR66 shape. Deterministic (``sort_keys``) so byte-equivalent
-    across call sites. Never infers taxonomy from title/question text.
+    Parameters
+    ----------
+    trade:
+        Raw upstream trade dict, or ``None`` for metadata-only call sites.
+    gamma_market:
+        Raw Gamma market dict, or ``None`` for metadata-only call sites.
+    requested_condition_id:
+        The trade's requested condition id after canonical normalization.
+        When ``None`` the function derives it from ``trade`` (using the
+        ``conditionId`` or ``market_source_id`` field). Initial-ingestion
+        callers pass the value explicitly to drive the new gate.
+    enforce_exact_condition_match:
+        When True, the snapshot is ONLY emitted when the canonical requested
+        condition id matches the Gamma market's ``conditionId`` after
+        normalization. When False (default — backfill semantics), the
+        snapshot is always emitted and ``exact_match`` reflects whether the
+        Gamma market itself carries a condition id. Initial-ingestion
+        callers pass ``True`` to enforce the safety gate.
     """
     market = _mapping(gamma_market)
     source = dict(market)
@@ -239,210 +629,418 @@ def build_canonical_metadata(
     source["category"] = _official_category_for_v1_metadata(
         OfficialPolymarketTaxonomyResolverV1().resolve(source)
     )
-    return normalize_source_trade_metadata(source)
+    result = normalize_source_trade_metadata(source)
+    if not market:
+        return result
+    if requested_condition_id is None:
+        requested_condition_id = _requested_condition_id(trade)
+    if enforce_exact_condition_match:
+        # Initial-ingestion safety gate: a requested condition id MUST
+        # normalize-match the Gamma market's ``conditionId``; otherwise we
+        # drop the snapshot entirely so the persisted row never stamps
+        # ``exact_match=false`` with authoritative evidence attached. We
+        # also refuse to enrich the v1 (event/taxonomy/series) namespaces
+        # from the mismatched Gamma so no Gamma-authoritative field leaks
+        # into the persisted row at all.
+        if requested_condition_id is None:
+            return normalize_source_trade_metadata(trade)
+        if not _exact_condition_match(requested_condition_id, market):
+            return normalize_source_trade_metadata(trade)
+    result["_snapshot"] = _build_market_snapshot(
+        market,
+        trade,
+        requested_condition_id=requested_condition_id,
+        enforce_exact_condition_match=enforce_exact_condition_match,
+    )
+    return CanonicalSourceTradeMetadata(result, _token=_CANONICAL_TRUST_TOKEN)
 
 
-def _gamma_condition_id(gamma_market: Optional[Mapping[str, Any]]) -> Optional[str]:
-    if not gamma_market:
-        return None
-    cid = gamma_market.get("conditionId") or gamma_market.get("id")
-    return str(cid).lower() if cid is not None else None
+def _gamma_condition_id(gamma_market: Mapping[str, Any]) -> str | None:
+    value = gamma_market.get("conditionId")
+    return str(value).lower() if value is not None else None
 
 
-def _gamma_token_ids(gamma_market: Optional[Mapping[str, Any]]) -> list[str]:
-    """Return the token ids that belong to this Gamma condition.
+def _gamma_token_ids(gamma_market: Mapping[str, Any]) -> list[str]:
+    return [str(token).lower() for token in parse_clob_token_ids(dict(gamma_market)) if token]
 
-    Uses the proven repository-wide ``parse_clob_token_ids`` contract, which
-    accepts Gamma ``clobTokenIds`` as a JSON-encoded list string OR a bare
-    list, and returns ``[]`` for missing/malformed/empty evidence. Tokens are
-    normalized to lower-case for case-insensitive membership checks.
+
+def _normalize_condition_id(value: Any) -> str | None:
+    """Return a lowercased canonical condition-id string, or ``None`` for empty.
+
+    Whitespace is stripped and the value must be a non-empty string. Any
+    non-string (or empty after strip) yields ``None`` so the comparison is
+    fail-closed: only normalized non-empty strings can prove an identity
+    match. This is the single condition-id normalization rule for both the
+    backfill merge path and the initial-ingestion canonical builder.
     """
-    if not gamma_market:
-        return []
-    # parse_clob_token_ids reads ``clobTokenIds`` from the passed mapping; it
-    # tolerates the field being absent or shaped unlike a list (returns []).
-    tokens = parse_clob_token_ids(dict(gamma_market))
-    return [str(t).lower() for t in tokens if t]
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip().lower()
+    return stripped or None
+
+
+def _requested_condition_id(trade: Mapping[str, Any] | None) -> str | None:
+    """Return the requested trade condition id, normalized.
+
+    Accepts the raw ``conditionId`` field or, for DB-row-shaped inputs, the
+    ``market_source_id`` field. Any other value yields ``None`` so the
+    canonical builder cannot infer identity from any secondary field.
+    """
+    if not isinstance(trade, Mapping):
+        return None
+    raw = trade.get("conditionId")
+    if raw is None:
+        raw = trade.get("market_source_id")
+    return _normalize_condition_id(raw)
+
+
+def _exact_condition_match(
+    requested: str | None, gamma_market: Mapping[str, Any]
+) -> bool:
+    """Return True iff requested and gamma condition ids match after normalization.
+
+    A normalized requested condition id AND a gamma condition id must both
+    be present and byte-equal after strip/lower. Empty or missing either
+    side fails closed. The function is intentionally pure: it never infers
+    identity from any other Gamma field (slug, title, question, token).
+    """
+    return (
+        requested is not None
+        and _normalize_condition_id(gamma_market.get("conditionId")) == requested
+    )
+
+
+def _merge_standard_namespace(
+    existing: dict[str, Any], incoming: dict[str, Any], namespace: str
+) -> tuple[dict[str, Any], bool, list[str]]:
+    current = existing.get(namespace)
+    reasons: list[str] = []
+    if not isinstance(current, dict):
+        if _is_empty(current):
+            return dict(incoming), True, reasons
+        return {}, False, [f"{namespace}_not_dict_conflict"]
+
+    output = dict(current)
+    changed = False
+    for key, value in incoming.items():
+        if _is_empty(value):
+            continue
+        old = current.get(key)
+        if _is_empty(old):
+            output[key] = value
+            changed = True
+            continue
+        if key == "tags":
+            if not isinstance(old, (list, tuple, set, frozenset)):
+                reasons.append(f"{namespace}_{key}_type_conflict")
+                continue
+            if set(_tags(old)) == set(_tags(value)):
+                continue
+        elif old == value:
+            continue
+        reasons.append(f"{namespace}_{key}_conflict")
+    return output, changed, reasons
+
+
+def _merge_refreshable_dict(
+    current: Any,
+    incoming: Mapping[str, Any],
+    namespace: str,
+    *,
+    immutable_fields: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Any], bool, list[str]]:
+    if not isinstance(current, dict):
+        if _is_empty(current):
+            return dict(incoming), True, []
+        return {}, False, [f"_snapshot_{namespace}_type_conflict"]
+    output = dict(current)
+    changed = False
+    reasons: list[str] = []
+    for key, value in incoming.items():
+        if _is_empty(value):
+            continue
+        old = current.get(key)
+        if _is_empty(old):
+            output[key] = value
+            changed = True
+            continue
+        elif old == value:
+            continue
+        elif (
+            key in immutable_fields
+            or isinstance(old, (dict, list))
+            or isinstance(value, (dict, list))
+        ):
+            reasons.append(f"_snapshot_{namespace}_{key}_conflict")
+        else:
+            output[key] = value
+            changed = True
+    return output, changed, reasons
+
+def _merge_trade_validation(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Union-merge two ``provenance.trade_validation`` payloads.
+
+    The diagnostics are caller-context only: an earlier build may have
+    observed trade-context errors (selected token/outcome disagreement) that
+    a later no-context build cannot observe. The audit demands:
+
+      * existing diagnostics are preserved through replay;
+      * new diagnostics from a later trade-context build are merged in;
+      * contradictory context does NOT silently overwrite accepted
+        diagnostics;
+      * null / missing context does NOT erase existing diagnostics.
+
+    Return the merged dict, or ``existing`` unchanged when the merge is a
+    no-op (callers rely on identity to skip downstream writes).
+    """
+    if not isinstance(incoming, dict):
+        return existing
+    merged = dict(existing)
+    # ``errors`` is the union, preserving insertion order so the deterministic
+    # JSON contract stays stable. Already-present diagnostics are never
+    # overwritten.
+    existing_errors = list(existing.get("errors") or [])
+    incoming_errors = list(incoming.get("errors") or [])
+    seen = set(existing_errors)
+    for item in incoming_errors:
+        if item not in seen:
+            existing_errors.append(item)
+            seen.add(item)
+    if existing_errors != list(existing.get("errors") or []):
+        merged["errors"] = existing_errors
+    # Booleans: if the existing context already observed a value, keep it;
+    # only fill when the existing value is ``None`` and the incoming value is
+    # informative. This protects against contradictory later context silently
+    # overwriting accepted diagnostics; a later ``None`` never clears an
+    # already-observed True/False.
+    for key in ("valid_index", "index_token_agrees", "index_outcome_agrees"):
+        if key not in incoming:
+            continue
+        new_value = incoming[key]
+        old_value = existing.get(key)
+        if old_value is None and new_value is not None:
+            merged[key] = new_value
+    # ``outcome_index_supplied`` is informative only: prefer True (we observed
+    # one); False is recorded when explicitly False; never overwritten
+    # forward from True to False because the caller may simply have lacked
+    # context.
+    if incoming.get("outcome_index_supplied") is True:
+        merged.setdefault("outcome_index_supplied", True)
+    if merged == existing:
+        return existing
+    return merged
+
+
+def _merge_snapshot(
+    existing_snapshot: Any, incoming: Mapping[str, Any]
+) -> tuple[dict[str, Any], bool, list[str]]:
+    if not isinstance(existing_snapshot, dict):
+        if _is_empty(existing_snapshot):
+            return dict(incoming), True, []
+        return {}, False, ["_snapshot_type_conflict"]
+
+    output = dict(existing_snapshot)
+    changed = False
+    reasons: list[str] = []
+
+    # Preserve ``provenance.trade_validation`` from the existing record when
+    # the incoming build carries a different (or absent) trade context —
+    # union of diagnostics, no churn. Substantive equality is gated ONLY on
+    # the authoritative Gamma-shape namespaces below.
+    existing_provenance = existing_snapshot.get("provenance")
+    incoming_provenance = incoming.get("provenance")
+    existing_tv = (
+        existing_provenance.get("trade_validation")
+        if isinstance(existing_provenance, dict)
+        else None
+    )
+    incoming_tv = (
+        incoming_provenance.get("trade_validation")
+        if isinstance(incoming_provenance, dict)
+        else None
+    )
+    if isinstance(incoming_tv, dict) and isinstance(existing_tv, dict):
+        merged_tv = _merge_trade_validation(existing_tv, incoming_tv)
+        if merged_tv is not existing_tv:
+            output_prov = output.setdefault("provenance", {})
+            if isinstance(output_prov, dict):
+                output_prov["trade_validation"] = merged_tv
+                changed = True
+    elif isinstance(incoming_tv, dict):
+        output_prov = output.setdefault("provenance", {})
+        if isinstance(output_prov, dict):
+            output_prov["trade_validation"] = dict(incoming_tv)
+            changed = True
+
+    for namespace in ("market", "outcomes", "lifecycle", "resolution", "provenance"):
+        new_namespace = incoming.get(namespace)
+        if not isinstance(new_namespace, Mapping):
+            continue
+        # Exclude ``trade_validation`` from the substantive namespace merge:
+        # its ``errors`` list and booleans are context-dependent and must
+        # never produce a ``_snapshot_provenance_*_conflict`` reason. The
+        # namespace-level merge above already preserved them with union
+        # semantics, so we simply skip the field here.
+        if namespace == "provenance":
+            new_namespace = {
+                key: value
+                for key, value in new_namespace.items()
+                if key != "trade_validation"
+            }
+            if not new_namespace:
+                continue
+        merged_namespace, namespace_changed, namespace_reasons = _merge_refreshable_dict(
+            existing_snapshot.get(namespace),
+            new_namespace,
+            namespace,
+            immutable_fields=(
+                _IMMUTABLE_PROVENANCE_FIELDS
+                if namespace == "provenance"
+                else frozenset()
+            ),
+        )
+        if namespace_changed:
+            output[namespace] = merged_namespace
+            changed = True
+        reasons.extend(namespace_reasons)
+    return output, changed, reasons
+
+
+def _snapshot_for_replay_comparison(snapshot: Any) -> Any:
+    """Remove audit-only timestamps, caller-only context, before replay."""
+    if not isinstance(snapshot, dict):
+        return snapshot
+    output = json.loads(json.dumps(snapshot))
+    provenance = output.get("provenance")
+    if isinstance(provenance, dict):
+        provenance.pop("retrieved_at", None)
+        provenance.pop("provider_updated_at", None)
+        # ``trade_validation`` carries the caller's optional context
+        # diagnostics (selected token / outcome / index). Two builds of the
+        # same authoritative Gamma evidence with different caller contexts
+        # are substantively equivalent — only the substantive Gamma-shape
+        # fields drive replay comparison. We strip this entire nested
+        # object so replay equality is gated on Gamma evidence only; the
+        # ``_merge_snapshot`` layer still preserves it on every merge
+        # without using it as a substantive-equality signal.
+        provenance.pop("trade_validation", None)
+        # Wallet-context fields (``trade_response_*``) are caller-only
+        # echoes too: a Gamma fetch with vs without trade context produces
+        # different ``trade_response_*`` strings even though the substantive
+        # evidence is identical. The merge layer preserves them on every
+        # merge via ``_merge_trade_validation`` / per-key handling, so the
+        # replay layer ignores them.
+        for key in list(provenance):
+            if key.startswith("trade_response_"):
+                provenance.pop(key)
+    return output
 
 
 def merge_canonical_metadata(
-    existing_json: Optional[str],
-    gamma_market: Optional[Mapping[str, Any]],
+    existing_json: str | None,
+    gamma_market: Mapping[str, Any] | None,
     *,
     condition_id: str,
-    token_id: Optional[str] = None,
+    token_id: str | None = None,
 ) -> tuple[dict[str, Any], str, list[str]]:
-    """Safely merge canonical namespaces into existing ``metadata_json``.
-
-    Returns ``(new_metadata, status, reason_codes)``.
-
-    RETURN CONTRACT (callers MUST honor this to preserve the original DB row):
-
-      * status ``unavailable`` or ``conflict`` -> ``new_metadata`` is the
-        ORIGINAL parsed existing object (or the raw ``existing_json`` string
-        when it could not be parsed). Callers MUST NOT overwrite the stored
-        row on these statuses — the original value is returned untouched.
-      * status ``filled`` -> ``new_metadata`` is the merged object (byte-stable).
-      * status ``unchanged`` -> ``new_metadata`` equals the original.
-
-    Rules:
-      * Fills only canonical namespaces (``taxonomy``, ``event``, ``series``).
-      * Preserves unrelated existing metadata (e.g. ``foo=bar``).
-      * Never touches identity/economic columns.
-      * SOLE authority for canonical taxonomy is the trusted Gamma market.
-      * ``condition_id`` must EXACTLY match the Gamma market's condition id;
-        mismatch -> ``unavailable`` (fail closed).
-      * If the trade carries a ``token_id``, it MUST belong to the matched
-        Gamma condition per the real Gamma ``clobTokenIds`` list:
-          - missing/malformed/empty Gamma token evidence -> ``unavailable``
-            with ``token_membership_unavailable``
-          - token absent from the parsed list -> ``unavailable`` with
-            ``token_id_not_in_condition``
-          - a duplicate/ambiguous occurrence -> ``unavailable`` with
-            ``token_membership_ambiguous``
-          - exactly one matching token proceeds.
-      * Malformed / non-object existing metadata -> ``unavailable`` (blocked);
-        the caller preserves the original DB value.
-      * Missing Gamma taxonomy -> ``unavailable`` (no error, no overwrite).
-      * ``metadata_version`` conflict: an existing non-empty version that
-        differs from ``"1"`` blocks as ``version_conflict`` (never rewritten).
-      * Any non-empty, differing value across taxonomy / event / series ->
-        ``conflict`` (existing value preserved; caller must NOT overwrite).
-      * Empty/missing existing fields are FILLABLE (filled from Gamma).
-      * Incoming None/empty Gamma fields are absence of evidence: an existing
-        populated value is PRESERVED (not a conflict).
-      * ``metadata_version`` is stamped on every returned shape.
-
-    ``condition_id`` is the source_trade's ``market_source_id`` (the trusted
-    Gamma condition id). The provided Gamma market MUST match it.
-    """
-    # --- Fail-closed parse of the existing stored value. --------------------
-    existing, parse_err = _parse_metadata(existing_json)
-    if parse_err is not None:
-        # Return the RAW original value so the caller can preserve it verbatim.
-        return _preserve_opt(existing_json), MERGE_UNAVAILABLE, [parse_err]
-
-    reason_codes: list[str] = []
+    if not existing_json:
+        existing: dict[str, Any] = {}
+    else:
+        try:
+            parsed = json.loads(existing_json)
+        except (json.JSONDecodeError, TypeError):
+            return existing_json, MERGE_UNAVAILABLE, ["existing_metadata_malformed_json"]  # type: ignore[return-value]
+        if not isinstance(parsed, dict):
+            return existing_json, MERGE_UNAVAILABLE, ["existing_metadata_not_object"]  # type: ignore[return-value]
+        existing = parsed
 
     if gamma_market is None:
-        reason_codes.append("gamma_missing")
-        return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
-
-    g_cid = _gamma_condition_id(gamma_market)
-    req_cid = condition_id.lower() if condition_id else None
-    if g_cid != req_cid:
-        reason_codes.append("condition_id_mismatch")
-        return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
-
-    # --- Token ownership via the REAL Gamma token contract. ----------------
+        return _ensure_version(existing), MERGE_UNAVAILABLE, ["gamma_missing"]
+    if _gamma_condition_id(gamma_market) != condition_id.lower():
+        return _ensure_version(existing), MERGE_UNAVAILABLE, ["condition_id_mismatch"]
     if token_id:
         owned = _gamma_token_ids(gamma_market)
+        matches = sum(token == str(token_id).lower() for token in owned)
         if not owned:
-            reason_codes.append("token_membership_unavailable")
-            return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
-        match_count = sum(1 for t in owned if t == str(token_id).lower())
-        if match_count == 0:
-            reason_codes.append("token_id_not_in_condition")
-            return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
-        if match_count > 1:
-            reason_codes.append("token_membership_ambiguous")
-            return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
+            return _ensure_version(existing), MERGE_UNAVAILABLE, ["token_membership_unavailable"]
+        if matches == 0:
+            return _ensure_version(existing), MERGE_UNAVAILABLE, ["token_id_not_in_condition"]
+        if matches > 1:
+            return _ensure_version(existing), MERGE_UNAVAILABLE, ["token_membership_ambiguous"]
 
-    # --- metadata_version conflict (before building the merge). ------------
-    existing_version = existing.get("metadata_version")
-    if existing_version not in (None, "", METADATA_VERSION):
-        reason_codes.append("version_conflict")
-        # Preserve the original (do NOT rewrite version "2" -> "1").
-        return dict(existing), MERGE_CONFLICT, reason_codes
+    version = existing.get("metadata_version")
+    if version not in (None, "", METADATA_VERSION):
+        return dict(existing), MERGE_CONFLICT, ["version_conflict"]
 
-    new = build_canonical_metadata({}, gamma_market)
-    new_taxonomy = new.get("taxonomy") or {}
-    if not new_taxonomy.get("raw_category"):
-        reason_codes.append("taxonomy_unavailable")
-        return _ensure_version(existing), MERGE_UNAVAILABLE, reason_codes
-
-    merged = dict(existing)  # preserve unrelated metadata
+    incoming = build_canonical_metadata({}, gamma_market)
+    merged = dict(existing)
     changed = False
-    conflict = False
+    reasons: list[str] = []
+    existing_snapshot = existing.get("_snapshot")
+    incoming_snapshot = incoming["_snapshot"]
+    snapshot_substantively_equal = (
+        _snapshot_for_replay_comparison(existing_snapshot)
+        == _snapshot_for_replay_comparison(incoming_snapshot)
+    )
 
-    for ns in ("taxonomy", "event", "series"):
-        if ns not in new:
-            continue
-        existing_ns = existing.get(ns)
-        new_ns = new[ns]
-        if not isinstance(existing_ns, dict):
-            # empty / None existing namespace -> fillable;
-            # a NON-EMPTY non-dict existing namespace -> conflict.
-            if existing_ns is None or (isinstance(existing_ns, (str, list, tuple, set, dict)) and not existing_ns):
-                merged[ns] = new_ns
-                changed = True
-            else:
-                conflict = True
-                reason_codes.append(f"{ns}_not_dict_conflict")
-            continue
-        merged_ns = dict(existing_ns)
-        for k, v in new_ns.items():
-            if v is None or v == "" or (isinstance(v, (list, tuple, set, dict)) and not v):
-                # incoming Gamma field is absence of evidence (None, empty
-                # string, or empty collection): preserve an existing populated
-                # value; never a conflict and never a fill.
-                continue
-            if k not in existing_ns:
-                # missing key in existing -> fillable
-                merged_ns[k] = v
-                changed = True
-            elif k == "tags":
-                # tags are an order-insensitive set when both sides are lists.
-                ev_raw = existing_ns[k]
-                # Empty / missing / None / "" existing tags -> fillable.
-                if ev_raw is None or ev_raw == "" or (
-                    isinstance(ev_raw, (list, tuple, set, frozenset)) and not ev_raw
-                ):
-                    merged_ns[k] = v
-                    changed = True
-                elif isinstance(ev_raw, (list, tuple, set, frozenset)):
-                    # Both sides are lists -> compare as normalized sets.
-                    ev_set = set(_tags(ev_raw))
-                    v_set = set(_tags(v))
-                    if ev_set == v_set:
-                        continue
-                    conflict = True
-                    reason_codes.append("taxonomy_tags_conflict")
-                else:
-                    # Existing non-empty tags that is NOT a list -> TYPE
-                    # CONFLICT. Must NOT be overwritten (existing preserved).
-                    conflict = True
-                    reason_codes.append("taxonomy_tags_type_conflict")
-            else:
-                ev = existing_ns[k]
-                if ev == v:
-                    # identical (incl. both None) -> no change
-                    continue
-                if ev is None or ev == "":
-                    # existing is empty/None -> fillable from Gamma
-                    merged_ns[k] = v
-                    changed = True
-                elif not isinstance(ev, (str, int, float, bool)) or not isinstance(
-                    v, (str, int, float, bool)
-                ):
-                    # a non-empty namespace field of the wrong type -> conflict
-                    conflict = True
-                    reason_codes.append(f"{ns}_{k}_type_conflict")
-                else:
-                    # both non-empty scalars and differing -> block (fail closed)
-                    conflict = True
-                    reason_codes.append(f"{ns}_{k}_conflict")
-        if changed and not conflict:
-            merged[ns] = merged_ns
+    for namespace in ("taxonomy", "event", "series"):
+        merged_namespace, namespace_changed, namespace_reasons = _merge_standard_namespace(
+            existing, incoming[namespace], namespace
+        )
+        if namespace_changed:
+            merged[namespace] = merged_namespace
+            changed = True
+        reasons.extend(namespace_reasons)
 
-    if conflict:
-        return _ensure_version(existing), MERGE_CONFLICT, reason_codes
+    if snapshot_substantively_equal:
+        snapshot = existing_snapshot
+        snapshot_changed = False
+        snapshot_reasons: list[str] = []
+    else:
+        snapshot, snapshot_changed, snapshot_reasons = _merge_snapshot(
+            existing_snapshot, incoming_snapshot
+        )
+    if snapshot_changed:
+        assert isinstance(snapshot, dict)
+        provenance = snapshot.setdefault("provenance", {})
+        provenance["retrieved_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        merged["_snapshot"] = snapshot
+        changed = True
+    reasons.extend(snapshot_reasons)
 
-    if changed:
-        merged = json.loads(_as_json(merged))
-        merged["metadata_version"] = METADATA_VERSION
-        return merged, MERGE_FILLED, reason_codes
+    merged["metadata_version"] = METADATA_VERSION
+    if reasons:
+        return json.loads(json.dumps(merged, sort_keys=True)), MERGE_CONFLICT, reasons
+    if not changed:
+        reasons.append("no_change")
+        return _ensure_version(existing), MERGE_UNCHANGED, reasons
+    return json.loads(json.dumps(merged, sort_keys=True)), MERGE_FILLED, reasons
 
-    reason_codes.append("no_change")
-    out = _ensure_version(existing)
-    return out, MERGE_UNCHANGED, reason_codes
+
+def build_metadata_from_gamma_market(
+    raw: Mapping[str, Any] | None,
+    gamma_market: Mapping[str, Any] | None,
+) -> dict[str, Any] | CanonicalSourceTradeMetadata:
+    """Compatibility alias for callers that have not moved to the canonical name."""
+    return build_canonical_metadata(raw, gamma_market)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical-metadata trust boundary
+#
+# Trust is represented by ``CanonicalSourceTradeMetadata`` type identity, not
+# payload contents. The canonical builder is the only production constructor.
+# Ordinary mappings — even schema-perfect copies — always remain untrusted and
+# must pass through bounded metadata-v1 normalization.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def is_canonical_source_trade_metadata(raw: Any) -> bool:
+    """Return whether ``raw`` has trusted canonical type identity.
+
+    Ordinary mappings always return ``False`` regardless of their contents.
+    This helper exists for compatibility and must never inspect mapping fields.
+    """
+    return type(raw) is CanonicalSourceTradeMetadata

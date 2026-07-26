@@ -40,9 +40,9 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
-import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,17 +54,21 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import evidence_db as ed  # noqa: E402  (DbConn with count_table_optional)
+
 from polycopy.db.database import Database  # noqa: E402
+from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+    MERGE_CONFLICT,
+    build_canonical_metadata,
+    merge_canonical_metadata,
+)
+from polycopy.ingestion.specialist_evidence_collector import (  # noqa: E402
+    EvidenceCollectorConfig,
+    collect_evidence,
+)
 from polycopy.ingestion.specialist_evidence_watchlist import (  # noqa: E402
     add_watch,
 )
-from polycopy.ingestion.specialist_evidence_collector import (  # noqa: E402
-    collect_evidence,
-    EvidenceCollectorConfig,
-)
-from polycopy.ingestion.canonical_metadata import build_canonical_metadata  # noqa: E402
-
-import evidence_db as ed  # noqa: E402  (DbConn with count_table_optional)
 
 
 def _load(n):
@@ -433,7 +437,7 @@ def test_s7_v20_to_v21_preservation():
 
 # ── C. disposable E2E lifecycle (deterministic) ────────────────────────────────
 
-def test_s7_disposable_e2e_full_lifecycle():
+def test_s7_disposable_e2e_full_lifecycle(capsys):
     """Deterministic disposable proof of every required integration transition.
 
     Uses fakes for every network-backed seam (collector provider, backfill
@@ -494,6 +498,7 @@ def test_s7_disposable_e2e_full_lifecycle():
         "SELECT market_source_id FROM source_trades WHERE id=?", (tid,)
     ).fetchone()[0] for tid in (CT1, CT2)}
     CT_POL = CT1 if cid_of[CT1] == COND_A else CT2
+    CT_SPORTS = CT1 if cid_of[CT1] == COND_B else CT2
     # Canonical taxonomy persisted via the collector's merge.
     tax = db.conn.execute(
         "SELECT COUNT(*) FROM source_trades WHERE json_extract(metadata_json,"
@@ -696,47 +701,82 @@ def test_s7_disposable_e2e_full_lifecycle():
     assert st_re[1] is not None, st_re
     assert "T" in st_re[1], st_re
     # ── SECTION 3: PROVE AN ACTUAL CONFLICT (contradictory canonical Gamma) ──
-    # Force CT2 to a known baseline taxonomy (Sports) and feed backfill a Gamma
-    # whose conditionId MATCHES CT2's market_source_id (COND_B) but whose taxonomy
+    # Force the COND_B trade to a known baseline taxonomy (Sports) and feed
+    # backfill a Gamma whose conditionId MATCHES its market_source_id but whose taxonomy
     # category is the OPPOSITE (Politics). A mismatched conditionId would yield
-    # unavailable, not conflict -- so the Gamma must carry CT2's real conditionId.
-    ct2_meta = json.loads(db.conn.execute(
-        "SELECT metadata_json FROM source_trades WHERE id=?", (CT2,)).fetchone()[0])
-    ct2_meta["taxonomy"] = {"raw_category": "Sports", "tags": ["nba"]}
+    # unavailable, not conflict -- so Gamma must carry the selected trade's real conditionId.
+    sports_meta = json.loads(db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT_SPORTS,)).fetchone()[0])
+    sports_meta["taxonomy"] = {"raw_category": "Sports", "tags": ["nba"]}
+    sports_meta["custom_conflict_preserved"] = "KEEP_CONFLICT_CONTEXT"
     db.conn.execute("UPDATE source_trades SET metadata_json=? WHERE id=?",
-                    (json.dumps(ct2_meta, sort_keys=True), CT2))
+                    (json.dumps(sports_meta, sort_keys=True), CT_SPORTS))
     db.conn.commit()
-    ct2_cat = "Sports"
+    sports_cat = "Sports"
     opp_cat = "Politics"
     gamma_opp = dict(GAMMA_B)  # conditionId == COND_B, clobTokenIds == [TOK_A, TOK_B]
     gamma_opp["category"] = opp_cat
     gamma_opp["tags"] = ["election"]
+    # A lifecycle transition is substantive provider evidence; do not use
+    # provider/local audit timestamps merely to force snapshot inequality.
+    gamma_opp["closed"] = True
+    gamma_opp["active"] = False
+    gamma_opp["slug"] = "nba-conflicting-provider-evidence"
+
+    # The field-scoped merge result preserves the protected taxonomy and
+    # unrelated local context while retaining valid, unrelated lifecycle
+    # evidence from Gamma. The backfill remains fail-closed and will not persist
+    # this conflict-bearing merge output.
+    before_conflict = db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT_SPORTS,)
+    ).fetchone()[0]
+    preview, preview_status, preview_reasons = merge_canonical_metadata(
+        before_conflict,
+        gamma_opp,
+        condition_id=COND_B,
+        token_id=TOK_B,
+    )
+    assert preview_status == MERGE_CONFLICT, preview_reasons
+    assert "taxonomy_raw_category_conflict" in preview_reasons, preview_reasons
+    assert preview["taxonomy"]["raw_category"] == sports_cat, preview
+    assert preview["custom_conflict_preserved"] == "KEEP_CONFLICT_CONTEXT", preview
+    assert preview["_snapshot"]["lifecycle"]["closed"] is True, preview
+    assert preview["_snapshot"]["lifecycle"]["active"] is False, preview
+
     _BACKFILL_ADAPTER_CALLS.clear()
     _BACKFILL_ADAPTER_INSTANCES.clear()
     backfill._make_adapter = _fake_backfill_adapter_factory(
         by_condition={COND_A: GAMMA_A, COND_B: gamma_opp})
+    capsys.readouterr()
     try:
-        rc_conf = backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+        rc_conf = backfill.main(["--db-path", str(db.db_path),
+                                 "--source-trade-id", CT_SPORTS,
                                  "--write", "--allow-live", "--confirm-production-db",
-                                 "--limit", "50"])
+                                 "--limit", "50", "--json"])
     finally:
         backfill._make_adapter = orig_adapter
     # The command returns the accepted honest result (rc 0, conflict counted).
     assert rc_conf == 0, rc_conf
-    # The actual adapter WAS called for CT2's condition id (not skipped).
+    conflict_counts = json.loads(capsys.readouterr().out)
+    assert conflict_counts["selected"] == 1, conflict_counts
+    assert conflict_counts["conflict"] == 1, conflict_counts
+    assert conflict_counts["written"] == 1, conflict_counts
+    # The actual adapter WAS called for the selected trade's condition id.
     assert len(_BACKFILL_ADAPTER_INSTANCES) == 1, _BACKFILL_ADAPTER_INSTANCES
     assert COND_B in _BACKFILL_ADAPTER_INSTANCES[0].calls, \
         _BACKFILL_ADAPTER_INSTANCES[0].calls
     # source_trades.metadata_json is preserved byte-for-byte (conflict not overwritten).
-    prior = db.conn.execute(
-        "SELECT metadata_json FROM source_trades WHERE id=?", (CT2,)).fetchone()[0]
-    after = json.loads(prior)
-    assert after["taxonomy"]["raw_category"] == ct2_cat, after
+    after_conflict = db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT_SPORTS,)).fetchone()[0]
+    assert after_conflict == before_conflict
+    after = json.loads(after_conflict)
+    assert after["taxonomy"]["raw_category"] == sports_cat, after
+    assert after["custom_conflict_preserved"] == "KEEP_CONFLICT_CONTEXT", after
     # source_trade_enrichments records the honest conflict status + exact code.
     crow = db.conn.execute(
-        "SELECT status, reason_codes_json FROM source_trade_enrichments "
-        "WHERE source_trade_internal_id=?", (CT2,)).fetchone()
-    assert crow is not None, "CT2 provenance row missing"
+        "SELECT status, reason_codes_json, evidence_hash FROM source_trade_enrichments "
+        "WHERE source_trade_internal_id=?", (CT_SPORTS,)).fetchone()
+    assert crow is not None, "COND_B provenance row missing"
     assert crow["status"] == "conflict", crow
     codes = json.loads(crow["reason_codes_json"]) if crow["reason_codes_json"] else []
     assert codes, codes
@@ -745,22 +785,53 @@ def test_s7_disposable_e2e_full_lifecycle():
     # Normalized category is NOT falsely replaced (stays NULL under conflict).
     ncat = db.conn.execute(
         "SELECT normalized_category FROM source_trade_enrichments "
-        "WHERE source_trade_internal_id=?", (CT2,)).fetchone()[0]
+        "WHERE source_trade_internal_id=?", (CT_SPORTS,)).fetchone()[0]
     assert ncat is None, ncat
-    # Resolve the conflict: strip CT2's taxonomy so the matching Gamma (GAMMA_B,
+
+    # Conflict replay is idempotent: it is counted again but neither metadata
+    # nor current provenance is rewritten.
+    before_conflict_hash = crow["evidence_hash"]
+    before_conflict_reasons = crow["reason_codes_json"]
+    backfill._make_adapter = _fake_backfill_adapter_factory(
+        by_condition={COND_A: GAMMA_A, COND_B: gamma_opp})
+    capsys.readouterr()
+    try:
+        rc_conf_replay = backfill.main([
+            "--db-path", str(db.db_path), "--source-trade-id", CT_SPORTS,
+            "--write", "--allow-live", "--confirm-production-db", "--limit", "50", "--json",
+        ])
+    finally:
+        backfill._make_adapter = orig_adapter
+    assert rc_conf_replay == 0, rc_conf_replay
+    replay_counts = json.loads(capsys.readouterr().out)
+    assert replay_counts["conflict"] == 1, replay_counts
+    assert replay_counts["written"] == 0, replay_counts
+    assert db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT_SPORTS,)
+    ).fetchone()[0] == before_conflict
+    conflict_replay = db.conn.execute(
+        "SELECT status, reason_codes_json, evidence_hash FROM source_trade_enrichments "
+        "WHERE source_trade_internal_id=?", (CT_SPORTS,)
+    ).fetchone()
+    assert conflict_replay["status"] == "conflict", conflict_replay
+    assert conflict_replay["reason_codes_json"] == before_conflict_reasons, conflict_replay
+    assert conflict_replay["evidence_hash"] == before_conflict_hash, conflict_replay
+
+    # Resolve the conflict: strip the COND_B trade's taxonomy so the matching Gamma (GAMMA_B,
     # Sports) triggers a real FILL -> provenance rewritten to 'complete'. A plain
     # re-run with matching data is UNCHANGED and skips the provenance rewrite, so
     # we force a fill to honestly clear the conflict.
-    ct2_res_meta = json.loads(db.conn.execute(
-        "SELECT metadata_json FROM source_trades WHERE id=?", (CT2,)).fetchone()[0])
-    ct2_res_meta["taxonomy"] = {}
+    sports_res_meta = json.loads(db.conn.execute(
+        "SELECT metadata_json FROM source_trades WHERE id=?", (CT_SPORTS,)).fetchone()[0])
+    sports_res_meta["taxonomy"] = {}
     db.conn.execute("UPDATE source_trades SET metadata_json=? WHERE id=?",
-                    (json.dumps(ct2_res_meta, sort_keys=True), CT2))
+                    (json.dumps(sports_res_meta, sort_keys=True), CT_SPORTS))
     db.conn.commit()
     backfill._make_adapter = _fake_backfill_adapter_factory(
         by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B})
     try:
-        rc_res = backfill.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+        rc_res = backfill.main(["--db-path", str(db.db_path),
+                                "--source-trade-id", CT_SPORTS,
                                 "--write", "--allow-live", "--confirm-production-db",
                                 "--limit", "50"])
     finally:
@@ -768,7 +839,7 @@ def test_s7_disposable_e2e_full_lifecycle():
     assert rc_res == 0, rc_res
     rstat = db.conn.execute(
         "SELECT status FROM source_trade_enrichments "
-        "WHERE source_trade_internal_id=?", (CT2,)).fetchone()[0]
+        "WHERE source_trade_internal_id=?", (CT_SPORTS,)).fetchone()[0]
     assert rstat == "complete", rstat
 
     # ── rescore: dry-run zero decisions ──

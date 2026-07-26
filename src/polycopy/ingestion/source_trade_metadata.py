@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from polycopy.ingestion.canonical_metadata import (
+    CanonicalSourceTradeMetadata,
     build_canonical_metadata,
     normalize_source_trade_metadata as _normalize_source_trade_metadata,
 )
@@ -69,6 +70,11 @@ def normalize_source_trade_metadata(raw: Mapping[str, Any] | None) -> dict[str, 
     return _normalize_source_trade_metadata(raw)
 
 
+def _is_trusted_canonical(raw: Any) -> bool:
+    """Select the full-snapshot path only by exact internal type identity."""
+    return type(raw) is CanonicalSourceTradeMetadata
+
+
 def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> str | None:
     """Return only a conflict-free trusted broad category for metadata v1.
 
@@ -90,21 +96,47 @@ def _official_category_for_v1_metadata(result: OfficialTaxonomyResult) -> str | 
 def build_metadata_from_gamma_market(
     trade: Mapping[str, Any] | None,
     gamma_market: Mapping[str, Any] | None,
-) -> dict[str, Any]:
+    *,
+    requested_condition_id: str | None = None,
+    enforce_exact_condition_match: bool = False,
+) -> dict[str, Any] | CanonicalSourceTradeMetadata:
     """Build the canonical PR66 metadata contract from a trusted Gamma market.
 
     Thin delegation to :func:`polycopy.ingestion.canonical_metadata.build_canonical_metadata`
     — the single canonical producer shared by the research evidence plane. The
     approved-wallet collector therefore emits a byte-identical nested shape to
     collection, backfill, and per-trade enrichment.
+
+    ``enforce_exact_condition_match`` enables the initial-ingestion safety
+    gate. Initial-ingestion callers must pass ``True``; backfill callers
+    must not (the merge layer enforces identity upstream).
     """
-    return build_canonical_metadata(trade, gamma_market)
+    return build_canonical_metadata(
+        trade,
+        gamma_market,
+        requested_condition_id=requested_condition_id,
+        enforce_exact_condition_match=enforce_exact_condition_match,
+    )
 
 
 def serialize_source_trade_metadata(raw: Mapping[str, Any] | None) -> str:
-    """Serialize canonical source-trade evidence deterministically."""
+    """Serialize source-trade metadata through one fail-closed boundary.
+
+    Only the exact builder-owned :class:`CanonicalSourceTradeMetadata` type
+    receives full-snapshot serialization. Every ordinary mapping, including
+    dict subclasses and schema-perfect copies, is treated as untrusted and
+    routed through bounded metadata-v1 normalization.
+    """
+    if _is_trusted_canonical(raw):
+        assert type(raw) is CanonicalSourceTradeMetadata
+        return json.dumps(
+            raw.to_plain_dict(),
+            sort_keys=True,
+            separators=_CANONICAL_SEPARATORS,
+        )
+    normalized = _normalize_source_trade_metadata(raw)
     return json.dumps(
-        normalize_source_trade_metadata(raw),
+        normalized,
         sort_keys=True,
         separators=_CANONICAL_SEPARATORS,
     )

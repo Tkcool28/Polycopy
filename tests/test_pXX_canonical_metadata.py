@@ -114,11 +114,14 @@ def test_merge_missing_gamma_unavailable():
 
 
 def test_merge_no_title_inference():
-    # A market with no category but a title must NOT infer taxonomy.
+    # A market with no category but a question must NOT infer taxonomy.
+    # PR66+: merge is FILLED because we capture the snapshot (question, lifecycle),
+    # but taxonomy stays null — proving we never infer from title/question text.
     no_cat = FakeMarket({"conditionId": "0xc2", "question": "Who wins?"})
-    new_meta, status, rc = merge_canonical_metadata(None, no_cat, condition_id="0xc2")
-    assert status == MERGE_UNAVAILABLE
-    assert "taxonomy_unavailable" in rc
+    new_meta, status, _ = merge_canonical_metadata(None, no_cat, condition_id="0xc2")
+    assert status == MERGE_FILLED  # snapshot fills even without taxonomy
+    # Verify taxonomy was NOT inferred from the question text.
+    assert new_meta["taxonomy"]["raw_category"] is None
 
 
 # ── S3 canonical-metadata tags contract ──────────────────────────────────────

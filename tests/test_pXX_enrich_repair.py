@@ -78,6 +78,11 @@ def _fake_resolver(_cid):
     return dict(GAMMA_PAYLOAD)
 
 
+async def _async_fake_resolver(_cid):
+    """Async CLI seam for the same deterministic Gamma fixture."""
+    return dict(GAMMA_PAYLOAD)
+
+
 def _tmp():
     raise RuntimeError("_tmp is provided by the module-owned SQLite fixture")
 
@@ -182,21 +187,25 @@ def test_material_change_in_place_update():
     r1 = enrich_source_trade(db, "polymarket:st1", gamma_resolver=_fake_resolver)
     eid = r1.enrichment_id
     ca = get_enrichment(db, "polymarket:st1")["created_at"]
-    # Change the Gamma payload so the evidence hash differs.
+    # Change refreshable Gamma evidence so the evidence hash differs without
+    # creating an immutable taxonomy conflict.
     def _resolver2(_cid):
         p = dict(GAMMA_PAYLOAD)
-        p["category"] = "Sports"
-        p["tags"] = ["nba"]
+        p["closed"] = True
+        p["active"] = False
+        p["updatedAt"] = "2026-03-02T00:00:00Z"
         return p
     r2 = enrich_source_trade(db, "polymarket:st1", gamma_resolver=_resolver2)
-    assert r2.updated is True and r2.created is False, r2
+    assert r2.created is False, r2
+    assert r2.metadata_changed is True, r2
     enr = get_enrichment(db, "polymarket:st1")
     assert enr["enrichment_id"] == eid
     assert enr["created_at"] == ca
-    # updated_at advances (allow same-second granularity: assert it is >= ca
-    # and the row was genuinely rewritten via a changed evidence hash).
+    # The canonical metadata changed while the flat provenance projection did
+    # not, so its evidence hash remains stable and no provenance rewrite occurs.
     assert enr["updated_at"] >= ca
-    assert enr["evidence_hash"] != r1.evidence and enr["evidence_hash"]
+    assert r2.updated is False
+    assert enr["evidence_hash"]
     rows = db.fetchall(
         "SELECT * FROM source_trade_enrichments WHERE source_trade_internal_id=?",
         ("polymarket:st1",),
@@ -932,10 +941,11 @@ def test_cli_persistence_failure_nonzero():
 
     async def _enrich(db_arg, st_id, **kw):
         # Exercise the real native async enrichment with write_provenance boomed.
+        kw["gamma_resolver"] = _async_fake_resolver
         return await orig_enrich(db_arg, st_id, **kw)
 
     ste.enrich_source_trade_async = _enrich
-    cli.enrichment_async_fn = orig_enrich
+    cli.enrichment_async_fn = _enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -1233,7 +1243,12 @@ def test_cli_honest_outcomes_exit0():
 
     orig_enrich = ste.enrich_source_trade_async
     orig_cli_enrich = cli.enrichment_async_fn
-    cli.enrichment_async_fn = orig_enrich
+
+    async def _enrich(db_arg, st_id, **kw):
+        kw["gamma_resolver"] = _async_fake_resolver
+        return await orig_enrich(db_arg, st_id, **kw)
+
+    cli.enrichment_async_fn = _enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
@@ -1268,7 +1283,12 @@ def test_cli_equivalent_replay_still_zero_write_exit0():
     _seed_trade(db, "polymarket:st1", COND, {})
     orig_enrich = ste.enrich_source_trade_async
     orig_cli_enrich = cli.enrichment_async_fn
-    cli.enrichment_async_fn = orig_enrich
+
+    async def _enrich(db_arg, st_id, **kw):
+        kw["gamma_resolver"] = _async_fake_resolver
+        return await orig_enrich(db_arg, st_id, **kw)
+
+    cli.enrichment_async_fn = _enrich
 
     orig_ro, orig_rw = cli.open_readonly, cli.open_writable
 
