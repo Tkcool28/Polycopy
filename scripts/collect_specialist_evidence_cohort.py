@@ -224,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         write = args.write
         allow_live = args.allow_live
         confirm_production_db = args.confirm_production_db
+        operational_lock_held = True
 
     if args.write and not require_write_gates(_GateArgs(), db_path=args.db_path):
         print(

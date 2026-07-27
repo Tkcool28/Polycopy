@@ -84,6 +84,7 @@ from polycopy.engine.trade_settlement import (
     settle_source_trade_against_truth,
 )
 from polycopy.runtime.locks import operational_job_lock
+from polycopy.ingestion.source_trade_resolution import apply_existing_resolution_updates
 from polycopy.utils.concurrency import LockError
 
 
@@ -440,33 +441,10 @@ def _apply_trade_settlements(
     plans: Iterable[tuple[sqlite3.Row, Any]],
 ) -> int:
     """Write each settlement. Returns the number of rows updated."""
-    n = 0
-    for trade_row, settlement in plans:
-        if settlement is None:
-            continue
-        db.conn.execute(
-            """
-            UPDATE source_trades
-               SET resolution_status = ?,
-                   resolved_at = ?,
-                   winning_token_id = ?,
-                   is_winning_trade = ?,
-                   realized_pnl = ?,
-                   settlement_source = ?
-             WHERE id = ?
-            """,
-            (
-                settlement.resolution_status,
-                settlement.resolved_at,
-                settlement.winning_token_id,
-                settlement.is_winning_trade,
-                settlement.realized_pnl,
-                settlement.settlement_source,
-                str(trade_row["id"]),
-            ),
-        )
-        n += 1
-    return n
+    return apply_existing_resolution_updates(
+        db.conn,
+        [(str(trade_row["id"]), settlement) for trade_row, settlement in plans if settlement is not None],
+    )
 
 
 # ── CLI / entry point ────────────────────────────────────────────────────────

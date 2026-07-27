@@ -619,12 +619,12 @@ def test_pr24y_source_probe_module_still_valid():
     assert "polymarket_data_api_trades_user" in names
 
 
-def test_pr24x_audit_still_reports_legacy_writers():
+def test_pr24x_audit_reports_canonical_writer_architecture():
     from polycopy.engine import source_trade_ingestion_writer_audit as xmod
     audit = xmod.build_source_trade_ingestion_writer_audit(None)
     prod = [w for w in audit.write_paths if w.classification == "production_write_path"]
     assert len(prod) >= 1
-    assert audit.centralized_writer_exists is False
+    assert audit.centralized_writer_exists is True
 
 
 def test_no_timer_service_deploy_behavior_in_writer():

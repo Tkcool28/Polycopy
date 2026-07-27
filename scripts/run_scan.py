@@ -1406,42 +1406,33 @@ def _persist_trade(db: Database, trade: SourceTrade) -> bool | None:
     trade history is not available to ``_compute_wallet_metrics``.
     """
     try:
-        # Defensive normalization: None / sentinel pass through; legitimate
-        # addresses are stored in canonical lowercase form. This mirrors
-        # what the parser now does and keeps every persistence path
-        # consistent.
+        from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
+        from polycopy.ingestion.source_trade_writer import write_valid_rows
+
         ta = trade.trader_address
-        if ta is not None and ta and not is_sentinel_trader_address(ta):
-            persisted_trader_address: str | None = str(ta).strip().lower() or None
-        else:
-            persisted_trader_address = None
-        cur = db.execute(
-            """INSERT OR IGNORE INTO source_trades
-               (id, source, source_trade_id, market_source_id, side,
-                outcome, quantity, price, trader_address, timestamp,
-                is_sample, token_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(uuid.uuid4()),
-                trade.source,
-                trade.source_trade_id,
-                trade.market_source_id,
-                trade.side.value if hasattr(trade.side, "value") else str(trade.side),
-                trade.outcome,
-                float(trade.quantity),
-                float(trade.price),
-                persisted_trader_address,
-                trade.timestamp.isoformat() if trade.timestamp else None,
-                int(bool(trade.is_sample)),
-                # PR-1: persist upstream CLOB token id verbatim. None when
-                # the source payload didn't carry an asset field (legacy
-                # fallback path in resolve_trade_to_outcome).
-                trade.token_id,
-            ),
+        persisted_trader_address = (
+            str(ta).strip().lower()
+            if ta is not None and ta and not is_sentinel_trader_address(ta)
+            else None
         )
-        db.conn.commit()
-        # rowcount == 1 means a fresh insert; 0 means duplicate (UNIQUE hit)
-        return bool(getattr(cur, "rowcount", 0))
+        candidate = NormalizedSourceTrade(
+            source=trade.source,
+            source_trade_id=trade.source_trade_id,
+            market_source_id=trade.market_source_id,
+            side=trade.side.value if hasattr(trade.side, "value") else str(trade.side),
+            outcome=trade.outcome,
+            quantity=float(trade.quantity),
+            price=float(trade.price),
+            trader_address=persisted_trader_address,
+            timestamp=trade.timestamp,
+            is_sample=int(bool(trade.is_sample)),
+            token_id=trade.token_id,
+            validation_status="valid",
+        )
+        result = write_valid_rows(db, [candidate], dry_run=False)
+        if result.errors:
+            return None
+        return bool(result.inserted)
     except Exception as e:
         logger.warning(
             "persist_trade failed (%s @ %s): %s",

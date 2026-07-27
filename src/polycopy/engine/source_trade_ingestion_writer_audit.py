@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 # ── Versioning ───────────────────────────────────────────────────────────────
-AUDIT_VERSION = "PR24X-1"
+AUDIT_VERSION = "PR24X-2"
 
 # Path anchors used by the static inspector. All relative to a repo root.
 _REPO_ROOT_HINTS = ("src/polycopy", "scripts", "tests")
@@ -108,6 +108,7 @@ class WritePath:
 
 CLASSIFICATIONS = (
     "production_write_path",
+    "reconciliation_write_path",
     "sample_test_seed_path",
     "migration_schema_path",
     "report_only_read_path",
@@ -225,13 +226,11 @@ class IngestionWriterAudit:
         default_factory=WalSafeWritePolicy
     )
     future_sequence: list[FutureSequenceStep] = field(default_factory=list)
-    centralized_writer_exists: bool = False
+    centralized_writer_exists: bool = True
     centralized_writer_note: str = (
-        "No safe centralized source_trade writer exists today. "
-        "persist_trade is duplicated across two collectors "
-        "(run_scan.py and collect_smart_money_data.py). PR24X "
-        "recommends building ONE shared writer role per the "
-        "architecture below rather than a new parallel path."
+        "write_valid_rows() is the sole authorized centralized source_trades "
+        "writer. Legacy collectors adapt their rows to it; bounded metadata "
+        "and resolution reconciliation remain existing-row-only update roles."
     )
     guardrail_flags: dict[str, bool] = field(default_factory=dict)
 
@@ -277,12 +276,14 @@ def _classify(path: str, verb: str, is_sample: bool) -> tuple[str, bool, bool, b
     # Migration / schema DDL.
     if "db/schema" in rel or name in ("database.py",):
         return ("migration_schema_path", True, True, is_sample)
-    # Settlement UPDATE during backfill.
-    if "backfill_resolution_truth" in name:
+    if name == "source_trade_writer.py":
         return ("production_write_path", True, True, is_sample)
-    # Production collector writers.
-    if name in ("run_scan.py", "collect_smart_money_data.py", "live_smoke_pr3_fixes.py"):
-        return ("production_write_path", True, True, is_sample)
+    if name in ("source_trade_metadata_reconciliation.py", "source_trade_resolution.py"):
+        return ("reconciliation_write_path", True, True, is_sample)
+    if name == "pr24z_canonical_identity.py":
+        return ("migration_schema_path", True, False, is_sample)
+    if name == "live_smoke_pr3_fixes.py":
+        return ("sample_test_seed_path", True, True, is_sample)
     return ("dead_unused_unknown", True, False, is_sample)
 
 
@@ -405,11 +406,10 @@ def _default_collectors() -> list[CollectorAudit]:
             reads=True,
             writes_db=True,
             tables_touched=("source_trades", "wallets", "markets"),
-            writes_source_trades_directly=True,
-            fetcher_only_safe=False,
-            notes="PRODUCTION writer. Calls _persist_trade() (run_scan.py:1419) "
-            "directly. Also persists wallets/markets. Must be refactored so "
-            "ingestion delegates to the single shared writer.",
+            writes_source_trades_directly=False,
+            fetcher_only_safe=True,
+            notes="Retained legacy orchestration. _persist_trade() adapts raw "
+            "rows and delegates initial persistence to write_valid_rows().",
         ),
         CollectorAudit(
             name="collect_smart_money_data.run_collection",
@@ -417,11 +417,10 @@ def _default_collectors() -> list[CollectorAudit]:
             reads=True,
             writes_db=True,
             tables_touched=("source_trades", "wallets", "markets"),
-            writes_source_trades_directly=True,
-            fetcher_only_safe=False,
-            notes="PRODUCTION writer. Calls _persist_trade() "
-            "(collect_smart_money_data.py:703) directly. Duplicate of the "
-            "run_scan writer. Must be refactored to the shared writer.",
+            writes_source_trades_directly=False,
+            fetcher_only_safe=True,
+            notes="Retained legacy orchestration. _persist_trade() adapts raw "
+            "rows and delegates initial persistence to write_valid_rows().",
         ),
         CollectorAudit(
             name="wallet_discovery",
@@ -439,11 +438,10 @@ def _default_collectors() -> list[CollectorAudit]:
             reads=True,
             writes_db=True,
             tables_touched=("source_trades",),
-            writes_source_trades_directly=True,
-            fetcher_only_safe=False,
-            notes="UPDATEs source_trades resolution columns (line 449). "
-            "Settlement-stage, not ingestion. Must remain a separate, "
-            "explicit, single-owner writer.",
+            writes_source_trades_directly=False,
+            fetcher_only_safe=True,
+            notes="Legacy settlement orchestration delegates existing-row "
+            "updates to source_trade_resolution's sole resolution contract.",
         ),
     ]
 
@@ -687,13 +685,13 @@ def report_to_markdown(audit: IngestionWriterAudit) -> str:
         lines.append(f"- **{k}**: {v}")
     lines.append("")
 
-    lines.append("## 7. WAL-Safe Write Policy (future writer)")
+    lines.append("## 7. WAL-Safe Write Policy")
     wp = d["wal_safe_write_policy"]
     for k, v in wp.items():
         lines.append(f"- {k}: **{v}**")
     lines.append("")
 
-    lines.append("## 8. Future Manual Ingestion Sequence")
+    lines.append("## 8. Ingestion Sequence")
     for s in d["future_sequence"]:
         lines.append(f"- **{s['pr']}** — {s['title']} "
                      f"(writes DB: {s['writes_db']}). {s['notes']}")

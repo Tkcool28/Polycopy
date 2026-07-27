@@ -559,7 +559,9 @@ class TestFileLockFdLeakRegression:
         )
 
         def fd_count() -> int:
-            return len(os.listdir(f"/proc/{os.getpid()}/fd"))
+            # /proc/self is namespace-safe. os.getpid() may return a PID that is not
+            # exposed under the runner's mounted /proc when PID namespaces differ.
+            return len(os.listdir("/proc/self/fd"))
 
         def lock_held() -> bool:
             """True if the lock file exists AND contains a PID line."""

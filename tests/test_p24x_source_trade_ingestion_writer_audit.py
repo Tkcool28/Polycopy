@@ -280,17 +280,17 @@ def test_direct_source_trade_write_paths_are_classified():
     prod = [w for w in audit.write_paths
             if w.classification == "production_write_path"]
     assert len(prod) >= 1, "at least one production write path should be detected"
-    # The two known collector-owned INSERTs are present.
-    run_scan = [w for w in audit.write_paths
-                if w.path == "scripts/run_scan.py" and w.line == 1419]
-    collect = [w for w in audit.write_paths
-               if w.path == "scripts/collect_smart_money_data.py" and w.line == 703]
-    assert run_scan, "run_scan.py:1419 writer not detected"
-    assert collect, "collect_smart_money_data.py:703 writer not detected"
-    # Settlement UPDATE present.
-    backfill = [w for w in audit.write_paths
-                if w.path == "scripts/backfill_resolution_truth.py" and w.line == 449]
-    assert backfill, "backfill_resolution_truth.py:449 UPDATE not detected"
+    canonical = [w for w in audit.write_paths
+                 if w.path == "src/polycopy/ingestion/source_trade_writer.py"
+                 and w.classification == "production_write_path"]
+    assert canonical, "canonical source-trade writer not detected"
+    assert not [w for w in audit.write_paths if w.path in {
+        "scripts/run_scan.py",
+        "scripts/collect_smart_money_data.py",
+        "scripts/backfill_resolution_truth.py",
+    }], "legacy orchestration must not retain direct source_trades SQL"
+    assert [w for w in audit.write_paths
+            if w.classification == "reconciliation_write_path"]
     # Test/temp DB seeds are distinguished from production.
     test_seeds = [w for w in audit.write_paths
                   if w.classification == "test_temp_db_only"]
@@ -307,9 +307,8 @@ def test_report_distinguishes_production_from_test_seed_paths():
     assert "production_write_path" in md
     assert "test_temp_db_only" in md
     assert "sample_test_seed_path" in md
-    # The production writer paths appear by file:line.
-    assert "scripts/run_scan.py:1419" in md
-    assert "scripts/collect_smart_money_data.py:703" in md
+    assert "src/polycopy/ingestion/source_trade_writer.py" in md
+    assert "reconciliation_write_path" in md
 
 
 # ── Architecture: exactly one writer role ────────────────────────────────────
@@ -329,17 +328,14 @@ def test_architecture_has_exactly_one_writer_role():
 def test_collectors_not_allowed_to_own_db_writes_in_proposed_arch():
     """The proposed architecture forbids collector-owned writes.
 
-    Even though today run_scan/collect DO write, the audit must record them as
-    fetcher_only_safe=False and recommend refactoring to the shared writer.
+    Legacy orchestration remains, but it delegates initial persistence to the
+    shared writer and cannot own source_trades SQL.
     """
     audit = build_source_trade_ingestion_writer_audit(None)
     offenders = [c for c in audit.collectors
                  if c.writes_source_trades_directly]
-    assert offenders, "current collector-owned writers must be recorded"
-    for c in offenders:
-        assert c.fetcher_only_safe is False
-    # The recommendation is explicit: no centralized writer exists today.
-    assert audit.centralized_writer_exists is False
+    assert not offenders, "collectors must not own source_trades SQL"
+    assert audit.centralized_writer_exists is True
     low_note = audit.centralized_writer_note.lower()
     assert "writer" in low_note and (
         "centralized" in low_note or "shared" in low_note
@@ -359,7 +355,7 @@ def test_report_serializes_to_json():
     assert "dedupe_strategy" in parsed
     assert "wal_safe_write_policy" in parsed
     assert "future_sequence" in parsed
-    assert parsed["centralized_writer_exists"] is False
+    assert parsed["centralized_writer_exists"] is True
 
 
 def test_guardrail_flags_all_true():
