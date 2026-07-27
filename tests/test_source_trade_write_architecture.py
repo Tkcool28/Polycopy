@@ -65,17 +65,23 @@ def _production_sql_mutations(path: Path) -> list[str]:
 
     out: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
+        if not isinstance(node, ast.Call):
             continue
         method = node.func.attr if isinstance(node.func, ast.Attribute) else None
-        if method not in {"execute", "executemany"}:
+        if method not in {"execute", "executemany", "executescript", "fetchone", "fetchall"}:
             continue
-        sql = resolve(node.args[0])
+        sql_node = node.args[0] if node.args else next(
+            (keyword.value for keyword in node.keywords if keyword.arg in {"sql", "query", "statement"}),
+            None,
+        )
+        if sql_node is None:
+            continue
+        sql = resolve(sql_node)
         if sql is None:
             # The architecture guard is source-trade scoped. Dynamic SQL that
             # names the protected table is unsafe because it cannot be proven
             # to be one of the narrow authorized operations.
-            origin = origins.get(node.args[0].id, node.args[0]) if isinstance(node.args[0], ast.Name) else node.args[0]
+            origin = origins.get(sql_node.id, sql_node) if isinstance(sql_node, ast.Name) else sql_node
             expression = ast.unparse(origin)
             if "source_trades" in expression.lower() and _MUTATION.search(expression):
                 out.append("UNRESOLVED_SQL")
@@ -131,6 +137,9 @@ def test_sql_guard_rejects_indirected_and_dynamic_source_trade_mutations(tmp_pat
         "fstring": 'sql = f"REPLACE INTO {\'source_trades\'} VALUES (?)"\n    conn.execute(sql)',
         "multiline": 'sql = """\\n UPDATE   source_trades SET metadata_json=?\\n """\n    conn.execute(sql)',
         "many": 'sql = "INSERT INTO source_trades VALUES (?)"\n    conn.executemany(sql, [])',
+        "script": 'conn.executescript("DELETE FROM source_trades;")',
+        "cursor": 'cursor = conn.cursor()\n    cursor.execute("UPDATE source_trades SET metadata_json=?")',
+        "keyword": 'db.execute(sql="DELETE FROM source_trades")',
         "wrapper": 'sql = "DELETE FROM source_trades"\n    db.execute(sql)',
         "helper_sql": 'def sql_text():\n        return "UPDATE source_trades SET metadata_json=?"\n    conn.execute(sql_text())',
         "helper_execute": 'def write():\n        db.execute("INSERT OR REPLACE INTO source_trades VALUES (?)")\n    write()',
