@@ -26,7 +26,7 @@ def serialize_canonical_merge_metadata(metadata: _CanonicalMergeMetadata) -> str
     """
     if type(metadata) is not _CanonicalMergeMetadata:
         raise TypeError("metadata replacement requires canonical merge output")
-    return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+    return metadata._serialized_json()
 
 
 @dataclass(frozen=True)

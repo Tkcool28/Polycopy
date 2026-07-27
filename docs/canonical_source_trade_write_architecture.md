@@ -1,66 +1,83 @@
 # Canonical `source_trades` write architecture
 
-## Contract
+## Initial-ingestion contract
 
-Initial production ingestion has exactly one SQL boundary:
+Every retained collector follows one explicit boundary:
 
 ```text
-collector-specific adapter → canonical normalization → canonical metadata builder
-→ source_trade_writer.write_valid_rows → source_trades
+collector-specific adapter
+→ approved shared normalizer for that collector contract
+→ honestly validated NormalizedSourceTrade
+→ source_trade_writer.write_valid_rows
+→ sole initial source_trades INSERT boundary
 ```
 
-`write_valid_rows` owns the sole initial `INSERT OR IGNORE` and deduplicates
-only by `(source, source_trade_id)`. Collectors supply raw trade facts;
-normalization derives the canonical identity, canonical wallet/side values and
-validation status; the writer alone serializes initial metadata through the PR
-#79 trusted metadata boundary.
+`source_trade_writer.write_valid_rows` owns the sole initial `INSERT OR IGNORE`
+for `source_trades` and its `(source, source_trade_id)` duplicate identity. The
+writer accepts validated `NormalizedSourceTrade` values only: it performs no
+normalization and no collector may hard-code `validation_status="valid"`.
 
-The legacy scan and smart-money collectors are retained only as orchestration
-paths. Their local persistence functions now adapt their parsed `SourceTrade`
-to `NormalizedSourceTrade` and call the canonical writer. They no longer carry
-collector-owned `source_trades` SQL.
+Approved-wallet collectors use the stricter approved-wallet normalizer. The
+retained `run_scan` and smart-money collectors use
+`normalize_legacy_source_trade`, whose compatibility policy explicitly permits
+BUY and SELL, missing wallet addresses, and missing token IDs when the retained
+legacy contract requires them. It still rejects invalid price, quantity, or
+timestamp before the canonical writer is called. Sentinel wallets become
+`None`; legitimate wallet addresses are canonicalized.
 
-## Bounded reconciliation allowlist
+## Existing-row reconciliation
 
-| Role | Boundary | Existing-row selector | Allowed fields | Missing row |
+Initial ingestion is distinct from bounded existing-row reconciliation:
+
+| Role | Boundary | Selector | Allowed mutation | Missing row |
 | --- | --- | --- | --- | --- |
-| Metadata reconciliation | `source_trade_metadata_reconciliation.reconcile_metadata_json` | `(source, source_trade_id)` or immutable `id` | `metadata_json` only | `missing`, never INSERT |
-| Approved-wallet duplicate repair | `collect_approved_wallet_trades._enrich_existing_row` | canonical `(source, source_trade_id)` | `metadata_json` only | `missing` |
-| Specialist enrichment | `source_trade_enrichment._persist` | immutable `id` | `metadata_json` only | failure/rollback |
-| Taxonomy backfill | `backfill_specialist_trade_taxonomy` | immutable `id` | `metadata_json` only | failure/rollback |
-| Resolution reconciliation | `source_trade_resolution.apply_existing_resolution_updates` | immutable `id` | `resolution_status`, `resolved_at`, `winning_token_id`, `is_winning_trade`, `realized_pnl`, `settlement_source` | rowcount 0, never INSERT |
+| Metadata reconciliation | `reconcile_metadata_json` | immutable `id` or `(source, source_trade_id)` | `metadata_json` only | `missing`, never INSERT |
+| Resolution reconciliation | `apply_existing_resolution_updates` | immutable `id` | resolution fields only | no update, never INSERT |
 
-Metadata replacement of a non-empty row requires the private carrier emitted
-only after `merge_canonical_metadata` has compared persisted evidence with the
-authoritative Gamma response. Ordinary mappings and JSON strings are sent
-through the PR #79 bounded serializer, so they cannot self-certify `_snapshot`
-evidence. Exact existing bytes are a zero-write replay.
+Metadata replacement authority is a private immutable carrier issued only by
+`merge_canonical_metadata` after comparison with authoritative evidence. It
+captures deterministic serialized bytes at issuance; inspection returns
+detached values and `copy.copy`/`copy.deepcopy` intentionally return the same
+immutable authority object. Ordinary mappings, `dict(result)`, and JSON
+round-trips have no replacement authority. Exact persisted-byte replay is a
+zero-write reuse.
 
-`backfill_resolution_truth` remains a maintenance planner for existing market
-truth, but delegates its source-trade settlement application to the authorized
-resolution boundary and no longer owns a second mutation statement.
+## SQL architecture evidence
 
-## Locking and database targeting
+`polycopy.engine.source_trade_sql_architecture` is the shared, read-only AST
+scanner used by both the architecture tests and the PR24X ingestion-writer
+audit. It records structured evidence for supported SQL sinks (`execute`,
+`executemany`, `executescript`, `iterquery`, and `query`), including source
+path, lexical scope, line, SQL operation, table, touched columns, selector
+columns, and resolution status.
 
-Independently invoked retained evidence mutators own
-`/tmp/polycopy-operational-jobs.lock` for their writable lifetime through the
-shared lock helper. The cohort obtains it once and marks the nested writable
-open as already lock-owned, preventing self-deadlock.
+The scanner follows statement order, local reassignment, simple aliases,
+`getattr` sink aliases, and simple helper returns. It is deliberately
+fail-closed for locally evidenced, unresolved source-trade DML. Its contract
+permits exactly one writer `INSERT OR IGNORE` column contract and narrowly
+specified metadata and resolution update contracts; schema, migration, and
+non-production demo/smoke paths are separately recognized. Disposable-tree
+negative cases prove that unauthorized inserts, updates, deletes, wrong
+columns/selectors, and unresolved relevant SQL make the audit fail.
 
-The default settings DB is the resolved repository `data/polycopy.db`, not a
-current-working-directory relative path. Evidence commands retain explicit
-disposable DB overrides for tests and non-production runs. Demo and smoke
-writers reject both the repository and `/root/Polycopy` production DB paths.
+The PR24X audit derives its status from this scanner evidence. It does not rely
+on a hard-coded `centralized_writer_exists` result or collector narrative.
 
-## Architecture guard
+## Writable evidence DB locking
 
-`tests/test_source_trade_write_architecture.py` scans executable production
-SQL call sites with a role-specific allowlist. It distinguishes the canonical
-initial insert, metadata-only update boundary, resolution-only update boundary,
-schema/migration exceptions, and non-production demo/smoke exceptions. Tests,
-docs and comments are outside the production scan.
+`open_writable(db_path, args, *, operational_lock_already_held=False)` makes
+lock ownership explicit. An internally owned writable open acquires the shared
+operational lock and `DbConn.close()` releases only that internally acquired
+lock. An already-held outer lock is never reacquired or released by `DbConn`.
 
-## Deferred finding
+`discover_research_wallets.py` and
+`collect_specialist_evidence_cohort.py` are external lock owners: they acquire
+the lock around their outer write sequence and call `open_writable(...,
+operational_lock_already_held=True)`. Independent writable CLIs retain default
+internal ownership.
 
-`/root/Polycopy/polycopy.db` is historical evidence of the old relative-path
-fallback. It is not modified or removed by this PR.
+## Safety boundary
+
+This architecture documents source-code and disposable-test behavior only. It
+does not run production collectors, backfills, or databases, and it does not
+alter historical database files.

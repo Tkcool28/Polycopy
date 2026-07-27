@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,6 +62,8 @@ TRADE = {
 
 
 def _dump(value):
+    if isinstance(value, Mapping):
+        value = dict(value)
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
@@ -390,6 +393,7 @@ def test_conflict_without_unrelated_fill_is_never_mislabeled_unchanged():
     first, _, _ = merge_canonical_metadata(
         None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
+    first = dict(first)
     first["taxonomy"]["raw_category"] = "Sports"
     merged, status, reasons = merge_canonical_metadata(
         _dump(first), FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
@@ -404,6 +408,7 @@ def test_immutable_snapshot_provenance_conflicts_and_is_preserved():
     first, _, _ = merge_canonical_metadata(
         None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
+    first = dict(first)
     first["_snapshot"]["provenance"]["provider"] = "not-gamma"
     merged, status, reasons = merge_canonical_metadata(
         _dump(first), FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
@@ -444,6 +449,7 @@ def test_null_values_do_not_erase_existing_and_unrelated_survives():
     first, _, _ = merge_canonical_metadata(
         None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
+    first = dict(first)
     first["unrelated"] = {"keep": True}
     gamma = dict(FULL_GAMMA, question=None, active=None)
     merged, _, _ = merge_canonical_metadata(

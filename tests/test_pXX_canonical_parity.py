@@ -61,6 +61,8 @@ GAMMA = FakeMarket(
 
 
 def _canon(meta) -> str:
+    if isinstance(meta, collections.abc.Mapping):
+        meta = dict(meta)
     return json.dumps(meta, sort_keys=True)
 
 

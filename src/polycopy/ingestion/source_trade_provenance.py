@@ -136,7 +136,7 @@ def build_provenance_payload(
     """
     # On conflict/unavailable the merge returns the original preserved value
     # (which may be a malformed JSON string, not a dict). Only classify a dict.
-    safe_meta = canonical_meta if isinstance(canonical_meta, dict) else {}
+    safe_meta = dict(canonical_meta) if isinstance(canonical_meta, Mapping) else {}
 
     usable = False
     normalized_category: Optional[str] = None

@@ -174,7 +174,9 @@ def main(argv: list[str] | None = None) -> int:
 
             if want_write:
                 # Open writable DB only AFTER discovery (inside lock)
-                db = ed.open_writable(args.db_path, args)
+                db = ed.open_writable(
+                    args.db_path, args, operational_lock_already_held=True
+                )
             else:
                 # Dry-run: open read-only DB for state lookup (inside lock)
                 db = ed.open_readonly(args.db_path)

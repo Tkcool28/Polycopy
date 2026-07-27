@@ -1,117 +1,32 @@
 """Regression guard for the bounded source-trade mutation architecture."""
 from __future__ import annotations
 
-import ast
+import copy
 import importlib.util
-import re
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
-from polycopy.ingestion.canonical_metadata import merge_canonical_metadata
-from polycopy.ingestion.source_trade_metadata_reconciliation import reconcile_metadata_json
-
-ROOT = Path(__file__).resolve().parents[1]
-_MUTATION = re.compile(
-    r"\b(?:INSERT(?:\s+OR\s+(?:IGNORE|REPLACE))?|REPLACE|UPDATE|DELETE)\b[\s\S]{0,100}\bsource_trades\b",
-    re.IGNORECASE,
+from polycopy.engine.source_trade_sql_architecture import (
+    SqlFinding,
+    contract_violations,
+    scan_python_file,
+    scan_repository,
+)
+from polycopy.ingestion.canonical_metadata import _CanonicalMergeMetadata, merge_canonical_metadata
+from polycopy.ingestion.source_trade_metadata_reconciliation import (
+    reconcile_metadata_json,
+    serialize_canonical_merge_metadata,
 )
 
-
-def _production_sql_mutations(path: Path) -> list[str]:
-    """Resolve simple local SQL data flow; unresolved execution fails closed."""
-    tree = ast.parse(path.read_text(), filename=str(path))
-    values: dict[str, str | None] = {}
-    origins: dict[str, ast.AST] = {}
-    helpers: dict[str, ast.AST] = {}
-
-    def resolve(node: ast.AST) -> str | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            return node.value
-        if isinstance(node, ast.Name):
-            return values.get(node.id)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left, right = resolve(node.left), resolve(node.right)
-            return left + right if left is not None and right is not None else None
-        if isinstance(node, ast.JoinedStr):
-            parts: list[str] = []
-            for value in node.values:
-                if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                    parts.append(value.value)
-                elif isinstance(value, ast.FormattedValue):
-                    rendered = resolve(value.value)
-                    if rendered is None:
-                        return None
-                    parts.append(rendered)
-                else:
-                    return None
-            return "".join(parts)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.args:
-            returned = helpers.get(node.func.id)
-            return resolve(returned) if returned is not None else None
-        return None
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            value = getattr(node, "value", None)
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if value is not None:
-                for target in targets:
-                    if isinstance(target, ast.Name):
-                        values[target.id] = resolve(value)
-                        origins[target.id] = value
-        elif isinstance(node, ast.FunctionDef) and len(node.body) == 1 and isinstance(node.body[0], ast.Return):
-            helpers[node.name] = node.body[0].value
-
-    out: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        method = node.func.attr if isinstance(node.func, ast.Attribute) else None
-        if method not in {"execute", "executemany", "executescript", "fetchone", "fetchall"}:
-            continue
-        sql_node = node.args[0] if node.args else next(
-            (keyword.value for keyword in node.keywords if keyword.arg in {"sql", "query", "statement"}),
-            None,
-        )
-        if sql_node is None:
-            continue
-        sql = resolve(sql_node)
-        if sql is None:
-            # The architecture guard is source-trade scoped. Dynamic SQL that
-            # names the protected table is unsafe because it cannot be proven
-            # to be one of the narrow authorized operations.
-            origin = origins.get(sql_node.id, sql_node) if isinstance(sql_node, ast.Name) else sql_node
-            expression = ast.unparse(origin)
-            if "source_trades" in expression.lower() and _MUTATION.search(expression):
-                out.append("UNRESOLVED_SQL")
-        elif _MUTATION.search(sql):
-            out.append(" ".join(sql.split()))
-    return out
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_source_trade_sql_roles_are_exactly_allowlisted() -> None:
     """Executable production SQL cannot create a new writer by accident."""
-    allowed = {
-        "src/polycopy/ingestion/source_trade_writer.py": {"INSERT"},
-        "src/polycopy/ingestion/source_trade_metadata_reconciliation.py": {"UPDATE"},
-        "src/polycopy/ingestion/source_trade_resolution.py": {"UPDATE"},
-        "src/polycopy/db/schema.py": {"INSERT", "UPDATE", "DELETE", "REPLACE"},
-        "src/polycopy/migrations/pr24z_canonical_identity.py": {"UPDATE"},
-        "scripts/seed_demo_data.py": {"INSERT", "UPDATE", "DELETE", "REPLACE"},
-        "scripts/live_smoke_pr3_fixes.py": {"INSERT"},
-    }
-    discovered: dict[str, list[str]] = {}
-    for base in (ROOT / "src", ROOT / "scripts"):
-        for path in base.rglob("*.py"):
-            statements = _production_sql_mutations(path)
-            if statements:
-                discovered[str(path.relative_to(ROOT))] = statements
-    assert set(discovered) <= set(allowed), discovered
-    for rel, statements in discovered.items():
-        for statement in statements:
-            kind = statement.split()[0].upper()
-            assert kind in allowed[rel], f"{rel}: unauthorized {kind}: {statement}"
+    findings = scan_repository(ROOT)
+    assert contract_violations(findings) == []
     writer_source = (ROOT / "src/polycopy/ingestion/source_trade_writer.py").read_text()
     assert "INSERT OR IGNORE INTO source_trades" in writer_source
     for rel in ("scripts/run_scan.py", "scripts/collect_smart_money_data.py"):
@@ -149,10 +64,64 @@ def test_sql_guard_rejects_indirected_and_dynamic_source_trade_mutations(tmp_pat
     for name, body in cases.items():
         path = tmp_path / f"{name}.py"
         path.write_text(f"def run(conn, db, user_supplied):\n    {body}\n")
-        findings = _production_sql_mutations(path)
+        findings = scan_python_file(path)
         assert findings, name
         if name == "dynamic":
-            assert findings == ["UNRESOLVED_SQL"]
+            assert len(findings) == 1 and not findings[0].resolved
+
+
+def test_shared_scanner_respects_scope_order_aliases_and_source_only_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "scanner_bypasses.py"
+    path.write_text(
+        """
+def forward(sql):
+    return sql
+
+def run(conn, user_sql, unrelated_sql):
+    table = "source_trades"
+    sql = f"UPDATE {table} SET metadata_json=? WHERE id=?"
+    run_sql = getattr(conn, "execute")
+    run_sql(sql)
+    sql = "SELECT 1"
+    run_sql(sql)
+    sql = user_sql + " DELETE FROM source_trades"
+    conn.execute(query=sql)
+    conn.execute(unrelated_sql)
+    conn.execute(statement=forward("INSERT OR IGNORE INTO source_trades (id) VALUES (?)"))
+
+class Nested:
+    def delete(self, conn):
+        conn.execute("DELETE FROM source_trades")
+"""
+    )
+    findings = scan_python_file(path)
+    assert [(finding.resolved, finding.operation, finding.sink) for finding in findings] == [
+        (True, "UPDATE", "execute"),
+        (False, None, "execute"),
+        (True, "INSERT OR IGNORE", "execute"),
+        (True, "DELETE", "execute"),
+    ]
+    assert findings[1].reason == "unresolved_source_trade_sql"
+    assert [finding.scope for finding in findings] == ["run", "run", "run", "Nested.delete"]
+
+
+def test_shared_scanner_enforces_exact_writer_metadata_and_resolution_roles() -> None:
+    writer_columns = (
+        "id", "source", "source_trade_id", "market_source_id", "side", "outcome",
+        "quantity", "price", "trader_address", "timestamp", "is_sample", "token_id", "metadata_json",
+    )
+    valid = [
+        SqlFinding("src/polycopy/ingestion/source_trade_writer.py", "write_valid_rows", 1, "execute", True, "INSERT OR IGNORE", "source_trades", writer_columns, ()),
+        SqlFinding("src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "reconcile_metadata_json", 1, "execute", True, "UPDATE", "source_trades", ("metadata_json",), ("id",)),
+        SqlFinding("src/polycopy/ingestion/source_trade_resolution.py", "apply_existing_resolution_updates", 1, "execute", True, "UPDATE", "source_trades", ("resolution_status", "resolved_at", "winning_token_id", "is_winning_trade", "realized_pnl", "settlement_source"), ("id",)),
+    ]
+    assert contract_violations(valid) == []
+    invalid = [
+        valid[0].__class__(**{**valid[0].__dict__, "operation": "INSERT"}),
+        valid[1].__class__(**{**valid[1].__dict__, "columns": ("metadata_json", "side")}),
+        valid[2].__class__(**{**valid[2].__dict__, "selector_columns": ("source",)}),
+    ]
+    assert contract_violations(invalid) == invalid
 
 
 def _db() -> SimpleNamespace:
@@ -194,6 +163,42 @@ def test_trusted_merge_can_update_existing_row_but_never_create_one() -> None:
         db, merged, internal_id="row", allow_nonempty_replace=True
     ).status == "updated"
     assert "condition_id" in db.conn.execute("SELECT metadata_json FROM source_trades").fetchone()[0]
+
+
+
+def test_canonical_merge_authority_is_immutable_and_captured() -> None:
+    db = _db()
+    db.conn.execute("INSERT INTO source_trades VALUES ('row', 's', 'trade', '{\"prior\":true}')")
+    merged, status, _ = merge_canonical_metadata(
+        None,
+        {"conditionId": "x", "category": "Politics", "events": [], "series": []},
+        condition_id="x",
+    )
+    assert status == "filled"
+    expected = dict(merged)
+    with __import__("pytest").raises(TypeError):
+        merged["forged"] = True  # type: ignore[index]
+    inspection = merged["_snapshot"]
+    inspection["provenance"]["provider"] = "forged"
+    shallow, deep = copy.copy(merged), copy.deepcopy(merged)
+    assert shallow is merged
+    assert deep is merged
+    for reconstructed in (dict(merged), json.loads(json.dumps(dict(merged)))):
+        with __import__("pytest").raises(ValueError):
+            reconcile_metadata_json(db, reconstructed, internal_id="row", allow_nonempty_replace=True)
+    assert reconcile_metadata_json(db, merged, internal_id="row", allow_nonempty_replace=True).status == "updated"
+    assert reconcile_metadata_json(db, shallow, internal_id="row", allow_nonempty_replace=True).status == "reused"
+    assert reconcile_metadata_json(db, deep, internal_id="row", allow_nonempty_replace=True).status == "reused"
+    saved = db.conn.execute("SELECT metadata_json FROM source_trades WHERE id='row'").fetchone()[0]
+    assert saved == json.dumps(expected, sort_keys=True, separators=(",", ":"))
+    assert "forged" not in saved
+
+
+def test_canonical_merge_authority_cannot_be_directly_constructed() -> None:
+    with __import__("pytest").raises(TypeError):
+        _CanonicalMergeMetadata({"forged": True}, _token=object())
+    with __import__("pytest").raises(TypeError):
+        serialize_canonical_merge_metadata({"forged": True})  # type: ignore[arg-type]
 
 
 def test_arbitrary_mapping_cannot_forge_canonical_merge_authority() -> None:

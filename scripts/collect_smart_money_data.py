@@ -693,24 +693,10 @@ class PolymarketCollector:
         Anonymous / sentinel trader addresses are stored as ``NULL`` and
         never become wallet rows.
         """
-        from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
+        from polycopy.ingestion.normalized_source_trade import normalize_legacy_source_trade
         from polycopy.ingestion.source_trade_writer import write_valid_rows
 
-        persisted_trader_address = canonical_wallet_address(trade.trader_address)
-        candidate = NormalizedSourceTrade(
-            source=trade.source,
-            source_trade_id=trade.source_trade_id,
-            market_source_id=trade.market_source_id,
-            side=trade.side.value if hasattr(trade.side, "value") else str(trade.side),
-            outcome=trade.outcome,
-            quantity=float(trade.quantity),
-            price=float(trade.price),
-            trader_address=persisted_trader_address,
-            timestamp=trade.timestamp,
-            is_sample=int(trade.is_sample),
-            token_id=trade.token_id,
-            validation_status="valid",
-        )
+        candidate = normalize_legacy_source_trade(trade)
         result = write_valid_rows(db, [candidate], dry_run=False)
         if result.errors:
             raise RuntimeError(result.error_message or "canonical source-trade write failed")

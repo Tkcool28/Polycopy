@@ -1576,8 +1576,8 @@ def test_main_write_call_order_exact():
         op_lock=lambda *a, **kw: _OrderLock())
     real_open_rw = ed.open_writable
     real_persist = discover_research_wallets.persist_candidates
-    def _rw(path, args):
-        db = real_open_rw(str(path), args)
+    def _rw(path, args, **kwargs):
+        db = real_open_rw(str(path), args, **kwargs)
         real_close = db.close
         def _close():
             order.append("db_close")

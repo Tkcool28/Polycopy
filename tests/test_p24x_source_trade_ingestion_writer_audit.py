@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -32,8 +33,8 @@ import pytest
 from polycopy.engine import source_trade_ingestion_writer_audit as mod
 from polycopy.engine.source_trade_ingestion_writer_audit import (
     build_source_trade_ingestion_writer_audit,
-    report_to_markdown,
     report_to_json,
+    report_to_markdown,
 )
 
 # Unmistakably fake identifiers (mirrors PR24R / PR24U / PR24V / PR24W).
@@ -356,6 +357,56 @@ def test_report_serializes_to_json():
     assert "wal_safe_write_policy" in parsed
     assert "future_sequence" in parsed
     assert parsed["centralized_writer_exists"] is True
+
+
+
+def _architecture_tree(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    for relative in (
+        "src/polycopy/ingestion/source_trade_writer.py",
+        "src/polycopy/ingestion/source_trade_metadata_reconciliation.py",
+        "src/polycopy/ingestion/source_trade_resolution.py",
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(mod.__file__).resolve().parents[1] / "ingestion" / target.name, target)
+    return root
+
+
+@pytest.mark.parametrize(
+    ("relative", "statement"),
+    [
+        ("scripts/second_writer.py", "db.execute('INSERT INTO source_trades (id) VALUES (?)')"),
+        ("scripts/dynamic_writer.py", "table = 'source_' + suffix\n    sql = 'INSERT INTO ' + table\n    db.execute(sql)"),
+        ("scripts/collector.py", "db.execute('INSERT INTO source_trades (id) VALUES (?)')"),
+        ("scripts/unresolved.py", "statement = unknown + ' DELETE FROM source_trades'\n    db.execute(statement)"),
+        ("src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "db.execute('UPDATE source_trades SET price=? WHERE id=?')"),
+        ("src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "db.execute('UPDATE source_trades SET metadata_json=? WHERE price=?')"),
+        ("src/polycopy/ingestion/source_trade_resolution.py", "db.execute('UPDATE source_trades SET side=? WHERE id=?')"),
+        ("src/polycopy/ingestion/source_trade_writer.py", "db.execute('UPDATE source_trades SET side=? WHERE id=?')"),
+        ("src/polycopy/engine/unexpected.py", "db.execute('DELETE FROM source_trades')"),
+    ],
+)
+def test_audit_derives_false_for_disposable_architecture_violations(
+    tmp_path: Path, relative: str, statement: str
+) -> None:
+    root = _architecture_tree(tmp_path)
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    prefix = "def probe(db, table=None, statement=None):\n    "
+    target.write_text((target.read_text() if target.exists() else "") + "\n" + prefix + statement + "\n")
+    audit = build_source_trade_ingestion_writer_audit(None, repo_root=str(root))
+    assert audit.centralized_writer_exists is False
+    assert audit.violations or audit.approved_initial_insert_count != 1
+
+
+def test_actual_repository_audit_verdict_is_scanner_derived() -> None:
+    audit = build_source_trade_ingestion_writer_audit(None)
+    assert audit.approved_initial_insert_count == 1
+    assert audit.violations == []
+    assert audit.unresolved_sinks == []
+    assert audit.collector_owned_mutations == []
+    assert audit.centralized_writer_exists is True
 
 
 def test_guardrail_flags_all_true():

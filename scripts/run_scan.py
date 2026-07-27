@@ -1406,29 +1406,10 @@ def _persist_trade(db: Database, trade: SourceTrade) -> bool | None:
     trade history is not available to ``_compute_wallet_metrics``.
     """
     try:
-        from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
+        from polycopy.ingestion.normalized_source_trade import normalize_legacy_source_trade
         from polycopy.ingestion.source_trade_writer import write_valid_rows
 
-        ta = trade.trader_address
-        persisted_trader_address = (
-            str(ta).strip().lower()
-            if ta is not None and ta and not is_sentinel_trader_address(ta)
-            else None
-        )
-        candidate = NormalizedSourceTrade(
-            source=trade.source,
-            source_trade_id=trade.source_trade_id,
-            market_source_id=trade.market_source_id,
-            side=trade.side.value if hasattr(trade.side, "value") else str(trade.side),
-            outcome=trade.outcome,
-            quantity=float(trade.quantity),
-            price=float(trade.price),
-            trader_address=persisted_trader_address,
-            timestamp=trade.timestamp,
-            is_sample=int(bool(trade.is_sample)),
-            token_id=trade.token_id,
-            validation_status="valid",
-        )
+        candidate = normalize_legacy_source_trade(trade)
         result = write_valid_rows(db, [candidate], dry_run=False)
         if result.errors:
             return None

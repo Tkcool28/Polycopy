@@ -38,9 +38,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+
+from polycopy.engine.source_trade_sql_architecture import (
+    contract_violations,
+    scan_repository,
+)
 
 # ── Versioning ───────────────────────────────────────────────────────────────
 AUDIT_VERSION = "PR24X-2"
@@ -214,7 +219,7 @@ class IngestionWriterAudit:
     """Top-level audit result object."""
 
     audit_version: str = AUDIT_VERSION
-    repo_root: Optional[str] = None
+    repo_root: str | None = None
     db_safety_layer: DbSafetyLayer = field(default_factory=DbSafetyLayer)
     source_trades_inventory: dict[str, Any] = field(default_factory=dict)
     write_paths: list[WritePath] = field(default_factory=list)
@@ -226,11 +231,15 @@ class IngestionWriterAudit:
         default_factory=WalSafeWritePolicy
     )
     future_sequence: list[FutureSequenceStep] = field(default_factory=list)
-    centralized_writer_exists: bool = True
+    scanner_findings: list[dict[str, Any]] = field(default_factory=list)
+    approved_initial_insert_count: int = 0
+    approved_reconciliation_findings: list[dict[str, Any]] = field(default_factory=list)
+    violations: list[dict[str, Any]] = field(default_factory=list)
+    unresolved_sinks: list[dict[str, Any]] = field(default_factory=list)
+    collector_owned_mutations: list[dict[str, Any]] = field(default_factory=list)
+    centralized_writer_exists: bool = False
     centralized_writer_note: str = (
-        "write_valid_rows() is the sole authorized centralized source_trades "
-        "writer. Legacy collectors adapt their rows to it; bounded metadata "
-        "and resolution reconciliation remain existing-row-only update roles."
+        "Derived from shared source-trade SQL architecture evidence."
     )
     guardrail_flags: dict[str, bool] = field(default_factory=dict)
 
@@ -247,6 +256,12 @@ class IngestionWriterAudit:
             "dedupe_strategy": self.dedupe_strategy,
             "wal_safe_write_policy": self.wal_safe_write_policy.as_dict(),
             "future_sequence": [s.as_dict() for s in self.future_sequence],
+            "scanner_findings": self.scanner_findings,
+            "approved_initial_insert_count": self.approved_initial_insert_count,
+            "approved_reconciliation_findings": self.approved_reconciliation_findings,
+            "violations": self.violations,
+            "unresolved_sinks": self.unresolved_sinks,
+            "collector_owned_mutations": self.collector_owned_mutations,
             "centralized_writer_exists": self.centralized_writer_exists,
             "centralized_writer_note": self.centralized_writer_note,
             "guardrail_flags": self.guardrail_flags,
@@ -254,7 +269,7 @@ class IngestionWriterAudit:
 
 
 # ── Static inspectors (read files on disk; never run them) ───────────────────
-def _looks_like_write(line: str) -> Optional[str]:
+def _looks_like_write(line: str) -> str | None:
     low = " " + line.lower() + " "
     for verb in _WRITE_VERBS:
         if verb in low and "source_trades" in low:
@@ -559,8 +574,8 @@ def _inventory_from_conn(conn: sqlite3.Connection) -> dict[str, Any]:
 
 # ── Builders ─────────────────────────────────────────────────────────────────
 def build_source_trade_ingestion_writer_audit(
-    conn: Optional[sqlite3.Connection] = None,
-    repo_root: Optional[str] = None,
+    conn: sqlite3.Connection | None = None,
+    repo_root: str | None = None,
     *,
     detect_repo: bool = True,
 ) -> IngestionWriterAudit:
@@ -589,6 +604,38 @@ def build_source_trade_ingestion_writer_audit(
             root = Path.cwd()
 
     inventory = _inventory_from_conn(conn) if conn is not None else {}
+    scanner_findings = scan_repository(root)
+    scanner_violations = contract_violations(scanner_findings)
+    finding_dicts = [asdict(finding) for finding in scanner_findings]
+    violation_dicts = [asdict(finding) for finding in scanner_violations]
+    writer_inserts = [
+        finding for finding in scanner_findings
+        if finding.path == "src/polycopy/ingestion/source_trade_writer.py"
+        and finding.table == "source_trades"
+        and finding.operation == "INSERT OR IGNORE"
+        and finding not in scanner_violations
+    ]
+    reconciliations = [
+        finding for finding in scanner_findings
+        if finding.path in {
+            "src/polycopy/ingestion/source_trade_metadata_reconciliation.py",
+            "src/polycopy/ingestion/source_trade_resolution.py",
+        }
+        and finding.table == "source_trades"
+        and finding not in scanner_violations
+    ]
+    unresolved = [finding for finding in scanner_violations if not finding.resolved]
+    collector_mutations = [
+        finding for finding in scanner_findings
+        if finding.table == "source_trades"
+        and ("collect" in finding.path or "run_scan" in finding.path)
+    ]
+    centralized = (
+        len(writer_inserts) == 1
+        and not scanner_violations
+        and not collector_mutations
+        and len(reconciliations) >= 3
+    )
 
     audit = IngestionWriterAudit(
         repo_root=str(root),
@@ -598,6 +645,21 @@ def build_source_trade_ingestion_writer_audit(
         architecture_roles=_default_architecture_roles(),
         dedupe_strategy=_default_dedupe_strategy(),
         future_sequence=_default_future_sequence(),
+        scanner_findings=finding_dicts,
+        approved_initial_insert_count=len(writer_inserts),
+        approved_reconciliation_findings=[asdict(finding) for finding in reconciliations],
+        violations=violation_dicts,
+        unresolved_sinks=[asdict(finding) for finding in unresolved],
+        collector_owned_mutations=[asdict(finding) for finding in collector_mutations],
+        centralized_writer_exists=centralized,
+        centralized_writer_note=(
+            "Derived from shared scanner evidence: exactly one centralized canonical "
+            "writer initial insert, approved reconciliation contracts, and no violations."
+            if centralized else
+            "Scanner evidence did not prove a centralized writer: "
+            f"initial_inserts={len(writer_inserts)}, violations={len(scanner_violations)}, "
+            f"collector_mutations={len(collector_mutations)}."
+        ),
         guardrail_flags=_default_guardrail_flags(),
     )
     # Direct-connect bypass scan is informational; stored in notes of the

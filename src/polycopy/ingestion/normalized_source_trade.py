@@ -120,6 +120,8 @@ def _as_float(value: Any) -> Optional[float]:
 
 def _parse_timestamp(value: Any) -> Optional[datetime]:
     """Parse an int/float Unix seconds or ISO string into a UTC datetime."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -209,6 +211,47 @@ class NormalizedSourceTrade:
         d = asdict(self)
         d["timestamp"] = self.timestamp.isoformat() if self.timestamp else None
         return d
+
+
+def normalize_legacy_source_trade(
+    trade: Any,
+    *,
+    allow_sell: bool = True,
+    allow_missing_wallet: bool = True,
+    allow_missing_token_id: bool = True,
+) -> NormalizedSourceTrade:
+    """Normalize retained legacy ``SourceTrade`` objects before the writer.
+
+    Legacy collection retains BUY/SELL support and may not carry a token id;
+    those are explicit compatibility policies, never an implicit "valid" flag.
+    """
+    candidate = NormalizedSourceTrade(
+        source=str(trade.source),
+        source_trade_id=str(trade.source_trade_id),
+        market_source_id=str(trade.market_source_id or ""),
+        side=_side_uppercase(getattr(trade.side, "value", trade.side)) or "",
+        outcome=getattr(trade, "outcome", None),
+        trader_address=_canonicalize_wallet(getattr(trade, "trader_address", None)),
+        token_id=getattr(trade, "token_id", None),
+        timestamp=_parse_timestamp(getattr(trade, "timestamp", None)),
+        is_sample=int(bool(getattr(trade, "is_sample", False))),
+    )
+    candidate.price = _as_float(getattr(trade, "price", None))
+    candidate.quantity = _as_float(getattr(trade, "quantity", None))
+    if candidate.side not in ({"BUY", "SELL"} if allow_sell else {"BUY"}):
+        candidate.validation_reasons.append(REASON_UNSUPPORTED_SIDE)
+    if candidate.price is None or not 0.0 <= candidate.price <= 1.0:
+        candidate.validation_reasons.append(REASON_INVALID_PRICE)
+    if candidate.quantity is None or candidate.quantity <= 0.0:
+        candidate.validation_reasons.append(REASON_INVALID_QUANTITY)
+    if candidate.timestamp is None:
+        candidate.validation_reasons.append(REASON_INVALID_TIMESTAMP)
+    if candidate.trader_address is None and not allow_missing_wallet:
+        candidate.validation_reasons.append(REASON_MISSING_FIELDS)
+    if not candidate.token_id and not allow_missing_token_id:
+        candidate.validation_reasons.append(REASON_MISSING_FIELDS)
+    candidate.validation_status = "valid" if not candidate.validation_reasons else "rejected"
+    return candidate
 
 
 # ── Stable identity ────────────────────────────────────────────────────────────

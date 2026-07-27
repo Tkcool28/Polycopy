@@ -10,6 +10,7 @@ import copy
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, final
 
 from polycopy.adapters.polymarket import parse_clob_token_ids
@@ -32,23 +33,64 @@ _CANONICAL_TRUST_TOKEN = object()
 _MERGED_METADATA_TOKEN = object()
 
 
-@final
-class _CanonicalMergeMetadata(dict[str, Any]):
-    """Opaque result issued only by :func:`merge_canonical_metadata`.
+def _freeze_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_metadata(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_metadata(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_metadata(item) for item in value)
+    return value
 
-    This is deliberately distinct from builder output: reconciliation authority
-    represents a completed comparison of persisted metadata with authoritative
-    Gamma evidence, not merely a canonical-looking mapping.
+
+def _thaw_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_metadata(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_metadata(item) for item in value]
+    return copy.deepcopy(value)
+
+
+@final
+class _CanonicalMergeMetadata(Mapping[str, Any]):
+    """Immutable, opaque authority issued only by a completed canonical merge.
+
+    The deterministic serialized bytes are captured before the object is exposed.
+    Reconciliation consumes only those bytes; inspection is through an immutable
+    deep snapshot, never a caller-mutable ``dict`` subclass.
     """
 
-    def __init__(self, value: dict[str, Any], *, _token: object) -> None:
+    __slots__ = ("_serialized", "_view")
+
+    def __init__(self, value: Mapping[str, Any], *, _token: object) -> None:
         if _token is not _MERGED_METADATA_TOKEN:
             raise TypeError("canonical merge output is internal")
-        super().__init__(copy.deepcopy(value))
+        plain = copy.deepcopy(dict(value))
+        self._serialized = json.dumps(plain, sort_keys=True, separators=(",", ":"))
+        self._view = _freeze_metadata(plain)
+
+    def __getitem__(self, key: str) -> Any:
+        # Inspection gets a detached mutable copy; edits never affect authority.
+        return _thaw_metadata(self._view[key])
+
+    def __iter__(self):
+        return iter(self._view)
+
+    def __len__(self) -> int:
+        return len(self._view)
+
+    def __copy__(self) -> _CanonicalMergeMetadata:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _CanonicalMergeMetadata:
+        return self
+
+    def _serialized_json(self) -> str:
+        return self._serialized
 
 
 def _canonical_merge_output(value: dict[str, Any]) -> _CanonicalMergeMetadata:
-    """Issue reconciliation authority at the canonical merge boundary only."""
+    """Issue immutable replacement authority at the canonical merge boundary."""
     return _CanonicalMergeMetadata(value, _token=_MERGED_METADATA_TOKEN)
 
 
@@ -965,7 +1007,7 @@ def merge_canonical_metadata(
     *,
     condition_id: str,
     token_id: str | None = None,
-) -> tuple[dict[str, Any], str, list[str]]:
+) -> tuple[Mapping[str, Any], str, list[str]]:
     if not existing_json:
         existing: dict[str, Any] = {}
     else:

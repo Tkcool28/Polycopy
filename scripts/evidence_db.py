@@ -254,7 +254,9 @@ def require_write_gates(args: Any, *, db_path: str) -> bool:
     return True
 
 
-def open_writable(db_path: str, args: Any) -> DbConn:
+def open_writable(
+    db_path: str, args: Any, *, operational_lock_already_held: bool = False
+) -> DbConn:
     """Open a writable connection ONLY after all production gates pass.
 
     Refuses (raises ``RuntimeError``) when the caller has not satisfied
@@ -282,11 +284,10 @@ def open_writable(db_path: str, args: Any) -> DbConn:
             f"{REQUIRED_SCHEMA_VERSION}, found {version} at {resolved}; "
             f"refusing to auto-migrate"
         )
-    # Retained independently-invoked mutation CLIs own the shared lock for
-    # their full writable lifetime.  Cohort callers pass this explicit marker
-    # after acquiring it once around their outer transaction.
+    # The caller explicitly declares only an outer lock it already owns. DbConn
+    # releases a lock only when this function acquired it.
     lock_cm = None
-    if not getattr(args, "operational_lock_held", False):
+    if not operational_lock_already_held:
         lock_cm = operational_job_lock(
             "evidence-write", timeout=float(getattr(args, "lock_timeout", 30.0))
         )
