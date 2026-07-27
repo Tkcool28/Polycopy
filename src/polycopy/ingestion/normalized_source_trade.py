@@ -33,7 +33,7 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Any, Optional
 
 from polycopy.ingestion.source_trade_metadata import normalize_source_trade_metadata
@@ -121,7 +121,7 @@ def _as_float(value: Any) -> Optional[float]:
 def _parse_timestamp(value: Any) -> Optional[datetime]:
     """Parse an int/float Unix seconds or ISO string into a UTC datetime."""
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     if value is None:
         return None
     if isinstance(value, (int, float)):
