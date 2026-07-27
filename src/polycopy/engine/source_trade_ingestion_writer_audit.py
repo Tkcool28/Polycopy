@@ -237,6 +237,17 @@ class IngestionWriterAudit:
     violations: list[dict[str, Any]] = field(default_factory=list)
     unresolved_sinks: list[dict[str, Any]] = field(default_factory=list)
     collector_owned_mutations: list[dict[str, Any]] = field(default_factory=list)
+    required_roles: tuple[str, ...] = (
+        "canonical_writer_insert",
+        "metadata_reconciliation_by_id",
+        "metadata_reconciliation_by_identity",
+        "resolution_reconciliation_by_id",
+    )
+    observed_role_counts: dict[str, int] = field(default_factory=dict)
+    missing_roles: list[str] = field(default_factory=list)
+    duplicate_roles: list[str] = field(default_factory=list)
+    unexpected_roles: list[dict[str, Any]] = field(default_factory=list)
+    false_verdict_reasons: list[str] = field(default_factory=list)
     centralized_writer_exists: bool = False
     centralized_writer_note: str = (
         "Derived from shared source-trade SQL architecture evidence."
@@ -262,6 +273,12 @@ class IngestionWriterAudit:
             "violations": self.violations,
             "unresolved_sinks": self.unresolved_sinks,
             "collector_owned_mutations": self.collector_owned_mutations,
+            "required_roles": list(self.required_roles),
+            "observed_role_counts": self.observed_role_counts,
+            "missing_roles": self.missing_roles,
+            "duplicate_roles": self.duplicate_roles,
+            "unexpected_roles": self.unexpected_roles,
+            "false_verdict_reasons": self.false_verdict_reasons,
             "centralized_writer_exists": self.centralized_writer_exists,
             "centralized_writer_note": self.centralized_writer_note,
             "guardrail_flags": self.guardrail_flags,
@@ -611,10 +628,15 @@ def build_source_trade_ingestion_writer_audit(
     writer_inserts = [
         finding for finding in scanner_findings
         if finding.path == "src/polycopy/ingestion/source_trade_writer.py"
+        and finding.scope == "write_valid_rows"
         and finding.table == "source_trades"
         and finding.operation == "INSERT OR IGNORE"
         and finding not in scanner_violations
     ]
+    writer_insert_roles = {
+        (finding.path, finding.scope, finding.line, finding.sink)
+        for finding in writer_inserts
+    }
     reconciliations = [
         finding for finding in scanner_findings
         if finding.path in {
@@ -624,18 +646,47 @@ def build_source_trade_ingestion_writer_audit(
         and finding.table == "source_trades"
         and finding not in scanner_violations
     ]
+    metadata_by_id = [f for f in reconciliations if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py" and f.scope == "reconcile_metadata_json" and set(f.selector_columns) == {"id"}]
+    metadata_by_identity = [f for f in reconciliations if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py" and f.scope == "reconcile_metadata_json" and set(f.selector_columns) == {"source", "source_trade_id"}]
+    resolution_by_id = [f for f in reconciliations if f.path == "src/polycopy/ingestion/source_trade_resolution.py" and f.scope == "apply_existing_resolution_updates" and set(f.selector_columns) == {"id"}]
     unresolved = [finding for finding in scanner_violations if not finding.resolved]
     collector_mutations = [
         finding for finding in scanner_findings
         if finding.table == "source_trades"
         and ("collect" in finding.path or "run_scan" in finding.path)
     ]
-    centralized = (
-        len(writer_inserts) == 1
-        and not scanner_violations
-        and not collector_mutations
-        and len(reconciliations) >= 3
-    )
+    role_counts = {
+        "canonical_writer_insert": len(writer_insert_roles),
+        "metadata_reconciliation_by_id": len(metadata_by_id),
+        "metadata_reconciliation_by_identity": len(metadata_by_identity),
+        "resolution_reconciliation_by_id": len(resolution_by_id),
+    }
+    missing_roles = [role for role, count in role_counts.items() if count == 0]
+    duplicate_roles = [role for role, count in role_counts.items() if count > 1]
+    runtime_role_paths = {
+        "src/polycopy/ingestion/source_trade_writer.py",
+        "src/polycopy/ingestion/source_trade_metadata_reconciliation.py",
+        "src/polycopy/ingestion/source_trade_resolution.py",
+    }
+    recognized_roles = set(writer_inserts + metadata_by_id + metadata_by_identity + resolution_by_id)
+    unexpected_findings = [
+        finding
+        for finding in scanner_findings
+        if finding.table == "source_trades"
+        and finding.path in runtime_role_paths
+        and finding not in recognized_roles
+    ]
+    unexpected_roles = [asdict(finding) for finding in scanner_violations + unexpected_findings]
+    false_reasons = [
+        *(f"missing_role:{role}" for role in missing_roles),
+        *(f"duplicate_role:{role}" for role in duplicate_roles),
+        *(f"unexpected_role:{item['path']}:{item['scope']}" for item in unexpected_roles),
+    ]
+    if unresolved:
+        false_reasons.append("unresolved_source_trade_sink")
+    if collector_mutations:
+        false_reasons.append("collector_owned_source_trade_mutation")
+    centralized = not false_reasons
 
     audit = IngestionWriterAudit(
         repo_root=str(root),
@@ -646,11 +697,16 @@ def build_source_trade_ingestion_writer_audit(
         dedupe_strategy=_default_dedupe_strategy(),
         future_sequence=_default_future_sequence(),
         scanner_findings=finding_dicts,
-        approved_initial_insert_count=len(writer_inserts),
+        approved_initial_insert_count=len(writer_insert_roles),
         approved_reconciliation_findings=[asdict(finding) for finding in reconciliations],
         violations=violation_dicts,
         unresolved_sinks=[asdict(finding) for finding in unresolved],
         collector_owned_mutations=[asdict(finding) for finding in collector_mutations],
+        observed_role_counts=role_counts,
+        missing_roles=missing_roles,
+        duplicate_roles=duplicate_roles,
+        unexpected_roles=unexpected_roles,
+        false_verdict_reasons=false_reasons,
         centralized_writer_exists=centralized,
         centralized_writer_note=(
             "Derived from shared scanner evidence: exactly one centralized canonical "

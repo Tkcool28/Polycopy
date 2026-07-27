@@ -13,7 +13,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from polycopy.ingestion.canonical_metadata import _CanonicalMergeMetadata
+from polycopy.ingestion.canonical_metadata import (
+    _CanonicalMergeMetadata,
+    _is_issued_canonical_merge_metadata,
+)
 from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
 
 
@@ -24,8 +27,8 @@ def serialize_canonical_merge_metadata(metadata: _CanonicalMergeMetadata) -> str
     cannot enter this path.  The opaque carrier can be issued only at the end
     of :func:`merge_canonical_metadata` after authoritative reconciliation.
     """
-    if type(metadata) is not _CanonicalMergeMetadata:
-        raise TypeError("metadata replacement requires canonical merge output")
+    if not _is_issued_canonical_merge_metadata(metadata):
+        raise TypeError("metadata replacement requires issued canonical merge output")
     return metadata._serialized_json()
 
 
@@ -57,10 +60,11 @@ def reconcile_metadata_json(
     by_identity = source is not None and source_trade_id is not None
     if by_internal == by_identity:
         raise ValueError("provide exactly one immutable row selector")
-    if allow_nonempty_replace and type(metadata) is not _CanonicalMergeMetadata:
-        raise ValueError("non-empty metadata replacement requires canonical merge output")
+    issued_authority = _is_issued_canonical_merge_metadata(metadata)
+    if allow_nonempty_replace and not issued_authority:
+        raise ValueError("non-empty metadata replacement requires issued canonical merge output")
 
-    if type(metadata) is _CanonicalMergeMetadata:
+    if issued_authority:
         serialized = serialize_canonical_merge_metadata(metadata)
     elif isinstance(metadata, Mapping) or metadata is None:
         serialized = serialize_source_trade_metadata(metadata)

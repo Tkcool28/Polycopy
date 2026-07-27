@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib.util
 import json
 import sqlite3
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,7 +107,35 @@ class Nested:
     assert [finding.scope for finding in findings] == ["run", "run", "run", "Nested.delete"]
 
 
-def test_shared_scanner_enforces_exact_writer_metadata_and_resolution_roles() -> None:
+
+def test_scanner_follows_local_execution_wrappers_and_control_headers(tmp_path: Path) -> None:
+    path = tmp_path / "wrappers.py"
+    path.write_text(
+        '''
+def execute_sql(db, statement):
+    run = db.execute
+    run(statement)
+
+def level_two(db, statement):
+    execute_sql(db=db, statement=statement)
+
+def run(db, unsafe):
+    sql = "DELETE FROM source_trades"
+    level_two(db, sql)
+    if db.execute("UPDATE source_trades SET side='SELL'"):
+        pass
+    db.execute("SELECT 1")
+    level_two(db, unsafe + " DELETE FROM source_trades")
+'''
+    )
+    findings = scan_python_file(path)
+    assert [(f.scope, f.sink, f.resolved, f.operation) for f in findings] == [
+        ("run", "execute", True, "DELETE"),
+        ("run", "execute", True, "UPDATE"),
+        ("run", "execute", False, None),
+    ]
+    assert findings[-1].reason == "unresolved_source_trade_sql"
+    assert contract_violations(findings) == findings
     writer_columns = (
         "id", "source", "source_trade_id", "market_source_id", "side", "outcome",
         "quantity", "price", "trader_address", "timestamp", "is_sample", "token_id", "metadata_json",
@@ -212,6 +242,49 @@ def test_arbitrary_mapping_cannot_forge_canonical_merge_authority() -> None:
     else:
         raise AssertionError("ordinary mapping authorized non-empty replacement")
     assert db.conn.execute("SELECT metadata_json FROM source_trades WHERE id='row'").fetchone()[0] == '{"authoritative":true}'
+
+
+def test_issued_merge_authority_rejects_unregistered_forgeries_and_is_weak() -> None:
+    import polycopy.ingestion.canonical_metadata as metadata_module
+
+    assert not hasattr(metadata_module, "_MERGED_METADATA_TOKEN")
+    assert not hasattr(metadata_module, "_issue_canonical_merge_metadata")
+    assert not hasattr(metadata_module, "_merge_issue_at_definition")
+    with __import__("pytest").raises(TypeError):
+        _CanonicalMergeMetadata({"forged": True})
+    forged = object.__new__(_CanonicalMergeMetadata)
+    forged._serialized = '{"forged":true}'
+    forged._view = {}
+    with __import__("pytest").raises(TypeError):
+        serialize_canonical_merge_metadata(forged)
+
+    issued, status, _ = merge_canonical_metadata(
+        None, {"conditionId": "x", "events": [], "series": []}, condition_id="x"
+    )
+    assert status == "filled"
+    assert copy.copy(issued) is issued and copy.deepcopy(issued) is issued
+    ref = weakref.ref(issued)
+    del issued
+    gc.collect()
+    assert ref() is None
+
+
+def test_merge_authority_subclass_spoof_and_reconstruction_cannot_replace() -> None:
+    db = _db()
+    db.conn.execute("INSERT INTO source_trades VALUES ('row', 's', 'trade', '{\"prior\":true}')")
+
+    class ForgedAuthority(_CanonicalMergeMetadata):  # type: ignore[misc]
+        pass
+
+    forged = object.__new__(ForgedAuthority)
+    forged._serialized = '{"forged":true}'
+    forged._view = {"forged": True}
+    for candidate in (forged, {"forged": True}, json.loads('{"forged":true}')):
+        with __import__("pytest").raises(ValueError):
+            reconcile_metadata_json(
+                db, candidate, internal_id="row", allow_nonempty_replace=True
+            )
+    assert db.conn.execute("SELECT metadata_json FROM source_trades WHERE id='row'").fetchone()[0] == '{"prior":true}'
 
 
 def test_seed_demo_callable_rejects_every_production_alias_before_mutation() -> None:

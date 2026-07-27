@@ -152,76 +152,55 @@ def main(argv: list[str] | None = None) -> int:
     db = None
     result = None
 
-    # Acquire lock BEFORE adapter construction or network discovery
+    # The complete writable lifecycle is inside the operational lock.  In
+    # particular, rollback and close happen before another discovery process can
+    # acquire the same lock after a persistence failure.
     try:
         with operational_job_lock("discovery", timeout=args.lock_timeout):
-            # Construct adapter INSIDE lock
-            if args.allow_live:
-                adapter = _make_adapter()
-
-            # Perform async discovery (inside lock) BEFORE writable DB open
-            if adapter is not None:
-                discovery_result = asyncio.run(discover_candidates(adapter, bounds))
-            else:
-                discovery_result = {
-                    "markets_requested": 0,
-                    "markets_completed": 0,
-                    "markets_partial": 0,
-                    "markets_failed": 0,
-                    "trades_examined": 0,
-                    "candidates": [],
-                }
-
-            if want_write:
-                # Open writable DB only AFTER discovery (inside lock)
-                db = ed.open_writable(
-                    args.db_path, args, operational_lock_already_held=True
+            try:
+                if args.allow_live:
+                    adapter = _make_adapter()
+                if adapter is not None:
+                    discovery_result = asyncio.run(discover_candidates(adapter, bounds))
+                else:
+                    discovery_result = {
+                        "markets_requested": 0, "markets_completed": 0,
+                        "markets_partial": 0, "markets_failed": 0,
+                        "trades_examined": 0, "candidates": [],
+                    }
+                db = (
+                    ed.open_writable(args.db_path, args, operational_lock_already_held=True)
+                    if want_write else ed.open_readonly(args.db_path)
                 )
-            else:
-                # Dry-run: open read-only DB for state lookup (inside lock)
-                db = ed.open_readonly(args.db_path)
-
-            # Persist candidates (inside lock)
-            result = persist_candidates(
-                db,
-                discovery_result,
-                add_to_watchlist=args.add_to_watchlist,
-                bounds=bounds,
-                perform_writes=want_write,
-            )
-
-            if want_write:
-                db.commit()
-
+                result = persist_candidates(
+                    db, discovery_result, add_to_watchlist=args.add_to_watchlist,
+                    bounds=bounds, perform_writes=want_write,
+                )
+                if want_write:
+                    db.commit()
+            except Exception as e:  # noqa: BLE001
+                run_id = result.run_id if result is not None else ""
+                try:
+                    if db is not None:
+                        db.rollback()
+                except Exception:
+                    pass
+                print(json.dumps({"error": str(e), "run_id": run_id, "status": "failed"}))
+                return 1
+            finally:
+                try:
+                    if db is not None:
+                        db.close()
+                except Exception:
+                    pass
+                if adapter is not None:
+                    try:
+                        asyncio.run(adapter.aclose())
+                    except Exception:
+                        pass
     except LockError:
-        # Lock contention - return nonzero, no provider/DB constructed
         print(json.dumps({"error": "lock_unavailable", "run_id": "", "status": "failed"}))
         return 4
-
-    except Exception as e:  # noqa: BLE001
-        # Preserve original exception, attempt rollback, report error
-        run_id = result.run_id if result is not None else ""
-        try:
-            if db is not None:
-                db.rollback()
-        except Exception:
-            pass
-        print(json.dumps({"error": str(e), "run_id": run_id, "status": "failed"}))
-        return 1
-
-    finally:
-        # Close DB
-        try:
-            if db is not None:
-                db.close()
-        except Exception:
-            pass
-        # Close adapter in all paths
-        if adapter is not None:
-            try:
-                asyncio.run(adapter.aclose())
-            except Exception:
-                pass
 
     # Handle output
     out = result.as_dict()

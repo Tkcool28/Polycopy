@@ -17,6 +17,7 @@ Verifies:
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -488,7 +489,81 @@ class TestCrossScriptLock:
             _cleanup(path)
 
 
-# ─── 8. Empty job_name validation ─────────────────────────────────────────────
+# ─── PR84 exact cleanup-window contender proof ──────────────────────────────
+def test_cleanup_window_contender_keeps_outer_lock_through_db_close(tmp_path: Path):
+    """A real DbConn close must not release the process-owned operational lock."""
+    lock_path = tmp_path / "ops.lock"
+    db_path = tmp_path / "proof.sqlite"
+    events = tmp_path / "events.log"
+    cleanup_ready = tmp_path / "cleanup-ready"
+    b_attempted = tmp_path / "b-attempted"
+    allow_cleanup = tmp_path / "allow-cleanup"
+    postclose_ready = tmp_path / "postclose-ready"
+    allow_exit = tmp_path / "allow-exit"
+    src = str(Path(__file__).resolve().parent.parent / "src")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    common = f"""
+import os, sys, time, sqlite3
+sys.path.insert(0, {src!r})
+from polycopy.runtime.locks import operational_job_lock
+sys.path.insert(0, {str(Path(__file__).resolve().parent.parent / 'scripts')!r})
+from evidence_db import DbConn
+LOCK={str(lock_path)!r}; DB={str(db_path)!r}; EVENTS={str(events)!r}
+def event(name):
+    with open(EVENTS, 'a', encoding='utf-8') as fh:
+        fh.write(f'{{time.monotonic():.9f}} {{os.getpid()}} {{name}}\\n'); fh.flush(); os.fsync(fh.fileno())
+def wait(path):
+    deadline=time.monotonic()+8
+    while not os.path.exists(path):
+        if time.monotonic()>deadline: raise RuntimeError('timeout '+path)
+        time.sleep(.01)
+"""
+    a = scripts / "a.py"
+    b = scripts / "b.py"
+    a.write_text(common + f"""
+with operational_job_lock('collect', lock_path=__import__('pathlib').Path(LOCK), timeout=5):
+    event('A_lock_acquired')
+    db=DbConn(sqlite3.connect(DB)); db.execute('CREATE TABLE IF NOT EXISTS proof (v INTEGER)')
+    event('A_db_open'); db.execute('BEGIN IMMEDIATE'); db.execute('INSERT INTO proof VALUES (1)'); event('A_write_started')
+    event('A_cleanup_started'); open({str(cleanup_ready)!r}, 'w').close(); wait({str(b_attempted)!r})
+    event('A_rollback'); db.rollback(); event('A_db_close'); db.close(); event('A_after_db_close_pause')
+    open({str(postclose_ready)!r}, 'w').close(); wait({str(allow_exit)!r})
+event('A_lock_exit')
+""")
+    b.write_text(common + f"""
+wait({str(cleanup_ready)!r}); event('B_attempted'); open({str(b_attempted)!r}, 'w').close()
+with operational_job_lock('scan', lock_path=__import__('pathlib').Path(LOCK), timeout=8): event('B_lock_acquired')
+event('B_lock_exit')
+""")
+    env = {**os.environ, "PYTHONPATH": src}
+    pa = subprocess.Popen([sys.executable, str(a)], env=env)
+    pb = None
+    try:
+        deadline = time.monotonic() + 8
+        while not cleanup_ready.exists() and time.monotonic() < deadline: time.sleep(.01)
+        assert cleanup_ready.exists()
+        pb = subprocess.Popen([sys.executable, str(b)], env=env)
+        while not b_attempted.exists() and time.monotonic() < deadline: time.sleep(.01)
+        assert b_attempted.exists() and pb.poll() is None
+        allow_cleanup.touch()
+        while not postclose_ready.exists() and time.monotonic() < deadline: time.sleep(.01)
+        assert postclose_ready.exists() and pb.poll() is None
+        assert 'B_lock_acquired' not in events.read_text()
+        allow_exit.touch()
+        assert pa.wait(timeout=8) == 0 and pb.wait(timeout=8) == 0
+        names = [line.split()[2] for line in events.read_text().splitlines()]
+        assert names == ['A_lock_acquired', 'A_db_open', 'A_write_started', 'A_cleanup_started', 'B_attempted', 'A_rollback', 'A_db_close', 'A_after_db_close_pause', 'A_lock_exit', 'B_lock_acquired', 'B_lock_exit']
+        assert sqlite3.connect(db_path).execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert sqlite3.connect(db_path).execute('SELECT COUNT(*) FROM proof').fetchone()[0] == 0
+    finally:
+        allow_cleanup.touch(); allow_exit.touch()
+        for proc in (pa, pb):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try: proc.wait(timeout=3)
+                except subprocess.TimeoutExpired: proc.kill()
+        _cleanup(lock_path)
 
 
 class TestInputValidation:

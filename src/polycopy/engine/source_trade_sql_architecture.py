@@ -44,6 +44,13 @@ class _Helper:
     returned: ast.AST
 
 
+@dataclass(frozen=True)
+class _ExecutionWrapper:
+    params: tuple[str, ...]
+    sql_parameter: str
+    sink: str
+
+
 def _columns(sql: str, operation: str | None) -> tuple[str, ...]:
     if operation == "UPDATE":
         match = re.search(r"\bSET\s+(.+?)(?:\bWHERE\b|$)", sql, re.IGNORECASE | re.DOTALL)
@@ -105,6 +112,94 @@ def _resolve(node: ast.AST | None, values: dict[str, ast.AST], helpers: dict[str
             return None
         return _resolve(helper.returned, local, helpers, seen)
     return None
+
+
+def _resolve_all(node: ast.AST | None, values: dict[str, ast.AST], helpers: dict[str, _Helper], seen: set[str] | None = None) -> tuple[str, ...]:
+    """Return every bounded static SQL alternative; never choose one branch."""
+    if node is None:
+        return ()
+    seen = set() if seen is None else seen
+    if isinstance(node, ast.IfExp):
+        return tuple(dict.fromkeys(
+            _resolve_all(node.body, values, helpers, seen)
+            + _resolve_all(node.orelse, values, helpers, seen)
+        ))
+    if isinstance(node, ast.Name):
+        if node.id in seen:
+            return ()
+        return _resolve_all(values.get(node.id), values, helpers, seen | {node.id})
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return tuple(left + right for left in _resolve_all(node.left, values, helpers, seen) for right in _resolve_all(node.right, values, helpers, seen))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helpers:
+        helper = helpers[node.func.id]
+        local = dict(values)
+        for parameter, argument in zip(helper.params, node.args):
+            local[parameter] = argument
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                local[keyword.arg] = keyword.value
+        return _resolve_all(helper.returned, local, helpers, seen)
+    resolved = _resolve(node, values, helpers, seen)
+    return (resolved,) if resolved is not None else ()
+
+
+def _has_unresolved_alternative(node: ast.AST | None, values: dict[str, ast.AST], helpers: dict[str, _Helper], seen: set[str] | None = None) -> bool:
+    """Whether a bounded alternative remains dynamic beside any static ones."""
+    if node is None:
+        return True
+    seen = set() if seen is None else seen
+    if isinstance(node, ast.IfExp):
+        return _has_unresolved_alternative(node.body, values, helpers, seen) or _has_unresolved_alternative(node.orelse, values, helpers, seen)
+    if isinstance(node, ast.Name):
+        return node.id in seen or _has_unresolved_alternative(values.get(node.id), values, helpers, seen | {node.id})
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _resolve(node, values, helpers, seen) is None
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in helpers:
+        helper = helpers[node.func.id]
+        local = dict(values)
+        for parameter, argument in zip(helper.params, node.args):
+            local[parameter] = argument
+        for keyword in node.keywords:
+            if keyword.arg is not None:
+                local[keyword.arg] = keyword.value
+        return _has_unresolved_alternative(helper.returned, local, helpers, seen)
+    return _resolve(node, values, helpers, seen) is None
+
+
+def _script_statements(sql: str) -> tuple[str, ...]:
+    """Bounded splitter for executescript: comments/empty fragments are ignored."""
+    fragments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        nxt = sql[index + 1] if index + 1 < len(sql) else ""
+        if quote:
+            current.append(char)
+            if char == quote:
+                if nxt == quote:  # SQLite doubled quote escape.
+                    current.append(nxt)
+                    index += 1
+                else:
+                    quote = None
+        elif char in {"'", '"'}:
+            quote = char
+            current.append(char)
+        elif char == ";":
+            fragment = re.sub(r"--[^\n]*(?:\n|$)", "", "".join(current))
+            fragment = re.sub(r"/\*.*?\*/", "", fragment, flags=re.DOTALL).strip()
+            if fragment:
+                fragments.append(fragment)
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    fragment = re.sub(r"--[^\n]*(?:\n|$)", "", "".join(current))
+    fragment = re.sub(r"/\*.*?\*/", "", fragment, flags=re.DOTALL).strip()
+    if fragment:
+        fragments.append(fragment)
+    return tuple(fragments)
 
 
 def _source_relevant(node: ast.AST | None, values: dict[str, ast.AST], helpers: dict[str, _Helper], seen: set[str] | None = None) -> bool:
@@ -178,6 +273,123 @@ def _sql_arg(call: ast.Call) -> ast.AST | None:
     return next((keyword.value for keyword in call.keywords if keyword.arg in _SQL_KEYS), None)
 
 
+def _execution_wrappers(statements: Iterable[ast.stmt], values: dict[str, ast.AST], aliases: dict[str, str]) -> dict[str, _ExecutionWrapper]:
+    """Recognize only local parameter-to-sink forwarding wrappers."""
+    wrappers: dict[str, _ExecutionWrapper] = {}
+    # Include methods and lexically nested functions.  The scanner remains
+    # lexical/read-only; callers are still resolved only through recognized
+    # parameter-to-sink forwarding below.
+    defs = [
+        node
+        for statement in statements
+        for node in ast.walk(statement)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    # The bounded model deliberately follows at most three forwarding hops.
+    # A longer path remains one fail-closed caller finding rather than a
+    # speculative sink execution.
+    max_wrapper_depth = 3
+    depths: dict[str, int] = {}
+    by_name = {node.name: node for node in defs}
+    forwarding_edges: dict[str, set[str]] = {name: set() for name in by_name}
+    for node in defs:
+        params = {arg.arg for arg in node.args.args}
+        for call in _calls_in(node):
+            target = (
+                call.func.id
+                if isinstance(call.func, ast.Name)
+                else call.func.attr if isinstance(call.func, ast.Attribute) else None
+            )
+            if target in by_name and any(
+                isinstance(argument, ast.Name) and argument.id in params
+                for argument in call.args
+            ):
+                forwarding_edges[node.name].add(target)
+
+    def reaches(origin: str, current: str, seen: set[str]) -> bool:
+        if current == origin:
+            return True
+        return any(
+            child == origin or reaches(origin, child, seen | {current})
+            for child in forwarding_edges[current]
+            if child not in seen or child == origin
+        )
+
+    for name, node in by_name.items():
+        if any(reaches(name, child, {name}) for child in forwarding_edges[name]):
+            params = tuple(arg.arg for arg in node.args.args)
+            if params:
+                wrappers[name] = _ExecutionWrapper(params, params[-1], "__recursive__")
+                depths[name] = 0
+    changed = True
+    while changed:
+        changed = False
+        for node in defs:
+            if node.name in wrappers:
+                continue
+            params = tuple(arg.arg for arg in node.args.args)
+            local_aliases: dict[str, str] = {}
+            for item in node.body:
+                _record_assignment(item, {}, local_aliases)
+                for call in _calls_in(item):
+                    sink = _sink_name(call, {}, local_aliases)
+                    arg = _sql_arg(call)
+                    if sink and isinstance(arg, ast.Name) and arg.id in params:
+                        wrappers[node.name] = _ExecutionWrapper(params, arg.id, sink)
+                        depths[node.name] = 1
+                        changed = True
+                        break
+                    if isinstance(call.func, ast.Name) and call.func.id == node.name:
+                        recursive_arg = next((value for value in call.args if isinstance(value, ast.Name) and value.id == params[-1]), None)
+                        if isinstance(recursive_arg, ast.Name) and recursive_arg.id in params:
+                            wrappers[node.name] = _ExecutionWrapper(params, recursive_arg.id, "__recursive__")
+                            changed = True
+                            break
+                    if isinstance(call.func, ast.Name) and call.func.id in wrappers:
+                        inner = wrappers[call.func.id]
+                        position = inner.params.index(inner.sql_parameter)
+                        forwarded = call.args[position] if len(call.args) > position else next((kw.value for kw in call.keywords if kw.arg == inner.sql_parameter), None)
+                        if isinstance(forwarded, ast.Name) and forwarded.id in params:
+                            depth = depths.get(call.func.id, max_wrapper_depth) + 1
+                            wrappers[node.name] = _ExecutionWrapper(
+                                params,
+                                forwarded.id,
+                                inner.sink if depth <= max_wrapper_depth else "__depth__",
+                            )
+                            depths[node.name] = depth
+                            changed = True
+                            break
+    return wrappers
+
+
+def _wrapper_argument(call: ast.Call, wrapper: _ExecutionWrapper) -> ast.AST | None:
+    position = wrapper.params.index(wrapper.sql_parameter)
+    if isinstance(call.func, ast.Attribute) and wrapper.params and wrapper.params[0] in {"self", "cls"}:
+        position -= 1
+    if len(call.args) > position:
+        return call.args[position]
+    return next((kw.value for kw in call.keywords if kw.arg == wrapper.sql_parameter), None)
+
+
+def _returned_wrapper_name(call: ast.Call) -> str | None:
+    """Recognize ``factory(receiver)(sql)`` for a lexical returned wrapper."""
+    if not isinstance(call.func, ast.Call) or not isinstance(call.func.func, ast.Name):
+        return None
+    # The caller supplies a local factory whose body returns a nested wrapper.
+    # The name is resolved by the bounded AST pass in ``_scan_scope``.
+    return call.func.func.id
+
+
+def _control_expressions(statement: ast.stmt) -> tuple[ast.AST, ...]:
+    if isinstance(statement, (ast.If, ast.While)):
+        return (statement.test,)
+    if isinstance(statement, (ast.For, ast.AsyncFor)):
+        return (statement.iter,)
+    if isinstance(statement, (ast.With, ast.AsyncWith)):
+        return tuple(item.context_expr for item in statement.items)
+    return ()
+
+
 def _calls_in(statement: ast.AST) -> Iterable[ast.Call]:
     """Yield calls without crossing into a nested lexical scope."""
     for child in ast.iter_child_nodes(statement):
@@ -240,9 +452,10 @@ def _classify(path: str, scope: str, line: int, sink: str, sql: str | None, *, r
     return SqlFinding(path, scope, line, sink, True, operation, table, _columns(sql, operation), _selectors(sql), sql=sql)
 
 
-def _scan_scope(statements: Iterable[ast.stmt], *, path: str, scope: str, helpers: dict[str, _Helper], values: dict[str, ast.AST] | None = None, aliases: dict[str, str] | None = None) -> list[SqlFinding]:
+def _scan_scope(statements: Iterable[ast.stmt], *, path: str, scope: str, helpers: dict[str, _Helper], values: dict[str, ast.AST] | None = None, aliases: dict[str, str] | None = None, wrappers: dict[str, _ExecutionWrapper] | None = None) -> list[SqlFinding]:
     values, aliases = dict(values or {}), dict(aliases or {})
     helpers = dict(helpers)
+    wrappers = {**dict(wrappers or {}), **_execution_wrappers(statements, values, aliases)}
     for statement in statements:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             body = [item for item in statement.body if not (isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant) and isinstance(item.value.value, str))]
@@ -259,6 +472,7 @@ def _scan_scope(statements: Iterable[ast.stmt], *, path: str, scope: str, helper
                     scope=child_scope,
                     helpers=helpers,
                     values=values,
+                    wrappers=wrappers,
                 )
             )
             continue
@@ -270,14 +484,38 @@ def _scan_scope(statements: Iterable[ast.stmt], *, path: str, scope: str, helper
         if not is_control:
             for call in _calls_in(statement):
                 sink = _sink_name(call, values, aliases)
+                arg = _sql_arg(call)
+                wrapper_name = call.func.id if isinstance(call.func, ast.Name) else call.func.attr if isinstance(call.func, ast.Attribute) else None
+                force_unresolved = False
+                if sink is None and wrapper_name in wrappers:
+                    wrapper = wrappers[wrapper_name]
+                    force_unresolved = wrapper.sink in {"__recursive__", "__depth__"}
+                    sink = "execute" if force_unresolved else wrapper.sink
+                    arg = _wrapper_argument(call, wrapper)
                 if sink is None:
                     continue
-                arg = _sql_arg(call)
                 relevant = _source_relevant(arg, values, helpers) and _dml_relevant(arg, values, helpers)
-                finding = _classify(path, scope, call.lineno, sink, _resolve(arg, values, helpers), relevant=relevant)
-                if finding is not None:
-                    findings.append(finding)
+                resolved_sql = () if force_unresolved else _resolve_all(arg, values, helpers)
+                if resolved_sql:
+                    for sql in resolved_sql:
+                        statements_to_classify = _script_statements(sql) if sink == "executescript" else (sql,)
+                        for statement_sql in statements_to_classify:
+                            finding = _classify(path, scope, call.lineno, sink, statement_sql, relevant=relevant)
+                            if finding is not None:
+                                findings.append(finding)
+                    if relevant and _has_unresolved_alternative(arg, values, helpers):
+                        finding = _classify(path, scope, call.lineno, sink, None, relevant=True)
+                        if finding is not None:
+                            findings.append(finding)
+                else:
+                    finding = _classify(path, scope, call.lineno, sink, None, relevant=relevant)
+                    if finding is not None:
+                        findings.append(finding)
         if is_control:
+            # Header expressions are executable too; scan them once, separately
+            # from cloned branch bodies so a control call cannot evade inspection.
+            for expression in _control_expressions(statement):
+                findings.extend(_scan_scope([ast.Expr(value=expression)], path=path, scope=scope, helpers=helpers, values=values, aliases=aliases))
             bodies: list[list[ast.stmt]] = []
             if hasattr(statement, "body"):
                 bodies.append(statement.body)
@@ -288,14 +526,42 @@ def _scan_scope(statements: Iterable[ast.stmt], *, path: str, scope: str, helper
                 bodies.append(statement.finalbody)
             for body in bodies:
                 findings.extend(_scan_scope(body, path=path, scope=scope, helpers=helpers, values=values, aliases=aliases))
-            branch_assignments = [
-                item
-                for item in statement.body + list(getattr(statement, "orelse", []))
-                if isinstance(item, (ast.Assign, ast.AnnAssign))
-            ]
-            for name in _assigned_names(branch_assignments):
-                values.pop(name, None)
-                aliases.pop(name, None)
+            # Preserve every bounded post-control value. A loop may execute
+            # zero times, and an ``if`` without ``else`` retains the incoming
+            # value on its false path. The synthetic conditional is only an
+            # alternative carrier for ``_resolve_all``; it is never executed.
+            branch_values: dict[str, list[ast.expr]] = {}
+            for body in bodies:
+                for item in ast.walk(ast.Module(body=body, type_ignores=[])):
+                    if isinstance(item, (ast.Assign, ast.AnnAssign)) and item.value is not None:
+                        targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+                        for target in targets:
+                            if isinstance(target, ast.Name):
+                                branch_values.setdefault(target.id, []).append(item.value)
+            preserve_incoming = (
+                isinstance(statement, (ast.For, ast.AsyncFor, ast.While, ast.Try))
+                or (isinstance(statement, ast.If) and not statement.orelse)
+            )
+            for name, alternatives in branch_values.items():
+                incoming = values.get(name)
+                if preserve_incoming and isinstance(incoming, ast.expr):
+                    alternatives.append(incoming)
+                alias_sinks = {
+                    sink
+                    for alternative in alternatives
+                    if (sink := _sink_from_value(alternative, values, aliases)) is not None
+                }
+                if len(alias_sinks) == 1:
+                    aliases[name] = alias_sinks.pop()
+                else:
+                    aliases.pop(name, None)
+                if len(alternatives) == 1:
+                    values[name] = alternatives[0]
+                    continue
+                value = alternatives[-1]
+                for alternative in reversed(alternatives[:-1]):
+                    value = ast.IfExp(test=ast.Constant(value=True), body=alternative, orelse=value)
+                values[name] = value
     return findings
 
 
@@ -321,6 +587,20 @@ def scan_repository(repo_root: Path) -> list[SqlFinding]:
     return [finding for root in (repo_root / "src", repo_root / "scripts") if root.exists() for path in root.rglob("*.py") for finding in scan_python_file(path, repo_root=repo_root)]
 
 
+def _is_explicit_schema_or_demo_role(finding: SqlFinding) -> bool:
+    """Exact non-runtime exceptions; similar names never confer write authority."""
+    if finding.path in {"scripts/seed_demo_data.py", "scripts/live_smoke_pr3_fixes.py"}:
+        return True
+    if finding.path == "src/polycopy/db/schema.py":
+        return finding.operation in {"INSERT", "INSERT OR IGNORE"}
+    # PR24Z is the sole audited migration that repairs canonical identity.
+    return (
+        finding.path == "src/polycopy/migrations/pr24z_canonical_identity.py"
+        and finding.operation == "UPDATE"
+        and finding.columns == ("source_trade_id",)
+    )
+
+
 def contract_violations(findings: Iterable[SqlFinding]) -> list[SqlFinding]:
     """Enforce the three deliberately narrow production source-trade roles."""
     violations: list[SqlFinding] = []
@@ -334,15 +614,15 @@ def contract_violations(findings: Iterable[SqlFinding]) -> list[SqlFinding]:
             continue
         if not finding.resolved:
             violations.append(finding)
-        elif finding.path.endswith("source_trade_writer.py"):
+        elif finding.path == "src/polycopy/ingestion/source_trade_writer.py":
             if finding.operation != "INSERT OR IGNORE" or finding.columns not in writer_columns:
                 violations.append(finding)
-        elif finding.path.endswith("source_trade_metadata_reconciliation.py"):
+        elif finding.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py":
             if finding.operation != "UPDATE" or finding.columns != ("metadata_json",) or set(finding.selector_columns) not in ({"id"}, {"source", "source_trade_id"}):
                 violations.append(finding)
-        elif finding.path.endswith("source_trade_resolution.py"):
+        elif finding.path == "src/polycopy/ingestion/source_trade_resolution.py":
             if finding.operation != "UPDATE" or set(finding.columns) != resolution_columns or set(finding.selector_columns) != {"id"}:
                 violations.append(finding)
-        elif "schema.py" not in finding.path and "/migrations/" not in finding.path and finding.path not in {"scripts/seed_demo_data.py", "scripts/live_smoke_pr3_fixes.py"}:
+        elif not _is_explicit_schema_or_demo_role(finding):
             violations.append(finding)
     return violations

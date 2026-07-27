@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import weakref
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -30,7 +31,58 @@ MERGE_UNAVAILABLE = "unavailable"
 
 
 _CANONICAL_TRUST_TOKEN = object()
-_MERGED_METADATA_TOKEN = object()
+
+
+def _merge_authority_system():
+    """Keep issued-object identity outside the importable carrier surface."""
+    issued: weakref.WeakSet[object] = weakref.WeakSet()
+
+    @final
+    class _CanonicalMergeMetadata(Mapping[str, Any]):
+        """Opaque immutable merge output; direct construction never issues authority."""
+
+        __slots__ = ("__weakref__", "_serialized", "_view")
+        __hash__ = object.__hash__
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise TypeError("canonical merge output is issued only by a completed merge")
+
+        def __getitem__(self, key: str) -> Any:
+            return _thaw_metadata(self._view[key])
+
+        def __iter__(self):
+            return iter(self._view)
+
+        def __len__(self) -> int:
+            return len(self._view)
+
+        def __copy__(self) -> _CanonicalMergeMetadata:
+            return self
+
+        def __deepcopy__(self, memo: dict[int, Any]) -> _CanonicalMergeMetadata:
+            return self
+
+        def _serialized_json(self) -> str:
+            return self._serialized
+
+    def issue(value: Mapping[str, Any]) -> _CanonicalMergeMetadata:
+        # Bypass __init__ only inside this lexical factory, then register the
+        # exact object identity.  A manually allocated/subclassed/reconstructed
+        # object is not accepted because it was never registered.
+        instance = object.__new__(_CanonicalMergeMetadata)
+        plain = copy.deepcopy(dict(value))
+        instance._serialized = json.dumps(plain, sort_keys=True, separators=(",", ":"))
+        instance._view = _freeze_metadata(plain)
+        issued.add(instance)
+        return instance
+
+    def accepts(value: object) -> bool:
+        return type(value) is _CanonicalMergeMetadata and value in issued
+
+    return _CanonicalMergeMetadata, accepts, issue
+
+
+_CanonicalMergeMetadata, _is_issued_canonical_merge_metadata, _merge_issue_at_definition = _merge_authority_system()
 
 
 def _freeze_metadata(value: Any) -> Any:
@@ -49,49 +101,6 @@ def _thaw_metadata(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_thaw_metadata(item) for item in value]
     return copy.deepcopy(value)
-
-
-@final
-class _CanonicalMergeMetadata(Mapping[str, Any]):
-    """Immutable, opaque authority issued only by a completed canonical merge.
-
-    The deterministic serialized bytes are captured before the object is exposed.
-    Reconciliation consumes only those bytes; inspection is through an immutable
-    deep snapshot, never a caller-mutable ``dict`` subclass.
-    """
-
-    __slots__ = ("_serialized", "_view")
-
-    def __init__(self, value: Mapping[str, Any], *, _token: object) -> None:
-        if _token is not _MERGED_METADATA_TOKEN:
-            raise TypeError("canonical merge output is internal")
-        plain = copy.deepcopy(dict(value))
-        self._serialized = json.dumps(plain, sort_keys=True, separators=(",", ":"))
-        self._view = _freeze_metadata(plain)
-
-    def __getitem__(self, key: str) -> Any:
-        # Inspection gets a detached mutable copy; edits never affect authority.
-        return _thaw_metadata(self._view[key])
-
-    def __iter__(self):
-        return iter(self._view)
-
-    def __len__(self) -> int:
-        return len(self._view)
-
-    def __copy__(self) -> _CanonicalMergeMetadata:
-        return self
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> _CanonicalMergeMetadata:
-        return self
-
-    def _serialized_json(self) -> str:
-        return self._serialized
-
-
-def _canonical_merge_output(value: dict[str, Any]) -> _CanonicalMergeMetadata:
-    """Issue immutable replacement authority at the canonical merge boundary."""
-    return _CanonicalMergeMetadata(value, _token=_MERGED_METADATA_TOKEN)
 
 
 @final
@@ -1007,6 +1016,7 @@ def merge_canonical_metadata(
     *,
     condition_id: str,
     token_id: str | None = None,
+    _issue: Any = _merge_issue_at_definition,
 ) -> tuple[Mapping[str, Any], str, list[str]]:
     if not existing_json:
         existing: dict[str, Any] = {}
@@ -1078,8 +1088,13 @@ def merge_canonical_metadata(
         return json.loads(json.dumps(merged, sort_keys=True)), MERGE_CONFLICT, reasons
     if not changed:
         reasons.append("no_change")
-        return _canonical_merge_output(_ensure_version(existing)), MERGE_UNCHANGED, reasons
-    return _canonical_merge_output(json.loads(json.dumps(merged, sort_keys=True))), MERGE_FILLED, reasons
+        return _issue(_ensure_version(existing)), MERGE_UNCHANGED, reasons
+    return _issue(json.loads(json.dumps(merged, sort_keys=True))), MERGE_FILLED, reasons
+
+
+# The issuance closure is retained only by ``merge_canonical_metadata``'s
+# definition-time default; it is not an importable minting API.
+del _merge_issue_at_definition
 
 
 def build_metadata_from_gamma_market(

@@ -1187,7 +1187,69 @@ def test_adapter_closes_on_dry_run_success():
     assert close_called == [True], "Adapter aclose must be called exactly once on dry-run success"
 
 
-# ── raw-address promotion is impossible ────────────────────────────────────────────
+# ── PR84 lifecycle ordering regressions ─────────────────────────────────────
+def test_pr84_write_lifecycle_success_order(monkeypatch, tmp_path: Path):
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self): events.append("lock_enter"); return self
+        def __exit__(self, *args): events.append("lock_exit")
+    class Adapter:
+        async def aclose(self): events.append("adapter_close")
+    class Db:
+        def commit(self): events.append("commit")
+        def rollback(self): events.append("rollback")
+        def close(self): events.append("db_close")
+    async def discover(*args): return {"candidates": []}
+    def persist(*args, **kwargs):
+        events.append("persist")
+        return type("Result", (), {"run_id": "r", "as_dict": lambda self: {"dry_run": False, "markets_requested": 0, "markets_completed": 0, "markets_partial": 0, "markets_failed": 0, "trades_examined": 0, "would_create_wallets": 0, "existing_wallets": 0, "new_wallets": 0, "would_create_watches": 0, "watches_created": 0, "candidates": []}})()
+    monkeypatch.setattr(discover_research_wallets, "operational_job_lock", lambda *a, **k: Lock())
+    monkeypatch.setattr(discover_research_wallets, "_make_adapter", lambda: events.append("adapter_create") or Adapter())
+    monkeypatch.setattr(discover_research_wallets, "discover_candidates", discover)
+    monkeypatch.setattr(discover_research_wallets, "persist_candidates", persist)
+    monkeypatch.setattr(discover_research_wallets.ed, "require_write_gates", lambda *a, **k: True)
+    monkeypatch.setattr(discover_research_wallets.ed, "open_writable", lambda *a, **k: events.append("db_open") or Db())
+    assert discover_research_wallets.main(["--write", "--allow-live", "--confirm-production-db", "--db-path", str(tmp_path / "db.sqlite")]) == 0
+    assert events == ["lock_enter", "adapter_create", "db_open", "persist", "commit", "db_close", "adapter_close", "lock_exit"]
+
+
+def test_pr84_write_lifecycle_persist_failure_order(monkeypatch, tmp_path: Path):
+    events: list[str] = []
+    class Lock:
+        def __enter__(self): events.append("lock_enter"); return self
+        def __exit__(self, *args): events.append("lock_exit")
+    class Adapter:
+        async def aclose(self): events.append("adapter_close")
+    class Db:
+        def rollback(self): events.append("rollback")
+        def close(self): events.append("db_close")
+    async def discover(*args): return {"candidates": []}
+    def persist(*args, **kwargs): events.append("persist_raises"); raise RuntimeError("controlled")
+    monkeypatch.setattr(discover_research_wallets, "operational_job_lock", lambda *a, **k: Lock())
+    monkeypatch.setattr(discover_research_wallets, "_make_adapter", lambda: events.append("adapter_create") or Adapter())
+    monkeypatch.setattr(discover_research_wallets, "discover_candidates", discover)
+    monkeypatch.setattr(discover_research_wallets, "persist_candidates", persist)
+    monkeypatch.setattr(discover_research_wallets.ed, "require_write_gates", lambda *a, **k: True)
+    monkeypatch.setattr(discover_research_wallets.ed, "open_writable", lambda *a, **k: events.append("db_open") or Db())
+    assert discover_research_wallets.main(["--write", "--allow-live", "--confirm-production-db", "--db-path", str(tmp_path / "db.sqlite")]) == 1
+    assert events == ["lock_enter", "adapter_create", "db_open", "persist_raises", "rollback", "db_close", "adapter_close", "lock_exit"]
+
+
+def test_pr84_adapter_and_db_open_failures_cleanup_inside_lock(monkeypatch, tmp_path: Path):
+    events: list[str] = []
+    class Lock:
+        def __enter__(self): events.append("lock_enter"); return self
+        def __exit__(self, *args): events.append("lock_exit")
+    class Adapter:
+        async def aclose(self): events.append("adapter_close")
+    monkeypatch.setattr(discover_research_wallets, "operational_job_lock", lambda *a, **k: Lock())
+    monkeypatch.setattr(discover_research_wallets.ed, "require_write_gates", lambda *a, **k: True)
+    monkeypatch.setattr(discover_research_wallets, "_make_adapter", lambda: events.append("adapter_create") or Adapter())
+    monkeypatch.setattr(discover_research_wallets, "discover_candidates", lambda *a: (_ for _ in ()).throw(RuntimeError("db-open prelude")))
+    # Adapter is created and closed even when work preceding DB open fails.
+    assert discover_research_wallets.main(["--write", "--allow-live", "--confirm-production-db", "--db-path", str(tmp_path / "db.sqlite")]) == 1
+    assert events == ["lock_enter", "adapter_create", "adapter_close", "lock_exit"]
 def test_raw_address_promotion_impossible():
     """No public function can promote a wallet from raw address argument."""
     import inspect

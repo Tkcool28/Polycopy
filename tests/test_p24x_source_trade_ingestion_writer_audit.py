@@ -398,6 +398,56 @@ def test_audit_derives_false_for_disposable_architecture_violations(
     audit = build_source_trade_ingestion_writer_audit(None, repo_root=str(root))
     assert audit.centralized_writer_exists is False
     assert audit.violations or audit.approved_initial_insert_count != 1
+    assert audit.false_verdict_reasons
+    assert audit.missing_roles or audit.duplicate_roles or audit.unexpected_roles
+
+
+@pytest.mark.parametrize(
+    ("name", "relative", "source", "expected_reason"),
+    [
+        ("writer_missing", "src/polycopy/ingestion/source_trade_writer.py", "def other(db):\n    db.execute('INSERT OR IGNORE INTO source_trades (id) VALUES (1)')\n", "missing_role:canonical_writer_insert"),
+        ("writer_duplicated", "src/polycopy/ingestion/source_trade_writer.py", "def write_valid_rows(db):\n    db.execute('INSERT OR IGNORE INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id, metadata_json) VALUES (1)')\n", "duplicate_role:canonical_writer_insert"),
+        ("metadata_id_missing", "src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "def reconcile_metadata_json(db):\n    db.execute('UPDATE source_trades SET metadata_json=? WHERE source=? AND source_trade_id=?')\n", "missing_role:metadata_reconciliation_by_id"),
+        ("metadata_identity_missing", "src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "def reconcile_metadata_json(db):\n    db.execute('UPDATE source_trades SET metadata_json=? WHERE id=?')\n", "missing_role:metadata_reconciliation_by_identity"),
+        ("resolution_missing", "src/polycopy/ingestion/source_trade_resolution.py", "def other(db):\n    db.execute('UPDATE source_trades SET resolution_status=? WHERE id=?')\n", "missing_role:resolution_reconciliation_by_id"),
+        ("metadata_duplicate", "src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "def reconcile_metadata_json(db):\n    db.execute('UPDATE source_trades SET metadata_json=? WHERE id=?')\n", "duplicate_role:metadata_reconciliation_by_id"),
+        ("resolution_duplicate", "src/polycopy/ingestion/source_trade_resolution.py", "def apply_existing_resolution_updates(db):\n    db.execute('UPDATE source_trades SET resolution_status=?, resolved_at=?, winning_token_id=?, is_winning_trade=?, realized_pnl=?, settlement_source=? WHERE id=?')\n", "duplicate_role:resolution_reconciliation_by_id"),
+    ],
+)
+def test_audit_exposes_role_specific_false_verdicts(tmp_path: Path, name: str, relative: str, source: str, expected_reason: str) -> None:
+    root = _architecture_tree(tmp_path)
+    target = root / relative
+    if name.endswith("missing"):
+        target.write_text(source)
+    else:
+        target.write_text(target.read_text() + "\n" + source)
+    audit = build_source_trade_ingestion_writer_audit(None, repo_root=str(root))
+    assert audit.centralized_writer_exists is False
+    assert expected_reason in audit.false_verdict_reasons
+    assert audit.observed_role_counts
+    assert audit.missing_roles or audit.duplicate_roles
+
+
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        ("scripts/wrong_file.py", "def write_valid_rows(db):\n    db.execute('INSERT OR IGNORE INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id, metadata_json) VALUES (1)')\n"),
+        ("src/polycopy/ingestion/source_trade_writer.py", "def wrong_scope(db):\n    db.execute('INSERT OR IGNORE INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id, metadata_json) VALUES (1)')\n"),
+        ("src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "def extra_metadata(db):\n    db.execute('UPDATE source_trades SET metadata_json=? WHERE id=?')\n"),
+        ("src/polycopy/ingestion/source_trade_resolution.py", "def extra_resolution(db):\n    db.execute('UPDATE source_trades SET resolution_status=?, resolved_at=?, winning_token_id=?, is_winning_trade=?, realized_pnl=?, settlement_source=? WHERE id=?')\n"),
+        ("src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "def reconcile_metadata_json(db):\n    db.execute('UPDATE source_trades SET metadata_json=? WHERE price=?')\n"),
+        ("src/polycopy/ingestion/source_trade_writer.py", "def write_valid_rows(db, flag):\n    if flag:\n        sql = 'INSERT OR IGNORE INTO source_trades (id, source, source_trade_id, market_source_id, side, outcome, quantity, price, trader_address, timestamp, is_sample, token_id, metadata_json) VALUES (1)'\n    else:\n        sql = 'DELETE FROM source_trades'\n    db.execute(sql)\n"),
+    ],
+)
+def test_audit_exposes_unexpected_role_verdicts(tmp_path: Path, relative: str, source: str) -> None:
+    root = _architecture_tree(tmp_path)
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text((target.read_text() if target.exists() else "") + "\n" + source)
+    audit = build_source_trade_ingestion_writer_audit(None, repo_root=str(root))
+    assert audit.centralized_writer_exists is False
+    assert audit.unexpected_roles
+    assert any(reason.startswith("unexpected_role:") for reason in audit.false_verdict_reasons)
 
 
 def test_actual_repository_audit_verdict_is_scanner_derived() -> None:
@@ -406,6 +456,16 @@ def test_actual_repository_audit_verdict_is_scanner_derived() -> None:
     assert audit.violations == []
     assert audit.unresolved_sinks == []
     assert audit.collector_owned_mutations == []
+    assert audit.observed_role_counts == {
+        "canonical_writer_insert": 1,
+        "metadata_reconciliation_by_id": 1,
+        "metadata_reconciliation_by_identity": 1,
+        "resolution_reconciliation_by_id": 1,
+    }
+    assert audit.missing_roles == []
+    assert audit.duplicate_roles == []
+    assert audit.unexpected_roles == []
+    assert audit.false_verdict_reasons == []
     assert audit.centralized_writer_exists is True
 
 
