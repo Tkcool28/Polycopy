@@ -13,31 +13,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from polycopy.ingestion.canonical_metadata import _CanonicalMergeMetadata
 from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
 
-_MERGED_TOKEN = object()
 
+def serialize_canonical_merge_metadata(metadata: _CanonicalMergeMetadata) -> str:
+    """Serialize authority issued by the completed canonical merge only.
 
-class _TrustedMergedMetadata(str):
-    """Private carrier emitted only after canonical merge logic has run."""
-
-    def __new__(cls, value: str, token: object):
-        if token is not _MERGED_TOKEN:
-            raise TypeError("trusted reconciliation metadata is internal")
-        return str.__new__(cls, value)
-
-
-def trusted_merged_metadata_json(metadata: Mapping[str, Any]) -> _TrustedMergedMetadata:
-    """Serialize the output of ``merge_canonical_metadata`` deterministically.
-
-    This is intentionally not a general-purpose trust classifier.  Initial
-    callers must use ``serialize_source_trade_metadata``; reconciliation
-    callers reach this only after the shared canonical merge has compared the
-    existing persisted evidence with an authoritative Gamma response.
+    An ordinary mapping, a canonical builder output, or a caller-created value
+    cannot enter this path.  The opaque carrier can be issued only at the end
+    of :func:`merge_canonical_metadata` after authoritative reconciliation.
     """
-    return _TrustedMergedMetadata(
-        json.dumps(metadata, sort_keys=True, separators=(",", ":")), _MERGED_TOKEN
-    )
+    if type(metadata) is not _CanonicalMergeMetadata:
+        raise TypeError("metadata replacement requires canonical merge output")
+    return json.dumps(metadata, sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -68,11 +57,11 @@ def reconcile_metadata_json(
     by_identity = source is not None and source_trade_id is not None
     if by_internal == by_identity:
         raise ValueError("provide exactly one immutable row selector")
-    if allow_nonempty_replace and type(metadata) is not _TrustedMergedMetadata:
-        raise ValueError("non-empty metadata replacement requires trusted merge output")
+    if allow_nonempty_replace and type(metadata) is not _CanonicalMergeMetadata:
+        raise ValueError("non-empty metadata replacement requires canonical merge output")
 
-    if type(metadata) is _TrustedMergedMetadata:
-        serialized = str(metadata)
+    if type(metadata) is _CanonicalMergeMetadata:
+        serialized = serialize_canonical_merge_metadata(metadata)
     elif isinstance(metadata, Mapping) or metadata is None:
         serialized = serialize_source_trade_metadata(metadata)
     else:
@@ -83,14 +72,16 @@ def reconcile_metadata_json(
             parsed = None
         serialized = serialize_source_trade_metadata(parsed if isinstance(parsed, Mapping) else None)
 
-    where, params = (
-        ("id=?", (internal_id,)) if by_internal
-        else ("source=? AND source_trade_id=?", (source, source_trade_id))
-    )
     try:
-        row = db.conn.execute(
-            f"SELECT metadata_json FROM source_trades WHERE {where}", params
-        ).fetchone()
+        if by_internal:
+            row = db.conn.execute(
+                "SELECT metadata_json FROM source_trades WHERE id=?", (internal_id,)
+            ).fetchone()
+        else:
+            row = db.conn.execute(
+                "SELECT metadata_json FROM source_trades WHERE source=? AND source_trade_id=?",
+                (source, source_trade_id),
+            ).fetchone()
         if row is None:
             return MetadataReconcileResult("missing")
         current = row[0] if isinstance(row[0], str) else None
@@ -104,10 +95,16 @@ def reconcile_metadata_json(
             return MetadataReconcileResult("reused")
         if current and current.strip() and not allow_nonempty_replace:
             return MetadataReconcileResult("conflict")
-        cur = db.conn.execute(
-            f"UPDATE source_trades SET metadata_json=? WHERE {where}",
-            (serialized, *params),
-        )
+        if by_internal:
+            cur = db.conn.execute(
+                "UPDATE source_trades SET metadata_json=? WHERE id=?",
+                (serialized, internal_id),
+            )
+        else:
+            cur = db.conn.execute(
+                "UPDATE source_trades SET metadata_json=? WHERE source=? AND source_trade_id=?",
+                (serialized, source, source_trade_id),
+            )
         if cur.rowcount != 1:
             raise sqlite3.IntegrityError("metadata target disappeared")
         if commit:
@@ -119,4 +116,4 @@ def reconcile_metadata_json(
         return MetadataReconcileResult("conflict")
 
 
-__all__ = ["MetadataReconcileResult", "reconcile_metadata_json", "trusted_merged_metadata_json"]
+__all__ = ["MetadataReconcileResult", "reconcile_metadata_json", "serialize_canonical_merge_metadata"]

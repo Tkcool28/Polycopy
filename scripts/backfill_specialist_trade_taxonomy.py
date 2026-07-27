@@ -84,10 +84,7 @@ from polycopy.ingestion.source_trade_provenance import (  # noqa: E402
     write_provenance,
 )
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
-from polycopy.ingestion.source_trade_metadata_reconciliation import (  # noqa: E402
-    reconcile_metadata_json,
-    trusted_merged_metadata_json,
-)
+from polycopy.ingestion.source_trade_metadata_reconciliation import reconcile_metadata_json
 from evidence_db import (  # noqa: E402
     DbConn,
     is_production_db,
@@ -404,7 +401,7 @@ async def _run_async(
             if merge_status in (MERGE_FILLED, MERGE_UNCHANGED):
                 reconciled = reconcile_metadata_json(
                     db,
-                    trusted_merged_metadata_json(new_meta),
+                    new_meta,
                     internal_id=t["id"],
                     allow_nonempty_replace=True,
                     commit=False,

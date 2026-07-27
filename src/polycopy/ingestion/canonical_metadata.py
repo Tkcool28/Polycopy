@@ -29,6 +29,27 @@ MERGE_UNAVAILABLE = "unavailable"
 
 
 _CANONICAL_TRUST_TOKEN = object()
+_MERGED_METADATA_TOKEN = object()
+
+
+@final
+class _CanonicalMergeMetadata(dict[str, Any]):
+    """Opaque result issued only by :func:`merge_canonical_metadata`.
+
+    This is deliberately distinct from builder output: reconciliation authority
+    represents a completed comparison of persisted metadata with authoritative
+    Gamma evidence, not merely a canonical-looking mapping.
+    """
+
+    def __init__(self, value: dict[str, Any], *, _token: object) -> None:
+        if _token is not _MERGED_METADATA_TOKEN:
+            raise TypeError("canonical merge output is internal")
+        super().__init__(copy.deepcopy(value))
+
+
+def _canonical_merge_output(value: dict[str, Any]) -> _CanonicalMergeMetadata:
+    """Issue reconciliation authority at the canonical merge boundary only."""
+    return _CanonicalMergeMetadata(value, _token=_MERGED_METADATA_TOKEN)
 
 
 @final
@@ -1015,8 +1036,8 @@ def merge_canonical_metadata(
         return json.loads(json.dumps(merged, sort_keys=True)), MERGE_CONFLICT, reasons
     if not changed:
         reasons.append("no_change")
-        return _ensure_version(existing), MERGE_UNCHANGED, reasons
-    return json.loads(json.dumps(merged, sort_keys=True)), MERGE_FILLED, reasons
+        return _canonical_merge_output(_ensure_version(existing)), MERGE_UNCHANGED, reasons
+    return _canonical_merge_output(json.loads(json.dumps(merged, sort_keys=True))), MERGE_FILLED, reasons
 
 
 def build_metadata_from_gamma_market(

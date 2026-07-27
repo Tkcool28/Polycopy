@@ -62,10 +62,7 @@ from polycopy.ingestion.source_trade_provenance import (
     write_provenance,
 )
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
-from polycopy.ingestion.source_trade_metadata_reconciliation import (
-    reconcile_metadata_json,
-    trusted_merged_metadata_json,
-)
+from polycopy.ingestion.source_trade_metadata_reconciliation import reconcile_metadata_json
 
 # Exact, repository-proven Polymarket source_trades writer values (no fuzzy
 # matching, no id prefixes). A bare "polymarket" literal is NOT a proven
@@ -406,7 +403,7 @@ def enrich_source_trade(
     # MERGE_FILLED / MERGE_UNCHANGED: canonical metadata may be persisted and
     # classified. Write the deterministic canonical metadata to source_trades.
     # On CONFLICT/UNAVAILABLE we passed metadata_json=None to skip the write.
-    new_metadata_json = trusted_merged_metadata_json(canonical_meta)
+    new_metadata_json = canonical_meta
     payload = build_provenance_payload(
         source_trade=row,
         canonical_meta=canonical_meta,

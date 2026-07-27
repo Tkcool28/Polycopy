@@ -103,6 +103,7 @@ def seed_demo_data(db: Database, force: bool = False) -> None:
         db: connected database.
         force: if True, clear existing sample data first.
     """
+    _require_disposable_db(Path(db.db_path))
     if force:
         _clear_sample_data(db)
 
