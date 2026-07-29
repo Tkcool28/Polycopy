@@ -14,6 +14,8 @@ Safety envelope (carried from PR68 + Pass 2):
   * A production DB write requires --write --confirm-production-db plus the
     approval-driven discovery gates (--approval-id, --max-new-trades 1,
     --allow-live for live network).
+  * The complete production-write lifecycle, including database open/close and
+    rollback/cleanup, is protected by the shared operational job lock.
   * Bounded: --max-new-trades (default 1, max bounded) + exact --approval-id.
   * Output includes the full artifact chain (approval/source-trade/enrichment/
     dispatch/candidate/paper-signal).
@@ -25,6 +27,7 @@ import argparse
 import asyncio
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -32,16 +35,19 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
     if _cand.exists() and str(_cand) not in sys.path:
         sys.path.insert(0, str(_cand))
 
-from polycopy.db.database import Database  # noqa: E402
-from polycopy.execution.specialist_approval import (  # noqa: E402
-    get_approval,
-)
-from polycopy.ingestion.approved_wallet_collector import collect  # noqa: E402
-from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
-from polycopy.ingestion.source_trade_enrichment import enrich_source_trade_async  # noqa: E402
-from polycopy.engine.approved_specialist_dispatcher import dispatch_one  # noqa: E402
-from polycopy.config.settings import Settings  # noqa: E402
 from polycopy.adapters.polymarket import PolymarketPublicAdapter  # noqa: E402
+from polycopy.config.settings import Settings  # noqa: E402
+from polycopy.db.database import Database  # noqa: E402
+from polycopy.engine.approved_specialist_dispatcher import dispatch_one  # noqa: E402
+from polycopy.execution.specialist_approval import get_approval  # noqa: E402
+from polycopy.ingestion.approved_wallet_collector import collect  # noqa: E402
+from polycopy.ingestion.source_trade_enrichment import enrich_source_trade_async  # noqa: E402
+from polycopy.ingestion.source_trade_writer import write_valid_rows  # noqa: E402
+from polycopy.runtime.locks import (  # noqa: E402
+    DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S,
+    LockError,
+    operational_job_lock,
+)
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 
@@ -53,58 +59,64 @@ def _is_production_db(db_path: str) -> bool:
         return False
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        description="Orchestrate approved-specialist trade -> paper signal (no execution)"
-    )
-    p.add_argument("--approval-id", required=True, help="Exact approval_id (UUID)")
-    p.add_argument("--max-new-trades", type=int, default=1,
-                   help="Bounded new-trade cap for collection (default 1)")
-    p.add_argument("--write", action="store_true", help="Persist all stages")
-    p.add_argument("--allow-live", action="store_true",
-                   help="Authorize live Gamma/CLOB/collection network")
-    p.add_argument("--confirm-production-db", action="store_true",
-                   help="Confirm target is the production DB")
-    p.add_argument("--db-path", default=str(PRODUCTION_DB_PATH))
-    p.add_argument("--json", action="store_true")
-    args = p.parse_args(argv)
+def _rollback_quietly(db) -> None:
+    """Rollback while the caller still owns the outer operational lock."""
+    conn = getattr(db, "conn", None)
+    rollback = getattr(conn, "rollback", None)
+    if callable(rollback):
+        try:
+            rollback()
+        except Exception:
+            pass
 
-    if args.max_new_trades < 1 or args.max_new_trades > 1:
-        print("error: --max-new-trades must be exactly 1 for approval-driven discovery",
-              file=sys.stderr)
-        return 2
 
-    is_prod = _is_production_db(args.db_path)
-    if args.write and is_prod:
-        missing = []
-        if not args.allow_live:
-            missing.append("--allow-live")
-        if not args.confirm_production_db:
-            missing.append("--confirm-production-db")
-        if missing:
-            print("error: production write requires: " + ", ".join(missing),
-                  file=sys.stderr)
-            return 2
+def _close_resources(*, db, adapter, runner) -> None:
+    """Close network/async/database resources before the outer lock releases."""
+    if adapter is not None:
+        aclose = getattr(adapter, "aclose", None)
+        if callable(aclose) and runner is not None:
+            try:
+                runner.run(aclose())
+            except Exception:
+                pass
+        else:
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+    if runner is not None:
+        runner.close()
+    if db is not None:
+        db.close()
 
+
+def _run(args) -> dict[str, object] | None:
     adapter = None
     runner = None
-    db = Database(Path(args.db_path)).connect()
+    db = None
+    failed = False
     try:
-        # Resolve approval (reject unknown/disabled/revoked via active check).
+        # Database opening is deliberately inside the outer operational lock.
+        db = Database(Path(args.db_path)).connect()
+
         try:
             approval = get_approval(db, args.approval_id)
         except KeyError:
             print("error: unknown approval_id", file=sys.stderr)
-            return 2
+            return None
         if not approval.enabled or approval.revoked_at is not None:
-            print(f"error: approval is {'disabled' if not approval.enabled else 'revoked'}",
-                  file=sys.stderr)
-            return 2
+            print(
+                f"error: approval is {'disabled' if not approval.enabled else 'revoked'}",
+                file=sys.stderr,
+            )
+            return None
         wallet = approval.wallet_address
 
         if not args.allow_live:
             print("error: --allow-live required for network collection", file=sys.stderr)
-            return 2
+            return None
 
         settings = Settings()
         adapter = PolymarketPublicAdapter(
@@ -122,8 +134,6 @@ def main(argv: list[str] | None = None) -> int:
             return gamma_cache[condition_id]
 
         def gamma_sync(condition_id: str):
-            # Dispatcher/scoring stays synchronous and must never invoke the
-            # async adapter. Collection/enrichment pre-resolve the exact trade.
             if condition_id not in gamma_cache:
                 raise RuntimeError(
                     "synchronous dispatch requested uncached Gamma market "
@@ -131,36 +141,46 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return gamma_cache[condition_id]
 
-        # ── Stage 1: collect at most one new trade (approval-driven) ──
         result = runner.run(collect(adapter, wallet, gamma_resolver=gamma_async))
-        accepted = result.accepted_rows[:args.max_new_trades]
+        accepted = result.accepted_rows[: args.max_new_trades]
         source_trade_internal_id = None
         inserted_trades = 0
+
         if args.write and accepted:
-            from polycopy.ingestion.normalized_source_trade import normalize_source_trade  # noqa
+            from polycopy.ingestion.normalized_source_trade import normalize_source_trade
+
             pre = {
-                (str(r[0]), str(r[1]))
-                for r in db.conn.execute(
+                (str(row[0]), str(row[1]))
+                for row in db.conn.execute(
                     "SELECT source, source_trade_id FROM source_trades WHERE source=?",
                     ("polymarket_data_api_trades_user",),
                 )
             }
-            norms = [normalize_source_trade(t, requested_wallet=wallet, allow_sell=False,
-                                            gamma_market=gamma_sync(t.market_source_id))
-                     for t in accepted]
-            # Replay-safe script boundary uses the exact canonical writer key:
-            # (source, source_trade_id), never an ID-only approximation.
-            fresh_norms = [
-                n for n in norms if (str(n.source), str(n.source_trade_id)) not in pre
+            norms = [
+                normalize_source_trade(
+                    trade,
+                    requested_wallet=wallet,
+                    allow_sell=False,
+                    gamma_market=gamma_sync(trade.market_source_id),
+                )
+                for trade in accepted
             ]
-            out = write_valid_rows(
-                db, fresh_norms, dry_run=False,
+            fresh_norms = [
+                norm
+                for norm in norms
+                if (str(norm.source), str(norm.source_trade_id)) not in pre
+            ]
+            persisted = write_valid_rows(
+                db,
+                fresh_norms,
+                dry_run=False,
                 pre_existing_ids={
-                    n.source_trade_id for n in fresh_norms if n.source_trade_id is not None
+                    norm.source_trade_id
+                    for norm in fresh_norms
+                    if norm.source_trade_id is not None
                 },
             )
-            inserted_trades = out.inserted
-            # Resolve the persisted internal id of the first accepted trade.
+            inserted_trades = persisted.inserted
             first = norms[0]
             row = db.fetchone(
                 "SELECT id FROM source_trades WHERE source=? AND source_trade_id=?",
@@ -168,12 +188,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             if row:
                 source_trade_internal_id = row["id"]
-        elif accepted:
-            source_trade_internal_id = None  # dry-run: no persistence
 
         if source_trade_internal_id is None and args.write and not inserted_trades:
-            # No new trade collected; nothing to enrich/dispatch.
-            out = {
+            return {
                 "approval_id": args.approval_id,
                 "source_trade_internal_id": None,
                 "inserted_trades": 0,
@@ -182,61 +199,128 @@ def main(argv: list[str] | None = None) -> int:
                 "candidate_id": None,
                 "paper_signal_decision_id": None,
                 "paper_signal_verdict": None,
-                "mode": "write" if args.write else "dry-run",
+                "mode": "write",
             }
-            print(json.dumps(out, sort_keys=True) if args.json else
-                  "no new trade collected for approval")
-            return 0
 
-        # ── Stage 2 + 3: enrich + dispatch the exact source trade ──
         if source_trade_internal_id is not None:
-            enrichment = runner.run(enrich_source_trade_async(
-                db, source_trade_internal_id,
-                gamma_resolver=gamma_async, dry_run=not args.write))
-            disp = dispatch_one(
-                db, approval_id=args.approval_id,
+            enrichment = runner.run(
+                enrich_source_trade_async(
+                    db,
+                    source_trade_internal_id,
+                    gamma_resolver=gamma_async,
+                    dry_run=not args.write,
+                )
+            )
+            dispatch = dispatch_one(
+                db,
+                approval_id=args.approval_id,
                 source_trade_internal_id=source_trade_internal_id,
-                gamma_resolver=gamma_sync, clob_provider=adapter,
-                dry_run=not args.write)
+                gamma_resolver=gamma_sync,
+                clob_provider=adapter,
+                dry_run=not args.write,
+            )
         else:
             enrichment = None
-            disp = None
+            dispatch = None
 
-        out = {
+        return {
             "approval_id": args.approval_id,
             "source_trade_internal_id": source_trade_internal_id,
             "inserted_trades": inserted_trades,
             "enrichment_id": enrichment.enrichment_id if enrichment else None,
             "enrichment_status": enrichment.status if enrichment else None,
-            "dispatch_id": disp.dispatch_id if disp else None,
-            "dispatch_status": disp.status if disp else None,
-            "candidate_id": disp.candidate_id if disp else None,
-            "paper_signal_decision_id": disp.paper_signal_decision_id if disp else None,
-            "paper_signal_verdict": disp.paper_signal_verdict if disp else None,
+            "dispatch_id": dispatch.dispatch_id if dispatch else None,
+            "dispatch_status": dispatch.status if dispatch else None,
+            "candidate_id": dispatch.candidate_id if dispatch else None,
+            "paper_signal_decision_id": (
+                dispatch.paper_signal_decision_id if dispatch else None
+            ),
+            "paper_signal_verdict": dispatch.paper_signal_verdict if dispatch else None,
             "mode": "write" if args.write else "dry-run",
         }
+    except BaseException:
+        failed = True
+        if db is not None:
+            _rollback_quietly(db)
+        raise
     finally:
-        if adapter is not None:
-            aclose = getattr(adapter, "aclose", None)
-            if callable(aclose) and runner is not None:
-                try:
-                    runner.run(aclose())
-                except Exception:
-                    pass
-            elif callable(getattr(adapter, "close", None)):
-                try:
-                    adapter.close()
-                except Exception:
-                    pass
-        if runner is not None:
-            runner.close()
-        db.close()
+        # Rollback and every cleanup/close operation occur before the enclosing
+        # operational_job_lock context exits. Nested writers never own this lock.
+        if failed and db is not None:
+            _rollback_quietly(db)
+        _close_resources(db=db, adapter=adapter, runner=runner)
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Orchestrate approved-specialist trade -> paper signal (no execution)"
+    )
+    parser.add_argument("--approval-id", required=True, help="Exact approval_id (UUID)")
+    parser.add_argument(
+        "--max-new-trades",
+        type=int,
+        default=1,
+        help="Bounded new-trade cap for collection (default 1)",
+    )
+    parser.add_argument("--write", action="store_true", help="Persist all stages")
+    parser.add_argument(
+        "--allow-live", action="store_true", help="Authorize live Gamma/CLOB/collection network"
+    )
+    parser.add_argument(
+        "--confirm-production-db", action="store_true", help="Confirm target is the production DB"
+    )
+    parser.add_argument("--db-path", default=str(PRODUCTION_DB_PATH))
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=DEFAULT_OPERATIONAL_LOCK_TIMEOUT_S,
+        help="Seconds to wait for the shared operational lock",
+    )
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.max_new_trades != 1:
+        print(
+            "error: --max-new-trades must be exactly 1 for approval-driven discovery",
+            file=sys.stderr,
+        )
+        return 2
+    if args.lock_timeout < 0:
+        print("error: --lock-timeout must be non-negative", file=sys.stderr)
+        return 2
+
+    is_prod = _is_production_db(args.db_path)
+    if args.write and is_prod:
+        missing = []
+        if not args.allow_live:
+            missing.append("--allow-live")
+        if not args.confirm_production_db:
+            missing.append("--confirm-production-db")
+        if missing:
+            print("error: production write requires: " + ", ".join(missing), file=sys.stderr)
+            return 2
+
+    lock_context = (
+        operational_job_lock("approved-specialist", timeout=args.lock_timeout)
+        if args.write and is_prod
+        else nullcontext()
+    )
+    try:
+        with lock_context:
+            output = _run(args)
+    except LockError as exc:
+        print(f"error: operational lock unavailable: {exc}", file=sys.stderr)
+        return 1
+
+    if output is None:
+        return 2
     if args.json:
-        print(json.dumps(out, sort_keys=True))
+        print(json.dumps(output, sort_keys=True))
+    elif output["source_trade_internal_id"] is None and args.write:
+        print("no new trade collected for approval")
     else:
-        for k, v in out.items():
-            print(f"{k}={v}")
+        for key, value in output.items():
+            print(f"{key}={value}")
     return 0
 
 
