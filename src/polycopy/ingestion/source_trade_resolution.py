@@ -85,6 +85,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Protocol
 
 from polycopy.adapters.polymarket import PolymarketPublicAdapter
@@ -539,23 +540,14 @@ async def _resolve_rows(
         # guarded by the still-unresolved precondition. A concurrent /
         # repeated write that already flipped status is simply skipped
         # (rowcount 0) rather than aborting the whole batch.
-        for row_id, vals in updates:
-            cur = conn.execute(
-                "UPDATE source_trades SET "
-                "resolution_status=?, resolved_at=?, winning_token_id=?, "
-                "is_winning_trade=?, realized_pnl=?, settlement_source=? "
-                "WHERE id=? AND COALESCE(resolution_status, 'unresolved')='unresolved'",
-                (
-                    vals["resolution_status"],
-                    vals["resolved_at"],
-                    vals["winning_token_id"],
-                    vals["is_winning_trade"],
-                    vals["realized_pnl"],
-                    vals["settlement_source"],
-                    row_id,
-                ),
-            )
-            report.updated += max(0, cur.rowcount)
+        report.updated += apply_existing_resolution_updates(
+            conn,
+            [
+                (row_id, SimpleNamespace(**vals))
+                for row_id, vals in updates
+            ],
+            unresolved_only=True,
+        )
 
 
 def resolve_source_trades(
@@ -598,6 +590,52 @@ def resolve_source_trades(
     )
     report.duration_seconds = (datetime.now(timezone.utc) - start).total_seconds()
     return report
+
+
+RESOLUTION_COLUMNS = (
+    "resolution_status",
+    "resolved_at",
+    "winning_token_id",
+    "is_winning_trade",
+    "realized_pnl",
+    "settlement_source",
+)
+
+
+def apply_existing_resolution_updates(
+    conn: Any,
+    updates: list[tuple[str, Any]],
+    *,
+    unresolved_only: bool = False,
+) -> int:
+    """Apply the sole approved resolution-column update contract.
+
+    The caller supplies existing immutable row ids and settlement values.  This
+    function never inserts, never upserts and never touches a column outside
+    ``RESOLUTION_COLUMNS``.  Backfill callers use this instead of maintaining
+    their own ``source_trades`` UPDATE implementation.
+    """
+    where = "WHERE id=?"
+    if unresolved_only:
+        where += " AND COALESCE(resolution_status, 'unresolved')='unresolved'"
+    updated = 0
+    for row_id, settlement in updates:
+        cur = conn.execute(
+            "UPDATE source_trades SET "
+            "resolution_status=?, resolved_at=?, winning_token_id=?, "
+            "is_winning_trade=?, realized_pnl=?, settlement_source=? " + where,
+            (
+                settlement.resolution_status,
+                settlement.resolved_at,
+                settlement.winning_token_id,
+                settlement.is_winning_trade,
+                settlement.realized_pnl,
+                settlement.settlement_source,
+                row_id,
+            ),
+        )
+        updated += max(0, cur.rowcount)
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -1025,22 +1063,7 @@ def _with_savepoint(
     conn.execute("SAVEPOINT specialist_refresh_market")
     try:
         if source_updates:
-            for row_id, settlement in source_updates:
-                conn.execute(
-                    "UPDATE source_trades SET "
-                    "resolution_status=?, resolved_at=?, winning_token_id=?, "
-                    "is_winning_trade=?, realized_pnl=?, settlement_source=? "
-                    "WHERE id=?",
-                    (
-                        settlement.resolution_status,
-                        settlement.resolved_at,
-                        settlement.winning_token_id,
-                        settlement.is_winning_trade,
-                        settlement.realized_pnl,
-                        settlement.settlement_source,
-                        row_id,
-                    ),
-                )
+            apply_existing_resolution_updates(conn, source_updates)
         if bookkeeping_writer is not None:
             bookkeeping_writer(db, outcome)
     except Exception:

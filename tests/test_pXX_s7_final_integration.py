@@ -59,6 +59,7 @@ import evidence_db as ed  # noqa: E402  (DbConn with count_table_optional)
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MERGE_CONFLICT,
+    CanonicalSourceTradeMetadata,
     build_canonical_metadata,
     merge_canonical_metadata,
 )
@@ -297,6 +298,12 @@ def _seed_trade(db, tid, cond=COND_A, meta=None, side="BUY",
                 realized_pnl=None, timestamp=None, trader=ADDR):
     if meta is None:
         meta = build_canonical_metadata({}, GAMMA_A)
+    # The builder now returns an immutable ``Mapping`` carrier; the SQL
+    # column needs ordinary JSON-serializable bytes.
+    if isinstance(meta, CanonicalSourceTradeMetadata):
+        meta_bytes = meta._serialized_json()
+    else:
+        meta_bytes = json.dumps(meta, sort_keys=True)
     db.conn.execute(
         "INSERT INTO source_trades("
         "id, source, source_trade_id, market_source_id, side, outcome, "
@@ -305,7 +312,7 @@ def _seed_trade(db, tid, cond=COND_A, meta=None, side="BUY",
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (tid, "polymarket", tid, cond, side, "Yes", 10.0, 0.40,
          trader, timestamp or "2026-03-01T00:00:00Z", 0,
-         json.dumps(meta, sort_keys=True),
+         meta_bytes,
          resolution_status, is_winning_trade, realized_pnl))
     db.conn.commit()
 

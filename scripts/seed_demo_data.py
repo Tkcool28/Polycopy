@@ -51,6 +51,14 @@ from polycopy.scoring.engine import score_wallet
 from polycopy.utils.concurrency import FileLock, lock_path
 
 logger = logging.getLogger(__name__)
+PRODUCTION_DB_PATH = (Path(__file__).resolve().parents[1] / "data" / "polycopy.db").resolve()
+REAL_PRODUCTION_DB_PATH = Path("/root/Polycopy/data/polycopy.db").resolve()
+
+
+def _require_disposable_db(db_path: Path) -> None:
+    """Demo seeding is never permitted against either production DB alias."""
+    if db_path.resolve() in {PRODUCTION_DB_PATH, REAL_PRODUCTION_DB_PATH}:
+        raise ValueError("seed_demo_data refuses the canonical production database")
 
 # ── Fixed UUIDs for reproducible demo data ──────────────────────────────────
 
@@ -95,6 +103,7 @@ def seed_demo_data(db: Database, force: bool = False) -> None:
         db: connected database.
         force: if True, clear existing sample data first.
     """
+    _require_disposable_db(Path(db.db_path))
     if force:
         _clear_sample_data(db)
 
@@ -351,6 +360,7 @@ def _seed_markets(db: Database) -> None:
 
 def _seed_source_trades(db: Database) -> None:
     """Seed fictional trades for each wallet."""
+    _require_disposable_db(Path(db.db_path))
     trades = [
         # Alpha: many recent, profitable-looking trades
         *[
@@ -1034,6 +1044,7 @@ def main() -> int:
         with lock:
             settings = get_settings()
             db_path = Path(args.db) if args.db else settings.db_path
+            _require_disposable_db(db_path)
             db = Database(db_path=db_path)
             db.connect()
             try:

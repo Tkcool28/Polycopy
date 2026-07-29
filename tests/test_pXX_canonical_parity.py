@@ -23,15 +23,21 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+from polycopy.ingestion import source_trade_metadata
+from polycopy.ingestion.canonical_metadata import (
     MERGE_CONFLICT,
     MERGE_FILLED,
-    MERGE_UNCHANGED,
     MERGE_UNAVAILABLE,
+    MERGE_UNCHANGED,
+    _is_issued_canonical_merge_metadata,
     build_canonical_metadata,
+    is_canonical_source_trade_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion import source_trade_metadata  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
+from polycopy.ingestion.source_trade_metadata_reconciliation import (
+    serialize_canonical_merge_metadata,
+)
 
 
 class FakeMarket(collections.abc.Mapping):
@@ -60,8 +66,25 @@ GAMMA = FakeMarket(
 )
 
 
+def _plain(meta):
+    if is_canonical_source_trade_metadata(meta) or _is_issued_canonical_merge_metadata(meta):
+        return meta.to_plain_dict()
+    if isinstance(meta, collections.abc.Mapping):
+        return json.loads(json.dumps(meta, sort_keys=True))
+    return meta
+
+
 def _canon(meta) -> str:
-    return json.dumps(meta, sort_keys=True)
+    """Compare detached semantic trees; never shallow-copy an issued carrier."""
+    return json.dumps(_plain(meta), sort_keys=True)
+
+
+def _persisted_bytes(meta) -> str:
+    if is_canonical_source_trade_metadata(meta):
+        return serialize_source_trade_metadata(meta)
+    if _is_issued_canonical_merge_metadata(meta):
+        return serialize_canonical_merge_metadata(meta)
+    return json.dumps(_plain(meta), sort_keys=True)
 
 
 def _without_retrieved_at(meta):
@@ -87,7 +110,7 @@ def test_collection_writer_matches_builder():
 
 def test_merge_full_equals_collection_writer():
     merged, status, rc = merge_canonical_metadata(
-        _canon({}), GAMMA, condition_id="0xcond1"
+        _persisted_bytes({}), GAMMA, condition_id="0xcond1"
     )
     assert status == MERGE_FILLED
     assert _canon(_without_retrieved_at(merged)) == _canon(
@@ -97,9 +120,9 @@ def test_merge_full_equals_collection_writer():
 
 def test_all_three_producers_identical():
     writer = build_canonical_metadata({}, GAMMA)
-    merged, _, _ = merge_canonical_metadata(_canon({}), GAMMA, condition_id="0xcond1")
+    merged, _, _ = merge_canonical_metadata(_persisted_bytes({}), GAMMA, condition_id="0xcond1")
     remerged, status, _ = merge_canonical_metadata(
-        _canon(writer), GAMMA, condition_id="0xcond1"
+        _persisted_bytes(writer), GAMMA, condition_id="0xcond1"
     )
     assert status == MERGE_UNCHANGED
     assert _canon(writer) == _canon(_without_retrieved_at(merged))
@@ -109,11 +132,11 @@ def test_all_three_producers_identical():
 def test_metadata_version_present_everywhere():
     filled, _, _ = merge_canonical_metadata(None, GAMMA, condition_id="0xcond1")
     unchanged, _, _ = merge_canonical_metadata(
-        _canon(filled), GAMMA, condition_id="0xcond1"
+        _persisted_bytes(filled), GAMMA, condition_id="0xcond1"
     )
     unavailable, _, _ = merge_canonical_metadata(None, None, condition_id="0xcond1")
     conflict, _, _ = merge_canonical_metadata(
-        _canon({"taxonomy": {"raw_category": "Sports"}}),
+        _persisted_bytes({"taxonomy": {"raw_category": "Sports"}}),
         GAMMA,
         condition_id="0xcond1",
     )

@@ -54,17 +54,25 @@ def test_build_canonical_shape():
     assert meta["taxonomy"]["raw_category"] == "Politics"
     assert meta["event"]["slug"] == "us-election"
     assert meta["series"]["slug"] == "pol"
-    # deterministic JSON
-    assert json.dumps(meta, sort_keys=True) == json.dumps(meta, sort_keys=True)
+    # Deterministic JSON: serialize via the canonical serializer so the
+    # immutable carrier's captured bytes are used. The same builder input
+    # must produce the same bytes on every call.
+    from polycopy.ingestion.source_trade_metadata import (
+        serialize_source_trade_metadata,
+    )
+    assert serialize_source_trade_metadata(meta) == serialize_source_trade_metadata(meta)
 
 
 def test_build_matches_in_collection_writer():
     # source_trade_metadata.build_metadata_from_gamma_market must be byte-equal.
     from polycopy.ingestion import source_trade_metadata
+    from polycopy.ingestion.source_trade_metadata import (
+        serialize_source_trade_metadata,
+    )
 
     a = build_canonical_metadata({}, GAMMA)
     b = source_trade_metadata.build_metadata_from_gamma_market({}, GAMMA)
-    assert json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+    assert serialize_source_trade_metadata(a) == serialize_source_trade_metadata(b)
 
 
 def test_merge_filled():
@@ -83,7 +91,8 @@ def test_merge_preserves_unrelated():
 
 def test_merge_unchanged():
     # Re-merging a row that already equals the builder output must be UNCHANGED.
-    existing = json.dumps(build_canonical_metadata({}, GAMMA), sort_keys=True)
+    existing_payload = build_canonical_metadata({}, GAMMA).to_plain_dict()
+    existing = json.dumps(existing_payload, sort_keys=True)
     new_meta, status, rc = merge_canonical_metadata(existing, GAMMA, condition_id="0xcond1")
     assert status == MERGE_UNCHANGED
     assert new_meta["taxonomy"]["raw_category"] == "Politics"
@@ -151,7 +160,7 @@ def test_missing_tags_fillable_from_gamma():
         existing, gamma, condition_id="0xc1", token_id="0xtok_a"
     )
     assert status == MERGE_FILLED
-    assert merged["taxonomy"].get("tags") == ["election"], merged
+    assert list(merged["taxonomy"].get("tags") or []) == ["election"], merged
 
 
 def test_empty_string_tags_fillable():
@@ -163,21 +172,21 @@ def test_empty_string_tags_fillable():
         existing, gamma, condition_id="0xc1", token_id="0xtok_a"
     )
     assert status == MERGE_FILLED
-    assert merged["taxonomy"]["tags"] == ["election"], merged
+    assert list(merged["taxonomy"]["tags"]) == ["election"], merged
 
 
 def test_list_tags_compared_as_normalized_set():
     gamma = _gamma_with_tags(["election", "2026"])
     # Start from the real producer output (full canonical shape, empty event/
     # series) and only reorder the tags — that is the realistic stored row.
-    existing = build_canonical_metadata({}, gamma)
-    existing["taxonomy"]["tags"] = ["2026", "election"]
-    existing = json.dumps(existing, sort_keys=True)
+    existing_payload = build_canonical_metadata({}, gamma).to_plain_dict()
+    existing_payload["taxonomy"]["tags"] = ["2026", "election"]
+    existing = json.dumps(existing_payload, sort_keys=True)
     merged, status, rc = merge_canonical_metadata(
         existing, gamma, condition_id="0xc1", token_id="0xtok_a"
     )
     assert status == MERGE_UNCHANGED, (status, rc)
-    assert merged["taxonomy"]["tags"] == ["2026", "election"], merged
+    assert sorted(merged["taxonomy"]["tags"]) == ["2026", "election"], merged
 
 
 def test_wrong_type_tags_string_conflict_not_overwritten():

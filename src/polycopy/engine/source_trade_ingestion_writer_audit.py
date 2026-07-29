@@ -38,12 +38,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+
+from polycopy.engine.source_trade_sql_architecture import (
+    PREDICATE_METADATA_BY_ID,
+    PREDICATE_METADATA_BY_IDENTITY,
+    PREDICATE_RESOLUTION_BY_ID,
+    contract_violations,
+    scan_repository,
+)
 
 # ── Versioning ───────────────────────────────────────────────────────────────
-AUDIT_VERSION = "PR24X-1"
+AUDIT_VERSION = "PR24X-2"
 
 # Path anchors used by the static inspector. All relative to a repo root.
 _REPO_ROOT_HINTS = ("src/polycopy", "scripts", "tests")
@@ -108,6 +116,7 @@ class WritePath:
 
 CLASSIFICATIONS = (
     "production_write_path",
+    "reconciliation_write_path",
     "sample_test_seed_path",
     "migration_schema_path",
     "report_only_read_path",
@@ -213,7 +222,7 @@ class IngestionWriterAudit:
     """Top-level audit result object."""
 
     audit_version: str = AUDIT_VERSION
-    repo_root: Optional[str] = None
+    repo_root: str | None = None
     db_safety_layer: DbSafetyLayer = field(default_factory=DbSafetyLayer)
     source_trades_inventory: dict[str, Any] = field(default_factory=dict)
     write_paths: list[WritePath] = field(default_factory=list)
@@ -225,13 +234,26 @@ class IngestionWriterAudit:
         default_factory=WalSafeWritePolicy
     )
     future_sequence: list[FutureSequenceStep] = field(default_factory=list)
+    scanner_findings: list[dict[str, Any]] = field(default_factory=list)
+    approved_initial_insert_count: int = 0
+    approved_reconciliation_findings: list[dict[str, Any]] = field(default_factory=list)
+    violations: list[dict[str, Any]] = field(default_factory=list)
+    unresolved_sinks: list[dict[str, Any]] = field(default_factory=list)
+    collector_owned_mutations: list[dict[str, Any]] = field(default_factory=list)
+    required_roles: tuple[str, ...] = (
+        "canonical_writer_insert",
+        "metadata_reconciliation_by_id",
+        "metadata_reconciliation_by_identity",
+        "resolution_reconciliation_by_id",
+    )
+    observed_role_counts: dict[str, int] = field(default_factory=dict)
+    missing_roles: list[str] = field(default_factory=list)
+    duplicate_roles: list[str] = field(default_factory=list)
+    unexpected_roles: list[dict[str, Any]] = field(default_factory=list)
+    false_verdict_reasons: list[str] = field(default_factory=list)
     centralized_writer_exists: bool = False
     centralized_writer_note: str = (
-        "No safe centralized source_trade writer exists today. "
-        "persist_trade is duplicated across two collectors "
-        "(run_scan.py and collect_smart_money_data.py). PR24X "
-        "recommends building ONE shared writer role per the "
-        "architecture below rather than a new parallel path."
+        "Derived from shared source-trade SQL architecture evidence."
     )
     guardrail_flags: dict[str, bool] = field(default_factory=dict)
 
@@ -248,6 +270,18 @@ class IngestionWriterAudit:
             "dedupe_strategy": self.dedupe_strategy,
             "wal_safe_write_policy": self.wal_safe_write_policy.as_dict(),
             "future_sequence": [s.as_dict() for s in self.future_sequence],
+            "scanner_findings": self.scanner_findings,
+            "approved_initial_insert_count": self.approved_initial_insert_count,
+            "approved_reconciliation_findings": self.approved_reconciliation_findings,
+            "violations": self.violations,
+            "unresolved_sinks": self.unresolved_sinks,
+            "collector_owned_mutations": self.collector_owned_mutations,
+            "required_roles": list(self.required_roles),
+            "observed_role_counts": self.observed_role_counts,
+            "missing_roles": self.missing_roles,
+            "duplicate_roles": self.duplicate_roles,
+            "unexpected_roles": self.unexpected_roles,
+            "false_verdict_reasons": self.false_verdict_reasons,
             "centralized_writer_exists": self.centralized_writer_exists,
             "centralized_writer_note": self.centralized_writer_note,
             "guardrail_flags": self.guardrail_flags,
@@ -255,7 +289,7 @@ class IngestionWriterAudit:
 
 
 # ── Static inspectors (read files on disk; never run them) ───────────────────
-def _looks_like_write(line: str) -> Optional[str]:
+def _looks_like_write(line: str) -> str | None:
     low = " " + line.lower() + " "
     for verb in _WRITE_VERBS:
         if verb in low and "source_trades" in low:
@@ -277,12 +311,14 @@ def _classify(path: str, verb: str, is_sample: bool) -> tuple[str, bool, bool, b
     # Migration / schema DDL.
     if "db/schema" in rel or name in ("database.py",):
         return ("migration_schema_path", True, True, is_sample)
-    # Settlement UPDATE during backfill.
-    if "backfill_resolution_truth" in name:
+    if name == "source_trade_writer.py":
         return ("production_write_path", True, True, is_sample)
-    # Production collector writers.
-    if name in ("run_scan.py", "collect_smart_money_data.py", "live_smoke_pr3_fixes.py"):
-        return ("production_write_path", True, True, is_sample)
+    if name in ("source_trade_metadata_reconciliation.py", "source_trade_resolution.py"):
+        return ("reconciliation_write_path", True, True, is_sample)
+    if name == "pr24z_canonical_identity.py":
+        return ("migration_schema_path", True, False, is_sample)
+    if name == "live_smoke_pr3_fixes.py":
+        return ("sample_test_seed_path", True, True, is_sample)
     return ("dead_unused_unknown", True, False, is_sample)
 
 
@@ -405,11 +441,10 @@ def _default_collectors() -> list[CollectorAudit]:
             reads=True,
             writes_db=True,
             tables_touched=("source_trades", "wallets", "markets"),
-            writes_source_trades_directly=True,
-            fetcher_only_safe=False,
-            notes="PRODUCTION writer. Calls _persist_trade() (run_scan.py:1419) "
-            "directly. Also persists wallets/markets. Must be refactored so "
-            "ingestion delegates to the single shared writer.",
+            writes_source_trades_directly=False,
+            fetcher_only_safe=True,
+            notes="Retained legacy orchestration. _persist_trade() adapts raw "
+            "rows and delegates initial persistence to write_valid_rows().",
         ),
         CollectorAudit(
             name="collect_smart_money_data.run_collection",
@@ -417,11 +452,10 @@ def _default_collectors() -> list[CollectorAudit]:
             reads=True,
             writes_db=True,
             tables_touched=("source_trades", "wallets", "markets"),
-            writes_source_trades_directly=True,
-            fetcher_only_safe=False,
-            notes="PRODUCTION writer. Calls _persist_trade() "
-            "(collect_smart_money_data.py:703) directly. Duplicate of the "
-            "run_scan writer. Must be refactored to the shared writer.",
+            writes_source_trades_directly=False,
+            fetcher_only_safe=True,
+            notes="Retained legacy orchestration. _persist_trade() adapts raw "
+            "rows and delegates initial persistence to write_valid_rows().",
         ),
         CollectorAudit(
             name="wallet_discovery",
@@ -439,11 +473,10 @@ def _default_collectors() -> list[CollectorAudit]:
             reads=True,
             writes_db=True,
             tables_touched=("source_trades",),
-            writes_source_trades_directly=True,
-            fetcher_only_safe=False,
-            notes="UPDATEs source_trades resolution columns (line 449). "
-            "Settlement-stage, not ingestion. Must remain a separate, "
-            "explicit, single-owner writer.",
+            writes_source_trades_directly=False,
+            fetcher_only_safe=True,
+            notes="Legacy settlement orchestration delegates existing-row "
+            "updates to source_trade_resolution's sole resolution contract.",
         ),
     ]
 
@@ -561,8 +594,8 @@ def _inventory_from_conn(conn: sqlite3.Connection) -> dict[str, Any]:
 
 # ── Builders ─────────────────────────────────────────────────────────────────
 def build_source_trade_ingestion_writer_audit(
-    conn: Optional[sqlite3.Connection] = None,
-    repo_root: Optional[str] = None,
+    conn: sqlite3.Connection | None = None,
+    repo_root: str | None = None,
     *,
     detect_repo: bool = True,
 ) -> IngestionWriterAudit:
@@ -591,6 +624,87 @@ def build_source_trade_ingestion_writer_audit(
             root = Path.cwd()
 
     inventory = _inventory_from_conn(conn) if conn is not None else {}
+    scanner_findings = scan_repository(root)
+    scanner_violations = contract_violations(scanner_findings)
+    finding_dicts = [asdict(finding) for finding in scanner_findings]
+    violation_dicts = [asdict(finding) for finding in scanner_violations]
+    writer_inserts = [
+        finding for finding in scanner_findings
+        if finding.path == "src/polycopy/ingestion/source_trade_writer.py"
+        and finding.scope == "write_valid_rows"
+        and finding.table == "source_trades"
+        and finding.operation == "INSERT OR IGNORE"
+        and finding not in scanner_violations
+    ]
+    writer_insert_roles = {
+        (finding.path, finding.scope, finding.line, finding.sink)
+        for finding in writer_inserts
+    }
+    reconciliations = [
+        finding for finding in scanner_findings
+        if finding.path in {
+            "src/polycopy/ingestion/source_trade_metadata_reconciliation.py",
+            "src/polycopy/ingestion/source_trade_resolution.py",
+        }
+        and finding.table == "source_trades"
+        and finding not in scanner_violations
+    ]
+    metadata_by_id = [
+        f for f in reconciliations
+        if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py"
+        and f.scope == "reconcile_metadata_json"
+        and f.predicate_fingerprint == PREDICATE_METADATA_BY_ID
+    ]
+    metadata_by_identity = [
+        f for f in reconciliations
+        if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py"
+        and f.scope == "reconcile_metadata_json"
+        and f.predicate_fingerprint == PREDICATE_METADATA_BY_IDENTITY
+    ]
+    resolution_by_id = [
+        f for f in reconciliations
+        if f.path == "src/polycopy/ingestion/source_trade_resolution.py"
+        and f.scope == "apply_existing_resolution_updates"
+        and f.predicate_fingerprint == PREDICATE_RESOLUTION_BY_ID
+    ]
+    unresolved = [finding for finding in scanner_violations if not finding.resolved]
+    collector_mutations = [
+        finding for finding in scanner_findings
+        if finding.table == "source_trades"
+        and ("collect" in finding.path or "run_scan" in finding.path)
+    ]
+    role_counts = {
+        "canonical_writer_insert": len(writer_insert_roles),
+        "metadata_reconciliation_by_id": len(metadata_by_id),
+        "metadata_reconciliation_by_identity": len(metadata_by_identity),
+        "resolution_reconciliation_by_id": len(resolution_by_id),
+    }
+    missing_roles = [role for role, count in role_counts.items() if count == 0]
+    duplicate_roles = [role for role, count in role_counts.items() if count > 1]
+    runtime_role_paths = {
+        "src/polycopy/ingestion/source_trade_writer.py",
+        "src/polycopy/ingestion/source_trade_metadata_reconciliation.py",
+        "src/polycopy/ingestion/source_trade_resolution.py",
+    }
+    recognized_roles = set(writer_inserts + metadata_by_id + metadata_by_identity + resolution_by_id)
+    unexpected_findings = [
+        finding
+        for finding in scanner_findings
+        if finding.table == "source_trades"
+        and finding.path in runtime_role_paths
+        and finding not in recognized_roles
+    ]
+    unexpected_roles = [asdict(finding) for finding in scanner_violations + unexpected_findings]
+    false_reasons = [
+        *(f"missing_role:{role}" for role in missing_roles),
+        *(f"duplicate_role:{role}" for role in duplicate_roles),
+        *(f"unexpected_role:{item['path']}:{item['scope']}" for item in unexpected_roles),
+    ]
+    if unresolved:
+        false_reasons.append("unresolved_source_trade_sink")
+    if collector_mutations:
+        false_reasons.append("collector_owned_source_trade_mutation")
+    centralized = not false_reasons
 
     audit = IngestionWriterAudit(
         repo_root=str(root),
@@ -600,6 +714,26 @@ def build_source_trade_ingestion_writer_audit(
         architecture_roles=_default_architecture_roles(),
         dedupe_strategy=_default_dedupe_strategy(),
         future_sequence=_default_future_sequence(),
+        scanner_findings=finding_dicts,
+        approved_initial_insert_count=len(writer_insert_roles),
+        approved_reconciliation_findings=[asdict(finding) for finding in reconciliations],
+        violations=violation_dicts,
+        unresolved_sinks=[asdict(finding) for finding in unresolved],
+        collector_owned_mutations=[asdict(finding) for finding in collector_mutations],
+        observed_role_counts=role_counts,
+        missing_roles=missing_roles,
+        duplicate_roles=duplicate_roles,
+        unexpected_roles=unexpected_roles,
+        false_verdict_reasons=false_reasons,
+        centralized_writer_exists=centralized,
+        centralized_writer_note=(
+            "Derived from shared scanner evidence: exactly one centralized canonical "
+            "writer initial insert, approved reconciliation contracts, and no violations."
+            if centralized else
+            "Scanner evidence did not prove a centralized writer: "
+            f"initial_inserts={len(writer_inserts)}, violations={len(scanner_violations)}, "
+            f"collector_mutations={len(collector_mutations)}."
+        ),
         guardrail_flags=_default_guardrail_flags(),
     )
     # Direct-connect bypass scan is informational; stored in notes of the
@@ -687,13 +821,13 @@ def report_to_markdown(audit: IngestionWriterAudit) -> str:
         lines.append(f"- **{k}**: {v}")
     lines.append("")
 
-    lines.append("## 7. WAL-Safe Write Policy (future writer)")
+    lines.append("## 7. WAL-Safe Write Policy")
     wp = d["wal_safe_write_policy"]
     for k, v in wp.items():
         lines.append(f"- {k}: **{v}**")
     lines.append("")
 
-    lines.append("## 8. Future Manual Ingestion Sequence")
+    lines.append("## 8. Ingestion Sequence")
     for s in d["future_sequence"]:
         lines.append(f"- **{s['pr']}** — {s['title']} "
                      f"(writes DB: {s['writes_db']}). {s['notes']}")

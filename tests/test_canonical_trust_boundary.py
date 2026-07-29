@@ -22,6 +22,8 @@ import copy
 import json
 import sys
 from pathlib import Path
+from types import MappingProxyType
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parent.parent
 for path in (ROOT / "src", ROOT / "scripts"):
@@ -34,6 +36,7 @@ from polycopy.ingestion.canonical_metadata import (
     MARKET_EVIDENCE_SNAPSHOT_CONTRACT_VERSION,
     METADATA_VERSION,
     CanonicalSourceTradeMetadata,
+    _is_issued_canonical_merge_metadata,
     build_canonical_metadata,
     is_canonical_source_trade_metadata,
     merge_canonical_metadata,
@@ -47,6 +50,11 @@ from polycopy.ingestion.source_trade_metadata import (
 from polycopy.ingestion.source_trade_metadata import (
     serialize_source_trade_metadata,
 )
+from polycopy.ingestion.source_trade_metadata_reconciliation import (
+    reconcile_metadata_json,
+    serialize_canonical_merge_metadata,
+)
+from polycopy.ingestion.source_trade_provenance import build_provenance_payload
 from polycopy.ingestion.source_trade_writer import write_valid_rows
 
 # All PR #79 fixtures must use the SAME constants the canonical builder
@@ -224,7 +232,11 @@ def test_fully_compliant_forged_mapping_fails_closed() -> None:
 
 
 def test_hostile_dict_subclass_cannot_select_trusted_path() -> None:
-    benign = dict(_genuine_canonical_payload())
+    # The immutable carrier intentionally refuses ``copy.deepcopy`` because
+    # its captured snapshot is a tree of ``MappingProxyType``. Convert to an
+    # untrusted plain dictionary via ``to_plain_dict()`` so the hostile
+    # dictionary proof can exercise the trust-boundary surface.
+    benign = _genuine_canonical_payload().to_plain_dict()
     forged = copy.deepcopy(benign)
     forged["_snapshot"]["provenance"]["secret"] = "must-not-pass"
     hostile = _ChangingDict(benign, forged)
@@ -236,13 +248,107 @@ def test_hostile_dict_subclass_cannot_select_trusted_path() -> None:
 
 
 def test_copied_builder_mapping_loses_trust() -> None:
-    trusted = _genuine_canonical_payload()
-    ordinary = copy.deepcopy(dict(trusted))
+    """``copy.deepcopy`` and ``copy.copy`` of the immutable carrier return
+    the SAME issued instance (preserving trust by identity).
 
-    serialized = serialize_source_trade_metadata(ordinary)
-    assert "_snapshot" not in serialized
-    assert "exact_match" not in serialized
-    assert "gamma" not in serialized
+    A genuine detached inspection copy loses trust — only
+    ``to_plain_dict()`` produces an untrusted ordinary mapping.
+    """
+    trusted = _genuine_canonical_payload()
+    # Trusted: the issued carrier survives copy operations with identity preserved.
+    assert copy.copy(trusted) is trusted
+    assert copy.deepcopy(trusted) is trusted
+    assert is_canonical_source_trade_metadata(trusted)
+
+    # Untrusted detached copy explicitly loses authority.
+    ordinary = trusted.to_plain_dict()
+    assert isinstance(ordinary, dict)
+    assert not is_canonical_source_trade_metadata(ordinary)
+
+    serialized_trusted = serialize_source_trade_metadata(trusted)
+    serialized_untrusted = serialize_source_trade_metadata(ordinary)
+    assert "_snapshot" not in serialized_untrusted
+    assert "exact_match" not in serialized_untrusted
+    assert "gamma" not in serialized_untrusted
+    # The trusted serializer selects the captured-bytes fast path; the
+    # ordinary mapping takes the bounded v1-normalization path.
+    assert "_snapshot" in serialized_trusted
+
+
+def test_issued_carriers_preserve_captured_serialization_bytes() -> None:
+    """Authority serialization uses issuer-captured bytes, not generic JSON."""
+    initial = _genuine_canonical_payload()
+    merged, status, _ = merge_canonical_metadata(
+        None, dict(FULL_GAMMA), condition_id=CON_ID
+    )
+    assert status == "filled"
+    assert _is_issued_canonical_merge_metadata(merged)
+    assert serialize_source_trade_metadata(initial) == initial._serialized_json()
+    assert serialize_canonical_merge_metadata(merged) == cast(Any, merged)._serialized_json()
+    assert serialize_canonical_merge_metadata(merged) == serialize_canonical_merge_metadata(merged)
+
+
+def test_detached_metadata_is_for_inspection_only_and_json_reconstruction_stays_untrusted() -> None:
+    """Semantic comparison may detach; neither detachment nor JSON restores authority."""
+    issued = _genuine_canonical_payload()
+    plain = issued.to_plain_dict()
+    reconstructed = json.loads(json.dumps(plain, sort_keys=True))
+    assert not isinstance(issued, dict)
+    assert plain == reconstructed
+    assert not is_canonical_source_trade_metadata(plain)
+    assert not is_canonical_source_trade_metadata(reconstructed)
+
+
+def test_provenance_classification_recursively_detaches_issued_and_shallow_carriers() -> None:
+    """Classifiers receive ordinary nested dicts, never mapping proxies or authority."""
+    issued = _genuine_canonical_payload()
+    shallow = dict(issued)
+    assert isinstance(shallow["_snapshot"], MappingProxyType)
+    source_trade = {"token_id": "1111111111", "market_source_id": CON_ID, "outcome": "Yes"}
+    for candidate in (issued, shallow):
+        payload = build_provenance_payload(
+            source_trade=source_trade,
+            canonical_meta=candidate,
+            gamma_market=dict(FULL_GAMMA),
+            merge_status="filled",
+            gamma_state="found",
+        )
+        assert payload["normalized_category"] == "politics"
+        assert payload["taxonomy_status"] == "usable"
+
+
+def test_detached_plain_dictionary_cannot_authorize_replacement() -> None:
+    """An ordinary detached mapping carved from an issued carrier cannot
+    be used to authorize non-empty replacement through the reconciler.
+    This is the most important safety regression for the trust boundary.
+    """
+    import sqlite3
+    from types import SimpleNamespace
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE source_trades (id TEXT PRIMARY KEY, source TEXT, source_trade_id TEXT, metadata_json TEXT, UNIQUE(source, source_trade_id))"
+    )
+    db = SimpleNamespace(conn=conn)
+    db.conn.execute("INSERT INTO source_trades VALUES ('row', 's', 'trade', '{\"prior\":true}')")
+    # The legitimate authority that can authorize non-empty replacement is
+    # an issued merge carrier — produced by ``merge_canonical_metadata``.
+    trusted, _status, _reasons = merge_canonical_metadata(
+        None,
+        {"conditionId": "x", "category": "Politics", "events": [], "series": []},
+        condition_id="x",
+    )
+    # Detached copy from the issued carrier is ordinary dict and untrusted.
+    assert _is_issued_canonical_merge_metadata(trusted)
+    plain = cast(Any, trusted).to_plain_dict()
+    assert isinstance(plain, dict)
+    assert not _is_issued_canonical_merge_metadata(plain)
+    with __import__("pytest").raises(ValueError):
+        reconcile_metadata_json(db, plain, internal_id="row", allow_nonempty_replace=True)
+    # The privileged merge carrier CAN authorize replacement:
+    assert reconcile_metadata_json(
+        db, trusted, internal_id="row", allow_nonempty_replace=True
+    ).status == "updated"
 
 
 # ════════════════════════════════════════════════════════════════════════════

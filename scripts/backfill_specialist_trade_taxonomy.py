@@ -84,6 +84,7 @@ from polycopy.ingestion.source_trade_provenance import (  # noqa: E402
     write_provenance,
 )
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
+from polycopy.ingestion.source_trade_metadata_reconciliation import reconcile_metadata_json
 from evidence_db import (  # noqa: E402
     DbConn,
     is_production_db,
@@ -398,12 +399,15 @@ async def _run_async(
         db.conn.execute("SAVEPOINT s3_backfill")
         try:
             if merge_status in (MERGE_FILLED, MERGE_UNCHANGED):
-                # Persist only on filled/unchanged. The merge output is a valid
-                # dict here by contract; serialize and overwrite metadata_json.
-                db.conn.execute(
-                    "UPDATE source_trades SET metadata_json = ? WHERE id = ?",
-                    (json.dumps(new_meta, sort_keys=True), t["id"]),
+                reconciled = reconcile_metadata_json(
+                    db,
+                    new_meta,
+                    internal_id=t["id"],
+                    allow_nonempty_replace=True,
+                    commit=False,
                 )
+                if reconciled.status not in {"updated", "reused"}:
+                    raise RuntimeError(f"metadata reconciliation failed: {reconciled.status}")
             # Build honest provenance from canonical + source-trade values.
             ev = _build_evidence(t, new_meta, gamma, merge_status, gamma_result,
                                  merge_reasons=merge_reasons)

@@ -61,6 +61,9 @@ from polycopy.ingestion.source_trade_writer import (  # noqa: E402
     write_valid_rows,
 )
 from polycopy.db.database import Database  # noqa: E402
+from polycopy.ingestion.source_trade_metadata_reconciliation import (  # noqa: E402
+    reconcile_metadata_json,
+)
 from polycopy.config.settings import Settings  # noqa: E402
 from polycopy.adapters.polymarket import PolymarketPublicAdapter  # noqa: E402
 from ingest_real_source_trades import _RealDataApiProvider  # noqa: E402
@@ -102,38 +105,20 @@ def _existing_source_trade_metadata(db: Database, source_trade_id: str) -> tuple
     return (True, (val if isinstance(val, str) else None))
 
 
-def _enrich_existing_row(db: Database, source_trade_id: str, metadata_json: str) -> str:
+def _enrich_existing_row(db: Database, source_trade_id: str, metadata_json: Any) -> str:
     """Enrich an existing empty-metadata row; refuse material conflicts.
 
     Returns one of: enriched | reused | conflict | missing.
     Immutable identity/economic columns are NEVER touched — only metadata_json
     is updated, and only when the existing value is empty OR byte-equivalent.
     """
-    exists, current = _existing_source_trade_metadata(db, source_trade_id)
-    if not exists:
-        return "missing"
-    if current and current.strip():
-        # Non-empty existing metadata.
-        if current.strip() == metadata_json.strip():
-            return "reused"
-        # Material conflict: do NOT silently overwrite.
-        return "conflict"
-    # Empty/missing metadata_json -> safe enrichment of this exact identity.
-    try:
-        db.conn.execute(
-            "UPDATE source_trades SET metadata_json=? "
-            "WHERE source=? AND source_trade_id=? AND "
-            "(metadata_json IS NULL OR trim(metadata_json)='')",
-            (metadata_json, "polymarket_data_api_trades_user", source_trade_id),
-        )
-        db.conn.commit()
-        return "enriched"
-    except sqlite3.Error:
-        try:
-            db.conn.rollback()
-        except sqlite3.Error:
-            pass
-        return "conflict"
+    result = reconcile_metadata_json(
+        db,
+        metadata_json,
+        source="polymarket_data_api_trades_user",
+        source_trade_id=source_trade_id,
+    )
+    return "enriched" if result.status == "updated" else result.status
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -343,10 +328,10 @@ def main(argv: list[str] | None = None) -> int:
                 if args.source_trade_id is not None and accepted:
                     chosen = accepted[0]
                     md = chosen.metadata
-                    import json as _json
-
-                    md_json = _json.dumps(md, sort_keys=True, separators=(",", ":")) if md else "{}"
-                    enriched_status = _enrich_existing_row(db, args.source_trade_id, md_json)
+                    # The shared reconciler sends this through the PR #79
+                    # exact-type serializer; ordinary mappings cannot retain
+                    # a forged canonical snapshot.
+                    enriched_status = _enrich_existing_row(db, args.source_trade_id, md)
                     if enriched_status == "enriched":
                         result.metadata_enriched += 1
                     elif enriched_status == "reused":

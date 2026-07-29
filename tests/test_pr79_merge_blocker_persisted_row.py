@@ -23,6 +23,7 @@ import asyncio
 import copy
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -701,8 +702,18 @@ def _context_invariant_replay_compare(snapshot):
     Wallet-context fields (``trade_response_*``) are also caller-only
     context and are stripped for the same reason.
     """
-    import copy as _copy
-    out = _copy.deepcopy(snapshot)
+    # The issued carrier's snapshot is a tree of ``MappingProxyType``;
+    # recursively thaw to a plain ``dict``/``list`` tree so downstream
+    # operations can mutate local copies safely.
+    def _thaw(value):
+        if isinstance(value, Mapping):
+            return {key: _thaw(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_thaw(item) for item in value]
+        if isinstance(value, tuple):
+            return [_thaw(item) for item in value]
+        return value
+    out = _thaw(snapshot)
     prov = out.get("provenance") if isinstance(out, dict) else None
     if isinstance(prov, dict):
         prov.pop("retrieved_at", None)

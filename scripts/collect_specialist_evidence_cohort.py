@@ -224,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         write = args.write
         allow_live = args.allow_live
         confirm_production_db = args.confirm_production_db
+        operational_lock_held = True
 
     if args.write and not require_write_gates(_GateArgs(), db_path=args.db_path):
         print(
@@ -269,7 +270,9 @@ def main(argv: list[str] | None = None) -> int:
                 timeout=getattr(args, "lock_timeout", 30.0),
                 lock_path=getattr(args, "lock_path", None),
             ):
-                db = open_writable(args.db_path, _GateArgs())
+                db = open_writable(
+                    args.db_path, _GateArgs(), operational_lock_already_held=True
+                )
                 try:
                     result = asyncio.run(
                         _async_run(db, args, spec, config=cfg, lock_already_held=True)

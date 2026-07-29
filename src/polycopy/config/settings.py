@@ -114,7 +114,10 @@ class Settings(BaseSettings):
     polymarket_private_key: Optional[str] = Field(default=None, description="Wallet private key. NEVER set in paper mode.")
 
     # ── Database ────────────────────────────────────────────────────────────
-    db_path: Path = Field(default=Path("polycopy.db"), description="SQLite database path.")
+    db_path: Path = Field(
+        default=Path(__file__).resolve().parents[3] / "data" / "polycopy.db",
+        description="Canonical repository production SQLite database path.",
+    )
     db_echo: bool = Field(default=False, description="Echo SQL statements (debug).")
     enable_demo_data: bool = Field(
         default=False,

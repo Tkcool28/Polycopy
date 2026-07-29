@@ -72,6 +72,8 @@ from polycopy.ingestion.canonical_metadata import (
     MERGE_FILLED,
     MERGE_UNCHANGED,
     MERGE_UNAVAILABLE,
+    _rehydrate_mapping,
+    is_canonical_source_trade_metadata,
 )
 from polycopy.scoring.wallet_evidence import (
     CATEGORY_TAXONOMY_PARTIAL,
@@ -135,8 +137,17 @@ def build_provenance_payload(
     persistence layer manages).
     """
     # On conflict/unavailable the merge returns the original preserved value
-    # (which may be a malformed JSON string, not a dict). Only classify a dict.
-    safe_meta = canonical_meta if isinstance(canonical_meta, dict) else {}
+    # (which may be a malformed JSON string, not a dict). Only classify a dict
+    # or issued carrier.
+    if is_canonical_source_trade_metadata(canonical_meta):
+        safe_meta = canonical_meta.to_plain_dict()
+    elif isinstance(canonical_meta, Mapping):
+        # A plain mapping with possibly nested immutable proxies (the
+        # "shallow dict(carrier)" trap). Detach recursively so
+        # ``isinstance(_, dict)`` downstream matches ordinary dicts.
+        safe_meta = _rehydrate_mapping(canonical_meta)
+    else:
+        safe_meta = {}
 
     usable = False
     normalized_category: Optional[str] = None

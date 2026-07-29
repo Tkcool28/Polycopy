@@ -31,8 +31,11 @@ Write paths
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
+
+from polycopy.runtime.locks import operational_job_lock
 
 # The research-evidence schema version every CLI requires.
 REQUIRED_SCHEMA_VERSION = 21
@@ -77,8 +80,9 @@ class DbConn:
     # production code paths. Defaults to ``None`` (no interference).
     _COMMIT_FAIL_HOOK: "Optional[BaseException]" = None
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, *, lock_cm: Any = None) -> None:
         self._conn = conn
+        self._lock_cm = lock_cm
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -148,7 +152,12 @@ class DbConn:
         return int(cur.fetchone()[0])
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.close()
+        finally:
+            if self._lock_cm is not None:
+                self._lock_cm.__exit__(None, None, None)
+                self._lock_cm = None
 
 
 def resolve_db_path(db_path: str) -> Path:
@@ -245,7 +254,9 @@ def require_write_gates(args: Any, *, db_path: str) -> bool:
     return True
 
 
-def open_writable(db_path: str, args: Any) -> DbConn:
+def open_writable(
+    db_path: str, args: Any, *, operational_lock_already_held: bool = False
+) -> DbConn:
     """Open a writable connection ONLY after all production gates pass.
 
     Refuses (raises ``RuntimeError``) when the caller has not satisfied
@@ -273,7 +284,20 @@ def open_writable(db_path: str, args: Any) -> DbConn:
             f"{REQUIRED_SCHEMA_VERSION}, found {version} at {resolved}; "
             f"refusing to auto-migrate"
         )
-    conn = sqlite3.connect(str(resolved))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return DbConn(conn)
+    # The caller explicitly declares only an outer lock it already owns. DbConn
+    # releases a lock only when this function acquired it.
+    lock_cm = None
+    if not operational_lock_already_held:
+        lock_cm = operational_job_lock(
+            "evidence-write", timeout=float(getattr(args, "lock_timeout", 30.0))
+        )
+        lock_cm.__enter__()
+    try:
+        conn = sqlite3.connect(str(resolved))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return DbConn(conn, lock_cm=lock_cm)
+    except Exception:
+        if lock_cm is not None:
+            lock_cm.__exit__(*sys.exc_info())
+        raise

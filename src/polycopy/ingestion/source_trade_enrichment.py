@@ -41,7 +41,6 @@ S5 repair scope
 from __future__ import annotations
 
 import inspect
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
@@ -63,6 +62,7 @@ from polycopy.ingestion.source_trade_provenance import (
     write_provenance,
 )
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
+from polycopy.ingestion.source_trade_metadata_reconciliation import reconcile_metadata_json
 
 # Exact, repository-proven Polymarket source_trades writer values (no fuzzy
 # matching, no id prefixes). A bare "polymarket" literal is NOT a proven
@@ -403,7 +403,7 @@ def enrich_source_trade(
     # MERGE_FILLED / MERGE_UNCHANGED: canonical metadata may be persisted and
     # classified. Write the deterministic canonical metadata to source_trades.
     # On CONFLICT/UNAVAILABLE we passed metadata_json=None to skip the write.
-    new_metadata_json = json.dumps(canonical_meta, sort_keys=True, separators=(",", ":"))
+    new_metadata_json = canonical_meta
     payload = build_provenance_payload(
         source_trade=row,
         canonical_meta=canonical_meta,
@@ -496,22 +496,21 @@ def _persist(
     # already-canonical value a true zero-write on replay.
     metadata_write_required = False
     if metadata_json is not None:
-        row = db.fetchone(
-            "SELECT metadata_json FROM source_trades WHERE id=?",
-            (source_trade_internal_id,),
-        )
+        row = db.fetchone("SELECT metadata_json FROM source_trades WHERE id=?", (source_trade_internal_id,))
         current_meta = row["metadata_json"] if row is not None else None
-        metadata_write_required = (current_meta != metadata_json)
+        metadata_write_required = (current_meta != str(metadata_json))
 
     db.conn.execute("SAVEPOINT s5_enrich")
     try:
         metadata_changed = False
         if metadata_write_required:
-            db.conn.execute(
-                "UPDATE source_trades SET metadata_json = ? WHERE id = ?",
-                (metadata_json, source_trade_internal_id),
+            reconciled = reconcile_metadata_json(
+                db, metadata_json, internal_id=source_trade_internal_id,
+                allow_nonempty_replace=True, commit=False,
             )
-            metadata_changed = True
+            if reconciled.status not in {"updated", "reused"}:
+                raise RuntimeError(f"metadata reconciliation failed: {reconciled.status}")
+            metadata_changed = reconciled.changed
         changed, is_new, enrichment_id = write_provenance(
             db,
             source_trade_internal_id=source_trade_internal_id,

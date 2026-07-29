@@ -693,39 +693,14 @@ class PolymarketCollector:
         Anonymous / sentinel trader addresses are stored as ``NULL`` and
         never become wallet rows.
         """
-        ta = trade.trader_address
-        if ta is not None:
-            canonical = canonical_wallet_address(ta)
-            persisted_trader_address = canonical  # None for sentinels/empty
-        else:
-            persisted_trader_address = None
-        cur = db.execute(
-            """INSERT OR IGNORE INTO source_trades
-               (id, source, source_trade_id, market_source_id, side, outcome,
-                quantity, price, trader_address, timestamp, is_sample,
-                token_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(uuid.uuid4()),
-                trade.source,
-                trade.source_trade_id,
-                trade.market_source_id,
-                trade.side.value if hasattr(trade.side, "value") else str(trade.side),
-                trade.outcome,
-                trade.quantity,
-                trade.price,
-                persisted_trader_address,
-                trade.timestamp.isoformat() if trade.timestamp else None,
-                int(trade.is_sample),
-                # PR-1: persist upstream CLOB token id verbatim. None when
-                # upstream payload didn't carry an asset field (legacy
-                # fallback path in resolve_trade_to_outcome).
-                trade.token_id,
-            ),
-        )
-        db.conn.commit()
-        # rowcount == 1 means a fresh insert; 0 means duplicate (UNIQUE hit)
-        return bool(getattr(cur, "rowcount", 0))
+        from polycopy.ingestion.normalized_source_trade import normalize_legacy_source_trade
+        from polycopy.ingestion.source_trade_writer import write_valid_rows
+
+        candidate = normalize_legacy_source_trade(trade)
+        result = write_valid_rows(db, [candidate], dry_run=False)
+        if result.errors:
+            raise RuntimeError(result.error_message or "canonical source-trade write failed")
+        return bool(result.inserted)
 
     def _persist_wallet(self, db: Database, wallet: Wallet) -> str | None:
         """Idempotently persist a wallet by canonical address.

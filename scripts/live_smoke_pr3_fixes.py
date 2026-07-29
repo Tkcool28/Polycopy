@@ -52,6 +52,16 @@ from polycopy.db.wallet_identity import (  # noqa: E402
     is_sentinel_trader_address,
 )
 
+PRODUCTION_DB_PATHS = {
+    (_REPO_ROOT / "data" / "polycopy.db").resolve(),
+    Path("/root/Polycopy/data/polycopy.db").resolve(),
+}
+
+
+def _require_disposable_db(db_path: Path) -> None:
+    if db_path.resolve() in PRODUCTION_DB_PATHS:
+        raise ValueError("live smoke refuses the canonical production database")
+
 
 def banner(msg: str) -> None:
     print("\n" + "=" * 64)
@@ -69,6 +79,7 @@ async def main() -> int:
     # 1. Temp DB
     tmpdir = Path(tempfile.mkdtemp(prefix="polycopy-pr3-smoke-"))
     db_path = tmpdir / "smoke.db"
+    _require_disposable_db(db_path)
     snap_dir = tmpdir / "snapshots"
     snap_dir.mkdir()
     os.environ["POLYCOPY_DB_PATH"] = str(db_path)
