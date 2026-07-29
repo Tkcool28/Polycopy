@@ -341,6 +341,7 @@ def test_production_exception_rolls_back_and_closes_before_lock_release(
     def close():
         events.append("db_close")
         original_close()
+        raise RuntimeError("db cleanup failure")
 
     db.close = close
     monkeypatch.setattr(cli, "operational_job_lock", lambda *_a, **_k: TrackingLock())
@@ -353,7 +354,13 @@ def test_production_exception_rolls_back_and_closes_before_lock_release(
         gamma_base_url="https://gamma.invalid", clob_base_url="https://clob.invalid",
         data_api_base_url="https://data.invalid",
     ))
-    monkeypatch.setattr(cli, "PolymarketPublicAdapter", _Adapter)
+
+    class FailingAdapter(_Adapter):
+        async def aclose(self) -> None:
+            events.append("adapter_close")
+            raise RuntimeError("adapter cleanup failure")
+
+    monkeypatch.setattr(cli, "PolymarketPublicAdapter", FailingAdapter)
 
     class Runner:
         def run(self, awaitable):
@@ -361,6 +368,7 @@ def test_production_exception_rolls_back_and_closes_before_lock_release(
 
         def close(self):
             events.append("runner_close")
+            raise RuntimeError("runner cleanup failure")
 
     async def collect(_adapter, _wallet, *, gamma_resolver):
         await gamma_resolver(CONDITION_ID)
@@ -396,7 +404,7 @@ def test_production_exception_rolls_back_and_closes_before_lock_release(
         ])
     assert events == [
         "lock_enter", "db_open", "canonical_writer", "writer_commit", "enrichment",
-        "rollback", "runner_close", "db_close", "lock_exit",
+        "rollback", "adapter_close", "runner_close", "db_close", "lock_exit",
     ]
     check = sqlite3.connect(tmp_path / "rollback.db")
     try:
@@ -405,15 +413,95 @@ def test_production_exception_rolls_back_and_closes_before_lock_release(
         check.close()
 
 
-def test_dry_run_remains_nonwriting_and_does_not_take_production_write_lock(
+def test_cleanup_adapter_failure_still_closes_runner_and_database_before_release() -> None:
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    class Adapter:
+        def close(self):
+            events.append("adapter_close")
+            raise RuntimeError("adapter cleanup failure")
+
+    class Runner:
+        def close(self):
+            events.append("runner_close")
+
+    class Db:
+        def close(self):
+            events.append("db_close")
+
+    with pytest.raises(RuntimeError, match="adapter cleanup failure"), Lock():
+        cli._cleanup(Adapter(), Runner(), Db(), pipeline_error=None)
+    assert events == ["lock_enter", "adapter_close", "runner_close", "db_close", "lock_exit"]
+
+
+def test_cleanup_runner_failure_still_closes_database_before_release() -> None:
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    class Runner:
+        def close(self):
+            events.append("runner_close")
+            raise RuntimeError("runner cleanup failure")
+
+    class Db:
+        def close(self):
+            events.append("db_close")
+
+    with pytest.raises(RuntimeError, match="runner cleanup failure"), Lock():
+        cli._cleanup(None, Runner(), Db(), pipeline_error=None)
+    assert events == ["lock_enter", "runner_close", "db_close", "lock_exit"]
+
+
+def test_cleanup_database_close_failure_releases_only_after_close_attempt() -> None:
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    class Db:
+        def close(self):
+            events.append("db_close")
+            raise RuntimeError("db cleanup failure")
+
+    with pytest.raises(RuntimeError, match="db cleanup failure"), Lock():
+        cli._cleanup(None, None, Db(), pipeline_error=None)
+    assert events == ["lock_enter", "db_close", "lock_exit"]
+
+
+def test_dry_run_remains_logically_nonwriting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    db = _install_cli_fakes(monkeypatch, tmp_path)
-    before = db.conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
-    db.close()
-    monkeypatch.setattr(cli, "_is_production_db", lambda _path: True)
-    monkeypatch.setattr(cli, "Database", lambda _path: pytest.fail("writable database opened"))
-    monkeypatch.setattr(cli, "operational_job_lock", lambda *_a, **_k: pytest.fail("dry-run locked"))
+    _install_cli_fakes(monkeypatch, tmp_path)
+    writer_calls: list[object] = []
+
+    def writer(*args, **kwargs):
+        writer_calls.append((args, kwargs))
+        raise AssertionError("dry-run must not persist a canonical source trade")
+
+    monkeypatch.setattr(cli, "write_valid_rows", writer)
 
     async def collect(_adapter, _wallet, *, gamma_resolver):
         await gamma_resolver(CONDITION_ID)
@@ -424,12 +512,13 @@ def test_dry_run_remains_nonwriting_and_does_not_take_production_write_lock(
         "--approval-id", APPROVAL_ID, "--allow-live",
         "--db-path", str(tmp_path / "approved-specialist.db"),
     ]) == 0
+    assert writer_calls == []
     after_conn = sqlite3.connect(tmp_path / "approved-specialist.db")
     try:
         after = after_conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
     finally:
         after_conn.close()
-    assert after == before == 0
+    assert after == 0
 
 
 def test_production_confirmation_flags_reject_before_lock_or_database_open(

@@ -107,7 +107,8 @@ def run_proof(db: Database, args: argparse.Namespace) -> dict:
     gamma, clob = deps.gamma.get_market, deps.clob
     enr = enrich_source_trade(db, st_id, gamma_resolver=gamma, dry_run=False)
 
-    # 4) durable dispatch (idempotent; bridge -> copy_candidate).
+    # The capability is an explicit bridge-write authorization only. This proof
+    # command refuses production DB paths; possession does not prove a lock is held.
     disp = dispatch_one(db, approval_id=aid, source_trade_internal_id=st_id,
                          gamma_resolver=gamma, clob_provider=clob, dry_run=False,
                          write_authorization=_issue_write_capability())

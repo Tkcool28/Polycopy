@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -51,48 +50,41 @@ def _is_production_db(db_path: str) -> bool:
         return False
 
 
-class _ReadOnlyDatabase:
-    """Read-only facade for production dry-runs; never runs migrations or PRAGMAs."""
+def _cleanup(adapter: Any, runner: Any, db: Any, *, pipeline_error: BaseException | None) -> None:
+    """Attempt every cleanup step, preserving a pre-existing pipeline failure.
 
-    def __init__(self, path: Path) -> None:
-        self.conn = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
-        self.conn.row_factory = sqlite3.Row
+    If the pipeline succeeded, surface the first cleanup error after all resources
+    have been attempted. If it failed, cleanup errors are deliberately secondary.
+    """
+    cleanup_error: BaseException | None = None
 
-    def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
-        return self.conn.execute(sql, params).fetchone()
+    def attempt(callback: Any) -> None:
+        nonlocal cleanup_error
+        try:
+            callback()
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
 
-    def fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-        return list(self.conn.execute(sql, params).fetchall())
-
-    def close(self) -> None:
-        self.conn.close()
-
-
-def _cleanup(adapter: Any, runner: Any, db: Any) -> None:
-    """Release every owned resource before the outer lifecycle can release its lock."""
     if adapter is not None:
         aclose = getattr(adapter, "aclose", None)
         if callable(aclose) and runner is not None:
-            try:
-                runner.run(aclose())
-            except Exception:
-                pass
+            attempt(lambda: runner.run(aclose()))
         elif callable(getattr(adapter, "close", None)):
-            try:
-                adapter.close()
-            except Exception:
-                pass
+            attempt(adapter.close)
     if runner is not None:
-        runner.close()
+        attempt(runner.close)
     if db is not None:
-        db.close()
+        attempt(db.close)
+
+    if pipeline_error is None and cleanup_error is not None:
+        raise cleanup_error
 
 
 def _run_pipeline(
     args: argparse.Namespace,
     *,
     write_authorization: object | None,
-    read_only: bool = False,
 ) -> dict[str, Any]:
     """Run one invocation after any required outer operational lock is acquired.
 
@@ -106,7 +98,7 @@ def _run_pipeline(
     runner = None
     db = None
     try:
-        db = _ReadOnlyDatabase(Path(args.db_path)) if read_only else Database(Path(args.db_path)).connect()
+        db = Database(Path(args.db_path)).connect()
         try:
             approval = get_approval(db, args.approval_id)
         except KeyError:
@@ -250,7 +242,7 @@ def _run_pipeline(
                 pass
         raise
     finally:
-        _cleanup(adapter, runner, db)
+        _cleanup(adapter, runner, db, pipeline_error=sys.exc_info()[1])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -293,13 +285,11 @@ def main(argv: list[str] | None = None) -> int:
             with operational_job_lock("scan", timeout=args.lock_timeout):
                 result = _run_pipeline(args, write_authorization=_issue_write_capability())
         else:
-            # Production dry-runs preserve the non-writing contract with a
-            # read-only SQLite facade. Temporary DB writes retain the existing
-            # unlocked test/dev behavior.
+            # Keep the established dry-run contract focused on logical writes:
+            # no canonical persistence, enrichment, dispatch, or bridge DML.
             result = _run_pipeline(
                 args,
                 write_authorization=_issue_write_capability() if args.write else None,
-                read_only=(not args.write and is_prod),
             )
     except LockError as exc:
         print(f"error: global operational lock unavailable: {exc}", file=sys.stderr)
