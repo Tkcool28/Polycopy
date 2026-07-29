@@ -64,11 +64,11 @@ class _PredicateParse:
     invalid_reason: str | None
 
     @classmethod
-    def approved(cls, fingerprint: str) -> "_PredicateParse":
+    def approved(cls, fingerprint: str) -> _PredicateParse:
         return cls(fingerprint, None)
 
     @classmethod
-    def invalid(cls, reason: str) -> "_PredicateParse":
+    def invalid(cls, reason: str) -> _PredicateParse:
         return cls(None, reason)
 
 
@@ -203,7 +203,7 @@ def _parse_equality_term(tokens: list[tuple[str, str]]) -> tuple[str, str] | Non
     if eq_tok[0] != "eq" or param_tok[0] != "param":
         return None
     column = _strip_identifier_wrappers(ident_tok[1]).lower()
-    return column, "eq({col},param)".format(col=column)
+    return column, f"eq({column},param)"
 
 
 def parse_predicate_fingerprint(sql: str) -> _PredicateParse:
@@ -264,10 +264,7 @@ def parse_predicate_fingerprint(sql: str) -> _PredicateParse:
     # Disallow the same column twice; require exactly the identity pair.
     if {left_col, right_col} != {"source", "source_trade_id"}:
         return _PredicateParse.invalid("and_columns_do_not_match_identity_pair")
-    canonical = "and({},{})".format(
-        sorted([left_fp, right_fp])[0],
-        sorted([left_fp, right_fp])[1],
-    )
+    canonical = f"and({min(left_fp, right_fp)},{max(left_fp, right_fp)})"
     if canonical not in _APPROVED_PREDICATES:
         return _PredicateParse.invalid("identity_fingerprint_not_approved")
     return _PredicateParse.approved(canonical)

@@ -28,15 +28,15 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from polycopy.db.database import Database  # noqa: E402
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+from polycopy.db.database import Database
+from polycopy.ingestion.canonical_metadata import (
     MERGE_FILLED,
     _rehydrate_mapping,
     build_canonical_metadata,
     is_canonical_source_trade_metadata,
 )
-from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
-from polycopy.ingestion.source_trade_enrichment import (  # noqa: E402
+from polycopy.ingestion.normalized_source_trade import SOURCE_NAME
+from polycopy.ingestion.source_trade_enrichment import (
     MISSING_MARKET_IDENTITY,
     SAMPLE_TRADE_REFUSED,
     SELL_NOT_SUPPORTED,
@@ -46,12 +46,12 @@ from polycopy.ingestion.source_trade_enrichment import (  # noqa: E402
     enrich_source_trade,
     get_enrichment,
 )
-from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata  # noqa: E402
-from polycopy.ingestion.source_trade_provenance import (  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
+from polycopy.ingestion.source_trade_provenance import (
     build_provenance_payload,
     enrichment_status_allows_dispatch,
 )
-from polycopy.scoring.wallet_evidence import classify_category_taxonomy  # noqa: E402
+from polycopy.scoring.wallet_evidence import classify_category_taxonomy
 
 # Real accepted Polymarket source_trades writer values (no fuzzy matching).
 CANON_SOURCE = SOURCE_NAME  # polymarket_data_api_trades_user
@@ -1090,7 +1090,7 @@ def test_selection_error_serialized():
 
 
 # ── 4c. CLI: invalid-selection -> exit 2, no provider call, zero write ──────
-import pytest  # noqa: E402
+import pytest
 
 
 def _run_cli_invalid(reason_code, *, side="BUY", source=CANON_SOURCE,

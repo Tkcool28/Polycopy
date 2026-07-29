@@ -13,6 +13,9 @@ from pathlib import Path
 
 import pytest
 
+from polycopy.engine.source_trade_ingestion_writer_audit import (
+    build_source_trade_ingestion_writer_audit,
+)
 from polycopy.engine.source_trade_sql_architecture import (
     PREDICATE_METADATA_BY_ID,
     PREDICATE_METADATA_BY_IDENTITY,
@@ -21,14 +24,8 @@ from polycopy.engine.source_trade_sql_architecture import (
     contract_violations,
     parse_predicate_fingerprint,
     scan_python_file,
-)
-from polycopy.engine.source_trade_sql_architecture import (
     scan_repository,
 )
-from polycopy.engine.source_trade_ingestion_writer_audit import (
-    build_source_trade_ingestion_writer_audit,
-)
-
 
 _RES_FIELDS = (
     "resolution_status",
@@ -93,18 +90,22 @@ _WRITE_COLS = (
         ),
         (
             "resolution_by_id",
-            "UPDATE source_trades SET "
-            "resolution_status=?, resolved_at=?, winning_token_id=?, "
-            "is_winning_trade=?, realized_pnl=?, settlement_source=? "
-            "WHERE id=?",
+            (
+                "UPDATE source_trades SET "
+                "resolution_status=?, resolved_at=?, winning_token_id=?, "
+                "is_winning_trade=?, realized_pnl=?, settlement_source=? "
+                "WHERE id=?"
+            ),
             PREDICATE_RESOLUTION_BY_ID,
         ),
         (
             "resolution_by_id_parenthesized",
-            "UPDATE source_trades SET "
-            "resolution_status=?, resolved_at=?, winning_token_id=?, "
-            "is_winning_trade=?, realized_pnl=?, settlement_source=? "
-            "WHERE (id=?)",
+            (
+                "UPDATE source_trades SET "
+                "resolution_status=?, resolved_at=?, winning_token_id=?, "
+                "is_winning_trade=?, realized_pnl=?, settlement_source=? "
+                "WHERE (id=?)"
+            ),
             PREDICATE_RESOLUTION_BY_ID,
         ),
     ],
@@ -314,7 +315,7 @@ def test_disposable_tree_extra_tautological_role_fails_audit(tmp_path: Path) -> 
 
 def test_scan_repository_does_not_crash_on_real_repo() -> None:
     """Sanity: the in-tree scanner still runs against the actual repo."""
-    findings = scan_repository(Path(".").resolve())
+    findings = scan_repository(Path.cwd())
     # The scanner must report findings (canonical writer + reconciler are present).
     assert isinstance(findings, list)
     for finding in findings:

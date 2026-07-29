@@ -24,23 +24,24 @@ import io
 import json
 import sqlite3
 import sys
-import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 for p in (str(ROOT / "src"), str(ROOT / "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from polycopy.db.database import Database  # noqa: E402
-from polycopy.ingestion.canonical_metadata import build_canonical_metadata  # noqa: E402
-from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata  # noqa: E402
-from polycopy.scoring.wallet_evidence import (  # noqa: E402
+from evidence_db import FORBIDDEN_EXECUTION_TABLES, DbConn, open_readonly
+
+from polycopy.db.database import Database
+from polycopy.ingestion.canonical_metadata import build_canonical_metadata
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
+from polycopy.scoring.wallet_evidence import (
     resolve_wallet_score_v1,
 )
-from evidence_db import DbConn, FORBIDDEN_EXECUTION_TABLES, open_readonly  # noqa: E402
-
 
 _LAST_SPY = None  # holds the most recent instrumented DbConn for §7 assertions
 

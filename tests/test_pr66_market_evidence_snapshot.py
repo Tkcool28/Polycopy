@@ -25,12 +25,12 @@ from polycopy.ingestion.canonical_metadata import (
     is_canonical_source_trade_metadata,
     merge_canonical_metadata,
 )
+from polycopy.ingestion.normalized_source_trade import (
+    normalize_source_trade,
+)
 from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
 from polycopy.ingestion.source_trade_metadata_reconciliation import (
     serialize_canonical_merge_metadata,
-)
-from polycopy.ingestion.normalized_source_trade import (
-    normalize_source_trade,
 )
 
 FULL_GAMMA = {

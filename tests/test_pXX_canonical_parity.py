@@ -23,8 +23,8 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from polycopy.ingestion import source_trade_metadata  # noqa: E402
-from polycopy.ingestion.canonical_metadata import (  # noqa: E402
+from polycopy.ingestion import source_trade_metadata
+from polycopy.ingestion.canonical_metadata import (
     MERGE_CONFLICT,
     MERGE_FILLED,
     MERGE_UNAVAILABLE,
@@ -34,8 +34,8 @@ from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     is_canonical_source_trade_metadata,
     merge_canonical_metadata,
 )
-from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata  # noqa: E402
-from polycopy.ingestion.source_trade_metadata_reconciliation import (  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
+from polycopy.ingestion.source_trade_metadata_reconciliation import (
     serialize_canonical_merge_metadata,
 )
 
