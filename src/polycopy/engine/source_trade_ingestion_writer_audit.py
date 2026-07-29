@@ -43,6 +43,9 @@ from pathlib import Path
 from typing import Any
 
 from polycopy.engine.source_trade_sql_architecture import (
+    PREDICATE_METADATA_BY_ID,
+    PREDICATE_METADATA_BY_IDENTITY,
+    PREDICATE_RESOLUTION_BY_ID,
     contract_violations,
     scan_repository,
 )
@@ -646,9 +649,24 @@ def build_source_trade_ingestion_writer_audit(
         and finding.table == "source_trades"
         and finding not in scanner_violations
     ]
-    metadata_by_id = [f for f in reconciliations if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py" and f.scope == "reconcile_metadata_json" and set(f.selector_columns) == {"id"}]
-    metadata_by_identity = [f for f in reconciliations if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py" and f.scope == "reconcile_metadata_json" and set(f.selector_columns) == {"source", "source_trade_id"}]
-    resolution_by_id = [f for f in reconciliations if f.path == "src/polycopy/ingestion/source_trade_resolution.py" and f.scope == "apply_existing_resolution_updates" and set(f.selector_columns) == {"id"}]
+    metadata_by_id = [
+        f for f in reconciliations
+        if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py"
+        and f.scope == "reconcile_metadata_json"
+        and f.predicate_fingerprint == PREDICATE_METADATA_BY_ID
+    ]
+    metadata_by_identity = [
+        f for f in reconciliations
+        if f.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py"
+        and f.scope == "reconcile_metadata_json"
+        and f.predicate_fingerprint == PREDICATE_METADATA_BY_IDENTITY
+    ]
+    resolution_by_id = [
+        f for f in reconciliations
+        if f.path == "src/polycopy/ingestion/source_trade_resolution.py"
+        and f.scope == "apply_existing_resolution_updates"
+        and f.predicate_fingerprint == PREDICATE_RESOLUTION_BY_ID
+    ]
     unresolved = [finding for finding in scanner_violations if not finding.resolved]
     collector_mutations = [
         finding for finding in scanner_findings

@@ -19,6 +19,8 @@ from typing import Any
 from polycopy.ingestion.canonical_metadata import (
     CanonicalSourceTradeMetadata,
     build_canonical_metadata,
+)
+from polycopy.ingestion.canonical_metadata import (
     normalize_source_trade_metadata as _normalize_source_trade_metadata,
 )
 from polycopy.taxonomy.official_polymarket import (
@@ -129,11 +131,7 @@ def serialize_source_trade_metadata(raw: Mapping[str, Any] | None) -> str:
     """
     if _is_trusted_canonical(raw):
         assert type(raw) is CanonicalSourceTradeMetadata
-        return json.dumps(
-            raw.to_plain_dict(),
-            sort_keys=True,
-            separators=_CANONICAL_SEPARATORS,
-        )
+        return raw._serialized_json()
     normalized = _normalize_source_trade_metadata(raw)
     return json.dumps(
         normalized,
@@ -147,10 +145,8 @@ def serialize_gamma_market_metadata(
     gamma_market: Mapping[str, Any] | None,
 ) -> str:
     """Serialize the canonical Gamma-derived metadata deterministically."""
-    return json.dumps(
-        build_metadata_from_gamma_market(trade, gamma_market),
-        sort_keys=True,
-        separators=_CANONICAL_SEPARATORS,
+    return serialize_source_trade_metadata(
+        build_metadata_from_gamma_market(trade, gamma_market)
     )
 
 

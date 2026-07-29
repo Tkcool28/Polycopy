@@ -30,31 +30,157 @@ MERGE_CONFLICT = "conflict"
 MERGE_UNAVAILABLE = "unavailable"
 
 
-_CANONICAL_TRUST_TOKEN = object()
+# Authority factory
+#
+# The canonical trust boundary is built once at import time by a single
+# factory below. Two bounded weak issuance registries (one for the initial
+# canonical metadata carrier, one for the merge carrier) live as closure
+# variables inside the factory; they are never rebound at module scope and
+# are not exposed on the public function signatures. The factory returns
+# only the carrier types, validators, initial builder, and merge function —
+# it never returns the issuer callables themselves. There is no module-level
+# trust token, no module-level issuer callable that accepts arbitrary
+# metadata, and no default / kwdefault that stores an authority issuer.
+#
+# Helper functions used inside the closures (e.g. ``_freeze_metadata``,
+# ``_thaw_metadata``, ``_merge_snapshot``, ``_build_market_snapshot``) live
+# below as ordinary module-level functions; name resolution occurs at call
+# time inside the closure, so the factory binding appears before all helper
+# definitions but the closures dispatch through them normally.
+
+_INITIAL_ISSUANCE: weakref.WeakSet[object] = weakref.WeakSet()
+_MERGE_ISSUANCE: weakref.WeakSet[object] = weakref.WeakSet()
 
 
-def _merge_authority_system():
-    """Keep issued-object identity outside the importable carrier surface."""
-    issued: weakref.WeakSet[object] = weakref.WeakSet()
+def _freeze_metadata(value: Any) -> Any:
+    """Deep-freeze every ``Mapping`` in the snapshot to ``MappingProxyType``.
+
+    Lists and tuples are NOT converted: they remain ordinary list/tuple
+    values so that downstream merge helpers (e.g. ``_merge_refreshable_dict``)
+    can compare existing and incoming lists with normal ``==`` semantics.
+    The captured-bytes serializer uses JSON anyway, which serializes both
+    types correctly. Iterating the proxy yields the original list items
+    rather than immutable copies.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_metadata(item) for key, item in value.items()})
+    return value
+
+
+def _thaw_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_metadata(item) for key, item in value.items()}
+    return copy.deepcopy(value)
+
+
+def _rehydrate_mapping(value: Any) -> Any:
+    """Deep-thaw a Mapping (or list/tuple) into plain ``dict``/``list`` trees.
+
+    The merge closure uses this when it needs to mutate a snapshot that came
+    from an immutable issued carrier. The result is a fresh tree; the input
+    is not touched.
+    """
+    return _thaw_metadata(value)
+
+
+def _build_metadata_authority_system():
+    """Build both carrier types, both validators, the initial builder, and
+    the merge function. The issuer callables for each carrier stay lexical
+    inside this factory and are never returned or bound at module scope.
+
+    Returns ``(CanonicalSourceTradeMetadata, _CanonicalMergeMetadata,
+    is_canonical_source_trade_metadata, _is_issued_canonical_merge_metadata,
+    build_canonical_metadata, merge_canonical_metadata)``.
+    """
 
     @final
-    class _CanonicalMergeMetadata(Mapping[str, Any]):
-        """Opaque immutable merge output; direct construction never issues authority."""
+    class CanonicalSourceTradeMetadata(Mapping[str, Any]):
+        """Trusted mapping issued only by the canonical builder.
 
-        __slots__ = ("__weakref__", "_serialized", "_view")
+        Direct construction is rejected. ``object.__new__``-allocated and
+        subclass instances are rejected unless they were registered by the
+        builder. The carrier stores a frozen ``MappingProxyType`` snapshot
+        plus deterministic captured bytes; mutation through the mapping
+        interface raises ``TypeError``. The serializer reads from the
+        captured bytes, so inspection-mutation attempts cannot change the
+        serialized output.
+
+        ``copy.copy`` and ``copy.deepcopy`` return the same instance, so
+        issued identity survives copy operations exactly. Issued carriers
+        that go out of scope are reclaimed by the bounded ``WeakSet``
+        registry; weak references that observe the live carrier still
+        resolve correctly while it lives.
+        """
+
+        __slots__ = ("__weakref__", "_serialized", "_snapshot")
         __hash__ = object.__hash__
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            raise TypeError("canonical merge output is issued only by a completed merge")
+            raise TypeError("CanonicalSourceTradeMetadata is builder-only")
 
         def __getitem__(self, key: str) -> Any:
-            return _thaw_metadata(self._view[key])
+            return self._snapshot[key]
 
         def __iter__(self):
-            return iter(self._view)
+            return iter(self._snapshot)
 
         def __len__(self) -> int:
-            return len(self._view)
+            return len(self._snapshot)
+
+        def __setitem__(self, key: str, value: Any) -> None:
+            raise TypeError("CanonicalSourceTradeMetadata is immutable")
+
+        def __delitem__(self, key: str) -> None:
+            raise TypeError("CanonicalSourceTradeMetadata is immutable")
+
+        def __copy__(self) -> CanonicalSourceTradeMetadata:
+            return self
+
+        def __deepcopy__(self, memo: dict[int, Any]) -> CanonicalSourceTradeMetadata:
+            return self
+
+        def to_plain_dict(self) -> dict[str, Any]:
+            """Return an untrusted deep copy of the captured snapshot for inspection."""
+            return _rehydrate_mapping(self._snapshot)
+
+        def _serialized_json(self) -> str:
+            """Return the deterministic captured bytes; ignore live mutable state."""
+            return self._serialized
+
+    @final
+    class _CanonicalMergeMetadata(Mapping[str, Any]):
+        """Opaque immutable merge output issued only by the merge closure.
+
+        Direct construction is rejected. ``object.__new__``-allocated
+        instances are not accepted unless they were registered by the
+        merge issuer. The captured snapshot is read-only; ``__setitem__``
+        and ``__delitem__`` raise. Shallow and deep copies return the
+        same instance so the issued identity is preserved; the weak
+        registry still tracks the live carrier exactly once.
+        """
+
+        __slots__ = ("__weakref__", "_serialized", "_snapshot")
+        __hash__ = object.__hash__
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise TypeError(
+                "canonical merge output is issued only by a completed merge"
+            )
+
+        def __getitem__(self, key: str) -> Any:
+            return self._snapshot[key]
+
+        def __iter__(self):
+            return iter(self._snapshot)
+
+        def __len__(self) -> int:
+            return len(self._snapshot)
+
+        def __setitem__(self, key: str, value: Any) -> None:
+            raise TypeError("canonical merge output is immutable")
+
+        def __delitem__(self, key: str) -> None:
+            raise TypeError("canonical merge output is immutable")
 
         def __copy__(self) -> _CanonicalMergeMetadata:
             return self
@@ -62,70 +188,224 @@ def _merge_authority_system():
         def __deepcopy__(self, memo: dict[int, Any]) -> _CanonicalMergeMetadata:
             return self
 
+        def to_plain_dict(self) -> dict[str, Any]:
+            """Return an untrusted deep copy for inspection and classification."""
+            return _rehydrate_mapping(self._snapshot)
+
         def _serialized_json(self) -> str:
             return self._serialized
 
-    def issue(value: Mapping[str, Any]) -> _CanonicalMergeMetadata:
-        # Bypass __init__ only inside this lexical factory, then register the
-        # exact object identity.  A manually allocated/subclassed/reconstructed
-        # object is not accepted because it was never registered.
-        instance = object.__new__(_CanonicalMergeMetadata)
+    def issue_initial(value: Mapping[str, Any]) -> CanonicalSourceTradeMetadata:
+        # Lexically scoped issuer: not exposed at module scope.
+        instance = object.__new__(CanonicalSourceTradeMetadata)
         plain = copy.deepcopy(dict(value))
-        instance._serialized = json.dumps(plain, sort_keys=True, separators=(",", ":"))
-        instance._view = _freeze_metadata(plain)
-        issued.add(instance)
+        snapshot = MappingProxyType(
+            {key: _freeze_metadata(item) for key, item in plain.items()}
+        )
+        serialized = json.dumps(plain, sort_keys=True, separators=(",", ":"))
+        instance._snapshot = snapshot
+        instance._serialized = serialized
+        _INITIAL_ISSUANCE.add(instance)
         return instance
 
-    def accepts(value: object) -> bool:
-        return type(value) is _CanonicalMergeMetadata and value in issued
+    def issue_merge(value: Mapping[str, Any]) -> _CanonicalMergeMetadata:
+        # Lexically scoped issuer: not exposed at module scope.
+        instance = object.__new__(_CanonicalMergeMetadata)
+        plain = copy.deepcopy(dict(value))
+        snapshot = MappingProxyType(
+            {key: _freeze_metadata(item) for key, item in plain.items()}
+        )
+        serialized = json.dumps(plain, sort_keys=True, separators=(",", ":"))
+        instance._snapshot = snapshot
+        instance._serialized = serialized
+        _MERGE_ISSUANCE.add(instance)
+        return instance
 
-    return _CanonicalMergeMetadata, accepts, issue
-
-
-_CanonicalMergeMetadata, _is_issued_canonical_merge_metadata, _merge_issue_at_definition = _merge_authority_system()
-
-
-def _freeze_metadata(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze_metadata(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return tuple(_freeze_metadata(item) for item in value)
-    if isinstance(value, tuple):
-        return tuple(_freeze_metadata(item) for item in value)
-    return value
-
-
-def _thaw_metadata(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {key: _thaw_metadata(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_metadata(item) for item in value]
-    return copy.deepcopy(value)
-
-
-@final
-class CanonicalSourceTradeMetadata(dict[str, Any]):
-    """Trusted dictionary created only by the canonical builder.
-
-    Construction requires a module-private identity token and snapshots the
-    builder-owned dictionary. Exact type identity selects trusted serialization;
-    ordinary dicts and all subclasses remain untrusted. ``deepcopy`` deliberately
-    returns a plain dict so copied payloads lose trust.
-    """
-
-    def __init__(self, value: dict[str, Any], *, _token: object) -> None:
-        if _token is not _CANONICAL_TRUST_TOKEN:
-            raise TypeError("CanonicalSourceTradeMetadata is builder-only")
-        super().__init__(copy.deepcopy(value))
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> CanonicalSourceTradeMetadata:
-        return CanonicalSourceTradeMetadata(
-            copy.deepcopy(dict(self), memo), _token=_CANONICAL_TRUST_TOKEN
+    def is_initial(value: object) -> bool:
+        return (
+            type(value) is CanonicalSourceTradeMetadata
+            and value in _INITIAL_ISSUANCE
         )
 
-    def to_plain_dict(self) -> dict[str, Any]:
-        """Return an untrusted deep copy for inspection or legacy handling."""
-        return copy.deepcopy(dict(self))
+    def is_merge(value: object) -> bool:
+        return (
+            type(value) is _CanonicalMergeMetadata
+            and value in _MERGE_ISSUANCE
+        )
+
+    def build_canonical_metadata(
+        trade: Mapping[str, Any] | None,
+        gamma_market: Mapping[str, Any] | None,
+        *,
+        requested_condition_id: str | None = None,
+        enforce_exact_condition_match: bool = False,
+    ) -> dict[str, Any] | CanonicalSourceTradeMetadata:
+        """Build the canonical PR66 metadata payload from a trusted Gamma market."""
+        market = _mapping(gamma_market)
+        source = dict(market)
+        events = market.get("events")
+        if isinstance(events, list) and events:
+            source["event"] = events[0]
+        series = market.get("series")
+        if isinstance(series, list) and series:
+            source["series"] = series[0]
+        source["category"] = _official_category_for_v1_metadata(
+            OfficialPolymarketTaxonomyResolverV1().resolve(source)
+        )
+        result = normalize_source_trade_metadata(source)
+        if not market:
+            return result
+        if requested_condition_id is None:
+            requested_condition_id = _requested_condition_id(trade)
+        if enforce_exact_condition_match:
+            if requested_condition_id is None:
+                return normalize_source_trade_metadata(trade)
+            if not _exact_condition_match(requested_condition_id, market):
+                return normalize_source_trade_metadata(trade)
+        result["_snapshot"] = _build_market_snapshot(
+            market,
+            trade,
+            requested_condition_id=requested_condition_id,
+            enforce_exact_condition_match=enforce_exact_condition_match,
+        )
+        return issue_initial(result)
+
+    def merge_canonical_metadata(
+        existing_json: str | None,
+        gamma_market: Mapping[str, Any] | None,
+        *,
+        condition_id: str,
+        token_id: str | None = None,
+    ) -> tuple[Mapping[str, Any], str, list[str]]:
+        """Reconcile an existing canonical metadata payload with a Gamma fetch.
+
+        The issuer callable is closed over inside this factory; it is NOT a
+        public default argument and is NOT accessible from this public
+        signature's ``defaults`` / ``kwdefaults``.
+        """
+        if not existing_json:
+            existing: dict[str, Any] = {}
+        else:
+            try:
+                parsed = json.loads(existing_json)
+            except (json.JSONDecodeError, TypeError):
+                return existing_json, MERGE_UNAVAILABLE, ["existing_metadata_malformed_json"]  # type: ignore[return-value]
+            if not isinstance(parsed, dict):
+                return existing_json, MERGE_UNAVAILABLE, ["existing_metadata_not_object"]  # type: ignore[return-value]
+            existing = parsed
+
+        if gamma_market is None:
+            return _ensure_version(existing), MERGE_UNAVAILABLE, ["gamma_missing"]
+        if _gamma_condition_id(gamma_market) != condition_id.lower():
+            return (
+                _ensure_version(existing),
+                MERGE_UNAVAILABLE,
+                ["condition_id_mismatch"],
+            )
+        if token_id:
+            owned = _gamma_token_ids(gamma_market)
+            matches = sum(token == str(token_id).lower() for token in owned)
+            if not owned:
+                return (
+                    _ensure_version(existing),
+                    MERGE_UNAVAILABLE,
+                    ["token_membership_unavailable"],
+                )
+            if matches == 0:
+                return (
+                    _ensure_version(existing),
+                    MERGE_UNAVAILABLE,
+                    ["token_id_not_in_condition"],
+                )
+            if matches > 1:
+                return (
+                    _ensure_version(existing),
+                    MERGE_UNAVAILABLE,
+                    ["token_membership_ambiguous"],
+                )
+
+        version = existing.get("metadata_version")
+        if version not in (None, "", METADATA_VERSION):
+            return dict(existing), MERGE_CONFLICT, ["version_conflict"]
+
+        incoming = build_canonical_metadata({}, gamma_market)
+        merged = dict(existing)
+        changed = False
+        reasons: list[str] = []
+        existing_snapshot = existing.get("_snapshot")
+        incoming_snapshot = incoming["_snapshot"]
+        snapshot_substantively_equal = (
+            _snapshot_for_replay_comparison(existing_snapshot)
+            == _snapshot_for_replay_comparison(incoming_snapshot)
+        )
+
+        for namespace in ("taxonomy", "event", "series"):
+            (
+                merged_namespace,
+                namespace_changed,
+                namespace_reasons,
+            ) = _merge_standard_namespace(existing, incoming[namespace], namespace)
+            if namespace_changed:
+                merged[namespace] = merged_namespace
+                changed = True
+            reasons.extend(namespace_reasons)
+
+        if snapshot_substantively_equal:
+            snapshot = existing_snapshot
+            snapshot_changed = False
+            snapshot_reasons: list[str] = []
+        else:
+            snapshot, snapshot_changed, snapshot_reasons = _merge_snapshot(
+                existing_snapshot, incoming_snapshot
+            )
+        if snapshot_changed:
+            assert isinstance(snapshot, dict)
+            provenance = snapshot.setdefault("provenance", {})
+            provenance["retrieved_at"] = datetime.now(UTC).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            merged["_snapshot"] = snapshot
+            changed = True
+        reasons.extend(snapshot_reasons)
+
+        merged["metadata_version"] = METADATA_VERSION
+        if reasons:
+            return (
+                json.loads(json.dumps(merged, sort_keys=True)),
+                MERGE_CONFLICT,
+                reasons,
+            )
+        if not changed:
+            reasons.append("no_change")
+            return issue_merge(_ensure_version(existing)), MERGE_UNCHANGED, reasons
+        return (
+            issue_merge(json.loads(json.dumps(merged, sort_keys=True))),
+            MERGE_FILLED,
+            reasons,
+        )
+
+    return (
+        CanonicalSourceTradeMetadata,
+        _CanonicalMergeMetadata,
+        is_initial,
+        is_merge,
+        build_canonical_metadata,
+        merge_canonical_metadata,
+    )
+
+
+(
+    CanonicalSourceTradeMetadata,
+    _CanonicalMergeMetadata,
+    is_canonical_source_trade_metadata,
+    _is_issued_canonical_merge_metadata,
+    build_canonical_metadata,
+    merge_canonical_metadata,
+) = _build_metadata_authority_system()
+
+# Drop the factory from the module surface; only the closure-built public
+# functions and the validators remain as the public authority surfaces.
+del _build_metadata_authority_system
 
 
 _IMMUTABLE_PROVENANCE_FIELDS = frozenset(
@@ -173,7 +453,7 @@ def _as_bool(value: Any) -> bool | None:
 
 def _is_empty(value: Any) -> bool:
     return value is None or value == "" or (
-        isinstance(value, (list, tuple, set, frozenset, dict)) and not value
+        isinstance(value, (list, tuple, set, frozenset, Mapping)) and not value
     )
 
 
@@ -662,69 +942,6 @@ def _build_market_snapshot(
     return snapshot
 
 
-def build_canonical_metadata(
-    trade: Mapping[str, Any] | None,
-    gamma_market: Mapping[str, Any] | None,
-    *,
-    requested_condition_id: str | None = None,
-    enforce_exact_condition_match: bool = False,
-) -> dict[str, Any] | CanonicalSourceTradeMetadata:
-    """Build the canonical PR66 metadata payload from a trusted Gamma market.
-
-    Parameters
-    ----------
-    trade:
-        Raw upstream trade dict, or ``None`` for metadata-only call sites.
-    gamma_market:
-        Raw Gamma market dict, or ``None`` for metadata-only call sites.
-    requested_condition_id:
-        The trade's requested condition id after canonical normalization.
-        When ``None`` the function derives it from ``trade`` (using the
-        ``conditionId`` or ``market_source_id`` field). Initial-ingestion
-        callers pass the value explicitly to drive the new gate.
-    enforce_exact_condition_match:
-        When True, the snapshot is ONLY emitted when the canonical requested
-        condition id matches the Gamma market's ``conditionId`` after
-        normalization. When False (default — backfill semantics), the
-        snapshot is always emitted and ``exact_match`` reflects whether the
-        Gamma market itself carries a condition id. Initial-ingestion
-        callers pass ``True`` to enforce the safety gate.
-    """
-    market = _mapping(gamma_market)
-    source = dict(market)
-    events = market.get("events")
-    if isinstance(events, list) and events:
-        source["event"] = events[0]
-    series = market.get("series")
-    if isinstance(series, list) and series:
-        source["series"] = series[0]
-    source["category"] = _official_category_for_v1_metadata(
-        OfficialPolymarketTaxonomyResolverV1().resolve(source)
-    )
-    result = normalize_source_trade_metadata(source)
-    if not market:
-        return result
-    if requested_condition_id is None:
-        requested_condition_id = _requested_condition_id(trade)
-    if enforce_exact_condition_match:
-        # Initial-ingestion safety gate: a requested condition id MUST
-        # normalize-match the Gamma market's ``conditionId``; otherwise we
-        # drop the snapshot entirely so the persisted row never stamps
-        # ``exact_match=false`` with authoritative evidence attached. We
-        # also refuse to enrich the v1 (event/taxonomy/series) namespaces
-        # from the mismatched Gamma so no Gamma-authoritative field leaks
-        # into the persisted row at all.
-        if requested_condition_id is None:
-            return normalize_source_trade_metadata(trade)
-        if not _exact_condition_match(requested_condition_id, market):
-            return normalize_source_trade_metadata(trade)
-    result["_snapshot"] = _build_market_snapshot(
-        market,
-        trade,
-        requested_condition_id=requested_condition_id,
-        enforce_exact_condition_match=enforce_exact_condition_match,
-    )
-    return CanonicalSourceTradeMetadata(result, _token=_CANONICAL_TRUST_TOKEN)
 
 
 def _gamma_condition_id(gamma_market: Mapping[str, Any]) -> str | None:
@@ -908,12 +1125,15 @@ def _merge_trade_validation(
 def _merge_snapshot(
     existing_snapshot: Any, incoming: Mapping[str, Any]
 ) -> tuple[dict[str, Any], bool, list[str]]:
-    if not isinstance(existing_snapshot, dict):
+    if not isinstance(existing_snapshot, Mapping) or _is_empty(existing_snapshot):
         if _is_empty(existing_snapshot):
-            return dict(incoming), True, []
+            return _rehydrate_mapping(incoming), True, []
         return {}, False, ["_snapshot_type_conflict"]
 
-    output = dict(existing_snapshot)
+    # Deep-thaw the existing snapshot to a plain dict tree so subsequent
+    # ``setdefault`` / item-assignment on sub-namespaces can mutate locally
+    # without touching any frozen mappingproxy captured by the issuer.
+    output = _rehydrate_mapping(existing_snapshot)
     changed = False
     reasons: list[str] = []
 
@@ -982,9 +1202,11 @@ def _merge_snapshot(
 
 def _snapshot_for_replay_comparison(snapshot: Any) -> Any:
     """Remove audit-only timestamps, caller-only context, before replay."""
-    if not isinstance(snapshot, dict):
+    if not isinstance(snapshot, Mapping):
         return snapshot
-    output = json.loads(json.dumps(snapshot))
+    # Deep-thaw frozen mappingproxy trees to plain dicts so JSON round-trip
+    # works and equality comparisons succeed across carriers.
+    output = json.loads(json.dumps(_rehydrate_mapping(snapshot)))
     provenance = output.get("provenance")
     if isinstance(provenance, dict):
         provenance.pop("retrieved_at", None)
@@ -1008,117 +1230,3 @@ def _snapshot_for_replay_comparison(snapshot: Any) -> Any:
             if key.startswith("trade_response_"):
                 provenance.pop(key)
     return output
-
-
-def merge_canonical_metadata(
-    existing_json: str | None,
-    gamma_market: Mapping[str, Any] | None,
-    *,
-    condition_id: str,
-    token_id: str | None = None,
-    _issue: Any = _merge_issue_at_definition,
-) -> tuple[Mapping[str, Any], str, list[str]]:
-    if not existing_json:
-        existing: dict[str, Any] = {}
-    else:
-        try:
-            parsed = json.loads(existing_json)
-        except (json.JSONDecodeError, TypeError):
-            return existing_json, MERGE_UNAVAILABLE, ["existing_metadata_malformed_json"]  # type: ignore[return-value]
-        if not isinstance(parsed, dict):
-            return existing_json, MERGE_UNAVAILABLE, ["existing_metadata_not_object"]  # type: ignore[return-value]
-        existing = parsed
-
-    if gamma_market is None:
-        return _ensure_version(existing), MERGE_UNAVAILABLE, ["gamma_missing"]
-    if _gamma_condition_id(gamma_market) != condition_id.lower():
-        return _ensure_version(existing), MERGE_UNAVAILABLE, ["condition_id_mismatch"]
-    if token_id:
-        owned = _gamma_token_ids(gamma_market)
-        matches = sum(token == str(token_id).lower() for token in owned)
-        if not owned:
-            return _ensure_version(existing), MERGE_UNAVAILABLE, ["token_membership_unavailable"]
-        if matches == 0:
-            return _ensure_version(existing), MERGE_UNAVAILABLE, ["token_id_not_in_condition"]
-        if matches > 1:
-            return _ensure_version(existing), MERGE_UNAVAILABLE, ["token_membership_ambiguous"]
-
-    version = existing.get("metadata_version")
-    if version not in (None, "", METADATA_VERSION):
-        return dict(existing), MERGE_CONFLICT, ["version_conflict"]
-
-    incoming = build_canonical_metadata({}, gamma_market)
-    merged = dict(existing)
-    changed = False
-    reasons: list[str] = []
-    existing_snapshot = existing.get("_snapshot")
-    incoming_snapshot = incoming["_snapshot"]
-    snapshot_substantively_equal = (
-        _snapshot_for_replay_comparison(existing_snapshot)
-        == _snapshot_for_replay_comparison(incoming_snapshot)
-    )
-
-    for namespace in ("taxonomy", "event", "series"):
-        merged_namespace, namespace_changed, namespace_reasons = _merge_standard_namespace(
-            existing, incoming[namespace], namespace
-        )
-        if namespace_changed:
-            merged[namespace] = merged_namespace
-            changed = True
-        reasons.extend(namespace_reasons)
-
-    if snapshot_substantively_equal:
-        snapshot = existing_snapshot
-        snapshot_changed = False
-        snapshot_reasons: list[str] = []
-    else:
-        snapshot, snapshot_changed, snapshot_reasons = _merge_snapshot(
-            existing_snapshot, incoming_snapshot
-        )
-    if snapshot_changed:
-        assert isinstance(snapshot, dict)
-        provenance = snapshot.setdefault("provenance", {})
-        provenance["retrieved_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        merged["_snapshot"] = snapshot
-        changed = True
-    reasons.extend(snapshot_reasons)
-
-    merged["metadata_version"] = METADATA_VERSION
-    if reasons:
-        return json.loads(json.dumps(merged, sort_keys=True)), MERGE_CONFLICT, reasons
-    if not changed:
-        reasons.append("no_change")
-        return _issue(_ensure_version(existing)), MERGE_UNCHANGED, reasons
-    return _issue(json.loads(json.dumps(merged, sort_keys=True))), MERGE_FILLED, reasons
-
-
-# The issuance closure is retained only by ``merge_canonical_metadata``'s
-# definition-time default; it is not an importable minting API.
-del _merge_issue_at_definition
-
-
-def build_metadata_from_gamma_market(
-    raw: Mapping[str, Any] | None,
-    gamma_market: Mapping[str, Any] | None,
-) -> dict[str, Any] | CanonicalSourceTradeMetadata:
-    """Compatibility alias for callers that have not moved to the canonical name."""
-    return build_canonical_metadata(raw, gamma_market)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Canonical-metadata trust boundary
-#
-# Trust is represented by ``CanonicalSourceTradeMetadata`` type identity, not
-# payload contents. The canonical builder is the only production constructor.
-# Ordinary mappings — even schema-perfect copies — always remain untrusted and
-# must pass through bounded metadata-v1 normalization.
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def is_canonical_source_trade_metadata(raw: Any) -> bool:
-    """Return whether ``raw`` has trusted canonical type identity.
-
-    Ordinary mappings always return ``False`` regardless of their contents.
-    This helper exists for compatibility and must never inspect mapping fields.
-    """
-    return type(raw) is CanonicalSourceTradeMetadata

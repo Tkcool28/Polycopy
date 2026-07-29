@@ -7,6 +7,7 @@ import importlib.util
 import json
 import sqlite3
 import weakref
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -141,15 +142,57 @@ def run(db, unsafe):
         "quantity", "price", "trader_address", "timestamp", "is_sample", "token_id", "metadata_json",
     )
     valid = [
-        SqlFinding("src/polycopy/ingestion/source_trade_writer.py", "write_valid_rows", 1, "execute", True, "INSERT OR IGNORE", "source_trades", writer_columns, ()),
-        SqlFinding("src/polycopy/ingestion/source_trade_metadata_reconciliation.py", "reconcile_metadata_json", 1, "execute", True, "UPDATE", "source_trades", ("metadata_json",), ("id",)),
-        SqlFinding("src/polycopy/ingestion/source_trade_resolution.py", "apply_existing_resolution_updates", 1, "execute", True, "UPDATE", "source_trades", ("resolution_status", "resolved_at", "winning_token_id", "is_winning_trade", "realized_pnl", "settlement_source"), ("id",)),
+        SqlFinding(
+            "src/polycopy/ingestion/source_trade_writer.py",
+            "write_valid_rows",
+            1,
+            "execute",
+            True,
+            "INSERT OR IGNORE",
+            "source_trades",
+            writer_columns,
+            (),
+            None,
+            None,
+            None,
+            None,
+        ),
+        SqlFinding(
+            "src/polycopy/ingestion/source_trade_metadata_reconciliation.py",
+            "reconcile_metadata_json",
+            1,
+            "execute",
+            True,
+            "UPDATE",
+            "source_trades",
+            ("metadata_json",),
+            ("id",),
+            "eq(id,param)",
+            None,
+            None,
+            None,
+        ),
+        SqlFinding(
+            "src/polycopy/ingestion/source_trade_resolution.py",
+            "apply_existing_resolution_updates",
+            1,
+            "execute",
+            True,
+            "UPDATE",
+            "source_trades",
+            ("resolution_status", "resolved_at", "winning_token_id", "is_winning_trade", "realized_pnl", "settlement_source"),
+            ("id",),
+            "eq(id,param)",
+            None,
+            None,
+            None,
+        ),
     ]
     assert contract_violations(valid) == []
     invalid = [
         valid[0].__class__(**{**valid[0].__dict__, "operation": "INSERT"}),
         valid[1].__class__(**{**valid[1].__dict__, "columns": ("metadata_json", "side")}),
-        valid[2].__class__(**{**valid[2].__dict__, "selector_columns": ("source",)}),
+        valid[2].__class__(**{**valid[2].__dict__, "predicate_fingerprint": None, "predicate_invalid_reason": "forged"}),
     ]
     assert contract_violations(invalid) == invalid
 
@@ -209,18 +252,36 @@ def test_canonical_merge_authority_is_immutable_and_captured() -> None:
     with __import__("pytest").raises(TypeError):
         merged["forged"] = True  # type: ignore[index]
     inspection = merged["_snapshot"]
-    inspection["provenance"]["provider"] = "forged"
+    # Immutable-carrier contract: nested mappingproxy cannot be mutated
+    # through the issued carrier or its captured snapshot.
+    with __import__("pytest").raises(TypeError):
+        inspection["provenance"]["provider"] = "forged"
     shallow, deep = copy.copy(merged), copy.deepcopy(merged)
     assert shallow is merged
     assert deep is merged
-    for reconstructed in (dict(merged), json.loads(json.dumps(dict(merged)))):
+    # Captured bytes ignore any inspection attempt; merged and copy
+    # share the same captured serialization.
+    assert shallow._serialized_json() == merged._serialized_json()
+    assert deep._serialized_json() == merged._serialized_json()
+    assert "forged" not in merged._serialized_json()
+    for reconstructed in (dict(merged), json.loads(merged._serialized_json())):
         with __import__("pytest").raises(ValueError):
             reconcile_metadata_json(db, reconstructed, internal_id="row", allow_nonempty_replace=True)
     assert reconcile_metadata_json(db, merged, internal_id="row", allow_nonempty_replace=True).status == "updated"
     assert reconcile_metadata_json(db, shallow, internal_id="row", allow_nonempty_replace=True).status == "reused"
     assert reconcile_metadata_json(db, deep, internal_id="row", allow_nonempty_replace=True).status == "reused"
     saved = db.conn.execute("SELECT metadata_json FROM source_trades WHERE id='row'").fetchone()[0]
-    assert saved == json.dumps(expected, sort_keys=True, separators=(",", ":"))
+    # ``expected`` retains frozen mappingproxy trees from ``dict(merged)``;
+    # serialize via the trusted-issuer form to avoid the encoding error
+    # below (``json.dumps`` cannot serialize ``mappingproxy``).
+    if expected and any(
+        isinstance(v, Mapping) and type(v).__name__ == "mappingproxy"
+        for v in expected.values()
+    ):
+        expected_serialized = merged._serialized_json()
+    else:
+        expected_serialized = json.dumps(expected, sort_keys=True, separators=(",", ":"))
+    assert saved == expected_serialized
     assert "forged" not in saved
 
 
@@ -247,14 +308,26 @@ def test_arbitrary_mapping_cannot_forge_canonical_merge_authority() -> None:
 def test_issued_merge_authority_rejects_unregistered_forgeries_and_is_weak() -> None:
     import polycopy.ingestion.canonical_metadata as metadata_module
 
-    assert not hasattr(metadata_module, "_MERGED_METADATA_TOKEN")
-    assert not hasattr(metadata_module, "_issue_canonical_merge_metadata")
-    assert not hasattr(metadata_module, "_merge_issue_at_definition")
+    # The merge authority factory is a single closure-scoped construction.
+    # The only public functions are the carrier types and their builders.
+    # There is no module-level generic issuer that accepts arbitrary
+    # metadata and stamps it as accepted.
+    for forbidden in (
+        "_MERGED_METADATA_TOKEN",
+        "_issue_canonical_merge_metadata",
+        "_merge_issue_at_definition",
+        "_issue_canonical_source_trade_metadata",
+        "_CANONICAL_TRUST_TOKEN",
+    ):
+        assert not hasattr(metadata_module, forbidden), forbidden
+    # The legacy ``_view`` slot is no longer used; the captured snapshot is
+    # stored under ``_snapshot``. The factory owns the only legitimate
+    # construction path through ``merge_canonical_metadata``.
     with __import__("pytest").raises(TypeError):
         _CanonicalMergeMetadata({"forged": True})
     forged = object.__new__(_CanonicalMergeMetadata)
     forged._serialized = '{"forged":true}'
-    forged._view = {}
+    forged._snapshot = {"forged": True}
     with __import__("pytest").raises(TypeError):
         serialize_canonical_merge_metadata(forged)
 

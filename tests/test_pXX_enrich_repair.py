@@ -31,7 +31,9 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.canonical_metadata import (  # noqa: E402
     MERGE_FILLED,
+    _rehydrate_mapping,
     build_canonical_metadata,
+    is_canonical_source_trade_metadata,
 )
 from polycopy.ingestion.normalized_source_trade import SOURCE_NAME  # noqa: E402
 from polycopy.ingestion.source_trade_enrichment import (  # noqa: E402
@@ -44,6 +46,7 @@ from polycopy.ingestion.source_trade_enrichment import (  # noqa: E402
     enrich_source_trade,
     get_enrichment,
 )
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata  # noqa: E402
 from polycopy.ingestion.source_trade_provenance import (  # noqa: E402
     build_provenance_payload,
     enrichment_status_allows_dispatch,
@@ -117,6 +120,10 @@ def _seed_wallet(db, wid="uuid-e", address="0xenrich000000000000000000000000000a
 
 def _seed_trade(db, tid, cond, metadata_json, *, side="BUY", source=CANON_SOURCE,
                 token=GTOK, is_sample=0, market_source_id=None):
+    if is_canonical_source_trade_metadata(metadata_json):
+        serialized_metadata = serialize_source_trade_metadata(metadata_json)
+    else:
+        serialized_metadata = json.dumps(_rehydrate_mapping(metadata_json), sort_keys=True)
     db.conn.execute(
         "INSERT INTO source_trades("
         "id, source, source_trade_id, market_source_id, token_id, side, "
@@ -126,7 +133,7 @@ def _seed_trade(db, tid, cond, metadata_json, *, side="BUY", source=CANON_SOURCE
          token, side, "Yes", 10.0, 0.40,
          "0xenrich000000000000000000000000000abc",
          "2026-02-01T00:00:00Z", is_sample,
-         json.dumps(metadata_json, sort_keys=True)),
+         serialized_metadata),
     )
     db.conn.commit()
 
@@ -313,7 +320,7 @@ def test_malformed_metadata_preserved():
 def test_metadata_version_conflict():
     db, _ = _open()
     _seed_wallet(db)
-    bad = dict(build_canonical_metadata({}, GAMMA_PAYLOAD))
+    bad = _rehydrate_mapping(build_canonical_metadata({}, GAMMA_PAYLOAD))
     bad["metadata_version"] = "2"
     _seed_trade(db, "polymarket:st1", COND, bad)
     res = enrich_source_trade(db, "polymarket:st1", gamma_resolver=_fake_resolver)
@@ -815,9 +822,10 @@ def test_normalize_once_then_replay_zero():
 
 # ── 2b. CLI: non-production --write without --allow-live => exit 2, no open ─
 def _run_cli_refusal(args):
-    import scripts.enrich_approved_source_trade as cli
     import evidence_db as edb
+
     import polycopy.ingestion.source_trade_enrichment as ste
+    import scripts.enrich_approved_source_trade as cli
 
     captured = {}
 
@@ -894,9 +902,9 @@ def test_cli_prod_write_requires_all_gates():
 
 # ── 3b. CLI: persistence failure -> exit nonzero, no commit ─────────────────
 def test_cli_persistence_failure_nonzero():
+    import polycopy.ingestion.source_trade_enrichment as ste
     import scripts.enrich_approved_source_trade as cli
     from polycopy.db.database import Database
-    import polycopy.ingestion.source_trade_enrichment as ste
 
     # A recording Database subclass so we can prove commit/rollback were (or
     # were not) called without monkeypatching read-only sqlite3 methods.
@@ -1234,8 +1242,8 @@ def test_cli_unknown_id_exit2_zero_write():
 
 # ── 4d. honest outcomes stay exit 0; provider/persistence stay exit 1 ───────
 def test_cli_honest_outcomes_exit0():
-    import scripts.enrich_approved_source_trade as cli
     import polycopy.ingestion.source_trade_enrichment as ste
+    import scripts.enrich_approved_source_trade as cli
 
     db = _NoCloseDb(_tmp()).connect()
     _seed_wallet(db)
@@ -1275,8 +1283,8 @@ def test_cli_honest_outcomes_exit0():
 
 
 def test_cli_equivalent_replay_still_zero_write_exit0():
-    import scripts.enrich_approved_source_trade as cli
     import polycopy.ingestion.source_trade_enrichment as ste
+    import scripts.enrich_approved_source_trade as cli
 
     db = _NoCloseDb(_tmp()).connect()
     _seed_wallet(db)

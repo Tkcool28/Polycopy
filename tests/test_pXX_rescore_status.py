@@ -35,6 +35,7 @@ for p in (str(ROOT / "src"), str(ROOT / "scripts")):
 
 from polycopy.db.database import Database  # noqa: E402
 from polycopy.ingestion.canonical_metadata import build_canonical_metadata  # noqa: E402
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata  # noqa: E402
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     resolve_wallet_score_v1,
 )
@@ -112,7 +113,7 @@ def _seed_trade(db, tid, cond=GCOND, meta=None, side="BUY",
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (tid, "polymarket", tid, cond, side, "Yes", 10.0, 0.40,
          trader, timestamp or "2026-02-01T00:00:00Z", 0,
-         json.dumps(meta, sort_keys=True),
+         serialize_source_trade_metadata(meta),
          resolution_status, is_winning_trade, realized_pnl),
     )
     db.conn.commit()

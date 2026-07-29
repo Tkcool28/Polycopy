@@ -18,9 +18,16 @@ from polycopy.ingestion.canonical_metadata import (
     MERGE_CONFLICT,
     MERGE_FILLED,
     MERGE_UNCHANGED,
+    _is_issued_canonical_merge_metadata,
+    _rehydrate_mapping,
     _validate_outcome_mapping,
     build_canonical_metadata,
+    is_canonical_source_trade_metadata,
     merge_canonical_metadata,
+)
+from polycopy.ingestion.source_trade_metadata import serialize_source_trade_metadata
+from polycopy.ingestion.source_trade_metadata_reconciliation import (
+    serialize_canonical_merge_metadata,
 )
 from polycopy.ingestion.normalized_source_trade import (
     normalize_source_trade,
@@ -62,8 +69,12 @@ TRADE = {
 
 
 def _dump(value):
+    if is_canonical_source_trade_metadata(value):
+        return serialize_source_trade_metadata(value)
+    if _is_issued_canonical_merge_metadata(value):
+        return serialize_canonical_merge_metadata(value)
     if isinstance(value, Mapping):
-        value = dict(value)
+        value = _rehydrate_mapping(value)
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
@@ -393,7 +404,7 @@ def test_conflict_without_unrelated_fill_is_never_mislabeled_unchanged():
     first, _, _ = merge_canonical_metadata(
         None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
-    first = dict(first)
+    first = _rehydrate_mapping(first)
     first["taxonomy"]["raw_category"] = "Sports"
     merged, status, reasons = merge_canonical_metadata(
         _dump(first), FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
@@ -408,7 +419,7 @@ def test_immutable_snapshot_provenance_conflicts_and_is_preserved():
     first, _, _ = merge_canonical_metadata(
         None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
-    first = dict(first)
+    first = _rehydrate_mapping(first)
     first["_snapshot"]["provenance"]["provider"] = "not-gamma"
     merged, status, reasons = merge_canonical_metadata(
         _dump(first), FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
@@ -449,7 +460,7 @@ def test_null_values_do_not_erase_existing_and_unrelated_survives():
     first, _, _ = merge_canonical_metadata(
         None, FULL_GAMMA, condition_id=FULL_GAMMA["conditionId"]
     )
-    first = dict(first)
+    first = _rehydrate_mapping(first)
     first["unrelated"] = {"keep": True}
     gamma = dict(FULL_GAMMA, question=None, active=None)
     merged, _, _ = merge_canonical_metadata(

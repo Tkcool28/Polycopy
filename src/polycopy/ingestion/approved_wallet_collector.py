@@ -23,10 +23,15 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from polycopy.ingestion import ingest_pipeline
+from polycopy.ingestion.canonical_metadata import (
+    _rehydrate_mapping,
+    is_canonical_source_trade_metadata,
+)
 from polycopy.ingestion.normalized_source_trade import NormalizedSourceTrade
 
 APPROVED_WALLET_ENV = "POLYCOPY_APPROVED_SOURCE_WALLET"
@@ -122,9 +127,13 @@ class CollectionResult:
         }
 
 
-def _classify_taxonomy(metadata: Optional[dict[str, Any]]) -> str:
+def _classify_taxonomy(metadata: Mapping[str, Any] | None) -> str:
     """Return usable|partial|unavailable for a canonical PR66 metadata dict."""
-    if not isinstance(metadata, dict):
+    if is_canonical_source_trade_metadata(metadata):
+        safe_metadata = cast(Any, metadata).to_plain_dict()
+    elif isinstance(metadata, Mapping):
+        safe_metadata = _rehydrate_mapping(metadata)
+    else:
         return "unavailable"
     from polycopy.scoring.wallet_evidence import (
         CATEGORY_TAXONOMY_PARTIAL,
@@ -133,7 +142,7 @@ def _classify_taxonomy(metadata: Optional[dict[str, Any]]) -> str:
     )
 
     try:
-        cls = classify_category_taxonomy(metadata)
+        cls = classify_category_taxonomy(safe_metadata)
     except Exception:
         return "unavailable"
     status = str(cls.status)

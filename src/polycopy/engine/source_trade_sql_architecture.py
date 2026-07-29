@@ -34,8 +34,42 @@ class SqlFinding:
     table: str | None
     columns: tuple[str, ...]
     selector_columns: tuple[str, ...]
+    predicate_fingerprint: str | None = None
+    predicate_invalid_reason: str | None = None
     reason: str | None = None
     sql: str | None = None
+
+
+# Approved reconciliation predicate grammars (Finding 3 — exact bounded
+# predicate fingerprints). Anything outside this grammar fails closed.
+PREDICATE_METADATA_BY_ID = "eq(id,param)"
+PREDICATE_METADATA_BY_IDENTITY = "and(eq(source,param),eq(source_trade_id,param))"
+PREDICATE_RESOLUTION_BY_ID = "eq(id,param)"
+_APPROVED_PREDICATES: frozenset[str] = frozenset(
+    {
+        PREDICATE_METADATA_BY_ID,
+        PREDICATE_METADATA_BY_IDENTITY,
+        PREDICATE_RESOLUTION_BY_ID,
+    }
+)
+
+# Identifier whitelist for equality terms. Only reconciliation columns are
+# approved; any other identifier fails closed.
+_APPROVED_PREDICATE_IDENTIFIERS: frozenset[str] = frozenset({"id", "source", "source_trade_id"})
+
+
+@dataclass(frozen=True)
+class _PredicateParse:
+    fingerprint: str | None
+    invalid_reason: str | None
+
+    @classmethod
+    def approved(cls, fingerprint: str) -> "_PredicateParse":
+        return cls(fingerprint, None)
+
+    @classmethod
+    def invalid(cls, reason: str) -> "_PredicateParse":
+        return cls(None, reason)
 
 
 @dataclass(frozen=True)
@@ -64,6 +98,179 @@ def _columns(sql: str, operation: str | None) -> tuple[str, ...]:
 def _selectors(sql: str) -> tuple[str, ...]:
     match = re.search(r"\bWHERE\s+(.+)$", sql, re.IGNORECASE | re.DOTALL)
     return tuple(re.findall(r"\b([a-zA-Z_][\w]*)\s*=\s*\?", match.group(1))) if match else ()
+
+
+# ------------------------------------------------------------------ #
+# Predicate fingerprint parser (Finding 3)
+#
+# Bounded fail-closed grammar. Only ``predicates`` documented as
+# approved are accepted. The parser strips benign syntactic noise
+# (whitespace, paired parentheses around the whole WHERE body or any
+# equality term, and ``"…[`` identifier wrappers) and otherwise requires
+# the exact form described in the contract. Anything that does not
+# match the grammar yields ``predicate_fingerprint=None`` and a
+# ``predicate_invalid_reason`` describing why.
+# ------------------------------------------------------------------ #
+_RE_PRED_TAIL = re.compile(r"\bWHERE\b(.*)", re.IGNORECASE | re.DOTALL)
+_RE_ORDER_TAIL = re.compile(r"\bORDER\s+BY\b.*$", re.IGNORECASE | re.DOTALL)
+_RE_LIMIT_TAIL = re.compile(r"\bLIMIT\b\s+[^)]*?[;)]?\s*$", re.IGNORECASE | re.DOTALL)
+_RE_TOKEN = re.compile(
+    r"""
+    (?P<and>\bAND\b)
+    | (?P<or>\bOR\b)
+    | (?P<in>\bIN\b)
+    | (?P<not>\bNOT\b)
+    | (?P<is>\bIS\b)
+    | (?P<like>\bLIKE\b)
+    | (?P<select>\bSELECT\b)
+    | (?P<identifier>"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)
+    | (?P<param>\?)
+    | (?P<eq>=)
+    | (?P<paren>\(|\))
+    | (?P<comma>,)
+    | (?P<string>'[^']*(?:''[^']*)*'|"[^"]*(?:""[^"]*)*")
+    | (?P<ws>\s+)
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+_RE_COLLATE = re.compile(r"\bCOLLATE\b\s+\w+", re.IGNORECASE)
+
+
+def _strip_identifier_wrappers(identifier: str) -> str:
+    if len(identifier) >= 2 and identifier[0] == identifier[-1] and identifier[0] in {'"', '`', '[', "'"}:
+        if identifier[0] == '[':
+            inner = identifier[1:-1]
+            if not inner.endswith(']'):
+                return identifier
+            return inner[:-1]
+        return identifier[1:-1]
+    return identifier
+
+
+def _tokenize_predicate(text: str) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    for match in _RE_TOKEN.finditer(text):
+        if match.start() != pos:
+            return []  # unrecognized token in between
+        kind = match.lastgroup
+        value = match.group()
+        if kind == "ws":
+            pos = match.end()
+            continue
+        tokens.append((str(kind), value))
+        pos = match.end()
+    if pos != len(text):
+        return []
+    return tokens
+
+
+def _strip_balanced_parens(tokens: list[tuple[str, str]]) -> list[tuple[str, str]] | None:
+    """Strip one layer of balanced outer parentheses around ``tokens``.
+
+    Returns the inner tokens when the list is enclosed by a single
+    well-balanced ``( … )`` pair; ``None`` when parens are not balanced or
+    more than one outer layer is present.
+    """
+    if not tokens:
+        return tokens
+    if tokens[0][0] != "paren" or tokens[0][1] != "(":
+        return tokens
+    depth = 0
+    last_paren_index = -1
+    for index, (kind, value) in enumerate(tokens):
+        if kind == "paren" and value == "(":
+            depth += 1
+        elif kind == "paren" and value == ")":
+            depth -= 1
+            if depth == 0:
+                last_paren_index = index
+                break
+        if depth < 0:
+            return None
+    if last_paren_index != len(tokens) - 1:
+        return None
+    return tokens[1:last_paren_index]  # type: ignore[return-value]
+
+
+def _parse_equality_term(tokens: list[tuple[str, str]]) -> tuple[str, str] | None:
+    """Parse ``approved_identifier = ?`` and return the lower-cased column name."""
+    if len(tokens) != 3:
+        return None
+    ident_tok, eq_tok, param_tok = tokens
+    if ident_tok[0] != "identifier":
+        return None
+    if eq_tok[0] != "eq" or param_tok[0] != "param":
+        return None
+    column = _strip_identifier_wrappers(ident_tok[1]).lower()
+    return column, "eq({col},param)".format(col=column)
+
+
+def parse_predicate_fingerprint(sql: str) -> _PredicateParse:
+    """Return an exact normalized predicate fingerprint, or a closed-fail reason."""
+    if _RE_COLLATE.search(sql) is not None:
+        return _PredicateParse.invalid("collate_clause_disallowed")
+    where_match = _RE_PRED_TAIL.search(sql)
+    if where_match is None:
+        return _PredicateParse.invalid("missing_where_clause")
+    predicate_text = where_match.group(1)
+    predicate_text = _RE_ORDER_TAIL.sub("", predicate_text)
+    predicate_text = _RE_LIMIT_TAIL.sub("", predicate_text)
+    predicate_text = predicate_text.strip().rstrip(";").strip()
+    if not predicate_text:
+        return _PredicateParse.invalid("empty_where_clause")
+    tokens = _tokenize_predicate(predicate_text)
+    if not tokens:
+        return _PredicateParse.invalid("unrecognized_predicate_tokens")
+    # Fail-closed: any other connector or sub-expression ⇒ invalid.
+    forbidden_kinds = {"or", "not", "in", "is", "like", "select", "string", "comma"}
+    if any(kind in forbidden_kinds for kind, _ in tokens):
+        return _PredicateParse.invalid("disallowed_predicate_construct")
+    # Peel a single, balanced outer pair of parentheses.
+    stripped = _strip_balanced_parens(tokens)
+    if stripped is None:
+        return _PredicateParse.invalid("unbalanced_or_stray_parens")
+    tokens = stripped
+    # Empty after stripping? Already handled above (empty_where_clause).
+    if not tokens:
+        return _PredicateParse.invalid("empty_predicate_after_normalization")
+    # Single term?
+    equality = _parse_equality_term(tokens)
+    if equality is not None:
+        column, fp = equality
+        if column not in _APPROVED_PREDICATE_IDENTIFIERS:
+            return _PredicateParse.invalid("identifier_not_in_approval_set")
+        if fp not in _APPROVED_PREDICATES:
+            return _PredicateParse.invalid("single_term_fingerprint_not_approved")
+        return _PredicateParse.approved(fp)
+    # Must be exactly ``equality AND equality`` — seven tokens total
+    # (identifier, =, ?, AND, identifier, =, ?).
+    if len(tokens) != 7:
+        return _PredicateParse.invalid("predicate_token_count_outside_grammar")
+    left = tokens[:3]
+    and_tok = tokens[3]
+    right_pair = tokens[4:]
+    if and_tok[0] != "and":
+        return _PredicateParse.invalid("missing_top_level_and")
+    left_eq = _parse_equality_term(left)
+    right_eq = _parse_equality_term(right_pair)
+    if left_eq is None or right_eq is None:
+        return _PredicateParse.invalid("and_branch_malformed_equality")
+    left_col, left_fp = left_eq
+    right_col, right_fp = right_eq
+    for column in (left_col, right_col):
+        if column not in _APPROVED_PREDICATE_IDENTIFIERS:
+            return _PredicateParse.invalid("identifier_not_in_approval_set")
+    # Disallow the same column twice; require exactly the identity pair.
+    if {left_col, right_col} != {"source", "source_trade_id"}:
+        return _PredicateParse.invalid("and_columns_do_not_match_identity_pair")
+    canonical = "and({},{})".format(
+        sorted([left_fp, right_fp])[0],
+        sorted([left_fp, right_fp])[1],
+    )
+    if canonical not in _APPROVED_PREDICATES:
+        return _PredicateParse.invalid("identity_fingerprint_not_approved")
+    return _PredicateParse.approved(canonical)
 
 
 def _resolve(node: ast.AST | None, values: dict[str, ast.AST], helpers: dict[str, _Helper], seen: set[str] | None = None) -> str | None:
@@ -441,7 +648,7 @@ def _record_assignment(statement: ast.stmt, values: dict[str, ast.AST], aliases:
 def _classify(path: str, scope: str, line: int, sink: str, sql: str | None, *, relevant: bool) -> SqlFinding | None:
     if sql is None:
         if relevant:
-            return SqlFinding(path, scope, line, sink, False, None, "source_trades", (), (), "unresolved_source_trade_sql", None)
+            return SqlFinding(path, scope, line, sink, False, None, "source_trades", (), (), None, None, "unresolved_source_trade_sql", None)
         return None
     match = _DML.search(sql)
     target = _TARGET.search(sql)
@@ -449,7 +656,21 @@ def _classify(path: str, scope: str, line: int, sink: str, sql: str | None, *, r
     if not match or table != "source_trades":
         return None
     operation = " ".join(match.group(1).upper().split())
-    return SqlFinding(path, scope, line, sink, True, operation, table, _columns(sql, operation), _selectors(sql), sql=sql)
+    parsed = parse_predicate_fingerprint(sql) if operation == "UPDATE" else _PredicateParse(None, None)
+    return SqlFinding(
+        path,
+        scope,
+        line,
+        sink,
+        True,
+        operation,
+        table,
+        _columns(sql, operation),
+        _selectors(sql),
+        parsed.fingerprint,
+        parsed.invalid_reason,
+        sql=sql,
+    )
 
 
 def _scan_scope(statements: Iterable[ast.stmt], *, path: str, scope: str, helpers: dict[str, _Helper], values: dict[str, ast.AST] | None = None, aliases: dict[str, str] | None = None, wrappers: dict[str, _ExecutionWrapper] | None = None) -> list[SqlFinding]:
@@ -602,7 +823,12 @@ def _is_explicit_schema_or_demo_role(finding: SqlFinding) -> bool:
 
 
 def contract_violations(findings: Iterable[SqlFinding]) -> list[SqlFinding]:
-    """Enforce the three deliberately narrow production source-trade roles."""
+    """Enforce the three deliberately narrow production source-trade roles.
+
+    Reconciliation statements are authorized only when their predicate
+    fingerprint matches the exact bounded grammar. Selector-column sets
+    alone never certify a finding as approved.
+    """
     violations: list[SqlFinding] = []
     writer_columns = {
         ("id", "source", "source_trade_id", "market_source_id", "side", "outcome", "quantity", "price", "trader_address", "timestamp", "is_sample", "token_id", "metadata_json"),
@@ -618,10 +844,23 @@ def contract_violations(findings: Iterable[SqlFinding]) -> list[SqlFinding]:
             if finding.operation != "INSERT OR IGNORE" or finding.columns not in writer_columns:
                 violations.append(finding)
         elif finding.path == "src/polycopy/ingestion/source_trade_metadata_reconciliation.py":
-            if finding.operation != "UPDATE" or finding.columns != ("metadata_json",) or set(finding.selector_columns) not in ({"id"}, {"source", "source_trade_id"}):
+            approved_fps = {
+                PREDICATE_METADATA_BY_ID,
+                PREDICATE_METADATA_BY_IDENTITY,
+            }
+            if (
+                finding.operation != "UPDATE"
+                or finding.columns != ("metadata_json",)
+                or finding.predicate_fingerprint is None
+                or finding.predicate_fingerprint not in approved_fps
+            ):
                 violations.append(finding)
         elif finding.path == "src/polycopy/ingestion/source_trade_resolution.py":
-            if finding.operation != "UPDATE" or set(finding.columns) != resolution_columns or set(finding.selector_columns) != {"id"}:
+            if (
+                finding.operation != "UPDATE"
+                or set(finding.columns) != resolution_columns
+                or finding.predicate_fingerprint != PREDICATE_RESOLUTION_BY_ID
+            ):
                 violations.append(finding)
         elif not _is_explicit_schema_or_demo_role(finding):
             violations.append(finding)
