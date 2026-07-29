@@ -44,6 +44,7 @@ from polycopy.execution.specialist_spine import (  # noqa: E402
 )
 from polycopy.ingestion.source_trade_enrichment import enrich_source_trade  # noqa: E402
 from polycopy.engine.approved_specialist_dispatcher import dispatch_one  # noqa: E402
+from polycopy.engine.approved_wallet_trade_bridge import _issue_write_capability  # noqa: E402
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
 FIXED_WALLET = "0x" + "a" * 40
@@ -106,9 +107,11 @@ def run_proof(db: Database, args: argparse.Namespace) -> dict:
     gamma, clob = deps.gamma.get_market, deps.clob
     enr = enrich_source_trade(db, st_id, gamma_resolver=gamma, dry_run=False)
 
-    # 4) durable dispatch (idempotent; bridge -> copy_candidate).
+    # The capability is an explicit bridge-write authorization only. This proof
+    # command refuses production DB paths; possession does not prove a lock is held.
     disp = dispatch_one(db, approval_id=aid, source_trade_internal_id=st_id,
-                         gamma_resolver=gamma, clob_provider=clob, dry_run=False)
+                         gamma_resolver=gamma, clob_provider=clob, dry_run=False,
+                         write_authorization=_issue_write_capability())
 
     # 5) decisions + paper signal already produced by dispatch (candidate_id,
     #    paper_signal_decision_id). Read them back.

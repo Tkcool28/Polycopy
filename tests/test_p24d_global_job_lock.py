@@ -60,6 +60,7 @@ OPERATIONAL_SCRIPTS = [
     "scripts/run_scan.py",
     "scripts/settle_paper_positions.py",
     "scripts/update_paper_portfolio.py",
+    "scripts/process_approved_specialist_trades.py",
 ]
 
 

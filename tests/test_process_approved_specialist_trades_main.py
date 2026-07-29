@@ -161,6 +161,378 @@ def _argv(tmp_path: Path, *, db_path: Path | None = None) -> list[str]:
     ]
 
 
+def test_production_write_lifecycle_holds_one_outer_lock_through_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The production writer lifecycle is serialized before DB open through close."""
+    events: list[str] = []
+    db = _TempDatabase(tmp_path / "locked-lifecycle.db")
+    original_close = db.close
+
+    class ConnectionProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, *args, **kwargs):
+            return self._conn.execute(*args, **kwargs)
+
+        def commit(self):
+            events.append("commit")
+            return self._conn.commit()
+
+        def rollback(self):
+            events.append("rollback")
+            return self._conn.rollback()
+
+        def close(self):
+            return self._conn.close()
+
+    db.conn = ConnectionProxy(db.conn)
+
+    class TrackingLock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    def database_factory(_path):
+        assert events == ["lock_enter"]
+        events.append("db_open")
+        return db
+
+    def close():
+        events.append("db_close")
+        original_close()
+
+    db.close = close
+    monkeypatch.setattr(cli, "Database", database_factory)
+    monkeypatch.setattr(cli, "operational_job_lock", lambda *_a, **_k: TrackingLock())
+    monkeypatch.setattr(cli, "_is_production_db", lambda _path: True)
+    monkeypatch.setattr(cli, "get_approval", lambda *_a: SimpleNamespace(
+        enabled=True, revoked_at=None, wallet_address="0xwallet"
+    ))
+    monkeypatch.setattr(cli, "Settings", lambda: SimpleNamespace(
+        gamma_base_url="https://gamma.invalid", clob_base_url="https://clob.invalid",
+        data_api_base_url="https://data.invalid",
+    ))
+    monkeypatch.setattr(cli, "PolymarketPublicAdapter", _Adapter)
+
+    class Runner:
+        def run(self, awaitable):
+            return _REAL_RUNNER().run(awaitable)
+
+        def close(self):
+            events.append("runner_close")
+
+    monkeypatch.setattr(cli.asyncio, "Runner", Runner)
+
+    async def collect(_adapter, _wallet, *, gamma_resolver):
+        await gamma_resolver(CONDITION_ID)
+        return SimpleNamespace(accepted_rows=[SimpleNamespace(market_source_id=CONDITION_ID)])
+
+    import polycopy.ingestion.normalized_source_trade as normalized
+
+    monkeypatch.setattr(normalized, "normalize_source_trade", lambda *_a, **_k: SimpleNamespace(
+        source="polymarket_data_api_trades_user", source_trade_id=SOURCE_TRADE_ID
+    ))
+
+    def writer(database, _rows, **kwargs):
+        events.append("canonical_writer")
+        database.conn.execute(
+            "INSERT INTO source_trades(id, source_trade_id, source) VALUES (?, ?, ?)",
+            ("internal-1", SOURCE_TRADE_ID, "polymarket_data_api_trades_user"),
+        )
+        return SimpleNamespace(inserted=1)
+
+    async def enrich(*_args, **_kwargs):
+        events.append("enrichment")
+        return SimpleNamespace(enrichment_id="enrichment-1", status="complete")
+
+    def dispatch(_db, **kwargs):
+        assert kwargs["write_authorization"] is not None
+        events.append("dispatch_candidate_snapshot_decision")
+        return SimpleNamespace(
+            dispatch_id="dispatch-1", status="complete", candidate_id="candidate-1",
+            paper_signal_decision_id="decision-1", paper_signal_verdict="COPY",
+        )
+
+    monkeypatch.setattr(cli, "collect", collect)
+    monkeypatch.setattr(cli, "write_valid_rows", writer)
+    monkeypatch.setattr(cli, "enrich_source_trade_async", enrich)
+    monkeypatch.setattr(cli, "dispatch_one", dispatch)
+
+    assert cli.main([
+        "--approval-id", APPROVAL_ID, "--allow-live", "--write",
+        "--confirm-production-db", "--db-path", str(tmp_path / "production.db"),
+    ]) == 0
+    assert events == [
+        "lock_enter", "db_open", "canonical_writer", "enrichment",
+        "dispatch_candidate_snapshot_decision", "commit", "runner_close", "db_close", "lock_exit",
+    ]
+
+
+def test_production_lock_failure_does_not_open_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+
+    class UnavailableLock:
+        def __enter__(self):
+            events.append("lock_attempt")
+            raise cli.LockError(tmp_path / "ops.lock", 0.0)
+
+        def __exit__(self, *_args):
+            raise AssertionError("unavailable lock must not exit")
+
+    monkeypatch.setattr(cli, "operational_job_lock", lambda *_a, **_k: UnavailableLock())
+    monkeypatch.setattr(cli, "_is_production_db", lambda _path: True)
+    monkeypatch.setattr(cli, "Database", lambda _path: pytest.fail("database opened before lock"))
+
+    assert cli.main([
+        "--approval-id", APPROVAL_ID, "--allow-live", "--write",
+        "--confirm-production-db", "--db-path", str(tmp_path / "production.db"),
+    ]) == 3
+    assert events == ["lock_attempt"]
+
+
+def test_production_exception_rolls_back_and_closes_before_lock_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+    db = _TempDatabase(tmp_path / "rollback.db")
+    original_close = db.close
+
+    class ConnectionProxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def commit(self):
+            events.append("writer_commit")
+            return self._conn.commit()
+
+        def rollback(self):
+            events.append("rollback")
+            return self._conn.rollback()
+
+        def close(self):
+            return self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    db.conn = ConnectionProxy(db.conn)
+
+    class TrackingLock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    def database_factory(_path):
+        events.append("db_open")
+        return db
+
+    def close():
+        events.append("db_close")
+        original_close()
+        raise RuntimeError("db cleanup failure")
+
+    db.close = close
+    monkeypatch.setattr(cli, "operational_job_lock", lambda *_a, **_k: TrackingLock())
+    monkeypatch.setattr(cli, "_is_production_db", lambda _path: True)
+    monkeypatch.setattr(cli, "Database", database_factory)
+    monkeypatch.setattr(cli, "get_approval", lambda *_a: SimpleNamespace(
+        enabled=True, revoked_at=None, wallet_address="0xwallet"
+    ))
+    monkeypatch.setattr(cli, "Settings", lambda: SimpleNamespace(
+        gamma_base_url="https://gamma.invalid", clob_base_url="https://clob.invalid",
+        data_api_base_url="https://data.invalid",
+    ))
+
+    class FailingAdapter(_Adapter):
+        async def aclose(self) -> None:
+            events.append("adapter_close")
+            raise RuntimeError("adapter cleanup failure")
+
+    monkeypatch.setattr(cli, "PolymarketPublicAdapter", FailingAdapter)
+
+    class Runner:
+        def run(self, awaitable):
+            return _REAL_RUNNER().run(awaitable)
+
+        def close(self):
+            events.append("runner_close")
+            raise RuntimeError("runner cleanup failure")
+
+    async def collect(_adapter, _wallet, *, gamma_resolver):
+        await gamma_resolver(CONDITION_ID)
+        return SimpleNamespace(accepted_rows=[SimpleNamespace(market_source_id=CONDITION_ID)])
+
+    import polycopy.ingestion.normalized_source_trade as normalized
+
+    monkeypatch.setattr(normalized, "normalize_source_trade", lambda *_a, **_k: SimpleNamespace(
+        source="polymarket_data_api_trades_user", source_trade_id=SOURCE_TRADE_ID
+    ))
+
+    def writer(database, _rows, **_kwargs):
+        events.append("canonical_writer")
+        database.conn.execute(
+            "INSERT INTO source_trades(id, source_trade_id, source) VALUES (?, ?, ?)",
+            ("internal-1", SOURCE_TRADE_ID, "polymarket_data_api_trades_user"),
+        )
+        database.conn.commit()
+        return SimpleNamespace(inserted=1)
+
+    async def enrich(*_args, **_kwargs):
+        events.append("enrichment")
+        raise RuntimeError("enrichment failure")
+
+    monkeypatch.setattr(cli.asyncio, "Runner", Runner)
+    monkeypatch.setattr(cli, "collect", collect)
+    monkeypatch.setattr(cli, "write_valid_rows", writer)
+    monkeypatch.setattr(cli, "enrich_source_trade_async", enrich)
+    with pytest.raises(RuntimeError, match="enrichment failure"):
+        cli.main([
+            "--approval-id", APPROVAL_ID, "--allow-live", "--write",
+            "--confirm-production-db", "--db-path", str(tmp_path / "production.db"),
+        ])
+    assert events == [
+        "lock_enter", "db_open", "canonical_writer", "writer_commit", "enrichment",
+        "rollback", "adapter_close", "runner_close", "db_close", "lock_exit",
+    ]
+    check = sqlite3.connect(tmp_path / "rollback.db")
+    try:
+        assert check.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0] == 1
+    finally:
+        check.close()
+
+
+def test_cleanup_adapter_failure_still_closes_runner_and_database_before_release() -> None:
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    class Adapter:
+        def close(self):
+            events.append("adapter_close")
+            raise RuntimeError("adapter cleanup failure")
+
+    class Runner:
+        def close(self):
+            events.append("runner_close")
+
+    class Db:
+        def close(self):
+            events.append("db_close")
+
+    with pytest.raises(RuntimeError, match="adapter cleanup failure"), Lock():
+        cli._cleanup(Adapter(), Runner(), Db(), pipeline_error=None)
+    assert events == ["lock_enter", "adapter_close", "runner_close", "db_close", "lock_exit"]
+
+
+def test_cleanup_runner_failure_still_closes_database_before_release() -> None:
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    class Runner:
+        def close(self):
+            events.append("runner_close")
+            raise RuntimeError("runner cleanup failure")
+
+    class Db:
+        def close(self):
+            events.append("db_close")
+
+    with pytest.raises(RuntimeError, match="runner cleanup failure"), Lock():
+        cli._cleanup(None, Runner(), Db(), pipeline_error=None)
+    assert events == ["lock_enter", "runner_close", "db_close", "lock_exit"]
+
+
+def test_cleanup_database_close_failure_releases_only_after_close_attempt() -> None:
+    events: list[str] = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("lock_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("lock_exit")
+            return False
+
+    class Db:
+        def close(self):
+            events.append("db_close")
+            raise RuntimeError("db cleanup failure")
+
+    with pytest.raises(RuntimeError, match="db cleanup failure"), Lock():
+        cli._cleanup(None, None, Db(), pipeline_error=None)
+    assert events == ["lock_enter", "db_close", "lock_exit"]
+
+
+def test_dry_run_remains_logically_nonwriting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_cli_fakes(monkeypatch, tmp_path)
+    writer_calls: list[object] = []
+
+    def writer(*args, **kwargs):
+        writer_calls.append((args, kwargs))
+        raise AssertionError("dry-run must not persist a canonical source trade")
+
+    monkeypatch.setattr(cli, "write_valid_rows", writer)
+
+    async def collect(_adapter, _wallet, *, gamma_resolver):
+        await gamma_resolver(CONDITION_ID)
+        return SimpleNamespace(accepted_rows=[SimpleNamespace(market_source_id=CONDITION_ID)])
+
+    monkeypatch.setattr(cli, "collect", collect)
+    assert cli.main([
+        "--approval-id", APPROVAL_ID, "--allow-live",
+        "--db-path", str(tmp_path / "approved-specialist.db"),
+    ]) == 0
+    assert writer_calls == []
+    after_conn = sqlite3.connect(tmp_path / "approved-specialist.db")
+    try:
+        after = after_conn.execute("SELECT COUNT(*) FROM source_trades").fetchone()[0]
+    finally:
+        after_conn.close()
+    assert after == 0
+
+
+def test_production_confirmation_flags_reject_before_lock_or_database_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli, "_is_production_db", lambda _path: True)
+    monkeypatch.setattr(cli, "operational_job_lock", lambda *_a, **_k: pytest.fail("lock acquired"))
+    monkeypatch.setattr(cli, "Database", lambda _path: pytest.fail("database opened"))
+    assert cli.main([
+        "--approval-id", APPROVAL_ID, "--write", "--allow-live",
+        "--db-path", str(tmp_path / "production.db"),
+    ]) == 2
+
+
 def test_main_uses_one_runner_passes_materialized_gamma_mapping_and_closes_once(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

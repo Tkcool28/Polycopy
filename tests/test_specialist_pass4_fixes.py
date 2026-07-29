@@ -15,20 +15,27 @@ from __future__ import annotations
 from pathlib import Path
 
 from polycopy.db.database import Database
+from polycopy.engine.approved_specialist_dispatcher import dispatch_one as _dispatch_one
+from polycopy.engine.approved_wallet_trade_bridge import _issue_write_capability
 from polycopy.execution.specialist_spine import (
+    _current_exposure,
     consume_eligible_signal,
     create_execution_authorization,
     settle_specialist_position,
-    _current_exposure,
 )
-from polycopy.engine.approved_specialist_dispatcher import dispatch_one
+
+
+def dispatch_one(*args, **kwargs):
+    """Temp-DB harness supplies the explicit outer write capability."""
+    kwargs.setdefault("write_authorization", _issue_write_capability())
+    return _dispatch_one(*args, **kwargs)
 from tests.fixtures.specialist_paper_fixtures import (
     bridge_dependencies,
     create_approval_for_target,
     ingest_target_trade,
     make_target_trade,
-    seed_resolved_evidence,
     paper_runtime,
+    seed_resolved_evidence,
 )
 
 _REPO = Path(__file__).resolve().parents[1]
