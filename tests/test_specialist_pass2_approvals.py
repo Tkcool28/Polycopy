@@ -12,16 +12,23 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
 from polycopy.db.database import Database
+from polycopy.engine.approved_specialist_dispatcher import dispatch_one as _dispatch_one
+from polycopy.engine.approved_wallet_trade_bridge import _issue_write_capability
 from polycopy.execution.specialist_approval import (
     create_approval,
-    set_enabled,
     revoke_approval,
+    set_enabled,
 )
-from polycopy.engine.approved_specialist_dispatcher import dispatch_one
-from polycopy.monitoring.approved_wallet_monitor import load_active_approvals
 
+
+def dispatch_one(*args, **kwargs):
+    """Temp-DB harness supplies the explicit outer write capability."""
+    kwargs.setdefault("write_authorization", _issue_write_capability())
+    return _dispatch_one(*args, **kwargs)
+from polycopy.monitoring.approved_wallet_monitor import load_active_approvals
 from tests.fixtures.specialist_paper_fixtures import (
     FIXED_WALLET,
     SPECIALIST_CATEGORY,
@@ -47,6 +54,20 @@ def _make_db(tmp_path: Path) -> Database:
 def _deps():
     d = bridge_dependencies()
     return d.gamma.get_market, d.clob
+
+
+def test_non_dry_dispatch_requires_explicit_outer_write_authorization(tmp_path: Path):
+    """A direct caller cannot silently mint a bridge write capability."""
+    db = _make_db(tmp_path)
+    ing = ingest_target_trade(db)
+    aid = create_approval_for_target(db)
+    gamma, clob = _deps()
+    with pytest.raises(PermissionError, match="outer write authorization"):
+        _dispatch_one(
+            db, approval_id=aid, source_trade_internal_id=ing["source_trade_internal_id"],
+            gamma_resolver=gamma, clob_provider=clob, dry_run=False,
+        )
+    assert _count(db, "approved_specialist_trade_dispatches") == 0
 
 
 # ───────────────────────────── positive ─────────────────────────────

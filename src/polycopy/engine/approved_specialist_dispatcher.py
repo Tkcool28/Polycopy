@@ -39,7 +39,6 @@ from polycopy.ingestion.source_trade_provenance import (
 )
 from polycopy.engine.approved_wallet_trade_bridge import (
     BridgeDependencies,
-    _issue_write_capability,
     process_approved_wallet_trades,
 )
 
@@ -228,6 +227,7 @@ def dispatch_one(
     clob_provider: Optional[Any] = None,
     dry_run: bool = False,
     formula_version: str = "1",
+    write_authorization: object | None = None,
 ) -> DispatchResult:
     """Dispatch exactly one approved source trade through enrichment + bridge.
 
@@ -301,6 +301,10 @@ def dispatch_one(
             paper_signal_verdict=None,
             reason_codes=["dry_run"], wrote=False, created=False,
         )
+    if write_authorization is None:
+        raise PermissionError(
+            "dispatch_one requires an outer write authorization for non-dry-run dispatch"
+        )
     dispatch_id = _create_dispatch(
         db, approval.approval_id, st_id,
         wallet=approval.wallet_address, category=approval.specialist_category,
@@ -361,7 +365,10 @@ def dispatch_one(
 
     rep = process_approved_wallet_trades(
         db, wallet=wallet, limit=1, dependencies=deps,
-        write=True, write_authorization=_issue_write_capability(),
+        write=True,
+        # The caller owns the production lifecycle and supplies its existing
+        # opaque bridge capability; this dispatcher never mints one.
+        write_authorization=write_authorization,
         source_trade_id=stored_sid, evaluate_canonical_decisions=True,
     )
     rows = rep.as_dict().get("rows", [])
@@ -467,6 +474,7 @@ def dispatch_batch(
     clob_provider: Optional[Any] = None,
     dry_run: bool = False,
     formula_version: str = "1",
+    write_authorization: object | None = None,
 ) -> list[DispatchResult]:
     """Bounded batch dispatcher. With an explicit source_trade_internal_id, the
     limit is forced to 1. Otherwise dispatches up to ``limit`` undispatched
@@ -475,13 +483,14 @@ def dispatch_batch(
         return [dispatch_one(
             db, approval_id=approval_id, source_trade_internal_id=source_trade_internal_id,
             gamma_resolver=gamma_resolver, dry_run=dry_run,
-            formula_version=formula_version,
+            formula_version=formula_version, write_authorization=write_authorization,
         )]
     results: list[DispatchResult] = []
     for _ in range(max(1, limit)):
         res = dispatch_one(
             db, approval_id=approval_id, gamma_resolver=gamma_resolver,
             dry_run=dry_run, formula_version=formula_version,
+            write_authorization=write_authorization,
         )
         results.append(res)
         if res.status in (DISPATCH_FAILED, DISPATCH_ENRICHMENT_INCOMPLETE) or not res.dispatch_id:

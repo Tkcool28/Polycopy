@@ -22,7 +22,14 @@ from polycopy.execution.specialist_spine import (
     create_execution_authorization,
     ExecutionRuntime,
 )
-from polycopy.engine.approved_specialist_dispatcher import dispatch_one
+from polycopy.engine.approved_specialist_dispatcher import dispatch_one as _dispatch_one
+from polycopy.engine.approved_wallet_trade_bridge import _issue_write_capability
+
+
+def dispatch_one(*args, **kwargs):
+    """Temp-DB harness supplies the explicit outer write capability."""
+    kwargs.setdefault("write_authorization", _issue_write_capability())
+    return _dispatch_one(*args, **kwargs)
 from tests.fixtures.specialist_paper_fixtures import (
     bridge_dependencies,
     create_approval_for_target,
