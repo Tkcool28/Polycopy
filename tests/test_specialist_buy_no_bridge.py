@@ -15,6 +15,8 @@ No production DB is touched; each case uses an isolated temp DB.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from polycopy.db.database import Database
 from polycopy.engine.approved_wallet_trade_bridge import (
     _issue_write_capability,
@@ -44,9 +46,18 @@ def _insert_source_trade(db: Database, *, side: str, outcome: str | None, token:
             (id, source, source_trade_id, market_source_id, side, outcome,
              quantity, price, trader_address, timestamp, is_sample, token_id)
         VALUES (?, 'polymarket_data_api_trades_user', ?, ?, ?, ?, 10.0, 0.4,
-                ?, '2026-07-14T11:30:00+00:00', 0, ?)
+                ?, ?, 0, ?)
         """,
-        (st_id, public, _YES_TOKEN, side, outcome if outcome is not None else "", FIXED_WALLET, token),
+        (
+            st_id,
+            public,
+            _YES_TOKEN,
+            side,
+            outcome if outcome is not None else "",
+            FIXED_WALLET,
+            datetime.now(UTC).isoformat(),
+            token,
+        ),
     )
     db.conn.commit()
     return st_id, public
