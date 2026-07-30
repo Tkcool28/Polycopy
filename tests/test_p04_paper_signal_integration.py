@@ -99,6 +99,8 @@ def _strong_wallet_result(wallet_id: str) -> WalletScoreResult:
         # PR24E: category_resolved_markets is required for a real
         # wallet verdict. Without it the helper promotes to INCOMPLETE.
         category_resolved_markets=20,
+        category_distinct_events=12,
+        category_active_days=14,
     )
     return compute_wallet_score_v1(input=inp)
 
@@ -203,18 +205,21 @@ def _persist_category(
             source_data_timestamp=source_data_timestamp,
         )
     elif verdict_str == "watchlist":
-        # Strong score but failed category gate.
+        # Score in WATCHLIST range (55-74) with all category gates
+        # passing. A high score with failed gates now produces
+        # INCOMPLETE under the corrected contract, so WATCHLIST
+        # requires sufficient evidence + moderate score.
         inp = CategoryWalletScoreInputV1(
             wallet_id=wallet_id,
             category_label=category,
-            info_score=0.95, win_rate=0.85, profit_factor=2.2,
-            trade_intervals_std=600.0, trade_count=300,
-            max_drawdown=0.05, sharpe_ratio=2.9,
+            info_score=0.55, win_rate=0.40, profit_factor=1.5,
+            trade_intervals_std=600.0, trade_count=200,
+            max_drawdown=0.20, sharpe_ratio=1.0,
             sample_fraction=0.0,
-            category_trade_count=280, category_distinct_markets=20,
-            overall_trade_count=300,
-            largest_winner_share=0.10, top_3_concentration=0.30,
-            category_resolved_markets=10,  # < 15
+            category_trade_count=50, category_distinct_markets=4,
+            overall_trade_count=200,
+            largest_winner_share=0.10, top_3_concentration=0.40,
+            category_resolved_markets=20,
             category_distinct_events=12,
             category_active_days=14,
             source_data_timestamp=source_data_timestamp,

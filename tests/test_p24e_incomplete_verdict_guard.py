@@ -794,6 +794,8 @@ class TestPR27NoSilentSkip:
             trade_count=150,
             resolved_markets=50,
             category_resolved_markets=20,
+            category_distinct_events=12,
+            category_active_days=14,
             active_trading_days=30,
             distinct_events=20,
             sample_fraction=0.20,

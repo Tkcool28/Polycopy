@@ -21,6 +21,7 @@ Verdict rules (frozen):
 - 55.0000–74.9999  → WATCHLIST
 - below 55          → SKIP
 - Missing essential evidence or missing essential gate value → INCOMPLETE
+- Any category gate below the minimum                     → INCOMPLETE
 
 Category-eligibility gates for COPY_CANDIDATE (frozen):
 - 15 resolved category markets
@@ -29,7 +30,7 @@ Category-eligibility gates for COPY_CANDIDATE (frozen):
 
 Behavior:
 - Score >= 75 AND every category gate passes → COPY_CANDIDATE
-- Score >= 75 but any category gate fails     → WATCHLIST (NOT COPY_CANDIDATE)
+- Score >= 75 but any category gate fails     → INCOMPLETE (NOT WATCHLIST)
 - Score 55 .. < 75                             → WATCHLIST
 - Score < 55                                   → SKIP
 - Any missing essential input or missing gate value → INCOMPLETE

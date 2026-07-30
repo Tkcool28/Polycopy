@@ -454,6 +454,8 @@ class TestWalletScoreV1Verdicts:
             sample_fraction=0.20,
             sharpe_ratio=0.5,
             max_drawdown=0.30,
+            category_distinct_events=12,
+            category_active_days=14,
         )
         assert result.verdict == WalletVerdict.SKIP
 

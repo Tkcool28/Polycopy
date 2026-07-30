@@ -679,10 +679,13 @@ def compute_wallet_score_v1(
     # The score gate is NOT an evidence gate — a low score is a quality
     # verdict (WATCHLIST/SKIP), not an evidence gap (INCOMPLETE).
     # We evaluate evidence gates separately from the score gate by
-    # checking for any non-score gate failures.
+    # checking for any non-score gate failures. Category evidence gate
+    # failures are ALSO evidence gaps that force INCOMPLETE — a wallet
+    # with insufficient category evidence cannot be SKIP'd on score
+    # alone; it must be INCOMPLETE.
     evidence_gates_pass = not any(
         not f.startswith("score") for f in wallet_qual.gate_failures
-    )
+    ) and not cat_failures
     if not evidence_gates_pass:
         # Evidence gates fail (missing or below minimum) → INCOMPLETE
         verdict = WalletVerdict.INCOMPLETE
