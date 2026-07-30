@@ -40,7 +40,9 @@ export function PaperOrdersPage() {
       <Card title="Paper Order Preview" badge="PAPER MANUAL">
         <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: 12 }}>
           Preview shows estimated fill, fees, and total cost. No real trade is executed.
-          All orders require explicit approval in paper_manual mode.
+          This page is read-only: legacy pending orders cannot be approved or
+          rejected here. Canonical specialist authorization and execution occur
+          through the separate canonical specialist workflow.
         </p>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '8px', marginBottom: 12 }}>
           <label style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
