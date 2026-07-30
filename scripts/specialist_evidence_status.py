@@ -43,13 +43,21 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
         sys.path.insert(0, str(_cand))
 
 from evidence_db import (  # noqa: E402
-    DbConn,
     FORBIDDEN_EXECUTION_TABLES,
     REQUIRED_SCHEMA_VERSION,
+    DbConn,
     open_readonly,
 )
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
+from polycopy.scoring.specialist_qualification_contract import (  # noqa: E402
+    CATEGORY_MIN_ACTIVE_DAYS,
+    CATEGORY_MIN_DISTINCT_EVENTS,
+    CATEGORY_MIN_RESOLVED_MARKETS,
+    WALLET_MIN_ACTIVE_TRADING_DAYS,
+    WALLET_MIN_DISTINCT_EVENTS,
+    WALLET_MIN_RESOLVED_MARKETS,
+)
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     CATEGORY_TAXONOMY_PARTIAL,
     CATEGORY_TAXONOMY_USABLE,
@@ -60,25 +68,15 @@ from polycopy.scoring.wallet_evidence import (  # noqa: E402
     resolve_category_score_v1,
     resolve_wallet_score_v1,
 )
-from polycopy.scoring.wallet_score_v1 import (  # noqa: E402
-    GLOBAL_MIN_ACTIVE_TRADING_DAYS,
-    GLOBAL_MIN_DISTINCT_EVENTS,
-    GLOBAL_MIN_RESOLVED_MARKETS,
-)
-from polycopy.scoring.category_wallet_score_v1 import (  # noqa: E402
-    CATEGORY_MIN_ACTIVE_DAYS,
-    CATEGORY_MIN_DISTINCT_EVENTS,
-    CATEGORY_MIN_RESOLVED_MARKETS,
-)
 
 # Execution-plane (and approval/dispatch) tables whose row counts MUST be zero
 # in the research plane. Any non-zero count forces RED (unexpected artifact).
 _EXECUTION_PLANE_TABLES = FORBIDDEN_EXECUTION_TABLES
 
 WALLET_GATES = {
-    "resolved_markets": GLOBAL_MIN_RESOLVED_MARKETS,
-    "active_trading_days": GLOBAL_MIN_ACTIVE_TRADING_DAYS,
-    "distinct_events": GLOBAL_MIN_DISTINCT_EVENTS,
+    "resolved_markets": WALLET_MIN_RESOLVED_MARKETS,
+    "active_trading_days": WALLET_MIN_ACTIVE_TRADING_DAYS,
+    "distinct_events": WALLET_MIN_DISTINCT_EVENTS,
 }
 CATEGORY_GATES = {
     "category_resolved_markets": CATEGORY_MIN_RESOLVED_MARKETS,
@@ -128,18 +126,32 @@ def _count_forbidden(db: DbConn, table: str) -> int:
 
 
 def _distance_to_gates(evidence: Any, gates: dict[str, int]) -> dict[str, Any]:
-    """Return remaining distance to each frozen gate (0 when met)."""
+    """Return remaining distance to each frozen gate (0 when met).
+
+    Missing values (None) are reported as ``value=None`` with
+    ``met=False`` — they are NOT treated as zero. This ensures the
+    status monitor's gate-distance reporting is consistent with the
+    evaluator's fail-closed treatment of missing evidence.
+    """
     out: dict[str, Any] = {}
     for key, minimum in gates.items():
         value = getattr(evidence, key, None)
-        v = value if isinstance(value, int) else 0
-        remaining = max(0, minimum - v)
-        out[key] = {
-            "minimum": minimum,
-            "value": v,
-            "remaining": remaining,
-            "met": remaining == 0,
-        }
+        if value is None:
+            out[key] = {
+                "minimum": minimum,
+                "value": None,
+                "remaining": minimum,
+                "met": False,
+            }
+        else:
+            v = value if isinstance(value, int) else 0
+            remaining = max(0, minimum - v)
+            out[key] = {
+                "minimum": minimum,
+                "value": v,
+                "remaining": remaining,
+                "met": remaining == 0,
+            }
     return out
 
 
