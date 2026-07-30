@@ -37,7 +37,10 @@ from polycopy.scoring.specialist_qualification_contract import (
     WALLET_MIN_DISTINCT_EVENTS,
     WALLET_MIN_RESOLVED_MARKETS,
     WALLET_SCORE_THRESHOLD,
+    CategoryQualification,
+    WalletQualification,
     evaluate_category_qualification,
+    evaluate_usable_specialist,
     evaluate_wallet_qualification,
 )
 from polycopy.scoring.wallet_score_v1 import (
@@ -835,3 +838,322 @@ class TestSharedContract:
         assert CATEGORY_MIN_RESOLVED_MARKETS == 15
         assert CATEGORY_MIN_DISTINCT_EVENTS == 8
         assert CATEGORY_MIN_ACTIVE_DAYS == 10
+
+
+# ── Usable specialist composition (Finding 1) ──────────────────────────────
+
+
+def _qualifying_wallet_q() -> WalletQualification:
+    """Wallet qualification with all gates passing."""
+    return evaluate_wallet_qualification(
+        score=85.0,
+        resolved_markets=50,
+        active_trading_days=30,
+        distinct_events=20,
+    )
+
+
+def _qualifying_category_q(label: str = "crypto") -> CategoryQualification:
+    """Category qualification with all gates passing."""
+    return evaluate_category_qualification(
+        score=85.0,
+        category_resolved_markets=20,
+        category_distinct_events=12,
+        category_active_days=14,
+        label=label,
+    )
+
+
+def _failing_category_q(label: str = "politics") -> CategoryQualification:
+    """Category qualification with score < 75."""
+    return evaluate_category_qualification(
+        score=60.0,
+        category_resolved_markets=20,
+        category_distinct_events=12,
+        category_active_days=14,
+        label=label,
+    )
+
+
+class TestUsableSpecialistComposition:
+    """Tests for evaluate_usable_specialist (Finding 1)."""
+
+    def test_wallet_qualifies_no_category_results(self):
+        """Wallet qualifies but no category evaluations exist."""
+        wq = _qualifying_wallet_q()
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=None
+        )
+        assert not result.usable
+        assert result.wallet_qualified
+        assert len(result.qualifying_category_labels) == 0
+        assert "no_category_qualifications" in result.reasons
+
+    def test_wallet_qualifies_empty_category_results(self):
+        """Wallet qualifies but no categories were evaluated."""
+        wq = _qualifying_wallet_q()
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[]
+        )
+        assert not result.usable
+        assert result.wallet_qualified
+        assert "no_category_qualifications" in result.reasons
+
+    def test_category_evidence_passes_score_fails(self):
+        """Category evidence passes but score is below 75."""
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=60.0,
+            category_resolved_markets=20,
+            category_distinct_events=12,
+            category_active_days=14,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert result.wallet_qualified
+        assert len(result.qualifying_category_labels) == 0
+        assert "no_qualifying_category" in result.reasons
+
+    def test_one_category_watchlist(self):
+        """Wallet qualifies, one category is WATCHLIST (score 55-74)."""
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=65.0,
+            category_resolved_markets=20,
+            category_distinct_events=12,
+            category_active_days=14,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert "no_qualifying_category" in result.reasons
+
+    def test_one_category_skip(self):
+        """Wallet qualifies, one category is SKIP (score < 55)."""
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=30.0,
+            category_resolved_markets=20,
+            category_distinct_events=12,
+            category_active_days=14,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert "no_qualifying_category" in result.reasons
+
+    def test_one_category_incomplete(self):
+        """Wallet qualifies, one category is INCOMPLETE (missing evidence)."""
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=85.0,
+            category_resolved_markets=None,
+            category_distinct_events=12,
+            category_active_days=14,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert "no_qualifying_category" in result.reasons
+
+    def test_one_category_copy_candidate(self):
+        """Wallet qualifies, one category is COPY_CANDIDATE."""
+        wq = _qualifying_wallet_q()
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert result.usable
+        assert result.wallet_qualified
+        assert "crypto" in result.qualifying_category_labels
+        assert len(result.reasons) == 0
+
+    def test_one_passes_one_fails(self):
+        """Wallet qualifies, one category passes and another fails."""
+        wq = _qualifying_wallet_q()
+        cat_ok = _qualifying_category_q("crypto")
+        cat_fail = _failing_category_q("politics")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq,
+            category_qualifications=[cat_ok, cat_fail],
+        )
+        assert result.usable
+        assert "crypto" in result.qualifying_category_labels
+        assert "politics" not in result.qualifying_category_labels
+
+    def test_category_qualifies_wallet_fails(self):
+        """Category qualifies but wallet does not."""
+        wq = evaluate_wallet_qualification(
+            score=60.0,
+            resolved_markets=50,
+            active_trading_days=30,
+            distinct_events=20,
+        )
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert not result.wallet_qualified
+        assert "wallet_not_qualified" in result.reasons
+
+    def test_parent_copy_candidate_cannot_manufacture_category(self):
+        """Parent wallet COPY_CANDIDATE cannot manufacture category qualification."""
+        wq = _qualifying_wallet_q()
+        # No category results at all
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=None
+        )
+        assert not result.usable
+        assert "no_category_qualifications" in result.reasons
+
+    def test_evidence_counts_without_score_qualification(self):
+        """Passing category evidence counts without score cannot qualify."""
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=70.0,  # < 75
+            category_resolved_markets=20,
+            category_distinct_events=12,
+            category_active_days=14,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert "no_qualifying_category" in result.reasons
+
+    def test_missing_category_score_fails_closed(self):
+        """Missing category score fails closed."""
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=None,
+            category_resolved_markets=20,
+            category_distinct_events=12,
+            category_active_days=14,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+
+    def test_repeated_composition_is_deterministic(self):
+        """Repeated composition with identical inputs is deterministic."""
+        wq = _qualifying_wallet_q()
+        cats = [_qualifying_category_q("a"), _qualifying_category_q("b")]
+        r1 = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=cats
+        )
+        r2 = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=cats
+        )
+        assert r1.usable == r2.usable
+        assert r1.qualifying_category_labels == r2.qualifying_category_labels
+        assert r1.reasons == r2.reasons
+
+
+# ── Stale-decision behavior (Finding 2) ────────────────────────────────────
+
+
+class TestStaleDecisionBehavior:
+    """Stale positive decisions must fail closed when current evidence is
+    missing, below threshold, changed, or cannot be validated."""
+
+    def test_stale_wallet_positive_current_category_positive(self):
+        """Stale wallet COPY_CANDIDATE + current category COPY_CANDIDATE
+        does NOT qualify — the wallet evidence is not current."""
+        # Current wallet: not qualified (missing evidence)
+        current_wallet = evaluate_wallet_qualification(
+            score=None,
+            resolved_markets=None,
+            active_trading_days=None,
+            distinct_events=None,
+        )
+        # Current category: qualified
+        current_cat = _qualifying_category_q("crypto")
+
+        result = evaluate_usable_specialist(
+            wallet_qualification=current_wallet,
+            category_qualifications=[current_cat],
+        )
+        assert not result.usable
+        assert "wallet_not_qualified" in result.reasons
+
+    def test_current_wallet_positive_stale_category_positive(self):
+        """Current wallet COPY_CANDIDATE + stale category COPY_CANDIDATE
+        does NOT qualify — the category evidence is not current."""
+        current_wallet = _qualifying_wallet_q()
+        # Current category: not qualified (missing evidence)
+        current_cat = evaluate_category_qualification(
+            score=None,
+            category_resolved_markets=None,
+            category_distinct_events=None,
+            category_active_days=None,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=current_wallet,
+            category_qualifications=[current_cat],
+        )
+        assert not result.usable
+        assert "no_qualifying_category" in result.reasons
+
+    def test_both_stale_positive(self):
+        """Both stale positive does not qualify."""
+        current_wallet = evaluate_wallet_qualification(
+            score=None,
+            resolved_markets=None,
+            active_trading_days=None,
+            distinct_events=None,
+        )
+        current_cat = evaluate_category_qualification(
+            score=None,
+            category_resolved_markets=None,
+            category_distinct_events=None,
+            category_active_days=None,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=current_wallet,
+            category_qualifications=[current_cat],
+        )
+        assert not result.usable
+
+    def test_historical_positive_current_evidence_below_threshold(self):
+        """Historical positive cannot substitute for current evidence
+        below threshold."""
+        current_wallet = _qualifying_wallet_q()
+        # Below threshold category evidence
+        current_cat = evaluate_category_qualification(
+            score=85.0,
+            category_resolved_markets=5,  # < 15
+            category_distinct_events=12,
+            category_active_days=14,
+            label="crypto",
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=current_wallet,
+            category_qualifications=[current_cat],
+        )
+        assert not result.usable
+        assert "no_qualifying_category" in result.reasons
+
+    def test_no_current_category_evaluations_fails_closed(self):
+        """Absence of current category evaluations fails closed."""
+        current_wallet = _qualifying_wallet_q()
+        result = evaluate_usable_specialist(
+            wallet_qualification=current_wallet,
+            category_qualifications=None,
+        )
+        assert not result.usable
+        assert "no_category_qualifications" in result.reasons

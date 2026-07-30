@@ -123,12 +123,15 @@ class CategoryQualification:
     ``gate_failures`` is always ordered by :data:`CATEGORY_GATE_ORDER`.
     ``score`` is the numeric score used for the threshold check (may be
     None when score evidence is missing).
+    ``label`` is the category label (e.g. ``"crypto"``) when known,
+    ``"unknown"`` otherwise.
     """
 
     qualified: bool
     score: float | None
     gate_failures: tuple[str, ...] = field(default_factory=tuple)
     missing_evidence: tuple[str, ...] = field(default_factory=tuple)
+    label: str = "unknown"
 
 
 def evaluate_wallet_qualification(
@@ -208,6 +211,7 @@ def evaluate_category_qualification(
     category_resolved_markets: int | None,
     category_distinct_events: int | None,
     category_active_days: int | None,
+    label: str = "unknown",
 ) -> CategoryQualification:
     """Evaluate category qualification against the frozen contract.
 
@@ -252,6 +256,7 @@ def evaluate_category_qualification(
         score=score,
         gate_failures=ordered_reasons,
         missing_evidence=missing,
+        label=label,
     )
 
 
@@ -294,6 +299,91 @@ def _sort_category_failures(
     return sorted(failures, key=lambda f: rank.get(f.gate, len(rank)))
 
 
+# ── Usable-specialist composition ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class UsableSpecialistResult:
+    """Result of evaluating whether a wallet is a usable category specialist.
+
+    ``usable`` is True only when:
+      - the wallet independently qualifies (wallet-level COPY_CANDIDATE); and
+      - at least one category independently qualifies (category-level
+        COPY_CANDIDATE).
+
+    ``wallet_qualified`` is the wallet-level qualification result.
+    ``qualifying_category_labels`` are the category labels that independently
+    qualified (empty when none qualify).
+    ``reasons`` are deterministic failure reasons when ``usable`` is False.
+    """
+
+    usable: bool
+    wallet_qualified: bool
+    qualifying_category_labels: tuple[str, ...] = field(default_factory=tuple)
+    reasons: tuple[str, ...] = field(default_factory=tuple)
+
+
+def evaluate_usable_specialist(
+    *,
+    wallet_qualification: WalletQualification,
+    category_qualifications: Sequence[CategoryQualification] | None = None,
+) -> UsableSpecialistResult:
+    """Evaluate whether a wallet is a usable category specialist.
+
+    A wallet is a usable specialist ONLY when:
+      1. The wallet independently qualifies (wallet-level COPY_CANDIDATE).
+      2. At least one current category independently qualifies (category-level
+         COPY_CANDIDATE).
+
+    Category qualification is NEVER inferred from the parent wallet status.
+    Passing category evidence counts alone (without category score >= 75)
+    is NOT sufficient for usable specialist status.
+
+    ``category_qualifications`` may be None (no category results exist) or
+    an empty sequence (no categories evaluated). Both fail closed.
+    """
+    reasons: list[str] = []
+
+    if not wallet_qualification.qualified:
+        reasons.append("wallet_not_qualified")
+        return UsableSpecialistResult(
+            usable=False,
+            wallet_qualified=False,
+            qualifying_category_labels=(),
+            reasons=tuple(reasons),
+        )
+
+    if category_qualifications is None or len(category_qualifications) == 0:
+        reasons.append("no_category_qualifications")
+        return UsableSpecialistResult(
+            usable=False,
+            wallet_qualified=True,
+            qualifying_category_labels=(),
+            reasons=tuple(reasons),
+        )
+
+    qualifying_labels: list[str] = []
+    for cat_qual in category_qualifications:
+        if cat_qual.qualified:
+            qualifying_labels.append(getattr(cat_qual, "label", "unknown"))
+
+    if not qualifying_labels:
+        reasons.append("no_qualifying_category")
+        return UsableSpecialistResult(
+            usable=False,
+            wallet_qualified=True,
+            qualifying_category_labels=(),
+            reasons=tuple(reasons),
+        )
+
+    return UsableSpecialistResult(
+        usable=True,
+        wallet_qualified=True,
+        qualifying_category_labels=tuple(sorted(qualifying_labels)),
+        reasons=(),
+    )
+
+
 __all__ = [
     "CATEGORY_GATE_ORDER",
     "CATEGORY_MIN_ACTIVE_DAYS",
@@ -307,8 +397,10 @@ __all__ = [
     "WALLET_SCORE_THRESHOLD",
     "CategoryGateFailure",
     "CategoryQualification",
+    "UsableSpecialistResult",
     "WalletGateFailure",
     "WalletQualification",
     "evaluate_category_qualification",
+    "evaluate_usable_specialist",
     "evaluate_wallet_qualification",
 ]
