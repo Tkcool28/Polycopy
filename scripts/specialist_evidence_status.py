@@ -57,6 +57,10 @@ from polycopy.scoring.specialist_qualification_contract import (  # noqa: E402
     WALLET_MIN_ACTIVE_TRADING_DAYS,
     WALLET_MIN_DISTINCT_EVENTS,
     WALLET_MIN_RESOLVED_MARKETS,
+    CategoryQualification,
+    evaluate_category_qualification,
+    evaluate_usable_specialist,
+    evaluate_wallet_qualification,
 )
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     CATEGORY_TAXONOMY_PARTIAL,
@@ -582,6 +586,8 @@ def build_wallet_status(
                 cat_result is not None
                 and cat_result.verdict == WalletVerdict.COPY_CANDIDATE
             ),
+            "_result": cat_result,
+            "_evidence": cat_ev,
         })
 
     best_category = _select_best_category(category_results)
@@ -641,23 +647,56 @@ def build_wallet_status(
     if coll_yellow and not coll_reason:
         yellow_reasons.append("collector_not_yet_collected")
 
-    # Determine state.
-    is_green = (
-        wallet_verdict == WalletVerdict.COPY_CANDIDATE.value
-        and best_category is not None
-        and best_category["verdict"] == WalletVerdict.COPY_CANDIDATE.value
+    # ── Shared contract composition ────────────────────────────────────────
+    # Convert current wallet evidence into the shared qualification contract.
+    wallet_qual = evaluate_wallet_qualification(
+        score=wallet_result.score if wallet_result is not None else None,
+        resolved_markets=wallet_ev.resolved_markets,
+        active_trading_days=wallet_ev.active_trading_days,
+        distinct_events=wallet_ev.distinct_events,
     )
-    score_pair_candidate = is_green
+
+    # Convert current category results into shared qualification objects.
+    cat_quals: list[CategoryQualification] = []
+    for cat_entry in category_results:
+        cat_result_obj = cat_entry.get("_result")
+        cat_ev_obj = cat_entry.get("_evidence")
+        if cat_result_obj is not None and cat_ev_obj is not None:
+            cat_quals.append(
+                evaluate_category_qualification(
+                    score=cat_result_obj.score,
+                    category_resolved_markets=cat_ev_obj.resolved_markets,
+                    category_distinct_events=cat_ev_obj.distinct_events,
+                    category_active_days=cat_ev_obj.active_trading_days,
+                    label=cat_entry["category_label"],
+                )
+            )
+
+    # Evaluate usable specialist via the shared composition helper.
+    specialist_result = evaluate_usable_specialist(
+        wallet_qualification=wallet_qual,
+        category_qualifications=cat_quals if cat_quals else None,
+    )
+
+    # Determine state.
+    # RED reasons (sample, execution, integrity, collector, refresh, conflicts)
+    # take priority regardless of the composition result.
     if reasons:
         state = "RED"
-    elif score_pair_candidate:
+    elif specialist_result.usable:
         state = "GREEN"
     else:
         state = "YELLOW"
 
     # ready_for_human_review is derived from the FINAL state, never directly
-    # from score_pair_candidate (S6 §2).
+    # from the composition result (S6 §2).
     ready_for_human_review = (state == "GREEN")
+
+    # Build the output payload. Strip internal fields from category_results.
+    clean_category_results = []
+    for entry in category_results:
+        clean = {k: v for k, v in entry.items() if not k.startswith("_")}
+        clean_category_results.append(clean)
 
     return {
         "wallet_id": wallet_id,
@@ -698,8 +737,14 @@ def build_wallet_status(
             "persisted": wallet_res.persisted,
         },
         "wallet_gate_distance": wallet_gate_distance,
-        "current_category_results": category_results,
+        "current_category_results": clean_category_results,
         "selected_best_category": best_category,
+        "usable_specialist": {
+            "usable": specialist_result.usable,
+            "wallet_qualified": specialist_result.wallet_qualified,
+            "qualifying_category_labels": list(specialist_result.qualifying_category_labels),
+            "reasons": list(specialist_result.reasons),
+        },
         "refresh_detail": refresh_detail,
         "last_collection_at": watch.get("last_collection_at"),
         "approval_created": False,

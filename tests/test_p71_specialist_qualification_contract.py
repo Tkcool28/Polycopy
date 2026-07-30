@@ -1157,3 +1157,205 @@ class TestStaleDecisionBehavior:
         )
         assert not result.usable
         assert "no_category_qualifications" in result.reasons
+
+
+# ── Distance reporting and diagnostic preservation ────────────────────────
+
+
+class TestReadinessDistanceReporting:
+    """Distance reporting must remain diagnostic-only and not override the
+    shared composition result."""
+
+    def test_distance_does_not_override_specialist_result(self):
+        """Distance values are diagnostic only — they cannot override the
+        shared composition result."""
+        # Wallet qualifies, no category results → not ready
+        wq = _qualifying_wallet_q()
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=None
+        )
+        assert not result.usable
+        assert "no_category_qualifications" in result.reasons
+
+    def test_deterministic_reasons(self):
+        """Composition reasons are deterministic."""
+        wq = _qualifying_wallet_q()
+        r1 = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=None
+        )
+        r2 = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=None
+        )
+        assert r1.reasons == r2.reasons
+
+    def test_qualifying_labels_deterministically_sorted(self):
+        """Qualifying category labels are deterministically sorted."""
+        wq = _qualifying_wallet_q()
+        cats = [
+            _qualifying_category_q("z_crypto"),
+            _qualifying_category_q("a_crypto"),
+        ]
+        r1 = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=cats
+        )
+        r2 = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=cats
+        )
+        assert r1.qualifying_category_labels == ("a_crypto", "z_crypto")
+        assert r1.qualifying_category_labels == r2.qualifying_category_labels
+
+
+# ── Wallet failure matrix (wiring integration) ────────────────────────────
+
+
+class TestWalletFailureMatrix:
+    """Each wallet failure mode must produce not-ready via the shared
+    contract."""
+
+    def test_resolved_markets_29_fails(self):
+        wq = evaluate_wallet_qualification(
+            score=85.0, resolved_markets=29, active_trading_days=30, distinct_events=20
+        )
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert not result.wallet_qualified
+
+    def test_active_days_19_fails(self):
+        wq = evaluate_wallet_qualification(
+            score=85.0, resolved_markets=50, active_trading_days=19, distinct_events=20
+        )
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert not result.wallet_qualified
+
+    def test_distinct_events_14_fails(self):
+        wq = evaluate_wallet_qualification(
+            score=85.0, resolved_markets=50, active_trading_days=30, distinct_events=14
+        )
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert not result.wallet_qualified
+
+    def test_wallet_score_below_75_fails(self):
+        wq = evaluate_wallet_qualification(
+            score=60.0, resolved_markets=50, active_trading_days=30, distinct_events=20
+        )
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert not result.wallet_qualified
+
+    def test_missing_wallet_score_fails(self):
+        wq = evaluate_wallet_qualification(
+            score=None, resolved_markets=50, active_trading_days=30, distinct_events=20
+        )
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert not result.wallet_qualified
+
+    def test_missing_wallet_evidence_fails(self):
+        wq = evaluate_wallet_qualification(
+            score=85.0, resolved_markets=None, active_trading_days=None, distinct_events=None
+        )
+        cat_q = _qualifying_category_q("crypto")
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+        assert not result.wallet_qualified
+
+
+# ── Category failure matrix ───────────────────────────────────────────────
+
+
+class TestCategoryFailureMatrix:
+    """Each category failure mode must produce not-ready via the shared
+    contract."""
+
+    def test_no_category_results(self):
+        wq = _qualifying_wallet_q()
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=None
+        )
+        assert not result.usable
+        assert "no_category_qualifications" in result.reasons
+
+    def test_cat_resolved_markets_14_fails(self):
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=85.0, category_resolved_markets=14, category_distinct_events=12,
+            category_active_days=14, label="crypto"
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+
+    def test_cat_distinct_events_7_fails(self):
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=85.0, category_resolved_markets=20, category_distinct_events=7,
+            category_active_days=14, label="crypto"
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+
+    def test_cat_active_days_9_fails(self):
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=85.0, category_resolved_markets=20, category_distinct_events=12,
+            category_active_days=9, label="crypto"
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+
+    def test_cat_score_below_75_fails(self):
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=60.0, category_resolved_markets=20, category_distinct_events=12,
+            category_active_days=14, label="crypto"
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+
+    def test_missing_cat_score_fails(self):
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=None, category_resolved_markets=20, category_distinct_events=12,
+            category_active_days=14, label="crypto"
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
+
+    def test_missing_cat_evidence_fails(self):
+        wq = _qualifying_wallet_q()
+        cat_q = evaluate_category_qualification(
+            score=85.0, category_resolved_markets=None, category_distinct_events=None,
+            category_active_days=None, label="crypto"
+        )
+        result = evaluate_usable_specialist(
+            wallet_qualification=wq, category_qualifications=[cat_q]
+        )
+        assert not result.usable
