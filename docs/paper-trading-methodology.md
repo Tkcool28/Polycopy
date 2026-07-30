@@ -103,15 +103,27 @@ Each signal contains:
 
 ### Flow
 
+**Legacy manual tools** (non-authoritative, sample/demo-only):
+
 ```
-Signal → Preview (non-executing) → Read-only Order Inspection → Canonical Specialist Authorization → Fill → Position
+POST /paper/preview → non-executing quote
+Legacy Orders page → read-only inspection of non-authoritative legacy orders
 ```
 
-The Orders page is read-only. Legacy pending orders cannot be approved or
-rejected from this page. The legacy `POST /paper/approve` and
-`POST /paper/reject` mutation routes have been retired (return 404).
-Canonical specialist authorization and execution occur through the separate
-canonical specialist workflow.
+**Canonical specialist execution** (authoritative):
+
+```
+paper_signal_decision → explicit execution authorization
+  → canonical paper execution → paper_order → paper_fill → paper_position
+```
+
+See `docs/specialist_paper_execution_spine.md` for the full canonical workflow.
+
+The legacy preview endpoint and legacy Orders page use non-authoritative legacy
+state. Neither provides input to nor advances the canonical specialist execution
+spine. Canonical authorization is performed separately against a
+`paper_signal_decision_id` via `paper_signal_execution_authorizations`. The
+retired `POST /paper/approve` and `POST /paper/reject` routes return 404.
 
 ### Preview (POST /paper/preview)
 
@@ -120,17 +132,17 @@ canonical specialist workflow.
    - Base price from market bid/ask
    - Slippage based on order size vs. available depth
    - Fee at `POLYCOPY_FILL_FEE_RATE` (default 0.1%)
-3. **Review delay** — in `paper_manual` mode, preview is non-executing and
-   does not create fillable orders. `POLYCOPY_REVIEW_DELAY_SECONDS` (default
-   30s) is a legacy parameter from the retired approve/reject workflow;
-   canonical specialist authorization applies separately.
+3. **Review delay** — `POLYCOPY_REVIEW_DELAY_SECONDS` (default 30s) is a legacy
+   parameter from the retired approve/reject workflow. Preview is non-executing
+   and does not create fillable orders. Canonical specialist authorization is
+   performed separately and is not gated by this delay.
 
 ### Paper Modes
 
 | Mode | Behavior |
 |------|----------|
 | `research_only` | No orders can be created. Read-only. |
-| `paper_manual` | Preview is non-executing; Orders page is read-only. Legacy approve/reject routes retired. Canonical specialist authorization applies. Default. |
+| `paper_manual` | Legacy preview is non-executing and the legacy Orders page is read-only; approve/reject routes are retired. Canonical specialist execution is a separate workflow. Default. |
 | `paper_auto` | Orders fill automatically after risk gates pass. |
 
 ## 5. Fill Model
