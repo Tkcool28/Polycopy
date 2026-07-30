@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
 import { PaperOrdersPage } from '../pages/PaperOrdersPage';
 import { makeOrders } from '../test/fixtures';
 
@@ -10,8 +10,6 @@ const { api } = vi.hoisted(() => ({
     paperOrders: vi.fn(),
     systemStatus: vi.fn(),
     paperPreview: vi.fn(),
-    paperApprove: vi.fn(),
-    paperReject: vi.fn(),
   },
 }))
 
@@ -45,7 +43,7 @@ describe('PaperOrdersPage', () => {
     expect(await screen.findByText('pending')).toBeInTheDocument()
   })
 
-  it('shows approve/reject actions for pending orders', async () => {
+  it('does not show approve/reject controls for pending orders', async () => {
     api.paperOrders.mockResolvedValue(makeOrders())
     api.systemStatus.mockResolvedValue({ paper_mode: 'paper_manual' })
     render(
@@ -54,8 +52,8 @@ describe('PaperOrdersPage', () => {
       </MemoryRouter>,
     )
     await screen.findByText('pending')
-    expect(screen.getByRole('button', { name: /approve/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /reject/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /approve/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /reject/i })).not.toBeInTheDocument()
   })
 
   it('opens preview result after clicking Preview (mocked API call)', async () => {
@@ -97,51 +95,5 @@ describe('PaperOrdersPage', () => {
     )
     await screen.findByText('pending')
     expect(screen.getByText(/\[DEMO\]/i)).toBeInTheDocument()
-  })
-
-  it('approve sends notes from input field', async () => {
-    api.paperOrders.mockResolvedValue(makeOrders())
-    api.systemStatus.mockResolvedValue({ paper_mode: 'paper_manual' })
-    api.paperApprove.mockResolvedValue({ status: 'ok' })
-    const user = userEvent.setup()
-
-    render(
-      <MemoryRouter>
-        <PaperOrdersPage />
-      </MemoryRouter>,
-    )
-
-    await screen.findByText('pending')
-    // Type a note
-    const textarea = screen.getByPlaceholderText(/Add a note/i);
-    await user.type(textarea, 'My custom approval note')
-    await user.click(screen.getByRole('button', { name: /approve/i }))
-    expect(api.paperApprove).toHaveBeenCalledWith({
-      order_id: '00000000-0000-0000-0000-000000000001',
-      notes: 'My custom approval note',
-    })
-  })
-
-  it('reject sends notes from input field', async () => {
-    api.paperOrders.mockResolvedValue(makeOrders())
-    api.systemStatus.mockResolvedValue({ paper_mode: 'paper_manual' })
-    api.paperReject.mockResolvedValue({ status: 'ok' })
-    const user = userEvent.setup()
-
-    render(
-      <MemoryRouter>
-        <PaperOrdersPage />
-      </MemoryRouter>,
-    )
-
-    await screen.findByText('pending')
-    // Type a note
-    const textarea = screen.getByPlaceholderText(/Add a note/i);
-    await user.type(textarea, 'My custom rejection note')
-    await user.click(screen.getByRole('button', { name: /reject/i }))
-    expect(api.paperReject).toHaveBeenCalledWith({
-      order_id: '00000000-0000-0000-0000-000000000001',
-      notes: 'My custom rejection note',
-    })
   })
 })

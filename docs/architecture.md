@@ -219,12 +219,6 @@ POST /paper/preview
   → RiskGate.check() [kill switch → paper mode → exposure limits]
   → FillModel.quoteFill() [bid/ask + slippage + fees]
   → ReviewDelay (paper_manual: 30s wait)
-
-POST /paper/approve (with SQLite-backed idempotency)
-  → PaperBroker.place_order()
-  → PnlTracker.record_buy/sell (FIFO lots)
-  → Position updated
-  → DecisionLogEntry created
   → Counterfactual scenarios computed
   → IdempotencyStore.check_and_store() (persistent replay protection)
 

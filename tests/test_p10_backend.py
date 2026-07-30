@@ -1468,7 +1468,7 @@ class TestAPIValidation:
 
     @staticmethod
     def _seed_pending_order(order_id: str):
-        """Seed a pending order in the DB so approve/reject can transition it."""
+        """Seed a pending order in the DB so preserved read endpoints can display it."""
         from polycopy.db.database import get_database
         db = get_database()
         # was hardcoded "2026-06-28T12:00:00+00:00"; now dynamic so the order
@@ -1495,57 +1495,15 @@ class TestAPIValidation:
         )
         db.conn.commit()
 
-    def test_paper_approve_returns_filled(self, client):
-        order_id = "00000000-0000-0000-0000-000000000099"
-        self._seed_pending_order(order_id)
-        resp = client.post("/paper/approve", json={
-            "order_id": order_id,
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        # paper_manual mode: order is PENDING then confirm_and_fill → FILLED
-        assert data["status"] == "filled"
-        assert data["id"] == order_id
+    def test_paper_approve_route_retired_returns_404(self, client):
+        """POST /paper/approve is retired — framework default 404."""
+        resp = client.post("/paper/approve", json={"order_id": "00000000-0000-0000-0000-000000000099"})
+        assert resp.status_code == 404
 
-    def test_paper_reject_returns_cancelled(self, client):
-        order_id = "00000000-0000-0000-0000-000000000098"
-        self._seed_pending_order(order_id)
-        resp = client.post("/paper/reject", json={
-            "order_id": order_id,
-        })
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "cancelled"
-        assert data["id"] == order_id
-
-    def test_paper_approve_duplicate_idempotent(self, client):
-        """Duplicate approval is idempotent: returns same result, status 200."""
-        order_id = "00000000-0000-0000-0000-000000000097"
-        self._seed_pending_order(order_id)
-        payload = {"order_id": order_id}
-        resp1 = client.post("/paper/approve", json=payload)
-        assert resp1.status_code == 200
-        data1 = resp1.json()
-        resp2 = client.post("/paper/approve", json=payload)
-        assert resp2.status_code == 200
-        data2 = resp2.json()
-        # Idempotent: same order_id returned
-        assert data1["id"] == data2["id"]
-        assert data1["status"] == data2["status"]
-
-    def test_paper_reject_duplicate_idempotent(self, client):
-        """Duplicate rejection is idempotent: returns same result, status 200."""
-        order_id = "00000000-0000-0000-0000-000000000096"
-        self._seed_pending_order(order_id)
-        payload = {"order_id": order_id}
-        resp1 = client.post("/paper/reject", json=payload)
-        assert resp1.status_code == 200
-        data1 = resp1.json()
-        resp2 = client.post("/paper/reject", json=payload)
-        assert resp2.status_code == 200
-        data2 = resp2.json()
-        assert data1["id"] == data2["id"]
-        assert data1["status"] == data2["status"]
+    def test_paper_reject_route_retired_returns_404(self, client):
+        """POST /paper/reject is retired — framework default 404."""
+        resp = client.post("/paper/reject", json={"order_id": "00000000-0000-0000-0000-000000000098"})
+        assert resp.status_code == 404
 
     def test_positions_returns_sample(self, client):
         resp = client.get("/positions")
@@ -1617,11 +1575,7 @@ class TestAPIValidation:
         assert data["is_duplicate"] is False
 
     def test_idempotency_check_duplicate(self, client):
-        # Register a key via approve
-        client.post("/paper/approve", json={
-            "order_id": "dup-test-order",
-        })
-        # The key is derived internally — just verify the endpoint works
+        # The idempotency endpoint is preserved; just verify it works
         resp = client.get("/idempotency/nonexistent-key")
         assert resp.status_code == 200
 

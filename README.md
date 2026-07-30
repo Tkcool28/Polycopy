@@ -133,8 +133,6 @@ data/audits/       → machine-readable capability audit artifacts
 | GET | `/signals` | List signals |
 | GET | `/signals/{id}` | Signal detail |
 | POST | `/paper/preview` | Preview paper order (risk-checked, no fill) |
-| POST | `/paper/approve` | Approve a paper order |
-| POST | `/paper/reject` | Reject a paper order |
 | GET | `/paper/orders` | List paper orders |
 | GET | `/positions` | List positions |
 | GET | `/portfolio/summary` | Portfolio summary with P&L |

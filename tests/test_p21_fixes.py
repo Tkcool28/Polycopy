@@ -1340,11 +1340,11 @@ def test_no_hardcoded_test_seeds():
     """Permanent guard: no test file may seed rows with a hardcoded
     ISO timestamp that becomes "in the future" or "in the distant
     past" relative to wall-clock and breaks time-dependent assertions
-    (notably ``order_preview_max_age_seconds`` at /paper/approve).
+    (notably ``order_preview_max_age_seconds`` at /paper/preview).
 
     Found bug (2026-06-28): multiple test files seeded orders with the
     literal "2026-06-28T12:00:00+00:00". Once wall-clock passed that
-    value, the /paper/approve handler returned 409 "preview expired"
+    value, the /paper/preview handler returned 409 "preview expired"
     and the full pytest suite began failing 13 paper-approve tests.
 
     This test scans every other test_*.py file and asserts the

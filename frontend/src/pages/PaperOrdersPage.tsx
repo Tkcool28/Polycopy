@@ -4,10 +4,9 @@ import { api } from '../lib/api';
 import { Card, LoadingState, ErrorState, EmptyState } from '../components/ui';
 
 export function PaperOrdersPage() {
-  const { data: orders, loading, error, refetch } = useApi(() => api.paperOrders());
+  const { data: orders, loading, error } = useApi(() => api.paperOrders());
   const { data: status } = useApi(() => api.systemStatus());
   const [previewData, setPreviewData] = useState<import('../lib/types').PaperOrderPreview | null>(null);
-  const [note, setNote] = useState('');
   const [actionResult, setActionResult] = useState<string | null>(null);
 
   // Preview form state
@@ -30,35 +29,6 @@ export function PaperOrdersPage() {
       setActionResult(null);
     } catch (e) {
       setActionResult(`Preview failed: ${(e as Error).message}`);
-    }
-  };
-
-  const handleApprove = async (orderId: string) => {
-    try {
-      const result = await api.paperApprove({ order_id: orderId, notes: note || undefined });
-      if (result?.status !== 'error') {
-        setActionResult(`Order ${orderId.slice(0, 8)}… APPROVED (${status?.paper_mode ?? 'paper'}) ${previewData?.is_sample ? '[SAMPLE]' : ''}`);
-        setNote('');
-        refetch();
-      } else {
-        setActionResult(`Approve failed: ${result?.detail ?? 'unknown error'}`);
-      }
-    } catch (e) {
-      setActionResult(`Approve failed: ${(e as Error).message}`);
-    }
-  };
-
-  const handleReject = async (orderId: string) => {
-    try {
-      const result = await api.paperReject({ order_id: orderId, notes: note || undefined });
-      if (result?.status !== 'error') {
-        setActionResult(`Order ${orderId.slice(0, 8)}… REJECTED (${status?.paper_mode ?? 'paper'})`);
-        refetch();
-      } else {
-        setActionResult(`Reject failed: ${result?.detail ?? 'unknown error'}`);
-      }
-    } catch (e) {
-      setActionResult(`Reject failed: ${(e as Error).message}`);
     }
   };
 
@@ -128,74 +98,47 @@ export function PaperOrdersPage() {
       </Card>
 
       <Card title="Pending Orders" badge={`${orders?.total_count ?? 0} ${orders?.is_sample_data ? '[DEMO]' : ''}`}>
+        {actionResult && (
+          <div style={{ padding: '8px 12px', background: 'var(--bg-elevated)', borderRadius: 'var(--radius-sm)', marginBottom: 12, fontSize: '0.78rem' }}>
+            {actionResult}
+          </div>
+        )}
         {orders && orders.orders.length > 0 ? (
-          <>
-            {actionResult && (
-              <div style={{ padding: '8px 12px', background: 'var(--bg-elevated)', borderRadius: 'var(--radius-sm)', marginBottom: 12, fontSize: '0.78rem' }}>
-                {actionResult}
-              </div>
-            )}
-            <table className="table table--responsive">
-              <thead>
-                <tr>
-                  <th>Market</th>
-                  <th>Outcome</th>
-                  <th>Side</th>
-                  <th className="text-right">Qty</th>
-                  <th className="text-right">Price</th>
-                  <th>Status</th>
-                  <th>Actions</th>
+          <table className="table table--responsive">
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>Outcome</th>
+                <th>Side</th>
+                <th className="text-right">Qty</th>
+                <th className="text-right">Price</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orders.orders.map((o) => (
+                <tr key={o.id}>
+                  <td data-label="Market">
+                    <span className="text-mono" style={{ fontSize: '0.72rem' }}>
+                      {o.market_id.slice(0, 12)}…
+                    </span>
+                  </td>
+                  <td data-label="Outcome">{o.outcome}</td>
+                  <td data-label="Side">{o.side}</td>
+                  <td data-label="Qty" className="text-right">{o.quantity}</td>
+                  <td data-label="Price" className="text-right">{formatPercent(o.price)}</td>
+                  <td data-label="Status">
+                    <span className={`tag tag--${o.status === 'pending' ? 'watch' : o.status === 'accepted' ? 'ok' : 'skip'}`}>
+                      {o.status}
+                    </span>
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {orders.orders.map((o) => (
-                  <tr key={o.id}>
-                    <td data-label="Market">
-                      <span className="text-mono" style={{ fontSize: '0.72rem' }}>
-                        {o.market_id.slice(0, 12)}…
-                      </span>
-                    </td>
-                    <td data-label="Outcome">{o.outcome}</td>
-                    <td data-label="Side">{o.side}</td>
-                    <td data-label="Qty" className="text-right">{o.quantity}</td>
-                    <td data-label="Price" className="text-right">{formatPercent(o.price)}</td>
-                    <td data-label="Status">
-                      <span className={`tag tag--${o.status === 'pending' ? 'watch' : o.status === 'accepted' ? 'ok' : 'skip'}`}>
-                        {o.status}
-                      </span>
-                    </td>
-                    <td data-label="Actions">
-                      {o.status === 'pending' && (
-                        <div style={{ display: 'flex', gap: 4 }}>
-                          <button onClick={() => handleApprove(o.id)} style={btnSmStyle('ok')}>
-                            Approve
-                          </button>
-                          <button onClick={() => handleReject(o.id)} style={btnSmStyle('danger')}>
-                            Reject
-                          </button>
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </>
+              ))}
+            </tbody>
+          </table>
         ) : (
           <EmptyState message="No pending paper orders" />
         )}
-      </Card>
-
-      <Card title="Manual Action Note" badge="AUDIT">
-        <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginBottom: 8 }}>
-          Notes are sent to the backend audit log with the approval or rejection. They do not affect order execution.
-        </div>
-        <textarea
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          placeholder="Add a note about this decision (optional audit note)..."
-          style={{ ...inputStyle, width: '100%', minHeight: 60, resize: 'vertical' }}
-        />
       </Card>
     </>
   );
@@ -225,17 +168,3 @@ const btnStyle: React.CSSProperties = {
   fontSize: '0.82rem',
   fontWeight: 600,
 };
-
-function btnSmStyle(kind: 'ok' | 'danger'): React.CSSProperties {
-  const bg = kind === 'ok' ? 'var(--success)' : 'var(--danger)';
-  return {
-    padding: '4px 8px',
-    background: bg,
-    color: '#fff',
-    border: 'none',
-    borderRadius: 'var(--radius-sm)',
-    cursor: 'pointer',
-    fontSize: '0.72rem',
-    fontWeight: 600,
-  };
-}

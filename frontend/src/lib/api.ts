@@ -51,16 +51,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  paperApprove: (body: { order_id: string; notes?: string }) =>
-    request<{ status: string; detail?: string }>('/paper/approve', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
-  paperReject: (body: { order_id: string; notes?: string }) =>
-    request<{ status: string; detail?: string }>('/paper/reject', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
   decisionLogExportUrl: (format: 'json' | 'csv') =>
     `${import.meta.env.VITE_API_BASE ?? ''}/decision-log/export?format=${format}`,
   config: () => request<import('./types').ConfigView>('/config'),

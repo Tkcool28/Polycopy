@@ -117,24 +117,6 @@ Signal → Preview → [Manual Review] → Approve/Reject → Fill → Position
 3. **Review delay** — in `paper_manual` mode, order cannot fill until
    `POLYCOPY_REVIEW_DELAY_SECONDS` (default 30s) after creation
 
-### Approve (POST /paper/approve)
-
-Uses SQLite-backed idempotency (persistent across restarts). If the same
-request is replayed, the stored result is returned — no duplicate orders,
-positions, or decision log entries are created.
-
-On approval:
-1. Order status transitions to FILLED
-2. PnlTracker records the FIFO lot
-3. Position is created or updated (average price recalculated)
-4. DecisionLogEntry is created with signal IDs, rationale, and metrics
-5. Counterfactual scenarios are computed for retrospective analysis
-
-### Reject (POST /paper/reject)
-
-Order status transitions to CANCELLED. DecisionLogEntry records the
-rejection rationale.
-
 ### Paper Modes
 
 | Mode | Behavior |

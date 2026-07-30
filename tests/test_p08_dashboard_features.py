@@ -182,28 +182,25 @@ class TestPaperOrderApproveReject:
         )
         db.conn.commit()
 
-    def test_approve_returns_accepted(self):
+    def test_approve_route_retired_returns_404(self):
         order_id = str(uuid4())
         self._seed_pending_order(order_id)
         r = client.post("/paper/approve", json={"order_id": order_id})
-        assert r.status_code == 200
-        assert r.json()["status"] == "filled"
+        assert r.status_code == 404
 
-    def test_reject_returns_cancelled(self):
+    def test_reject_route_retired_returns_404(self):
         order_id = str(uuid4())
         self._seed_pending_order(order_id)
         r = client.post("/paper/reject", json={"order_id": order_id})
-        assert r.status_code == 200
-        assert r.json()["status"] == "cancelled"
+        assert r.status_code == 404
 
     def test_approve_idempotency_duplicate(self):
         order_id = str(uuid4())
         self._seed_pending_order(order_id)
         r1 = client.post("/paper/approve", json={"order_id": order_id})
-        assert r1.status_code == 200
+        assert r1.status_code == 404
         r2 = client.post("/paper/approve", json={"order_id": order_id})
-        assert r2.status_code == 200
-        assert r2.json()["id"] == r1.json()["id"]
+        assert r2.status_code == 404
 
 
 class TestExistingEndpointsStillWork:

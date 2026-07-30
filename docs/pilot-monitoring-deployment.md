@@ -151,7 +151,7 @@ There is **no external notification channel** configured for this pilot:
   `deploy-units/automation-services.template.md` for a future, separately
   approved deployment step; it is **not** applied to the live units in this PR.
 - No mutation of `/root/Polycopy/data/polycopy.db`.
-- No order placement; no `/paper/preview` or `/paper/approve` calls.
+- No order placement; no `/paper/preview` calls.
 
 ## Validation done in this PR
 

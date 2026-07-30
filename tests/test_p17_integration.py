@@ -357,26 +357,18 @@ class TestPaperPreviewApproveRestartRetrieve:
             assert data["status"] == "pending"
             assert data["is_sample"] is True
 
-    def test_approve_persists_across_restart(
+    def test_approve_route_retired_returns_404(
         self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Approve a paper order, restart API, retrieve same order."""
+        """POST /paper/approve is retired — framework default 404."""
         _reset_api_state_demo(seeded_db, monkeypatch)
 
-        from polycopy.api.app import app, _bidask_provider
+        from polycopy.api.app import app
         from polycopy.db.database import get_database
-
-        market_id = "00000000-0000-0000-0000-000000000042"
-        _bidask_provider.set_snapshot(
-            market_id, "Yes", bid=0.58, ask=0.66, ask_volume=150.0, bid_volume=80.0
-        )
 
         order_id = str(uuid.uuid4())
         # Seed the pending order
         db = get_database()
-        # was hardcoded "2026-06-28T12:00:00+00:00"; now dynamic so the order
-        # doesn't expire past order_preview_max_age_seconds once wall-clock
-        # passes that hardcoded value.
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         db.execute(
@@ -385,7 +377,7 @@ class TestPaperPreviewApproveRestartRetrieve:
         )
         db.execute(
             "INSERT OR IGNORE INTO markets (id, source_id, source, question, fetched_at, is_sample) VALUES (?, ?, ?, ?, ?, ?)",
-            (market_id, "m1", "test", "Test Q", now, 0),
+            ("00000000-0000-0000-0000-000000000042", "m1", "test", "Test Q", now, 0),
         )
         db.execute(
             """
@@ -394,143 +386,62 @@ class TestPaperPreviewApproveRestartRetrieve:
                  status, filled_quantity, created_at, updated_at, is_sample)
             VALUES (?, ?, ?, 'buy', 'limit', 'Yes', 5.0, 0.63, 'pending', 0.0, ?, ?, 0)
             """,
-            (order_id, market_id, "00000000-0000-0000-0000-000000000080", now, now),
+            (order_id, "00000000-0000-0000-0000-000000000042", "00000000-0000-0000-0000-000000000080", now, now),
         )
         db.conn.commit()
 
-        # First session -- approve
         with TestClient(app) as client:
-            approve = client.post("/paper/approve", json={"order_id": order_id, "notes": "e2e approve"})
-            assert approve.status_code == 200
-            first_order_id = approve.json()["id"]
-            first_status = approve.json()["status"]
-            assert first_order_id == order_id
-
-        # Simulate restart
-        _reset_api_state_demo(seeded_db, monkeypatch)
-        from polycopy.api.app import _bidask_provider as _bidask2
-        _bidask2.set_snapshot(
-            market_id, "Yes", bid=0.58, ask=0.66, ask_volume=150.0, bid_volume=80.0
-        )
-
-        # Second session -- retrieve
-        with TestClient(app) as client:
-            orders = client.get("/paper/orders")
-            assert orders.status_code == 200
-            found = [o for o in orders.json()["orders"] if o["id"] == first_order_id]
-            assert len(found) == 1, "Approved order should be retrievable after restart"
-            assert found[0]["status"] == first_status
+            resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "e2e approve"})
+            assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Idempotency replay -> no duplicate
+# ---------------------------------------------------------------------------
+# Test 4: Retired routes return 404
 # ---------------------------------------------------------------------------
 
-class TestIdempotencyReplay:
-    """Same payload/idempotency key -> no duplicate orders/positions/decisions."""
+class TestRetiredRoutesReturn404:
+    """POST /paper/approve and POST /paper/reject are retired — 404."""
 
-    def test_approve_idempotent_no_duplicate(
+    def test_paper_approve_returns_404(
         self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Approving the same existing order twice returns same result, no duplicates."""
+        """POST /paper/approve is retired — framework default 404."""
         _reset_api_state_demo(seeded_db, monkeypatch)
-
-        from polycopy.api.app import app, _bidask_provider
-
-        market_id = "00000000-0000-0000-0000-000000000077"
-        _bidask_provider.set_snapshot(
-            market_id, "Yes", bid=0.55, ask=0.62, ask_volume=300.0, bid_volume=150.0
-        )
-
-        order_id = str(uuid.uuid4())
-        _insert_pending_order(order_id, market_id, quantity=8, price=0.59)
-
-        with TestClient(app) as client:
-            before_orders = client.get("/paper/orders").json()["total_count"]
-            before_decisions = client.get("/decision-log").json()["total_count"]
-
-            first = client.post(
-                "/paper/approve", json={"order_id": order_id, "notes": "idempotent test"}
-            )
-            assert first.status_code == 200
-            first_id = first.json()["id"]
-
-            second = client.post(
-                "/paper/approve", json={"order_id": order_id, "notes": "idempotent test"}
-            )
-            assert second.status_code == 200
-            assert second.json()["id"] == first_id
-
-            after_orders = client.get("/paper/orders").json()["total_count"]
-            after_decisions = client.get("/decision-log").json()["total_count"]
-            assert after_orders == before_orders
-            assert after_decisions == before_decisions + 1
-
-    def test_reject_idempotent_no_duplicate(
-        self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Rejecting the same existing order twice returns same result, no duplicates."""
-        _reset_api_state_demo(seeded_db, monkeypatch)
-
         from polycopy.api.app import app
-
-        order_id = str(uuid.uuid4())
-        _insert_pending_order(order_id, "00000000-0000-0000-0000-000000000088")
-
         with TestClient(app) as client:
-            before_orders = client.get("/paper/orders").json()["total_count"]
-            before_decisions = client.get("/decision-log").json()["total_count"]
+            resp = client.post("/paper/approve", json={"order_id": str(uuid.uuid4()), "notes": "idempotent test"})
+            assert resp.status_code == 404
 
-            first = client.post(
-                "/paper/reject", json={"order_id": order_id, "notes": "reject test"}
-            )
-            assert first.status_code == 200
-            first_id = first.json()["id"]
-
-            second = client.post(
-                "/paper/reject", json={"order_id": order_id, "notes": "reject test"}
-            )
-            assert second.status_code == 200
-            assert second.json()["id"] == first_id
-
-            after_orders = client.get("/paper/orders").json()["total_count"]
-            after_decisions = client.get("/decision-log").json()["total_count"]
-            assert after_orders == before_orders
-            assert after_decisions == before_decisions + 1
+    def test_paper_reject_returns_404(
+        self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POST /paper/reject is retired — framework default 404."""
+        _reset_api_state_demo(seeded_db, monkeypatch)
+        from polycopy.api.app import app
+        with TestClient(app) as client:
+            resp = client.post("/paper/reject", json={"order_id": str(uuid.uuid4()), "notes": "reject test"})
+            assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Reject pending; settle restart no double settlement
+# Test 5: Reject route retired; settle restart no double settlement
 # ---------------------------------------------------------------------------
 
 class TestRejectPendingAndSettlementIdempotency:
-    """Reject pending orders; settlement is idempotent across restarts."""
+    """Reject route is retired (404); settlement is idempotent across restarts."""
 
-    def test_reject_pending_order(
+    def test_paper_reject_returns_404(
         self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Rejecting a pending order marks it cancelled and persistent."""
+        """POST /paper/reject is retired — framework default 404."""
         _reset_api_state_demo(seeded_db, monkeypatch)
-
         from polycopy.api.app import app
-
-        order_id = str(uuid.uuid4())
-        _insert_pending_order(order_id, "00000000-0000-0000-0000-000000000089")
-
         with TestClient(app) as client:
             resp = client.post(
-                "/paper/reject", json={"order_id": order_id, "notes": "operator reject"}
+                "/paper/reject", json={"order_id": str(uuid.uuid4()), "notes": "operator reject"}
             )
-            assert resp.status_code == 200
-            data = resp.json()
-            assert data["status"] == "cancelled"
-            assert data["is_sample"] is True
-
-            # Verify in decision log
-            decisions = client.get("/decision-log")
-            entries = decisions.json()["entries"]
-            reject_entries = [e for e in entries if e["decision_type"] == "paper_reject"]
-            assert len(reject_entries) >= 1
+            assert resp.status_code == 404
 
     def test_settlement_script_idempotent(
         self, seeded_db: Path, monkeypatch: pytest.MonkeyPatch
@@ -857,17 +768,17 @@ class TestSnapshotOnlyOverallHealth:
 
 
 # ---------------------------------------------------------------------------
-# Fix 3: Buy fills debit simulated USDC
+# Fix 3: Retired approve route returns 404
 # ---------------------------------------------------------------------------
 
 
-class TestBuyFillDebitsUSDC:
-    """Approving a buy order must reduce the wallet's simulated USDC balance."""
+class TestRetiredApproveRouteReturns404:
+    """POST /paper/approve is retired — framework default 404."""
 
-    def _make_client_and_wallet(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial_usdc: float
-    ):
-        from datetime import datetime, timezone
+    def test_paper_approve_returns_404(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """POST /paper/approve is retired — framework default 404."""
         from polycopy.api.app import app
         import polycopy.db.database as db_module
         import polycopy.config.settings as settings_module
@@ -882,212 +793,14 @@ class TestBuyFillDebitsUSDC:
         get_settings = __import__("polycopy.config.settings", fromlist=["get_settings"]).get_settings
         get_database = __import__("polycopy.db.database", fromlist=["get_database"]).get_database
         get_settings(reload=True)
-        db = get_database(reload=True)
-        now = datetime.now(timezone.utc).isoformat()
-        wallet_id = "00000000-0000-0000-0000-000000000099"
-        market_id = "00000000-0000-0000-0000-000000000098"
-        order_id = str(uuid.uuid4())
-        db.execute(
-            "INSERT OR IGNORE INTO wallets (id, address, label, is_sample, created_at) VALUES (?, ?, ?, 0, ?)",
-            (wallet_id, "0xBUYTEST", "buy-wallet", now),
-        )
-        db.execute(
-            "INSERT INTO wallet_balances (wallet_id, currency, amount, as_of, is_sample) VALUES (?, ?, ?, ?, 0)",
-            (wallet_id, "USDC", initial_usdc, now),
-        )
-        db.execute(
-            "INSERT OR IGNORE INTO markets (id, source_id, source, question, active, closed, resolved, fetched_at, is_sample) "
-            "VALUES (?, ?, ?, ?, 1, 0, 0, ?, 0)",
-            (market_id, "m-buy", "test", "Buy test?", now),
-        )
-        db.execute(
-            "INSERT OR IGNORE INTO orders "
-            "(id, market_id, wallet_id, side, order_type, outcome, quantity, price, status, filled_quantity, created_at, updated_at, is_sample) "
-            "VALUES (?, ?, ?, 'buy', 'limit', 'Yes', ?, ?, 'pending', 0.0, ?, ?, 0)",
-            (order_id, market_id, wallet_id, 10.0, 0.5, now, now),
-        )
-        db.conn.commit()
-        return db, TestClient(app), order_id, wallet_id
-
-    def _reset_and_reload(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """Restart service objects to simulate API restart."""
-        import polycopy.db.database as db_module
-        import polycopy.config.settings as settings_module
-        from polycopy.api.app import _idempotency_store
-        from polycopy.api.app import _bidask_provider as _ba
-        # Set snapshot for deterministic fills
-        _ba.set_snapshot(
-            "00000000-0000-0000-0000-000000000098", "Yes",
-            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
-        )
-        if db_module._db is not None:
-            db_module._db.close()
-        db_module._db = None
-        settings_module._settings = None
-        _idempotency_store._db = None
-        _idempotency_store._ensured_table = False
-        get_settings = __import__("polycopy.config.settings", fromlist=["get_settings"]).get_settings
-        get_database = __import__("polycopy.db.database", fromlist=["get_database"]).get_database
-        get_settings(reload=True)
         get_database(reload=True)
 
-    def test_successful_buy_debits_cash(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Start with known USDC, approve buy, confirm cash decreases by notional + fee."""
-        from polycopy.api.app import _bidask_provider
-        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 100.0)
-        _bidask_provider.set_snapshot(
-            "00000000-0000-0000-0000-000000000098", "Yes",
-            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
-        )
         try:
-            resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "test buy"})
-            assert resp.status_code == 200
-            data = resp.json()
-            # Check balance decreased
-            bal = client.get(f"/wallets/{wallet_id}").json()["balances"][0]
-            assert bal["currency"] == "USDC"
-            # Approve uses order limit price (0.5) for accounting, not the market ask
-            from polycopy.config.settings import get_settings as _gs
-            fee_rate = _gs().fill_fee_rate  # 0.001
-            qty = 10.0
-            limit_price = 0.5  # order price
-            notional = limit_price * qty
-            fee = notional * fee_rate
-            expected = 100.0 - notional - fee
-            assert abs(bal["amount"] - expected) < 0.001, f"bal={bal['amount']}, expected={expected}"
-            # Exactly one position
-            positions = client.get("/positions", params={"wallet_id": wallet_id}).json()["positions"]
-            assert len(positions) == 1
-            # One fill = order status filled
-            assert data["status"] == "filled"
-            # Order ID unchanged
-            assert data["id"] == order_id
+            with TestClient(app) as client:
+                resp = client.post("/paper/approve", json={"order_id": str(uuid.uuid4()), "notes": "test buy"})
+                assert resp.status_code == 404
         finally:
-            db.close()
-
-    def test_insufficient_cash_fails_closed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Start below required total. Approval fails with no mutation."""
-        from polycopy.api.app import _bidask_provider
-        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 1.0)
-        _bidask_provider.set_snapshot(
-            "00000000-0000-0000-0000-000000000098", "Yes",
-            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
-        )
-        try:
-            resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "should fail"})
-            assert resp.status_code == 409
-            assert "insufficient" in resp.json()["detail"].lower()
-            # Balance unchanged
-            bal = client.get(f"/wallets/{wallet_id}").json()["balances"][0]
-            assert bal["amount"] == 1.0
-            # No position
-            positions = client.get("/positions", params={"wallet_id": wallet_id}).json()["positions"]
-            assert len(positions) == 0
-            # Order still pending
-            orders = client.get("/paper/orders", params={"status": "pending"}).json()["orders"]
-            assert any(o["id"] == order_id for o in orders)
-            # No decision log
-            decisions = client.get("/decision-log").json()["entries"]
-            assert not any(e["order_id"] == order_id for e in decisions)
-        finally:
-            db.close()
-
-    def test_exact_balance_succeeds(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Balance == notional + fee. Approval succeeds, final balance is 0."""
-        from polycopy.config.settings import get_settings as _gs
-        from polycopy.api.app import _bidask_provider
-        fee_rate = _gs().fill_fee_rate
-        limit_price = 0.5
-        qty = 10.0
-        notional = limit_price * qty
-        fee = notional * fee_rate
-        total = notional + fee
-        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, total)
-        _bidask_provider.set_snapshot(
-            "00000000-0000-0000-0000-000000000098", "Yes",
-            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
-        )
-        try:
-            resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "exact"})
-            assert resp.status_code == 200
-            bal = client.get(f"/wallets/{wallet_id}").json()["balances"][0]
-            assert abs(bal["amount"]) < 1e-9
-        finally:
-            db.close()
-
-    def test_idempotent_restart_no_double_debit(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Approve once, restart, replay same request. Cash debited only once."""
-        from polycopy.api.app import _bidask_provider
-        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 100.0)
-        _bidask_provider.set_snapshot(
-            "00000000-0000-0000-0000-000000000098", "Yes",
-            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
-        )
-        try:
-            first = client.post("/paper/approve", json={"order_id": order_id, "notes": "idempotent restart"})
-            assert first.status_code == 200
-            bal_after_first = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
-            # Simulate restart
-            self._reset_and_reload(tmp_path, monkeypatch)
-            self._reset_and_reload(tmp_path, monkeypatch)
-            from polycopy.api.app import _idempotency_store
-            _idempotency_store._db = None
-            _idempotency_store._ensured_table = False
-            __import__("polycopy.db.database", fromlist=["get_database"]).get_database(reload=True)
-            second = client.post("/paper/approve", json={"order_id": order_id, "notes": "idempotent restart"})
-            assert second.status_code == 200
-            bal_after_second = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
-            assert abs(bal_after_first - bal_after_second) < 1e-9, (
-                f"Double debit! first={bal_after_first}, second={bal_after_second}"
-            )
-        finally:
-            db.close()
-
-    def test_buy_then_sell_accounting(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Buy debits cash. Sell credits proceeds. Confirm P&L consistent."""
-        from polycopy.api.app import _bidask_provider
-        from polycopy.config.settings import get_settings as _gs
-        db, client, order_id, wallet_id = self._make_client_and_wallet(tmp_path, monkeypatch, 100.0)
-        _bidask_provider.set_snapshot(
-            "00000000-0000-0000-0000-000000000098", "Yes",
-            bid=0.45, ask=0.55, ask_volume=500.0, bid_volume=200.0,
-        )
-        try:
-            buy_resp = client.post("/paper/approve", json={"order_id": order_id, "notes": "buy"})
-            assert buy_resp.status_code == 200
-            balance_after_buy = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
-            # Now sell: a matching sell order must be created. Use a direct buy->sell flow.
-            # Create a new pending sell order referencing the same market/outcome/wallet/qty.
-            sell_order_id = str(uuid.uuid4())
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc).isoformat()
-            position = client.get("/positions", params={"wallet_id": wallet_id}).json()["positions"][0]
-            sell_qty = position["quantity"]
-            sell_price = 0.65
-            db.execute(
-                "INSERT OR IGNORE INTO orders "
-                "(id, market_id, wallet_id, side, order_type, outcome, quantity, price, status, filled_quantity, created_at, updated_at, is_sample) "
-                "VALUES (?, ?, ?, 'sell', 'limit', 'Yes', ?, ?, 'pending', 0.0, ?, ?, 0)",
-                (sell_order_id, position["market_id"], wallet_id, sell_qty, sell_price, now, now),
-            )
-            db.conn.commit()
-            sell_resp = client.post("/paper/approve", json={"order_id": sell_order_id, "notes": "sell"})
-            assert sell_resp.status_code == 200
-            balance_after_sell = client.get(f"/wallets/{wallet_id}").json()["balances"][0]["amount"]
-            # Cash must have increased by sell_price * sell_qty - fee
-            fee_rate = _gs().fill_fee_rate
-            sell_proceeds = sell_price * sell_qty * (1.0 - fee_rate)
-            assert balance_after_sell > balance_after_buy
-            assert abs((balance_after_sell - balance_after_buy) - sell_proceeds) < 0.01
-        finally:
-            db.close()
+            if db_module._db is not None:
+                db_module._db.close()
+            db_module._db = None
+            settings_module._settings = None

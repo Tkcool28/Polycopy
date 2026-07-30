@@ -174,46 +174,38 @@ class TestPaperOrders:
         assert data["estimated_fee"] > 0
         assert data["estimated_total_cost"] > 0
 
-    def test_approve_order_succeeds(self, client):
+    def test_approve_route_retired_returns_404(self, client):
         order_id = "00000000-0000-0000-0000-000000000001"
         self._seed_pending_order(order_id)
         resp = client.post("/paper/approve", json={"order_id": order_id})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "filled"
-        assert data["id"] == order_id
+        assert resp.status_code == 404
 
-    def test_approve_order_duplicate_rejected(self, client):
+    def test_approve_route_retired_duplicate_returns_404(self, client):
         order_id = "00000000-0000-0000-0000-000000000001"
         self._seed_pending_order(order_id)
         payload = {"order_id": order_id}
         # First submission
         resp1 = client.post("/paper/approve", json=payload)
-        assert resp1.status_code == 200
+        assert resp1.status_code == 404
 
-        # Duplicate submission — same order_id replays the same safe result
+        # Duplicate submission — both return 404
         resp2 = client.post("/paper/approve", json=payload)
-        assert resp2.status_code == 200
-        assert resp2.json()["id"] == resp1.json()["id"]
+        assert resp2.status_code == 404
 
-    def test_reject_order_succeeds(self, client):
+    def test_reject_route_retired_returns_404(self, client):
         order_id = "00000000-0000-0000-0000-000000000002"
         self._seed_pending_order(order_id)
         resp = client.post("/paper/reject", json={"order_id": order_id})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "cancelled"
-        assert data["id"] == order_id
+        assert resp.status_code == 404
 
-    def test_reject_order_duplicate_rejected(self, client):
+    def test_reject_route_retired_duplicate_returns_404(self, client):
         order_id = "00000000-0000-0000-0000-000000000002"
         self._seed_pending_order(order_id)
         payload = {"order_id": order_id}
         resp1 = client.post("/paper/reject", json=payload)
-        assert resp1.status_code == 200
+        assert resp1.status_code == 404
         resp2 = client.post("/paper/reject", json=payload)
-        assert resp2.status_code == 200
-        assert resp2.json()["id"] == resp1.json()["id"]
+        assert resp2.status_code == 404
 
     def test_list_paper_orders(self, client):
         resp = client.get("/paper/orders")
@@ -319,9 +311,7 @@ class TestIdempotency:
         assert "new" in data["message"].lower()
 
     def test_same_key_is_duplicate(self, client):
-        # Register a key by calling approve
-        client.post("/paper/approve", json={"order_id": "00000000-0000-0000-0000-000000000050"})
-        # The key is now in the store
+        # The idempotency endpoint is preserved; just verify it works
         resp = client.get("/idempotency/unknown")
         # Unknown key should be "new"
         assert resp.json()["is_duplicate"] is False
