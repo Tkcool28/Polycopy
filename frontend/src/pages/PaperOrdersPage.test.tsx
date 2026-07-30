@@ -43,7 +43,7 @@ describe('PaperOrdersPage', () => {
     expect(await screen.findByText('pending')).toBeInTheDocument()
   })
 
-  it('does not show approve/reject controls for pending orders', async () => {
+  it('identifies the legacy order view as read-only and has no approve/reject controls', async () => {
     api.paperOrders.mockResolvedValue(makeOrders())
     api.systemStatus.mockResolvedValue({ paper_mode: 'paper_manual' })
     render(
@@ -54,6 +54,8 @@ describe('PaperOrdersPage', () => {
     await screen.findByText('pending')
     expect(screen.queryByRole('button', { name: /approve/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /reject/i })).not.toBeInTheDocument()
+    expect(screen.getByText(/read-only/i)).toBeInTheDocument()
+    expect(screen.queryByText(/explicit approval/i)).not.toBeInTheDocument()
   })
 
   it('opens preview result after clicking Preview (mocked API call)', async () => {
