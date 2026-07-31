@@ -698,6 +698,13 @@ def build_wallet_status(
         clean = {k: v for k, v in entry.items() if not k.startswith("_")}
         clean_category_results.append(clean)
 
+    # Strip internal fields from the selected best category.
+    clean_best_category = (
+        {k: v for k, v in best_category.items() if not k.startswith("_")}
+        if best_category is not None
+        else None
+    )
+
     return {
         "wallet_id": wallet_id,
         "watch_id": watch.get("id"),
@@ -738,7 +745,7 @@ def build_wallet_status(
         },
         "wallet_gate_distance": wallet_gate_distance,
         "current_category_results": clean_category_results,
-        "selected_best_category": best_category,
+        "selected_best_category": clean_best_category,
         "usable_specialist": {
             "usable": specialist_result.usable,
             "wallet_qualified": specialist_result.wallet_qualified,

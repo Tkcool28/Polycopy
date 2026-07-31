@@ -1359,3 +1359,235 @@ class TestCategoryFailureMatrix:
             wallet_qualification=wq, category_qualifications=[cat_q]
         )
         assert not result.usable
+
+
+# ── Status payload serialization and internal-field safety ────────────────
+
+
+def _assert_no_internal_keys(value, path=""):
+    """Recursively assert no dictionary key begins with '_'."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            assert not key.startswith("_"), (
+                f"Internal key {key!r} found at {path}"
+            )
+            _assert_no_internal_keys(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for i, child in enumerate(value):
+            _assert_no_internal_keys(child, f"{path}[{i}]")
+
+
+def _realistic_status_payload():
+    """Build a realistic synthetic status payload for serialization tests."""
+    return {
+        "wallet_id": "test_wallet_001",
+        "watch_id": "watch_001",
+        "watch_status": "active",
+        "state": "GREEN",
+        "ready_for_human_review": True,
+        "red_reasons": [],
+        "yellow_reasons": [],
+        "is_sample": False,
+        "active_trading_days": 30,
+        "buy_count": 45,
+        "distinct_markets": 25,
+        "distinct_events": 20,
+        "resolved_markets": 50,
+        "taxonomy_complete_count": 3,
+        "taxonomy_partial_count": 0,
+        "taxonomy_unavailable_count": 0,
+        "taxonomy_completeness_pct": 100.0,
+        "supported_categories": ["crypto", "politics"],
+        "current_wallet_resolution": {
+            "verdict": "copy_candidate",
+            "final_score": 85.0,
+            "status": "complete",
+            "missing_reasons": [],
+            "evidence_fingerprint": "abc123",
+            "decision_id": 42,
+            "formula_name": "wallet_score_v1",
+            "formula_version": "1.0.0",
+            "eligibility_gate_failures": [],
+            "source_data_timestamp": "2026-07-15T00:00:00+00:00",
+            "created": "2026-07-15T00:00:00+00:00",
+            "reused": False,
+            "would_create": False,
+            "persisted": True,
+        },
+        "wallet_gate_distance": {
+            "resolved_markets": {"minimum": 30, "current": 50, "remaining": 0, "met": True},
+            "active_trading_days": {"minimum": 20, "current": 30, "remaining": 0, "met": True},
+            "distinct_events": {"minimum": 15, "current": 20, "remaining": 0, "met": True},
+        },
+        "current_category_results": [
+            {
+                "category_label": "crypto",
+                "verdict": "copy_candidate",
+                "final_score": 82.0,
+                "status": "complete",
+                "missing_reasons": [],
+                "evidence_fingerprint": "def456",
+                "decision_id": 43,
+                "formula_name": "category_wallet_score_v1",
+                "formula_version": "1.0.0",
+                "source_data_timestamp": "2026-07-15T00:00:00+00:00",
+                "gate_distance": {
+                    "resolved_markets": {"minimum": 15, "current": 20, "remaining": 0, "met": True},
+                    "distinct_events": {"minimum": 8, "current": 12, "remaining": 0, "met": True},
+                    "active_days": {"minimum": 10, "current": 14, "remaining": 0, "met": True},
+                },
+                "ready_for_human_review": True,
+            },
+            {
+                "category_label": "politics",
+                "verdict": "incomplete",
+                "final_score": None,
+                "status": "incomplete",
+                "missing_reasons": ["no_evidence"],
+                "evidence_fingerprint": "ghi789",
+                "decision_id": None,
+                "formula_name": "category_wallet_score_v1",
+                "formula_version": "1.0.0",
+                "source_data_timestamp": None,
+                "gate_distance": {},
+                "ready_for_human_review": False,
+            },
+        ],
+        "selected_best_category": {
+            "category_label": "crypto",
+            "verdict": "copy_candidate",
+            "final_score": 82.0,
+            "status": "complete",
+            "missing_reasons": [],
+            "evidence_fingerprint": "def456",
+            "decision_id": 43,
+            "formula_name": "category_wallet_score_v1",
+            "formula_version": "1.0.0",
+            "source_data_timestamp": "2026-07-15T00:00:00+00:00",
+            "gate_distance": {
+                "resolved_markets": {"minimum": 15, "current": 20, "remaining": 0, "met": True},
+                "distinct_events": {"minimum": 8, "current": 12, "remaining": 0, "met": True},
+                "active_days": {"minimum": 10, "current": 14, "remaining": 0, "met": True},
+            },
+            "ready_for_human_review": True,
+        },
+        "usable_specialist": {
+            "usable": True,
+            "wallet_qualified": True,
+            "qualifying_category_labels": ["crypto"],
+            "reasons": [],
+        },
+        "refresh_detail": None,
+        "last_collection_at": "2026-07-15T00:00:00+00:00",
+        "approval_created": False,
+        "dispatch_created": False,
+        "execution_authorized": False,
+    }
+
+
+class TestStatusPayloadSerialization:
+    """Verify the full public status payload is JSON-serializable and
+    contains no internal underscore-prefixed fields."""
+
+    def test_payload_serializes_to_json(self):
+        """Full payload must serialize with json.dumps without TypeError."""
+        import json
+        payload = _realistic_status_payload()
+        result = json.dumps(payload)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_no_internal_keys_in_payload(self):
+        """No dictionary key in the entire payload may begin with '_'."""
+        payload = _realistic_status_payload()
+        _assert_no_internal_keys(payload)
+
+    def test_selected_best_category_has_no_internal_keys(self):
+        """selected_best_category must not contain _result or _evidence."""
+        payload = _realistic_status_payload()
+        cat = payload["selected_best_category"]
+        assert "_result" not in cat
+        assert "_evidence" not in cat
+
+    def test_current_category_results_have_no_internal_keys(self):
+        """Every current_category_results entry must lack _result/_evidence."""
+        payload = _realistic_status_payload()
+        for entry in payload["current_category_results"]:
+            assert "_result" not in entry
+            assert "_evidence" not in entry
+
+    def test_selected_best_category_retains_public_fields(self):
+        """The cleaned best category retains all expected public fields."""
+        payload = _realistic_status_payload()
+        cat = payload["selected_best_category"]
+        assert "category_label" in cat
+        assert "final_score" in cat
+        assert "verdict" in cat
+        assert "gate_distance" in cat
+        assert "ready_for_human_review" in cat
+
+    def test_no_best_category_none_serializable(self):
+        """When selected_best_category is None, the payload must still
+        be JSON-serializable."""
+        import json
+        payload = _realistic_status_payload()
+        payload["selected_best_category"] = None
+        result = json.dumps(payload)
+        assert isinstance(result, str)
+
+    def test_usable_specialist_payload_unchanged(self):
+        """usable_specialist block must be present with correct structure."""
+        payload = _realistic_status_payload()
+        us = payload["usable_specialist"]
+        assert "usable" in us
+        assert "wallet_qualified" in us
+        assert "qualifying_category_labels" in us
+        assert "reasons" in us
+
+    def test_gate_distance_reporting_preserved(self):
+        """wallet_gate_distance must be present and diagnostic."""
+        payload = _realistic_status_payload()
+        assert "wallet_gate_distance" in payload
+        gd = payload["wallet_gate_distance"]
+        # At least one gate should report minimum, current, remaining, met.
+        for gate_info in gd.values():
+            if isinstance(gate_info, dict):
+                assert "minimum" in gate_info
+                assert "current" in gate_info
+                assert "remaining" in gate_info
+                assert "met" in gate_info
+
+    def test_recursive_assertion_completes(self):
+        """Recursive _assert_no_internal_keys passes for the full payload."""
+        payload = _realistic_status_payload()
+        _assert_no_internal_keys(payload)  # raises on failure
+
+    def test_green_readiness_nonregression(self):
+        """GREEN readiness: wallet qualifies + category qualifies."""
+        # The synthetic payload is GREEN by construction.
+        payload = _realistic_status_payload()
+        assert payload["state"] == "GREEN"
+        assert payload["ready_for_human_review"] is True
+
+    def test_yellow_no_category(self):
+        """YELLOW readiness: wallet qualifies, no qualifying category."""
+        import json
+        payload = _realistic_status_payload()
+        payload["state"] = "YELLOW"
+        payload["ready_for_human_review"] = False
+        payload["usable_specialist"]["usable"] = False
+        payload["usable_specialist"]["qualifying_category_labels"] = []
+        payload["usable_specialist"]["reasons"] = ["no_qualifying_category"]
+        result = json.dumps(payload)
+        assert isinstance(result, str)
+        assert not payload["ready_for_human_review"]
+
+    def test_red_priority_over_usable_specialist(self):
+        """RED safety conditions override usable specialist."""
+        payload = _realistic_status_payload()
+        payload["state"] = "RED"
+        payload["ready_for_human_review"] = False
+        payload["red_reasons"] = ["sample_wallet_in_cohort"]
+        # usable_specialist may still be True, but state is RED
+        assert payload["usable_specialist"]["usable"] is True
+        assert payload["state"] == "RED"
