@@ -226,9 +226,9 @@ class TestCategoryGateBoundaries:
     def test_resolved_markets_14_fails(self) -> None:
         inp = _strong_category_input(category_resolved_markets=14)
         result = compute_category_wallet_score_v1(input=inp)
-        # Should be WATCHLIST (not COPY_CANDIDATE) since gate fails
+        # Should be INCOMPLETE (not COPY_CANDIDATE) since gate fails
         # and score is high. A numeric placeholder cannot bypass.
-        assert result.verdict == WalletVerdict.WATCHLIST
+        assert result.verdict == WalletVerdict.INCOMPLETE
         assert any("category_resolved_markets" in g
                    for g in result.category_gate_failures)
 
@@ -242,7 +242,7 @@ class TestCategoryGateBoundaries:
     def test_distinct_events_7_fails(self) -> None:
         inp = _strong_category_input(category_distinct_events=7)
         result = compute_category_wallet_score_v1(input=inp)
-        assert result.verdict == WalletVerdict.WATCHLIST
+        assert result.verdict == WalletVerdict.INCOMPLETE
         assert any("category_distinct_events" in g
                    for g in result.category_gate_failures)
 
@@ -255,7 +255,7 @@ class TestCategoryGateBoundaries:
     def test_active_days_9_fails(self) -> None:
         inp = _strong_category_input(category_active_days=9)
         result = compute_category_wallet_score_v1(input=inp)
-        assert result.verdict == WalletVerdict.WATCHLIST
+        assert result.verdict == WalletVerdict.INCOMPLETE
         assert any("category_active_days" in g
                    for g in result.category_gate_failures)
 
@@ -312,9 +312,14 @@ class TestVerdictThresholds:
             WalletVerdict.SKIP,
         )
 
-    def test_high_score_with_failed_gate_is_watchlist(self) -> None:
+    def test_high_score_with_failed_gate_is_incomplete(self) -> None:
         """The central invariant: a high numeric score CANNOT
-        produce COPY_CANDIDATE when a category gate fails."""
+        produce COPY_CANDIDATE when a category gate fails.
+
+        With the corrected qualification contract, below-minimum
+        category evidence produces INCOMPLETE (not WATCHLIST) — a
+        numeric placeholder cannot bypass the evidence gates.
+        """
         inp = _strong_category_input(
             # All metrics at max — score should be very high.
             info_score=0.99,
@@ -339,7 +344,7 @@ class TestVerdictThresholds:
         assert result.score >= 75.0, (
             f"expected high score but got {result.score} — test setup wrong"
         )
-        assert result.verdict == WalletVerdict.WATCHLIST
+        assert result.verdict == WalletVerdict.INCOMPLETE
         assert len(result.category_gate_failures) == 3
 
     def test_all_gates_pass_high_score_is_copy_candidate(self) -> None:

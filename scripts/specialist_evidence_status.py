@@ -43,13 +43,25 @@ for _cand in (_REPO_ROOT / "src", _REPO_ROOT / "scripts", _REPO_ROOT):
         sys.path.insert(0, str(_cand))
 
 from evidence_db import (  # noqa: E402
-    DbConn,
     FORBIDDEN_EXECUTION_TABLES,
     REQUIRED_SCHEMA_VERSION,
+    DbConn,
     open_readonly,
 )
 
 PRODUCTION_DB_PATH = (_REPO_ROOT / "data" / "polycopy.db").resolve()
+from polycopy.scoring.specialist_qualification_contract import (  # noqa: E402
+    CATEGORY_MIN_ACTIVE_DAYS,
+    CATEGORY_MIN_DISTINCT_EVENTS,
+    CATEGORY_MIN_RESOLVED_MARKETS,
+    WALLET_MIN_ACTIVE_TRADING_DAYS,
+    WALLET_MIN_DISTINCT_EVENTS,
+    WALLET_MIN_RESOLVED_MARKETS,
+    CategoryQualification,
+    evaluate_category_qualification,
+    evaluate_usable_specialist,
+    evaluate_wallet_qualification,
+)
 from polycopy.scoring.wallet_evidence import (  # noqa: E402
     CATEGORY_TAXONOMY_PARTIAL,
     CATEGORY_TAXONOMY_USABLE,
@@ -60,25 +72,15 @@ from polycopy.scoring.wallet_evidence import (  # noqa: E402
     resolve_category_score_v1,
     resolve_wallet_score_v1,
 )
-from polycopy.scoring.wallet_score_v1 import (  # noqa: E402
-    GLOBAL_MIN_ACTIVE_TRADING_DAYS,
-    GLOBAL_MIN_DISTINCT_EVENTS,
-    GLOBAL_MIN_RESOLVED_MARKETS,
-)
-from polycopy.scoring.category_wallet_score_v1 import (  # noqa: E402
-    CATEGORY_MIN_ACTIVE_DAYS,
-    CATEGORY_MIN_DISTINCT_EVENTS,
-    CATEGORY_MIN_RESOLVED_MARKETS,
-)
 
 # Execution-plane (and approval/dispatch) tables whose row counts MUST be zero
 # in the research plane. Any non-zero count forces RED (unexpected artifact).
 _EXECUTION_PLANE_TABLES = FORBIDDEN_EXECUTION_TABLES
 
 WALLET_GATES = {
-    "resolved_markets": GLOBAL_MIN_RESOLVED_MARKETS,
-    "active_trading_days": GLOBAL_MIN_ACTIVE_TRADING_DAYS,
-    "distinct_events": GLOBAL_MIN_DISTINCT_EVENTS,
+    "resolved_markets": WALLET_MIN_RESOLVED_MARKETS,
+    "active_trading_days": WALLET_MIN_ACTIVE_TRADING_DAYS,
+    "distinct_events": WALLET_MIN_DISTINCT_EVENTS,
 }
 CATEGORY_GATES = {
     "category_resolved_markets": CATEGORY_MIN_RESOLVED_MARKETS,
@@ -128,18 +130,32 @@ def _count_forbidden(db: DbConn, table: str) -> int:
 
 
 def _distance_to_gates(evidence: Any, gates: dict[str, int]) -> dict[str, Any]:
-    """Return remaining distance to each frozen gate (0 when met)."""
+    """Return remaining distance to each frozen gate (0 when met).
+
+    Missing values (None) are reported as ``value=None`` with
+    ``met=False`` — they are NOT treated as zero. This ensures the
+    status monitor's gate-distance reporting is consistent with the
+    evaluator's fail-closed treatment of missing evidence.
+    """
     out: dict[str, Any] = {}
     for key, minimum in gates.items():
         value = getattr(evidence, key, None)
-        v = value if isinstance(value, int) else 0
-        remaining = max(0, minimum - v)
-        out[key] = {
-            "minimum": minimum,
-            "value": v,
-            "remaining": remaining,
-            "met": remaining == 0,
-        }
+        if value is None:
+            out[key] = {
+                "minimum": minimum,
+                "value": None,
+                "remaining": minimum,
+                "met": False,
+            }
+        else:
+            v = value if isinstance(value, int) else 0
+            remaining = max(0, minimum - v)
+            out[key] = {
+                "minimum": minimum,
+                "value": v,
+                "remaining": remaining,
+                "met": remaining == 0,
+            }
     return out
 
 
@@ -570,6 +586,8 @@ def build_wallet_status(
                 cat_result is not None
                 and cat_result.verdict == WalletVerdict.COPY_CANDIDATE
             ),
+            "_result": cat_result,
+            "_evidence": cat_ev,
         })
 
     best_category = _select_best_category(category_results)
@@ -629,23 +647,63 @@ def build_wallet_status(
     if coll_yellow and not coll_reason:
         yellow_reasons.append("collector_not_yet_collected")
 
-    # Determine state.
-    is_green = (
-        wallet_verdict == WalletVerdict.COPY_CANDIDATE.value
-        and best_category is not None
-        and best_category["verdict"] == WalletVerdict.COPY_CANDIDATE.value
+    # ── Shared contract composition ────────────────────────────────────────
+    # Convert current wallet evidence into the shared qualification contract.
+    wallet_qual = evaluate_wallet_qualification(
+        score=wallet_result.score if wallet_result is not None else None,
+        resolved_markets=wallet_ev.resolved_markets,
+        active_trading_days=wallet_ev.active_trading_days,
+        distinct_events=wallet_ev.distinct_events,
     )
-    score_pair_candidate = is_green
+
+    # Convert current category results into shared qualification objects.
+    cat_quals: list[CategoryQualification] = []
+    for cat_entry in category_results:
+        cat_result_obj = cat_entry.get("_result")
+        cat_ev_obj = cat_entry.get("_evidence")
+        if cat_result_obj is not None and cat_ev_obj is not None:
+            cat_quals.append(
+                evaluate_category_qualification(
+                    score=cat_result_obj.score,
+                    category_resolved_markets=cat_ev_obj.resolved_markets,
+                    category_distinct_events=cat_ev_obj.distinct_events,
+                    category_active_days=cat_ev_obj.active_trading_days,
+                    label=cat_entry["category_label"],
+                )
+            )
+
+    # Evaluate usable specialist via the shared composition helper.
+    specialist_result = evaluate_usable_specialist(
+        wallet_qualification=wallet_qual,
+        category_qualifications=cat_quals if cat_quals else None,
+    )
+
+    # Determine state.
+    # RED reasons (sample, execution, integrity, collector, refresh, conflicts)
+    # take priority regardless of the composition result.
     if reasons:
         state = "RED"
-    elif score_pair_candidate:
+    elif specialist_result.usable:
         state = "GREEN"
     else:
         state = "YELLOW"
 
     # ready_for_human_review is derived from the FINAL state, never directly
-    # from score_pair_candidate (S6 §2).
+    # from the composition result (S6 §2).
     ready_for_human_review = (state == "GREEN")
+
+    # Build the output payload. Strip internal fields from category_results.
+    clean_category_results = []
+    for entry in category_results:
+        clean = {k: v for k, v in entry.items() if not k.startswith("_")}
+        clean_category_results.append(clean)
+
+    # Strip internal fields from the selected best category.
+    clean_best_category = (
+        {k: v for k, v in best_category.items() if not k.startswith("_")}
+        if best_category is not None
+        else None
+    )
 
     return {
         "wallet_id": wallet_id,
@@ -686,8 +744,14 @@ def build_wallet_status(
             "persisted": wallet_res.persisted,
         },
         "wallet_gate_distance": wallet_gate_distance,
-        "current_category_results": category_results,
-        "selected_best_category": best_category,
+        "current_category_results": clean_category_results,
+        "selected_best_category": clean_best_category,
+        "usable_specialist": {
+            "usable": specialist_result.usable,
+            "wallet_qualified": specialist_result.wallet_qualified,
+            "qualifying_category_labels": list(specialist_result.qualifying_category_labels),
+            "reasons": list(specialist_result.reasons),
+        },
         "refresh_detail": refresh_detail,
         "last_collection_at": watch.get("last_collection_at"),
         "approval_created": False,

@@ -21,6 +21,7 @@ Verdict rules (frozen):
 - 55.0000–74.9999  → WATCHLIST
 - below 55          → SKIP
 - Missing essential evidence or missing essential gate value → INCOMPLETE
+- Any category gate below the minimum                     → INCOMPLETE
 
 Category-eligibility gates for COPY_CANDIDATE (frozen):
 - 15 resolved category markets
@@ -29,7 +30,7 @@ Category-eligibility gates for COPY_CANDIDATE (frozen):
 
 Behavior:
 - Score >= 75 AND every category gate passes → COPY_CANDIDATE
-- Score >= 75 but any category gate fails     → WATCHLIST (NOT COPY_CANDIDATE)
+- Score >= 75 but any category gate fails     → INCOMPLETE (NOT WATCHLIST)
 - Score 55 .. < 75                             → WATCHLIST
 - Score < 55                                   → SKIP
 - Any missing essential input or missing gate value → INCOMPLETE
@@ -48,16 +49,23 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from polycopy.scoring.helpers import clamp
+from polycopy.scoring.specialist_qualification_contract import (  # noqa: F401
+    CATEGORY_MIN_ACTIVE_DAYS,
+    CATEGORY_MIN_DISTINCT_EVENTS,
+    CATEGORY_MIN_RESOLVED_MARKETS,
+    CATEGORY_SCORE_THRESHOLD,
+    evaluate_category_qualification,
+)
 from polycopy.scoring.wallet_score_v1 import (
-    WalletVerdict,
     WalletScoreComponent,
+    WalletVerdict,
+    _category_specialization_component,
     _chronological_consistency_component,
     _concentration_quality_component,
     _info_price_improvement_component,
     _realized_performance_component,
     _risk_drawdown_component,
     _sample_reliability_component,
-    _category_specialization_component,
 )
 
 # ---- Formula identity (frozen) -------------------------------------------
@@ -65,15 +73,11 @@ from polycopy.scoring.wallet_score_v1 import (
 CATEGORY_WALLET_FORMULA_NAME = "category_wallet_score"
 CATEGORY_WALLET_FORMULA_VERSION = "1"
 
-# ---- Category eligibility minimums (frozen) -----------------------------
-
-CATEGORY_MIN_RESOLVED_MARKETS = 15
-CATEGORY_MIN_DISTINCT_EVENTS = 8
-CATEGORY_MIN_ACTIVE_DAYS = 10
+# ---- Category eligibility minimums (frozen, re-exported from shared contract
+# via the top-level import above — no redundant re-assignment needed)
 
 # ---- Verdict thresholds (frozen) -----------------------------------------
-
-VERDICT_COPY_CANDIDATE_MIN = 75.0
+VERDICT_COPY_CANDIDATE_MIN = CATEGORY_SCORE_THRESHOLD  # 75.0
 VERDICT_WATCHLIST_MIN = 55.0
 
 
@@ -162,65 +166,30 @@ class CategoryWalletScoreResultV1:
 # ---- Helpers --------------------------------------------------------------
 
 
-def _gate_failure_reason(
-    field: str,
-    actual: Optional[int],
-    minimum: int,
-) -> str:
-    """Format a canonical category gate failure reason string.
-
-    The reason is the operator-facing audit text stored in
-    `result.category_gate_failures`. It is intentionally
-    deterministic so re-scoring the same inputs yields the same
-    audit log.
-    """
-    return f"{field}={actual} < {minimum}"
-
-
 def _category_gates_pass(
     inp: CategoryWalletScoreInputV1,
 ) -> tuple[bool, list[str]]:
     """Return (all_pass, list_of_failures).
 
-    Any missing gate value (None) is INCOMPLETE upstream; here we
-    surface a deterministic reason for the gate so the audit
-    record can distinguish "missing" from "below minimum".
+    Delegates to the shared :func:`evaluate_category_qualification`
+    so that category gate enforcement is identical across the wallet
+    evaluator, category evaluator, and status monitor. Missing gate
+    values (None) fail closed — they are NOT silently skipped.
+
+    Only evidence gates are checked here; the score gate is evaluated
+    separately in the verdict logic.
     """
-    failures: list[str] = []
-    if inp.category_resolved_markets is None:
-        failures.append("category_resolved_markets=missing")
-    elif inp.category_resolved_markets < CATEGORY_MIN_RESOLVED_MARKETS:
-        failures.append(
-            _gate_failure_reason(
-                "category_resolved_markets",
-                inp.category_resolved_markets,
-                CATEGORY_MIN_RESOLVED_MARKETS,
-            )
-        )
-
-    if inp.category_distinct_events is None:
-        failures.append("category_distinct_events=missing")
-    elif inp.category_distinct_events < CATEGORY_MIN_DISTINCT_EVENTS:
-        failures.append(
-            _gate_failure_reason(
-                "category_distinct_events",
-                inp.category_distinct_events,
-                CATEGORY_MIN_DISTINCT_EVENTS,
-            )
-        )
-
-    if inp.category_active_days is None:
-        failures.append("category_active_days=missing")
-    elif inp.category_active_days < CATEGORY_MIN_ACTIVE_DAYS:
-        failures.append(
-            _gate_failure_reason(
-                "category_active_days",
-                inp.category_active_days,
-                CATEGORY_MIN_ACTIVE_DAYS,
-            )
-        )
-
-    return (len(failures) == 0, failures)
+    qual = evaluate_category_qualification(
+        score=None,  # score checked separately in verdict logic
+        category_resolved_markets=inp.category_resolved_markets,
+        category_distinct_events=inp.category_distinct_events,
+        category_active_days=inp.category_active_days,
+    )
+    # Filter out score failures — only evidence gates here.
+    evidence_failures = [
+        f for f in qual.gate_failures if not f.startswith("score")
+    ]
+    return (len(evidence_failures) == 0, evidence_failures)
 
 
 # ---- Score function -------------------------------------------------------
@@ -363,17 +332,24 @@ def compute_category_wallet_score_v1(
     # Category gate enforcement. Any missing gate value is
     # INCOMPLETE; any below-minimum value is recorded as a gate
     # failure and blocks COPY_CANDIDATE.
-    gates_pass, gate_failures = _category_gates_pass(input)
-    missing_gate_values = [g for g in gate_failures if g.endswith("=missing")]
+    _, gate_failures = _category_gates_pass(input)
+    missing_gate_values = [g for g in gate_failures if "missing" in g]
     if missing_gate_values:
         # Treat missing gate values as missing essentials so the
         # verdict is INCOMPLETE, not SKIP.
         missing_essentials.extend(missing_gate_values)
-        gate_failures = [g for g in gate_failures if not g.endswith("=missing")]
+        gate_failures = [g for g in gate_failures if "missing" not in g]
 
     # Incomplete wins over partial compute. Return INCOMPLETE with
-    # any partial component breakdown for audit.
+    # any partial component breakdown for audit. Include ALL gate
+    # failures (including missing values) for complete auditability.
     if missing_essentials:
+        full_qual = evaluate_category_qualification(
+            score=None,
+            category_resolved_markets=input.category_resolved_markets,
+            category_distinct_events=input.category_distinct_events,
+            category_active_days=input.category_active_days,
+        )
         return CategoryWalletScoreResultV1(
             wallet_id=wallet_id,
             category_label=category_label,
@@ -382,7 +358,7 @@ def compute_category_wallet_score_v1(
             input=input,
             components=components,
             missing_essentials=missing_essentials,
-            category_gate_failures=gate_failures,
+            category_gate_failures=list(full_qual.gate_failures),
             computed_at=now,
             is_sample=is_sample,
             source_data_timestamp=input.source_data_timestamp,
@@ -470,12 +446,42 @@ def compute_category_wallet_score_v1(
     weighted_total = sum(c.weighted_score for c in components)
     final_score = clamp(round(weighted_total, 4))
 
-    # Verdict rules (frozen).
-    if final_score >= VERDICT_COPY_CANDIDATE_MIN and gates_pass:
+    # Verdict rules (frozen, using shared qualification contract).
+    # The contract enforces: a high numerical score can never override
+    # insufficient evidence. Every gate is mandatory. Missing evidence
+    # fails closed.
+    cat_qual = evaluate_category_qualification(
+        score=final_score,
+        category_resolved_markets=input.category_resolved_markets,
+        category_distinct_events=input.category_distinct_events,
+        category_active_days=input.category_active_days,
+    )
+    # Deterministic failure ordering from the shared contract.
+    # The score gate failure is NOT an evidence gate failure — it is
+    # a quality verdict (WATCHLIST/SKIP), not an evidence gap. Only
+    # evidence gate failures go into category_gate_failures.
+    gate_failures = [
+        f for f in cat_qual.gate_failures if not f.startswith("score")
+    ]
+
+    # Verdict rules (frozen, using shared contract):
+    # - Evidence gate failure (missing or below minimum) → INCOMPLETE
+    #   (insufficient evidence for a trustworthy decision)
+    # - Score < 75 with evidence gates passing → WATCHLIST (>= 55) or SKIP
+    # - Score >= 75 with all gates passing → COPY_CANDIDATE
+    #
+    # The score gate is NOT an evidence gate — a low score is a quality
+    # verdict (WATCHLIST/SKIP), not an evidence gap (INCOMPLETE).
+    evidence_gates_pass = not any(
+        not f.startswith("score") for f in cat_qual.gate_failures
+    )
+    if not evidence_gates_pass:
+        # Evidence gates fail (missing or below minimum) → INCOMPLETE
+        verdict = WalletVerdict.INCOMPLETE
+    elif final_score >= VERDICT_COPY_CANDIDATE_MIN:
         verdict = WalletVerdict.COPY_CANDIDATE
     elif final_score >= VERDICT_WATCHLIST_MIN:
-        # Score >= 55. May be capped to WATCHLIST by failed gates,
-        # but is WATCHLIST regardless of gate pass/fail here.
+        # Evidence gates pass but score < 75 → WATCHLIST
         verdict = WalletVerdict.WATCHLIST
     else:
         verdict = WalletVerdict.SKIP
