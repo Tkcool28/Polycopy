@@ -44,7 +44,7 @@ import re
 import sqlite3
 import sys
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -444,7 +444,7 @@ def test_s7_v20_to_v21_preservation():
 
 # ── C. disposable E2E lifecycle (deterministic) ────────────────────────────────
 
-def test_s7_disposable_e2e_full_lifecycle(capsys):
+def test_s7_disposable_e2e_full_lifecycle(capsys, monkeypatch):
     """Deterministic disposable proof of every required integration transition.
 
     Uses fakes for every network-backed seam (collector provider, backfill
@@ -682,6 +682,8 @@ def test_s7_disposable_e2e_full_lifecycle(capsys):
 
     # ── refresh: recent unresolved market (no winner) vs resolved (valid resolved_at)
     refresh = _load("refresh_specialist_market_truth.py")
+    frozen_refresh_now = datetime(2026, 4, 1, tzinfo=UTC)
+    monkeypatch.setattr(refresh, "_utcnow", lambda: frozen_refresh_now)
     # unresolved
     rp_un = _RefreshProvider(by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B},
                              mode="unresolved")
@@ -693,6 +695,14 @@ def test_s7_disposable_e2e_full_lifecycle(capsys):
         "WHERE market_source_id=?", (COND_A,)).fetchone()
     assert st_un[0] == "unresolved", st_un
     assert st_un[1] is None, st_un  # no winner fabricated
+    # The immediate second observation is not due and is covered by the
+    # refresh-safety suite. Advance the disposable test clock before the
+    # later resolution so this lifecycle test exercises an eligible retry.
+    monkeypatch.setattr(
+        refresh,
+        "_utcnow",
+        lambda: frozen_refresh_now + timedelta(hours=25),
+    )
     # resolved
     rp_re = _RefreshProvider(by_condition={COND_A: GAMMA_A, COND_B: GAMMA_B},
                              mode="resolved")
