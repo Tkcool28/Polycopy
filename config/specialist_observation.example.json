@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "observation_id": "REQUIRES_EXPLICIT_OPERATOR_AUTHORIZATION",
+  "created_at": "REQUIRES_EXPLICIT_OPERATOR_AUTHORIZATION",
+  "timezone": "America/Denver",
+  "watch_ids": [
+    "sew_2eb71e1d1cdf40fa",
+    "sew_34f5ad48a0794dac",
+    "sew_3cf4e30a919a4579",
+    "sew_7b4c211a470a4dfe",
+    "sew_8d97ffa12fa440db"
+  ],
+  "planned_start_at": "REQUIRES_EXPLICIT_OPERATOR_AUTHORIZATION",
+  "planned_end_at": "DERIVED_BY_CONTROL_LAYER_FROM_START_PLUS_21_DAYS",
+  "duration_days": 21,
+  "checkpoint_days": [7, 14, 21],
+  "extension_policy": {"maximum_days": 7, "automatic": false, "requires_explicit_authorization": true},
+  "collection": {"timezone": "America/Denver", "runs_per_day": 4, "local_times": ["00:00", "06:00", "12:00", "18:00"], "max_new_source_trades_per_wallet_per_run": 25, "max_new_source_trades_per_cohort_per_run": 125, "max_gamma_enrichment_operations_per_run": 125, "buy_only": true},
+  "enrichment_policy": {"mode": "inline", "preserve_honest_classifications": true},
+  "refresh": {"timezone": "America/Denver", "runs_per_day": 1, "local_time": "01:00", "max_market_limit": 104, "requires_explicit_market_limit": true, "safety_behavior": "PR-90"},
+  "lock_path": "/tmp/polycopy-operational-jobs.lock",
+  "daily_operational_ceilings": {"max_collection_enrichment_provider_operations": 500, "max_market_refresh_provider_operations": 104, "max_total_planned_provider_operations": 604},
+  "database_path": "/root/Polycopy/data/polycopy.db",
+  "repository_baseline_sha": "REQUIRES_EXPLICIT_OPERATOR_AUTHORIZATION",
+  "status": "planned",
+  "creation_does_not_activate": true,
+  "activation": false,
+  "template_note": "This is inactive configuration only. It creates no data artifact and authorizes no runtime work."
+}
