@@ -18,7 +18,7 @@ import json
 import sys
 import asyncio
 import pytest
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +33,7 @@ from polycopy.ingestion.normalized_source_trade import (  # noqa: E402
 )
 from polycopy.ingestion.source_trade_resolution import (  # noqa: E402
     SPECIALIST_REFRESH_SOURCES,
+    select_markets_for_refresh,
 )
 
 
@@ -778,17 +779,66 @@ def test_conflicting_winner_blocks_all_writes_for_market():
     assert r2["winning_token_id"] == TOK_LOSE
     assert r1["realized_pnl"] == 6.0
     assert r2["realized_pnl"] == -4.0
+    # Exact market selection is a diagnostic override and records the conflict
+    # without mutating either canonical source row.
     bk = db.conn.execute(
         "SELECT last_status, last_error FROM specialist_market_refresh_state "
         "WHERE market_source_id=?", (COND,)).fetchone()
-    assert dict(bk)["last_status"] == "resolved"
-    assert dict(bk)["last_error"] == "conflict"
+    assert dict(bk) == {"last_status": "resolved", "last_error": "conflict"}
     db.close()
 
 
 # ---------------------------------------------------------------------------
 # 20. A forced bookkeeping/update failure rolls back all source-trade changes
 # ---------------------------------------------------------------------------
+
+
+
+def test_conflict_retry_budget_first_second_third_without_source_mutation(monkeypatch):
+    """Conflict is retryable for three exact diagnostic refreshes only."""
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "conflict-a", condition=COND, status="won", winner=TOK_WIN,
+                  token=TOK_WIN, price=0.40, qty=10.0)
+    _insert_trade(db, "conflict-b", condition=COND, status="won", winner=TOK_LOSE,
+                  token=TOK_LOSE, price=0.40, qty=10.0)
+    db.conn.execute(
+        "UPDATE source_trades SET is_winning_trade=1, realized_pnl=6.0, "
+        "settlement_source='source_trade_resolution', resolved_at='2026-03-01T00:00:00Z' "
+        "WHERE source_trade_id='conflict-a'"
+    )
+    db.conn.execute(
+        "UPDATE source_trades SET is_winning_trade=0, realized_pnl=-4.0, "
+        "settlement_source='source_trade_resolution', resolved_at='2026-03-01T00:00:00Z' "
+        "WHERE source_trade_id='conflict-b'"
+    )
+    db.conn.commit()
+    before = [dict(r) for r in db.conn.execute(
+        "SELECT * FROM source_trades WHERE market_source_id=? ORDER BY id", (COND,)
+    )]
+    for expected in (1, 2, 3):
+        provider = _provider_resolved(winner=TOK_WIN)
+        assert refresh.main([
+            "--db-path", str(db.db_path), "--market-source-id", COND,
+            "--write", "--allow-live", "--confirm-production-db",
+        ], provider=provider) == 0
+        state = dict(db.conn.execute(
+            "SELECT last_status, last_error, attempt_count, next_check_after "
+            "FROM specialist_market_refresh_state WHERE market_source_id=?", (COND,)
+        ).fetchone())
+        assert state["last_status"] == "resolved"
+        assert state["last_error"] == "conflict"
+        assert state["attempt_count"] == expected
+        if expected == 3:
+            assert state["next_check_after"] == refresh._TERMINAL_NEXT_CHECK_AFTER
+        else:
+            assert state["next_check_after"] != refresh._TERMINAL_NEXT_CHECK_AFTER
+    after = [dict(r) for r in db.conn.execute(
+        "SELECT * FROM source_trades WHERE market_source_id=? ORDER BY id", (COND,)
+    )]
+    assert after == before
+    db.close()
+
 
 def test_market_conflict_rolls_back_via_savepoint():
     db, _ = _open()
@@ -924,11 +974,12 @@ def test_replay_no_duplicate_bookkeeping():
         "SELECT COUNT(*) FROM specialist_market_refresh_state "
         "WHERE market_source_id=?", (COND,)).fetchone()[0]
     assert n == 1, n
-    # attempt_count increments to 2, not duplicated rows.
+    # Once canonical truth is terminal, the second invocation is suppressed
+    # before a provider call and does not consume another scheduling attempt.
     bk = db.conn.execute(
         "SELECT attempt_count FROM specialist_market_refresh_state "
         "WHERE market_source_id=?", (COND,)).fetchone()
-    assert dict(bk)["attempt_count"] == 2, dict(bk)
+    assert dict(bk)["attempt_count"] == 1, dict(bk)
     db.close()
 
 
@@ -1309,6 +1360,517 @@ def test_unconfirmed_production_write_touches_no_symbols():
             _m._validate_selector_readonly = real_validate
     finally:
         _m.is_production_db = real_is_prod
+
+
+# ---------------------------------------------------------------------------
+# SPECIALIST_REFRESH_SAFETY: bounded cohort, scheduling, and global lock
+# ---------------------------------------------------------------------------
+
+def test_watch_id_cohort_selects_five_active_watches_once_and_deterministically():
+    db, _ = _open()
+    watch_args = []
+    markets = {}
+    for i in range(5):
+        wid = f"wallet-cohort-{i}"
+        address = f"0xcohort{i}"
+        watch = f"watch-cohort-{i}"
+        condition = COND[:-1] + str(i)
+        _seed_wallet(db, wid=wid, address=address)
+        _seed_watch(db, wid=watch, wallet=wid, status="active")
+        _insert_trade(db, f"cohort-{i}", condition=condition, trader=address)
+        watch_args.extend(["--watch-id", watch])
+        markets[condition] = _gamma_market(
+            condition=condition, resolved=True, winner_token=TOK_WIN
+        )
+    provider = _FakeProvider(by_condition=markets)
+    rc = refresh.main(
+        ["--db-path", str(db.db_path), *watch_args, "--write", "--allow-live",
+         "--confirm-production-db"], provider=provider
+    )
+    assert rc == 0
+    assert provider.calls == sorted(markets)
+    assert all(_row(db, f"cohort-{i}")["resolution_status"] == "won" for i in range(5))
+    db.close()
+
+
+def test_five_watch_cohort_selects_104_distinct_markets_and_excludes_noncohort():
+    """Five active watches form one 104-market cohort; shared markets collapse."""
+    db, _ = _open()
+    watches = []
+    addresses = []
+    for wallet_index in range(5):
+        wallet_id = f"wallet-104-{wallet_index}"
+        address = f"0xcohort104{wallet_index}"
+        watch_id = f"watch-104-{wallet_index}"
+        _seed_wallet(db, wid=wallet_id, address=address)
+        _seed_watch(db, wid=watch_id, wallet=wallet_id, status="active")
+        watches.append(watch_id)
+        addresses.append(address)
+
+    # 103 unique cohort markets spread across all five watches.
+    expected = set()
+    for market_index in range(103):
+        market_id = f"0x{market_index:064x}"
+        expected.add(market_id)
+        _insert_trade(
+            db, f"cohort-104-{market_index}", condition=market_id,
+            trader=addresses[market_index % len(addresses)],
+        )
+
+    # A single market observed by two watched wallets must be one selected ID.
+    shared_market = f"0x{103:064x}"
+    expected.add(shared_market)
+    _insert_trade(db, "cohort-shared-a", condition=shared_market, trader=addresses[0])
+    _insert_trade(db, "cohort-shared-b", condition=shared_market, trader=addresses[1])
+
+    noncohort_market = f"0x{104:064x}"
+    _insert_trade(db, "noncohort", condition=noncohort_market, trader="0xoutside")
+
+    selected = select_markets_for_refresh(
+        db, watch_ids=watches, limit_markets=500,
+        now="2026-04-01T00:00:00+00:00",
+    )
+    assert selected == sorted(expected)
+    assert len(selected) == 104
+    assert selected.count(shared_market) == 1
+    assert noncohort_market not in selected
+    db.close()
+
+
+def test_schedule_compares_legacy_timestamp_offsets_as_instants():
+    db, _ = _open()
+    _seed_wallet(db)
+    now = "2026-04-02T00:00:00+00:00"
+    schedules = {
+        "z-due": "2026-04-01T23:00:00Z",
+        "z-not-due": "2026-04-02T01:00:00Z",
+        "zero-due": "2026-04-02T00:00:00+00:00",
+        "zero-not-due": "2026-04-02T00:01:00+00:00",
+        "offset-due": "2026-04-02T02:00:00+03:00",
+        "offset-not-due": "2026-04-02T04:00:00+03:00",
+    }
+    due = {"z-due", "zero-due", "offset-due"}
+    condition_for_trade = {}
+    for index, (trade_id, next_check_after) in enumerate(schedules.items()):
+        condition = f"0x{index + 200:064x}"
+        condition_for_trade[trade_id] = condition
+        _insert_trade(db, trade_id, condition=condition)
+        db.conn.execute(
+            "INSERT INTO specialist_market_refresh_state "
+            "(market_source_id, last_status, attempt_count, next_check_after) "
+            "VALUES (?, 'unresolved', 1, ?)",
+            (condition, next_check_after),
+        )
+    db.conn.commit()
+
+    selected = set(select_markets_for_refresh(
+        db, wallet_address=ADDR, limit_markets=100, now=now,
+    ))
+    assert selected == {condition_for_trade[trade_id] for trade_id in due}
+    db.close()
+
+
+def test_bookkeeping_writes_canonical_utc_timestamps(monkeypatch):
+    db, _ = _open()
+    offset_now = datetime(2026, 4, 1, 10, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    monkeypatch.setattr(refresh, "_utcnow", lambda: offset_now)
+    outcome = refresh.MarketRefreshOutcome(COND)
+    outcome.last_status = "unresolved"
+    refresh._upsert_bookkeeping(db, outcome)
+    state = dict(db.conn.execute(
+        "SELECT last_checked_at, next_check_after FROM specialist_market_refresh_state "
+        "WHERE market_source_id=?", (COND,),
+    ).fetchone())
+    assert state == {
+        "last_checked_at": "2026-04-01T05:00:00+00:00",
+        "next_check_after": "2026-04-02T05:00:00+00:00",
+    }
+    db.close()
+
+
+def test_write_report_keeps_initial_markets_selected_after_resolution(capsys):
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "report-selected", condition=COND)
+    assert refresh.main([
+        "--db-path", str(db.db_path), "--market-source-id", COND,
+        "--write", "--allow-live", "--confirm-production-db", "--json",
+    ], provider=_provider_resolved()) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["markets_selected"] == 1
+    assert report["updated"] == 1
+    db.close()
+
+
+def test_watch_id_cohort_refuses_duplicate_six_and_inactive_before_provider():
+    db, _ = _open()
+    _seed_wallet(db)
+    _seed_watch(db, wid=WATCH, wallet=WID, status="active")
+    _seed_watch(db, wid=WATCH_PAUSED, wallet=WID, status="paused")
+    _insert_trade(db, "t1")
+    provider = _provider_resolved()
+    base = ["--db-path", str(db.db_path), "--allow-live", "--write",
+            "--confirm-production-db"]
+    assert refresh.main([*base, "--watch-id", WATCH, "--watch-id", WATCH], provider=provider) == 2
+    six_watch_args = [
+        value for i in range(6) for value in ("--watch-id", f"six-{i}")
+    ]
+    assert refresh.main([*base, *six_watch_args], provider=provider) == 2
+    assert refresh.main([*base, "--watch-id", WATCH, "--watch-id", WATCH_PAUSED], provider=provider) == 2
+    assert provider.calls == []
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    db.close()
+
+
+def test_terminal_and_next_check_after_suppress_provider_and_retry_schedule(monkeypatch):
+    db, _ = _open()
+    _seed_wallet(db)
+    frozen = datetime(2026, 4, 1, tzinfo=UTC)
+    monkeypatch.setattr(refresh, "_utcnow", lambda: frozen)
+    _insert_trade(db, "terminal", condition=COND, status="won", winner=TOK_WIN)
+    _insert_trade(db, "pending", condition=COND[:-1] + "d")
+    pending = COND[:-1] + "d"
+    first = _FakeProvider(by_condition={pending: _gamma_market(
+        condition=pending, resolved=False, winner_token=None)})
+    assert refresh.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+                         "--write", "--allow-live", "--confirm-production-db"], provider=first) == 0
+    assert first.calls == [pending]
+    state = dict(db.conn.execute(
+        "SELECT attempt_count, next_check_after FROM specialist_market_refresh_state WHERE market_source_id=?",
+        (pending,)).fetchone())
+    assert state["attempt_count"] == 1
+    assert state["next_check_after"] == (frozen + timedelta(hours=24)).isoformat()
+    early = _FakeProvider()
+    assert refresh.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+                         "--write", "--allow-live", "--confirm-production-db"], provider=early) == 0
+    assert early.calls == []
+    monkeypatch.setattr(refresh, "_utcnow", lambda: frozen + timedelta(hours=25))
+    unavailable = _FakeProvider(by_condition={pending: None})
+    assert refresh.main(["--db-path", str(db.db_path), "--wallet-id", WID,
+                         "--write", "--allow-live", "--confirm-production-db"], provider=unavailable) == 0
+    state = dict(db.conn.execute(
+        "SELECT attempt_count, last_status, next_check_after FROM specialist_market_refresh_state WHERE market_source_id=?",
+        (pending,)).fetchone())
+    assert state["attempt_count"] == 1 and state["last_status"] == "unavailable"
+    assert state["next_check_after"] == (frozen + timedelta(hours=97)).isoformat()
+    outcome = refresh.MarketRefreshOutcome(pending)
+    outcome.last_status, outcome.last_error = "provider_unavailable", "provider_error:RuntimeError"
+    refresh._upsert_bookkeeping(db, outcome)
+    db.commit()
+    state = dict(db.conn.execute(
+        "SELECT attempt_count, last_status, last_error, next_check_after FROM specialist_market_refresh_state WHERE market_source_id=?",
+        (pending,)).fetchone())
+    assert state["attempt_count"] == 2
+    assert state["last_status"] == "provider_unavailable"
+    assert state["last_error"] == "provider_error:RuntimeError"
+    assert state["next_check_after"] == (frozen + timedelta(hours=49)).isoformat()
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("last_status", "prior_attempts", "expected_attempts", "expected_delay"),
+    [
+        ("resolved", 0, 1, None),
+        ("unresolved", 2, 3, 24),
+        ("unresolved", 3, 4, 24),
+        ("unavailable", 0, 1, 72),
+        ("unavailable", 2, 1, 72),
+        ("provider_unavailable", 0, 1, 24),
+        ("provider_unavailable", 2, 1, 24),
+        ("routing_http_error", 2, 1, 24),
+    ],
+)
+def test_bookkeeping_applies_status_specific_retry_policy(
+    monkeypatch, last_status, prior_attempts, expected_attempts, expected_delay
+):
+    """Unresolved has no attempt ceiling; failures retain their bounded budget."""
+    db, _ = _open()
+    frozen = datetime(2026, 4, 1, tzinfo=UTC)
+    monkeypatch.setattr(refresh, "_utcnow", lambda: frozen)
+    market_id = f"policy-{last_status}-{prior_attempts}"
+    if prior_attempts:
+        db.conn.execute(
+            "INSERT INTO specialist_market_refresh_state "
+            "(market_source_id, last_status, attempt_count, next_check_after) "
+            "VALUES (?, 'unresolved', ?, NULL)",
+            (market_id, prior_attempts),
+        )
+    outcome = refresh.MarketRefreshOutcome(market_id)
+    outcome.last_status = last_status
+    outcome.last_error = "honest-error" if last_status not in {"resolved", "unresolved"} else None
+    refresh._upsert_bookkeeping(db, outcome)
+    state = dict(db.conn.execute(
+        "SELECT attempt_count, last_status, last_error, next_check_after "
+        "FROM specialist_market_refresh_state WHERE market_source_id=?",
+        (market_id,),
+    ).fetchone())
+    assert state["attempt_count"] == expected_attempts
+    assert state["last_status"] == last_status
+    assert state["last_error"] == outcome.last_error
+    expected_deadline = (
+        refresh._TERMINAL_NEXT_CHECK_AFTER
+        if expected_delay is None
+        else (frozen + timedelta(hours=expected_delay)).isoformat()
+    )
+    assert state["next_check_after"] == expected_deadline
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "failure_status",
+    ["unavailable", "provider_unavailable", "routing_http_error"],
+)
+def test_bookkeeping_caps_failure_after_unresolved_observations(
+    monkeypatch, failure_status
+):
+    """A failure after unresolved starts a fresh consecutive failure budget."""
+    db, _ = _open()
+    frozen = datetime(2026, 4, 1, tzinfo=UTC)
+    monkeypatch.setattr(refresh, "_utcnow", lambda: frozen)
+    market_id = f"prior-unresolved-{failure_status}"
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state "
+        "(market_source_id, last_status, attempt_count, next_check_after) "
+        "VALUES (?, 'unresolved', 3, NULL)",
+        (market_id,),
+    )
+    outcome = refresh.MarketRefreshOutcome(market_id)
+    outcome.last_status = failure_status
+    outcome.last_error = f"honest-{failure_status}-error"
+    refresh._upsert_bookkeeping(db, outcome)
+    state = dict(db.conn.execute(
+        "SELECT attempt_count, last_status, last_error, next_check_after "
+        "FROM specialist_market_refresh_state WHERE market_source_id=?",
+        (market_id,),
+    ).fetchone())
+    assert state["attempt_count"] == 1
+    assert state["last_status"] == failure_status
+    assert state["last_error"] == outcome.last_error
+    assert state["next_check_after"] == (
+        frozen + timedelta(hours=72 if failure_status == "unavailable" else 24)
+    ).isoformat()
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "attempts", "next_check_after", "selected"),
+    [
+        ("unresolved", 3, "2026-03-31T23:59:59+00:00", True),
+        ("unresolved", 4, None, True),
+        ("unresolved", 4, "2026-04-01T01:00:00+00:00", False),
+        ("unavailable", 3, None, False),
+        ("provider_unavailable", 3, "2026-03-31T23:59:59+00:00", False),
+        ("routing_http_error", 3, None, False),
+    ],
+)
+def test_selector_preserves_legacy_unresolved_but_suppresses_failure_ceiling(
+    status, attempts, next_check_after, selected
+):
+    db, _ = _open()
+    _seed_wallet(db)
+    market_id = f"0x{attempts:063x}{len(status):x}"
+    _insert_trade(db, f"legacy-{status}-{next_check_after}", condition=market_id)
+    db.conn.execute(
+        "INSERT INTO specialist_market_refresh_state "
+        "(market_source_id, last_status, attempt_count, next_check_after) "
+        "VALUES (?, ?, ?, ?)",
+        (market_id, status, attempts, next_check_after),
+    )
+    db.conn.commit()
+    actual = select_markets_for_refresh(
+        db, wallet_address=ADDR, limit_markets=100,
+        now="2026-04-01T00:00:00+00:00",
+    )
+    assert (market_id in actual) is selected
+    db.close()
+
+
+def test_legacy_null_refresh_state_terminal_markets_skip_cli_provider_call():
+    """Legacy terminal state remains terminal even without a retry deadline."""
+    db, _ = _open()
+    _seed_wallet(db)
+    attempt_terminal = COND[:-1] + "e"
+    resolved_terminal = COND[:-1] + "f"
+    _insert_trade(db, "legacy-attempt", condition=attempt_terminal)
+    _insert_trade(db, "legacy-resolved", condition=resolved_terminal)
+    db.conn.executemany(
+        "INSERT INTO specialist_market_refresh_state "
+        "(market_source_id, last_status, attempt_count, next_check_after) "
+        "VALUES (?, ?, ?, NULL)",
+        [
+            (attempt_terminal, "provider_unavailable", 3),
+            (resolved_terminal, "resolved", 1),
+        ],
+    )
+    db.conn.commit()
+    provider = _FakeProvider(by_condition={
+        attempt_terminal: _gamma_market(
+            condition=attempt_terminal, resolved=True, winner_token=TOK_WIN
+        ),
+        resolved_terminal: _gamma_market(
+            condition=resolved_terminal, resolved=True, winner_token=TOK_WIN
+        ),
+    })
+
+    rc = refresh.main([
+        "--db-path", str(db.db_path), "--wallet-id", WID,
+        "--write", "--allow-live", "--confirm-production-db",
+    ], provider=provider)
+
+    assert rc == 0
+    assert provider.calls == [resolved_terminal]
+    assert _row(db, "legacy-attempt")["resolution_status"] == "unresolved"
+    assert _row(db, "legacy-resolved")["resolution_status"] == "won"
+    db.close()
+
+
+def test_periodic_selection_uses_canonical_truth_and_bounded_conflict_retry():
+    db, _ = _open()
+    _seed_wallet(db)
+    unresolved_legacy_resolved = "0x" + "1" * 64
+    unresolved_conflict = "0x" + "2" * 64
+    clean_terminal = "0x" + "3" * 64
+    exhausted_conflict = "0x" + "4" * 64
+    _insert_trade(db, "canonical-unresolved-resolved-bk", condition=unresolved_legacy_resolved)
+    _insert_trade(db, "canonical-unresolved-conflict-bk", condition=unresolved_conflict)
+    _insert_trade(db, "canonical-clean-terminal", condition=clean_terminal,
+                  status="won", winner=TOK_WIN)
+    _insert_trade(db, "canonical-terminal-conflict-exhausted", condition=exhausted_conflict,
+                  status="won", winner=TOK_WIN)
+    for market, status, error, attempts in (
+        (unresolved_legacy_resolved, "resolved", None, 1),
+        (unresolved_conflict, "resolved", "conflict", 1),
+        (clean_terminal, "resolved", None, 1),
+        (exhausted_conflict, "resolved", "conflict", 3),
+    ):
+        db.conn.execute(
+            "INSERT INTO specialist_market_refresh_state "
+            "(market_source_id, last_checked_at, last_status, last_error, "
+            "attempt_count, next_check_after) VALUES (?, ?, ?, ?, ?, ?)",
+            (market, "2026-04-01T00:00:00Z", status, error, attempts,
+             "2026-03-31T00:00:00Z"),
+        )
+    db.conn.commit()
+    selected = select_markets_for_refresh(
+        db, wallet_address=ADDR, now="2026-04-02T00:00:00Z", limit_markets=20,
+    )
+    assert unresolved_legacy_resolved in selected
+    assert unresolved_conflict in selected
+    assert clean_terminal not in selected
+    assert exhausted_conflict not in selected
+    db.close()
+
+
+def test_selection_prioritizes_unseen_then_oldest_due_deterministically():
+    db, _ = _open()
+    _seed_wallet(db)
+    unseen = "0x" + "f" * 64
+    old_high = "0x" + "e" * 64
+    old_low = "0x" + "1" * 64
+    newer = "0x" + "2" * 64
+    for index, market in enumerate((unseen, old_high, old_low, newer)):
+        _insert_trade(db, f"fair-{index}", condition=market)
+    for market, checked in (
+        (old_high, "2026-03-01T00:00:00Z"),
+        (old_low, "2026-03-01T00:00:00Z"),
+        (newer, "2026-03-15T00:00:00Z"),
+    ):
+        db.conn.execute(
+            "INSERT INTO specialist_market_refresh_state "
+            "(market_source_id, last_checked_at, last_status, attempt_count, "
+            "next_check_after) VALUES (?, ?, 'unresolved', 1, ?)",
+            (market, checked, "2026-03-20T00:00:00Z"),
+        )
+    db.conn.commit()
+    selected = select_markets_for_refresh(
+        db, wallet_address=ADDR, now="2026-04-02T00:00:00Z", limit_markets=3,
+    )
+    assert selected == [unseen, old_low, old_high]
+    db.close()
+
+
+def test_bounded_periodic_selection_rotates_backlog_across_cycles():
+    """Each bounded due cycle covers unseen backlog before fresh selections."""
+    db, _ = _open()
+    _seed_wallet(db)
+    markets = [
+        "0x" + "01" * 32,
+        "0x" + "02" * 32,
+        "0x" + "f0" * 32,
+        "0x" + "f1" * 32,
+        "0x" + "ff" * 32,
+    ]
+    for index, market in enumerate(markets):
+        _insert_trade(db, f"cycle-{index}", condition=market)
+
+    now = "2026-04-01T00:00:00+00:00"
+    first = select_markets_for_refresh(
+        db, wallet_address=ADDR, now=now, limit_markets=2,
+    )
+    assert first == markets[:2]
+
+    def mark_checked(selected, checked_at):
+        for market in selected:
+            db.conn.execute(
+                "INSERT INTO specialist_market_refresh_state "
+                "(market_source_id, last_checked_at, last_status, attempt_count, "
+                "next_check_after) VALUES (?, ?, 'unresolved', 1, ?) "
+                "ON CONFLICT(market_source_id) DO UPDATE SET "
+                "last_checked_at=excluded.last_checked_at, "
+                "last_status=excluded.last_status, "
+                "attempt_count=excluded.attempt_count, "
+                "next_check_after=excluded.next_check_after",
+                (market, checked_at, "2026-04-01T01:00:00+00:00"),
+            )
+        db.conn.commit()
+
+    mark_checked(first, now)
+    second = select_markets_for_refresh(
+        db, wallet_address=ADDR, now="2026-04-02T00:00:00+00:00", limit_markets=2,
+    )
+    assert second == markets[2:4]
+    mark_checked(second, "2026-04-02T00:00:00+00:00")
+
+    third = select_markets_for_refresh(
+        db, wallet_address=ADDR, now="2026-04-03T00:00:00+00:00", limit_markets=2,
+    )
+    # The final unseen market wins before the freshly checked second-cycle
+    # rows; equal first-cycle timestamps use normalized ID deterministically.
+    assert third == [markets[4], markets[0]]
+    assert select_markets_for_refresh(
+        db, wallet_address=ADDR, now="2026-04-03T00:00:00+00:00", limit_markets=2,
+    ) == third
+    db.close()
+
+
+def test_lock_refusal_prevents_provider_and_mutation_and_success_releases(monkeypatch):
+    db, _ = _open()
+    _seed_wallet(db)
+    _insert_trade(db, "t1")
+    provider = _provider_resolved()
+    monkeypatch.setattr(
+        refresh, "operational_job_lock",
+        lambda *_a, **_k: (_ for _ in ()).throw(refresh.LockError("held")),
+    )
+    rc = refresh.main(["--db-path", str(db.db_path), "--market-source-id", COND,
+                       "--write", "--allow-live", "--confirm-production-db"], provider=provider)
+    assert rc == 2 and provider.calls == []
+    assert _row(db, "t1")["resolution_status"] == "unresolved"
+    assert db.conn.execute("SELECT COUNT(*) FROM specialist_market_refresh_state").fetchone()[0] == 0
+
+    events = []
+    class _Lock:
+        def __enter__(self):
+            events.append("entered")
+            return self
+        def __exit__(self, *_exc):
+            events.append("released")
+    monkeypatch.setattr(refresh, "operational_job_lock", lambda *_a, **_k: _Lock())
+    assert refresh.main(["--db-path", str(db.db_path), "--market-source-id", COND,
+                         "--allow-live", "--lock-timeout", "0"], provider=provider) == 0
+    assert events == ["entered", "released"]
+    assert _row(db, "t1")["resolution_status"] == "unresolved"  # dry-run gate preserved
+    db.close()
 
 
 # ---------------------------------------------------------------------------

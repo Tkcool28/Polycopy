@@ -39,6 +39,7 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -59,13 +60,30 @@ from polycopy.ingestion.source_trade_resolution import (  # noqa: E402
     MarketRefreshOutcome,
     MarketStateProvider,
     build_market_state_provider,
+    MAX_REFRESH_ATTEMPTS,
+    REFRESH_FAILURE_STATUSES,
     resolve_selected_markets,
     select_markets_for_refresh,
 )
+from polycopy.runtime.locks import LockError, operational_job_lock  # noqa: E402
 
 PRODUCTION_DB_PATH = (REPO_ROOT / "data" / "polycopy.db").resolve()
 
 _MAX_MARKETS = 500
+_MAX_WATCH_COHORT = 5
+_TERMINAL_NEXT_CHECK_AFTER = "9999-12-31T23:59:59+00:00"
+
+
+def _utcnow() -> datetime:
+    """Injectable clock seam for refresh scheduling."""
+    return datetime.now(timezone.utc)
+
+
+def _canonical_utc_timestamp(value: datetime) -> str:
+    """Encode a scheduling instant in the sole canonical persisted form."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 # Targets this CLI must never create/modify (S5 / execution plane).
 _FORBIDDEN_ARTIFACT_TABLES = (
@@ -171,10 +189,13 @@ def _validate_selector_readonly(args: argparse.Namespace) -> Optional[int]:
     if args.watch_id:
         db = open_readonly(args.db_path)
         try:
-            addr = _resolve_watch_address_passthrough(db, args.watch_id)
+            addresses = [
+                _resolve_watch_address_passthrough(db, watch_id)
+                for watch_id in args.watch_id
+            ]
         finally:
             db.close()
-        if addr is None:
+        if any(addr is None for addr in addresses):
             print(
                 "error: --watch-id is unknown, paused, retired, or behind a "
                 "sample wallet; refusing (no markets selected)",
@@ -219,12 +240,13 @@ def _run(db: DbConn, args: argparse.Namespace, do_write: bool,
 
     before = _count_artifacts(db) if do_write else {}
 
+    selected_markets = _select_markets_for_args(db, args)
     report = _empty_report()
     try:
         outcomes = asyncio.run(
             resolve_selected_markets(
                 db,
-                markets=_select_markets_for_args(db, args),
+                markets=selected_markets,
                 provider=provider_obj,
                 apply=do_write,
                 report=_report_obj(),
@@ -248,7 +270,9 @@ def _run(db: DbConn, args: argparse.Namespace, do_write: bool,
 
     after = _count_artifacts(db) if do_write else {}
     report = _summarize(outcomes)
-    report["markets_selected"] = len(_select_markets_for_args(db, args))
+    # Resolution may make every selected market ineligible for a future pass;
+    # report the original cohort rather than re-selecting after writes.
+    report["markets_selected"] = len(selected_markets)
     report["artifact_counts"] = after
     report["artifact_delta"] = {
         t: after[t] - before[t]
@@ -266,12 +290,15 @@ def _select_markets_for_args(db: DbConn, args: argparse.Namespace) -> list[str]:
             # Refused upstream by _validate_selector_readonly; defensive empty.
             return []
         return select_markets_for_refresh(
-            db, wallet_address=wallet_address, limit_markets=args.limit_markets
+            db, wallet_address=wallet_address,
+            now=_canonical_utc_timestamp(_utcnow()),
+            limit_markets=args.limit_markets
         )
     return select_markets_for_refresh(
         db,
         market_source_id=args.market_source_id,
-        watch_id=args.watch_id,
+        watch_ids=args.watch_id,
+        now=_canonical_utc_timestamp(_utcnow()),
         limit_markets=args.limit_markets,
     )
 
@@ -337,17 +364,52 @@ def _upsert_bookkeeping(db: DbConn, outcome: MarketRefreshOutcome) -> None:
     fabricated, never taken from this table on later runs).
     """
     o = outcome
-    existing = db.fetchone(
-        "SELECT attempt_count FROM specialist_market_refresh_state "
+    prior = db.fetchone(
+        "SELECT last_status, last_error, attempt_count FROM specialist_market_refresh_state "
         "WHERE market_source_id=?",
         (o.market_source_id,),
     )
-    attempts = (existing["attempt_count"] if existing else 0) + o.attempt_count
+    prior_status = str(prior["last_status"] or "").lower() if prior else ""
+    prior_error = str(prior["last_error"] or "").lower() if prior else ""
+    prior_attempts = int(prior["attempt_count"] or 0) if prior else 0
+    current_failure = (
+        o.last_status in REFRESH_FAILURE_STATUSES
+        or (o.last_status == "resolved" and o.last_error == "conflict")
+    )
+    prior_failure = (
+        prior_status in REFRESH_FAILURE_STATUSES
+        or (prior_status == "resolved" and prior_error == "conflict")
+    )
+    if o.last_status == "unresolved":
+        attempts = prior_attempts + 1 if prior_status == "unresolved" else 1
+    elif current_failure:
+        attempts = min(MAX_REFRESH_ATTEMPTS, prior_attempts + 1) if prior_failure else 1
+    else:
+        attempts = 1
+    now = _utcnow()
+    if o.last_status == "resolved" and o.last_error != "conflict":
+        next_check_after = _TERMINAL_NEXT_CHECK_AFTER
+    elif o.last_status == "unresolved":
+        next_check_after = _canonical_utc_timestamp(now + timedelta(hours=24))
+    elif o.last_status == "unavailable":
+        next_check_after = (
+            _TERMINAL_NEXT_CHECK_AFTER
+            if attempts >= MAX_REFRESH_ATTEMPTS
+            else _canonical_utc_timestamp(now + timedelta(hours=72))
+        )
+    else:
+        # Provider/routing/error outcomes, including conflict, have a bounded
+        # three-attempt budget and a 24-hour retry interval.
+        next_check_after = (
+            _TERMINAL_NEXT_CHECK_AFTER
+            if attempts >= MAX_REFRESH_ATTEMPTS
+            else _canonical_utc_timestamp(now + timedelta(hours=24))
+        )
     db.execute(
         "INSERT INTO specialist_market_refresh_state "
         "(market_source_id, last_checked_at, last_status, last_error, "
         "resolved_at, attempt_count, next_check_after) "
-        "VALUES (?, datetime('now'), ?, ?, ?, ?, NULL) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(market_source_id) DO UPDATE SET "
         "last_checked_at=excluded.last_checked_at, "
         "last_status=excluded.last_status, "
@@ -357,10 +419,12 @@ def _upsert_bookkeeping(db: DbConn, outcome: MarketRefreshOutcome) -> None:
         "next_check_after=excluded.next_check_after",
         (
             o.market_source_id,
+            _canonical_utc_timestamp(now),
             o.last_status,
             o.last_error,
             o.resolved_at,
             attempts,
+            next_check_after,
         ),
     )
 
@@ -370,13 +434,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db-path", default=str(PRODUCTION_DB_PATH))
     p.add_argument("--market-source-id")
     p.add_argument("--wallet-id")
-    p.add_argument("--watch-id")
+    p.add_argument("--watch-id", action="append")
     p.add_argument("--limit-markets", type=int, default=100)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--write", action="store_true")
     p.add_argument("--allow-live", action="store_true")
     p.add_argument("--confirm-production-db", action="store_true")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--lock-timeout", type=float, default=30.0)
+    p.add_argument("--lock-path", type=Path)
     return p
 
 
@@ -401,6 +467,22 @@ def main(argv=None, *, provider=None, bookkeeping_writer=None) -> int:
     if args.limit_markets < 1 or args.limit_markets > _MAX_MARKETS:
         print(
             f"error: --limit-markets must be in [1, {_MAX_MARKETS}]",
+            file=sys.stderr,
+        )
+        return 2
+    if args.lock_timeout < 0:
+        print("error: --lock-timeout must be non-negative", file=sys.stderr)
+        return 2
+
+    # Repeated --watch-id values are one bounded cohort selector, never five
+    # independent runs. Validate its shape before any database/provider work.
+    if args.watch_id and (
+        len(args.watch_id) > _MAX_WATCH_COHORT
+        or len(set(args.watch_id)) != len(args.watch_id)
+        or any(not value for value in args.watch_id)
+    ):
+        print(
+            f"error: --watch-id cohort must contain 1..{_MAX_WATCH_COHORT} unique non-empty IDs",
             file=sys.stderr,
         )
         return 2
@@ -455,18 +537,29 @@ def main(argv=None, *, provider=None, bookkeeping_writer=None) -> int:
         )
         return 2
 
-    db = open_writable(args.db_path, args) if do_write else open_readonly(args.db_path)
     try:
-        report = _run(
-            db, args, do_write, provider=provider,
-            bookkeeping_writer=bookkeeping_writer,
-        )
+        # Serialize every provider-backed refresh, including dry-run reads.
+        # Acquire before the live-work connection or adapter can exist.
+        with operational_job_lock(
+            "specialist-refresh", timeout=args.lock_timeout, lock_path=args.lock_path
+        ):
+            db = open_writable(
+                args.db_path, args, operational_lock_already_held=True
+            ) if do_write else open_readonly(args.db_path)
+            try:
+                report = _run(
+                    db, args, do_write, provider=provider,
+                    bookkeeping_writer=bookkeeping_writer,
+                )
+            finally:
+                db.close()
+    except LockError as exc:
+        print(f"error: refresh lock unavailable: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001 - fail closed on any write failure
         # A source-update or bookkeeping failure must NOT return success.
         print(f"error: refresh failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    finally:
-        db.close()
 
     if args.json:
         print(json.dumps(report, indent=2))

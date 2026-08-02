@@ -84,7 +84,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Protocol
 
@@ -726,6 +726,18 @@ def build_market_state_provider() -> MarketStateProvider:
 # ``source="polymarket"`` (a legacy catch-all) is deliberately NOT accepted.
 SPECIALIST_REFRESH_SOURCES: frozenset[str] = frozenset({SOURCE_NAME, "polymarket_clob"})
 
+# Shared with the refresh CLI so the retry budget has one source of truth.
+MAX_REFRESH_ATTEMPTS = 3
+REFRESH_FAILURE_STATUSES: frozenset[str] = frozenset({
+    "unavailable",
+    "provider_unavailable",
+    "routing_http_error",
+    "malformed_payload",
+    "ambiguous",
+    "missing_winning_token",
+    "conflict",
+})
+
 
 def _specialist_eligible_clause() -> str:
     """Exact accepted-source predicate for the specialist refresh scan.
@@ -774,9 +786,11 @@ def select_markets_for_refresh(
     market_source_id: Optional[str] = None,
     wallet_address: Optional[str] = None,
     watch_id: Optional[str] = None,
+    watch_ids: list[str] | None = None,
+    now: str | None = None,
     limit_markets: int = 100,
 ) -> list[str]:
-    """Return the distinct eligible BUY market_source_ids for one selector.
+    """Return the distinct eligible BUY market_source_ids for one selector/cohort.
 
     Exactly one selector must be supplied by the caller (the CLI enforces the
     "exactly one" rule before calling this). Selection:
@@ -789,10 +803,18 @@ def select_markets_for_refresh(
     * ``watch_id`` — resolved to a wallet address via
       :func:`_resolve_watch_address`; refused when unknown/sample/paused/
       retired.
+    * ``watch_ids`` — a prevalidated active-watch cohort, resolved to canonical
+      wallet addresses and selected as one bounded cohort.
 
     Eligible rows are BUY, non-sample, with a non-empty ``market_source_id``,
-    and an exact accepted ``source`` value. Distinct markets are bounded by
-    ``limit_markets`` and ordered deterministically by ``market_source_id``.
+    and an exact accepted ``source`` value. Terminal source-trade truth is not
+    re-polled. Periodic selection respects injected UTC ``now`` and orders
+    eligible markets by: (1) markets without a refresh-state row, (2) oldest
+    checked eligible markets, (3) due scheduling age, and (4) normalized
+    ``market_source_id`` as a deterministic tie-breaker. Distinct periodic
+    markets are bounded by ``limit_markets``. An explicit
+    ``--market-source-id`` uses deterministic exact-selection behavior for
+    diagnostics and bypasses periodic suppression and scheduling eligibility.
     """
     sources = tuple(SPECIALIST_REFRESH_SOURCES)
     clauses = [_specialist_eligible_clause()]
@@ -809,10 +831,60 @@ def select_markets_for_refresh(
             return []
         clauses.append("LOWER(st.trader_address) = ?")
         params.append(addr.lower())
+    if watch_ids:
+        addresses = []
+        for candidate in watch_ids:
+            addr = _resolve_watch_address(db, candidate)
+            if addr is None:
+                return []
+            addresses.append(addr.lower())
+        placeholders = ", ".join("?" for _ in addresses)
+        clauses.append(f"LOWER(st.trader_address) IN ({placeholders})")
+        params.extend(addresses)
+    exact_selector = bool(market_source_id)
+    if not exact_selector:
+        # source_trades is canonical. Bookkeeping cannot suppress an
+        # inconsistent canonical unresolved row, while canonical terminal rows
+        # are suppressed for periodic scans.
+        clauses.append(
+            "(LOWER(COALESCE(st.resolution_status, 'unresolved')) "
+            "NOT IN ('won', 'lost', 'resolved') "
+            "OR (LOWER(COALESCE(rs.last_status, '')) = 'resolved' "
+            "AND LOWER(COALESCE(rs.last_error, '')) = 'conflict'))"
+        )
+        clauses.append(
+            "(rs.market_source_id IS NULL "
+            "OR LOWER(COALESCE(rs.last_status, '')) IN ('', 'unresolved') "
+            "OR (LOWER(COALESCE(rs.last_status, '')) = 'resolved' "
+            "AND (LOWER(COALESCE(rs.last_error, '')) != 'conflict' "
+            f"OR COALESCE(rs.attempt_count, 0) < {MAX_REFRESH_ATTEMPTS})) "
+            "OR (LOWER(COALESCE(rs.last_status, '')) IN "
+            "('unavailable', 'provider_unavailable', 'routing_http_error', "
+            "'malformed_payload', 'ambiguous', 'missing_winning_token') "
+            f"AND COALESCE(rs.attempt_count, 0) < {MAX_REFRESH_ATTEMPTS}))"
+        )
+    if not exact_selector:
+        # SQLite TEXT ordering is not instant ordering when legacy rows mix
+        # ``Z``, ``+00:00``, and non-zero UTC offsets. ``julianday`` normalizes
+        # supported ISO-8601 forms. A malformed non-NULL value fails closed.
+        clauses.append(
+            "(rs.market_source_id IS NULL OR rs.next_check_after IS NULL "
+            "OR julianday(rs.next_check_after) <= julianday(?))"
+        )
+        params.append(now or datetime.now(UTC).isoformat())
     sql = (
-        "SELECT DISTINCT st.market_source_id FROM source_trades st WHERE "
+        "SELECT DISTINCT st.market_source_id FROM source_trades st "
+        "LEFT JOIN specialist_market_refresh_state rs "
+        "ON LOWER(rs.market_source_id) = LOWER(st.market_source_id) WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY st.market_source_id LIMIT ?"
+        + (" ORDER BY "
+           "CASE WHEN rs.market_source_id IS NULL THEN 0 ELSE 1 END, "
+           "CASE WHEN rs.last_checked_at IS NULL THEN 0 "
+           "ELSE julianday(rs.last_checked_at) END, "
+           "CASE WHEN rs.next_check_after IS NULL THEN 0 "
+           "ELSE julianday(rs.next_check_after) END, "
+           "LOWER(st.market_source_id) LIMIT ?"
+           if not exact_selector else " ORDER BY LOWER(st.market_source_id) LIMIT ?")
     )
     params.append(int(limit_markets))
     rows = db.execute(sql, params).fetchall()
